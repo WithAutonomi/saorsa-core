@@ -2721,6 +2721,14 @@ impl DhtNetworkManager {
         &self.transport
     }
 
+    /// Get the underlying DHT core engine for direct access.
+    ///
+    /// This is used by `P2PNode` for DHT seeding (registering transport-level peers
+    /// into the DHT routing table).
+    pub fn dht_core(&self) -> &Arc<RwLock<DhtCoreEngine>> {
+        &self.dht
+    }
+
     /// Get the optional trust engine used by this manager.
     pub fn trust_engine(&self) -> Option<Arc<EigenTrustEngine>> {
         self.trust_engine.clone()

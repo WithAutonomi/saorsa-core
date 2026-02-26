@@ -17,10 +17,12 @@
 //! It handles peer connections, network events, and node lifecycle management.
 
 use crate::adaptive::{
-    EigenTrustEngine, NodeId, NodeId as AdaptiveNodeId, NodeStatisticsUpdate, TrustProvider,
+    EigenTrustEngine, NodeId as AdaptiveNodeId, NodeStatisticsUpdate, TrustProvider,
 };
 use crate::bootstrap::{BootstrapManager, ContactEntry, QualityMetrics};
 use crate::config::Config;
+use crate::dht::core_engine::{NodeCapacity, NodeId as DhtNodeId, NodeInfo};
+use crate::dht::derive_dht_key_from_peer_id;
 use crate::dht_network_manager::{DhtNetworkConfig, DhtNetworkManager};
 use crate::error::{NetworkError, P2PError, P2pResult as Result, PeerFailureReason};
 
@@ -30,7 +32,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use tokio::sync::{RwLock, broadcast};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -791,7 +793,7 @@ impl P2PNode {
         // Initialize and register a TrustWeightedKademlia DHT for the global API
         // Use a deterministic local NodeId derived from the peer_id
         {
-            let nid = crate::dht::derive_dht_key_from_peer_id(&peer_id);
+            let nid = derive_dht_key_from_peer_id(&peer_id);
             let _twdht = std::sync::Arc::new(crate::dht::TrustWeightedKademlia::new(
                 crate::identity::node_identity::NodeId::from_bytes(nid),
             ));
@@ -847,8 +849,9 @@ impl P2PNode {
         let trust_engine = {
             let mut pre_trusted = HashSet::new();
             for bootstrap_peer in &config.bootstrap_peers_str {
-                let node_id_bytes = crate::dht::derive_dht_key_from_peer_id(bootstrap_peer);
-                pre_trusted.insert(NodeId::from_bytes(node_id_bytes));
+                // Use canonical derivation to create NodeId from bootstrap peer address
+                let node_id_bytes = derive_dht_key_from_peer_id(bootstrap_peer);
+                pre_trusted.insert(AdaptiveNodeId::from_bytes(node_id_bytes));
             }
 
             let engine = Arc::new(EigenTrustEngine::new(pre_trusted));
@@ -996,7 +999,16 @@ impl P2PNode {
     ///
     /// Delegates to the standalone [`peer_id_to_trust_node_id`] function.
     fn peer_id_to_trust_node_id(peer_id: &str) -> AdaptiveNodeId {
-        crate::network::peer_id_to_trust_node_id(peer_id)
+        if let Ok(bytes) = hex::decode(peer_id)
+            && bytes.len() == 32
+        {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&bytes);
+            return AdaptiveNodeId::from_bytes(arr);
+        }
+        // Non-hex or wrong length: use canonical derivation
+        let hash = derive_dht_key_from_peer_id(peer_id);
+        AdaptiveNodeId::from_bytes(hash)
     }
 
     /// Report a successful interaction with a peer
@@ -1274,8 +1286,7 @@ impl P2PNode {
         Ok(())
     }
 
-    // start_network_listeners and start_message_receiving_system
-    // are now implemented in TransportHandle
+    // start_network_listeners and start_message_receiving_system are implemented in TransportHandle.
 
     /// Run the P2P node (blocks until shutdown)
     pub async fn run(&self) -> Result<()> {
@@ -1384,8 +1395,17 @@ impl P2PNode {
     }
 
     /// Connect to a peer
+    ///
+    /// Delegates to the transport handle for the actual QUIC connection (Happy Eyeballs,
+    /// self-connection prevention, etc.) and then seeds the DHT with the new peer.
     pub async fn connect_peer(&self, address: &str) -> Result<PeerId> {
-        self.transport.connect_peer(address).await
+        let peer_id = self.transport.connect_peer(address).await?;
+
+        // Seed DHT with this new peer
+        let dht_core = self.dht_manager.dht_core();
+        register_peer_in_dht(dht_core, &peer_id, address).await;
+
+        Ok(peer_id)
     }
 
     /// Disconnect from a peer
@@ -1592,6 +1612,69 @@ impl P2PNode {
         self.dht_manager.get_local(&key).await
     }
 
+    /// Seed the DHT routing table from currently connected P2P peers
+    ///
+    /// This method explicitly registers all currently connected P2P peers into the
+    /// DHT routing table. This is necessary because P2P transport connections do not
+    /// automatically populate the DHT - they operate at different layers.
+    ///
+    /// # Returns
+    /// The number of peers successfully added to the DHT routing table
+    ///
+    /// # Errors
+    /// Returns an error if DHT is not enabled or if seeding fails
+    pub async fn seed_dht_from_connected_peers(&self) -> Result<usize> {
+        let dht_core = self.dht_manager.dht_core();
+        let connected = self.transport.connected_peers().await;
+        let total_peers = connected.len();
+
+        tracing::debug!(peer_count = total_peers, "Seeding DHT from connected peers");
+
+        // Collect peer addresses via transport's peer_info method
+        let mut peer_data: Vec<(PeerId, String)> = Vec::new();
+        let mut skipped_no_addr = 0usize;
+        let mut skipped_not_found = 0usize;
+        for pid in &connected {
+            if let Some(info) = self.transport.peer_info(pid).await {
+                if let Some(addr) = info.addresses.first() {
+                    peer_data.push((pid.clone(), addr.clone()));
+                } else {
+                    skipped_no_addr += 1;
+                }
+            } else {
+                skipped_not_found += 1;
+            }
+        }
+
+        if skipped_no_addr > 0 {
+            tracing::warn!(
+                count = skipped_no_addr,
+                "Skipped peers with no addresses during DHT seeding"
+            );
+        }
+        if skipped_not_found > 0 {
+            tracing::warn!(
+                count = skipped_not_found,
+                "Skipped peers not found in peers map during DHT seeding"
+            );
+        }
+
+        let mut seeded_count = 0;
+        for (peer_id, address) in &peer_data {
+            if register_peer_in_dht(dht_core, peer_id, address).await {
+                seeded_count += 1;
+            }
+        }
+
+        tracing::info!(
+            seeded = seeded_count,
+            total = total_peers,
+            "DHT seeding complete"
+        );
+
+        Ok(seeded_count)
+    }
+
     /// Add a discovered peer to the bootstrap cache
     pub async fn add_discovered_peer(&self, peer_id: PeerId, addresses: Vec<String>) -> Result<()> {
         if let Some(ref bootstrap_manager) = self.bootstrap_manager {
@@ -1667,6 +1750,55 @@ impl P2PNode {
             return stats.total_contacts;
         }
         0
+    }
+
+    /// Discover peers from a connected bootstrap peer using FIND_NODE
+    ///
+    /// Sends a FIND_NODE request for our own peer ID to discover nearby peers
+    /// and populate the routing table. This is the core of Kademlia peer discovery.
+    ///
+    /// NOTE: Currently unused — bootstrap peer discovery is handled by
+    /// `DhtNetworkManager::bootstrap_from_peers()`. Retained for potential
+    /// direct-protocol discovery fallback.
+    #[allow(dead_code)]
+    async fn discover_peers_from(&self, peer_id: &PeerId) -> Result<usize> {
+        use crate::dht::network_integration::DhtMessage;
+
+        info!("Discovering peers from bootstrap peer: {peer_id}");
+
+        // Create our node ID as a DhtKey for the FIND_NODE query
+        // We query for ourselves to find nodes closest to us
+        let our_id_bytes = derive_dht_key_from_peer_id(&self.peer_id);
+        let target_key = crate::dht::DhtKey::from_bytes(our_id_bytes);
+
+        // Create FIND_NODE message
+        let find_node_msg = DhtMessage::FindNode {
+            target: target_key,
+            count: 20, // Request up to 20 closest nodes
+        };
+
+        // Serialize the message
+        let message_bytes = postcard::to_allocvec(&find_node_msg).map_err(|e| {
+            P2PError::Network(NetworkError::ProtocolError(
+                format!("Failed to serialize FIND_NODE message: {e}").into(),
+            ))
+        })?;
+
+        // Send the FIND_NODE request
+        self.send_message(peer_id, "/dht/1.0.0", message_bytes)
+            .await?;
+
+        // Note: Response handling is asynchronous through the message handler.
+        // For now, we log the request and let the response handler populate
+        // the routing table when it receives FindNodeReply.
+        //
+        // TODO: Implement request-response correlation with a timeout to get
+        // actual discovered peer count. For now, return 0 to indicate we sent
+        // the request but don't have immediate response data.
+
+        info!("Sent FIND_NODE request to {peer_id} for peer discovery");
+
+        Ok(0) // Actual count would require awaiting the response
     }
 
     /// Connect to bootstrap peers and perform initial peer discovery
@@ -1996,6 +2128,48 @@ mod diversity_tests {
         let manager = build_bootstrap_manager_like_prod(&config).await;
         assert!(manager.diversity_config().is_relaxed());
         assert_eq!(manager.diversity_config().max_nodes_per_asn, 5000);
+    }
+}
+
+/// Register a peer in the DHT routing table.
+///
+/// This is a standalone helper (not a method on `P2PNode`) so it can be
+/// called from spawned tasks that don't have access to `self`.  The function
+/// acquires the DHT write lock internally, so callers must NOT hold the lock.
+///
+/// Returns `true` if the peer was successfully added, `false` otherwise.
+async fn register_peer_in_dht(
+    dht: &tokio::sync::RwLock<crate::dht::DHT>,
+    peer_id: &PeerId,
+    address: &str,
+) -> bool {
+    let node_id_bytes = derive_dht_key_from_peer_id(peer_id);
+    let node_id = DhtNodeId::from_bytes(node_id_bytes);
+
+    let node_info = NodeInfo {
+        id: node_id,
+        address: address.to_string(),
+        last_seen: SystemTime::now(),
+        capacity: NodeCapacity::default(),
+    };
+
+    let mut dht_instance = dht.write().await;
+    match dht_instance.add_node(node_info).await {
+        Ok(()) => {
+            tracing::debug!(
+                peer_id = %peer_id,
+                "Added peer to DHT routing table"
+            );
+            true
+        }
+        Err(e) => {
+            tracing::debug!(
+                peer_id = %peer_id,
+                error = %e,
+                "Failed to add peer to DHT (may be due to security checks)"
+            );
+            false
+        }
     }
 }
 
