@@ -34,16 +34,13 @@ use crate::quantum_crypto::saorsa_transport_integration::{MlDsaPublicKey, MlDsaS
 use crate::secure_memory::SecureMemory;
 use crate::{P2PError, Result};
 use rand::{RngCore, thread_rng};
+use saorsa_pqc::api::sig::{MlDsa, MlDsaVariant};
 use saorsa_pqc::{HkdfSha3_256, api::traits::Kdf};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 /// Size of master seed in bytes (256 bits for security)
 const MASTER_SEED_SIZE: usize = 32;
-
-/// Sizes for ML-DSA-65 keys
-const ML_DSA_PUB_LEN: usize = 1952;
-const ML_DSA_SEC_LEN: usize = 4032;
 
 /// Maximum derivation depth to prevent stack overflow
 const MAX_DERIVATION_DEPTH: usize = 10;
@@ -456,27 +453,29 @@ impl HierarchicalKeyDerivation {
             current_chaincode = new_chaincode;
         }
 
-        // Derive ML-DSA key material deterministically
-        let mut derived = vec![0u8; ML_DSA_PUB_LEN + ML_DSA_SEC_LEN];
+        // Derive a 32-byte ML-DSA seed deterministically, then generate a real keypair
+        let mut xi = [0u8; 32];
         HkdfSha3_256::derive(
             &current_key,
             Some(&current_chaincode),
             b"ml-dsa keypair",
-            &mut derived,
+            &mut xi,
         )
         .map_err(|_| {
             P2PError::Security(SecurityError::InvalidKey(
                 "HKDF derivation failed".to_string().into(),
             ))
         })?;
-        let pub_bytes = &derived[..ML_DSA_PUB_LEN];
-        let sec_bytes = &derived[ML_DSA_PUB_LEN..];
-        let public_key = MlDsaPublicKey::from_bytes(pub_bytes).map_err(|e| {
+
+        let dsa = MlDsa::new(MlDsaVariant::MlDsa65);
+        let (pk, sk) = dsa.generate_keypair_from_seed(&xi);
+
+        let public_key = MlDsaPublicKey::from_bytes(&pk.to_bytes()).map_err(|e| {
             P2PError::Security(SecurityError::InvalidKey(
                 format!("Invalid ML-DSA public key: {e}").into(),
             ))
         })?;
-        let secret_key = MlDsaSecretKey::from_bytes(sec_bytes).map_err(|e| {
+        let secret_key = MlDsaSecretKey::from_bytes(&sk.to_bytes()).map_err(|e| {
             P2PError::Security(SecurityError::InvalidKey(
                 format!("Invalid ML-DSA secret key: {e}").into(),
             ))
@@ -485,7 +484,7 @@ impl HierarchicalKeyDerivation {
         // Zeroize temporary key material
         current_key.zeroize();
         current_chaincode.zeroize();
-        derived.zeroize();
+        xi.zeroize();
 
         Ok(DerivedKey {
             secret_key: std::sync::Arc::new(secret_key),
@@ -645,6 +644,10 @@ impl Zeroize for [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ML-DSA-65 key sizes for test assertions
+    const ML_DSA_PUB_LEN: usize = 1952;
+    const ML_DSA_SEC_LEN: usize = 4032;
 
     #[test]
     fn test_master_seed_generation() {

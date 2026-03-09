@@ -57,8 +57,8 @@ array-init = "2.1"
 serde_cbor = "0.11"
 statrs = "0.18"
 
-# Cryptography - Primary source of truth: saorsa-pqc 0.4.0
-saorsa-pqc = "0.4.0"
+# Cryptography - Primary source of truth: saorsa-pqc
+saorsa-pqc = { path = "../saorsa-pqc" }
 # Classical crypto for backward compatibility only
 # Classical crypto removed from production; PQC-only via saorsa-pqc and saorsa-transport
 # Password hashing

@@ -25,6 +25,9 @@
 
 use crate::error::IdentityError;
 use crate::{P2PError, Result};
+use saorsa_pqc::HkdfSha3_256;
+use saorsa_pqc::api::sig::{MlDsa, MlDsaVariant};
+use saorsa_pqc::api::traits::Kdf;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -135,40 +138,26 @@ impl NodeIdentity {
 
     /// Generate from seed (deterministic)
     pub fn from_seed(seed: &[u8; 32]) -> Result<Self> {
-        // Deterministically derive key material via HKDF-SHA3
-        use saorsa_pqc::{HkdfSha3_256, api::traits::Kdf};
+        // Derive a 32-byte ML-DSA seed from the input via HKDF-SHA3
+        let mut xi = [0u8; 32];
+        HkdfSha3_256::derive(seed, None, b"saorsa-node-identity-seed", &mut xi).map_err(|_| {
+            P2PError::Identity(IdentityError::InvalidFormat("HKDF expand failed".into()))
+        })?;
 
-        // ML-DSA-65 public/secret key sizes (bytes)
-        const ML_DSA_PUB_LEN: usize = 1952;
-        const ML_DSA_SEC_LEN: usize = 4032;
+        // Generate a real ML-DSA-65 keypair deterministically from the seed
+        let dsa = MlDsa::new(MlDsaVariant::MlDsa65);
+        let (pk, sk) = dsa.generate_keypair_from_seed(&xi);
 
-        let mut derived = vec![0u8; ML_DSA_PUB_LEN + ML_DSA_SEC_LEN];
-        HkdfSha3_256::derive(seed, None, b"saorsa-node-identity-seed", &mut derived).map_err(
-            |_| P2PError::Identity(IdentityError::InvalidFormat("HKDF expand failed".into())),
-        )?;
-
-        let pub_bytes = &derived[..ML_DSA_PUB_LEN];
-        let sec_bytes = &derived[ML_DSA_PUB_LEN..];
-
-        // Construct keys from bytes; these constructors accept byte slices in our integration
-        let public_key =
-            crate::quantum_crypto::saorsa_transport_integration::MlDsaPublicKey::from_bytes(
-                pub_bytes,
-            )
-            .map_err(|e| {
-                P2PError::Identity(IdentityError::InvalidFormat(
-                    format!("Invalid ML-DSA public key bytes: {e}").into(),
-                ))
-            })?;
-        let secret_key =
-            crate::quantum_crypto::saorsa_transport_integration::MlDsaSecretKey::from_bytes(
-                sec_bytes,
-            )
-            .map_err(|e| {
-                P2PError::Identity(IdentityError::InvalidFormat(
-                    format!("Invalid ML-DSA secret key bytes: {e}").into(),
-                ))
-            })?;
+        let public_key = MlDsaPublicKey::from_bytes(&pk.to_bytes()).map_err(|e| {
+            P2PError::Identity(IdentityError::InvalidFormat(
+                format!("Invalid ML-DSA public key bytes: {e}").into(),
+            ))
+        })?;
+        let secret_key = MlDsaSecretKey::from_bytes(&sk.to_bytes()).map_err(|e| {
+            P2PError::Identity(IdentityError::InvalidFormat(
+                format!("Invalid ML-DSA secret key bytes: {e}").into(),
+            ))
+        })?;
 
         let peer_id = peer_id_from_public_key(&public_key);
 
