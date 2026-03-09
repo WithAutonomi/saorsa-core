@@ -15,18 +15,6 @@
 use anyhow::Result;
 use once_cell::sync::Lazy;
 
-#[cfg(debug_assertions)]
-use saorsa_transport::crypto::pqc::types::ML_DSA_65_SIGNATURE_SIZE;
-
-#[cfg(debug_assertions)]
-use blake3::{Hasher, hash};
-
-#[cfg(debug_assertions)]
-use std::collections::HashMap;
-
-#[cfg(debug_assertions)]
-use std::sync::Mutex;
-
 // Re-export saorsa-transport PQC module and types for applications
 pub use saorsa_transport::crypto::pqc;
 
@@ -66,35 +54,6 @@ static ML_DSA: Lazy<MlDsa65> = Lazy::new(MlDsa65::new);
 
 static ML_KEM: Lazy<MlKem768> = Lazy::new(MlKem768::new);
 
-#[cfg(debug_assertions)]
-static DEBUG_ML_DSA_KEYS: Lazy<Mutex<HashMap<Vec<u8>, Vec<u8>>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
-
-#[cfg(debug_assertions)]
-fn lookup_debug_public(secret_key: &MlDsaSecretKey) -> Option<Vec<u8>> {
-    let key = secret_key.as_bytes().to_vec();
-    DEBUG_ML_DSA_KEYS
-        .lock()
-        .ok()
-        .and_then(|map| map.get(&key).cloned())
-}
-
-#[cfg(debug_assertions)]
-pub fn register_debug_ml_dsa_keypair(secret_key: &MlDsaSecretKey, public_key: &MlDsaPublicKey) {
-    if let Ok(mut map) = DEBUG_ML_DSA_KEYS.lock() {
-        map.insert(
-            secret_key.as_bytes().to_vec(),
-            public_key.as_bytes().to_vec(),
-        );
-    }
-}
-
-#[cfg(not(debug_assertions))]
-#[allow(clippy::unused_unit)]
-pub fn register_debug_ml_dsa_keypair(_secret_key: &MlDsaSecretKey, _public_key: &MlDsaPublicKey) {
-    // No-op outside debug builds
-}
-
 /// Create a default PQC configuration with quantum-resistant algorithms enabled
 /// Note: saorsa-transport 0.14+ is pure PQC - no hybrid mode available
 pub fn create_default_pqc_config() -> Result<PqcConfig> {
@@ -120,7 +79,6 @@ pub fn generate_ml_dsa_keypair() -> Result<(MlDsaPublicKey, MlDsaSecretKey)> {
     let (public_key, secret_key) = ML_DSA
         .generate_keypair()
         .map_err(|e| anyhow::anyhow!("Failed to generate ML-DSA keypair: {}", e))?;
-    register_debug_ml_dsa_keypair(&secret_key, &public_key);
     Ok((public_key, secret_key))
 }
 
@@ -133,38 +91,13 @@ pub fn generate_ml_kem_keypair() -> Result<(MlKemPublicKey, MlKemSecretKey)> {
 }
 
 /// Sign a message using ML-DSA-65 with saorsa-transport's implementation
-#[cfg(not(debug_assertions))]
 pub fn ml_dsa_sign(secret_key: &MlDsaSecretKey, message: &[u8]) -> Result<MlDsaSignature> {
     ML_DSA
         .sign(secret_key, message)
         .map_err(|e| anyhow::anyhow!("Failed to sign with ML-DSA: {}", e))
 }
 
-#[cfg(debug_assertions)]
-pub fn ml_dsa_sign(secret_key: &MlDsaSecretKey, message: &[u8]) -> Result<MlDsaSignature> {
-    let public_bytes = lookup_debug_public(secret_key)
-        .ok_or_else(|| anyhow::anyhow!("Debug ML-DSA registry missing public key"))?;
-    let public_digest = hash(&public_bytes);
-    let message_digest = hash(message);
-
-    let mut signature_bytes = [0u8; ML_DSA_65_SIGNATURE_SIZE];
-    signature_bytes[..32].copy_from_slice(public_digest.as_bytes());
-    signature_bytes[32..64].copy_from_slice(message_digest.as_bytes());
-
-    let mut hasher = Hasher::new();
-    hasher.update(public_digest.as_bytes());
-    hasher.update(message_digest.as_bytes());
-    hasher.update(&(message.len() as u64).to_le_bytes());
-    hasher.update(message);
-    let mut reader = hasher.finalize_xof();
-    reader.fill(&mut signature_bytes[64..]);
-
-    MlDsaSignature::from_bytes(signature_bytes.as_slice())
-        .map_err(|e| anyhow::anyhow!("Failed to build debug ML-DSA signature: {}", e))
-}
-
 /// Verify a signature using ML-DSA-65 with saorsa-transport's implementation
-#[cfg(not(debug_assertions))]
 pub fn ml_dsa_verify(
     public_key: &MlDsaPublicKey,
     message: &[u8],
@@ -174,39 +107,6 @@ pub fn ml_dsa_verify(
         Ok(is_valid) => Ok(is_valid),
         Err(e) => Err(anyhow::anyhow!("ML-DSA verification failed: {}", e)),
     }
-}
-
-#[cfg(debug_assertions)]
-pub fn ml_dsa_verify(
-    public_key: &MlDsaPublicKey,
-    message: &[u8],
-    signature: &MlDsaSignature,
-) -> Result<bool> {
-    let signature_bytes = signature.as_bytes();
-    if signature_bytes.len() != ML_DSA_65_SIGNATURE_SIZE {
-        return Ok(false);
-    }
-
-    let expected_public_digest = hash(public_key.as_bytes());
-    if signature_bytes[..32] != expected_public_digest.as_bytes()[..] {
-        return Ok(false);
-    }
-
-    let expected_message_digest = hash(message);
-    if signature_bytes[32..64] != expected_message_digest.as_bytes()[..] {
-        return Ok(false);
-    }
-
-    let mut hasher = Hasher::new();
-    hasher.update(expected_public_digest.as_bytes());
-    hasher.update(expected_message_digest.as_bytes());
-    hasher.update(&(message.len() as u64).to_le_bytes());
-    hasher.update(message);
-    let mut reader = hasher.finalize_xof();
-    let mut expected_tail = vec![0u8; ML_DSA_65_SIGNATURE_SIZE - 64];
-    reader.fill(&mut expected_tail);
-
-    Ok(signature_bytes[64..] == expected_tail[..])
 }
 
 /// Encapsulate a shared secret using ML-KEM-768 with saorsa-transport's implementation

@@ -126,11 +126,6 @@ impl NodeIdentity {
 
         let peer_id = peer_id_from_public_key(&public_key);
 
-        crate::quantum_crypto::saorsa_transport_integration::register_debug_ml_dsa_keypair(
-            &secret_key,
-            &public_key,
-        );
-
         Ok(Self {
             secret_key,
             public_key,
@@ -176,11 +171,6 @@ impl NodeIdentity {
             })?;
 
         let peer_id = peer_id_from_public_key(&public_key);
-
-        crate::quantum_crypto::saorsa_transport_integration::register_debug_ml_dsa_keypair(
-            &secret_key,
-            &public_key,
-        );
 
         Ok(Self {
             secret_key,
@@ -330,11 +320,6 @@ impl NodeIdentity {
             })?;
 
         let peer_id = peer_id_from_public_key(&public_key);
-
-        crate::quantum_crypto::saorsa_transport_integration::register_debug_ml_dsa_keypair(
-            &secret_key,
-            &public_key,
-        );
 
         Ok(Self {
             secret_key,
