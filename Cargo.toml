@@ -58,7 +58,7 @@ serde_cbor = "0.11"
 statrs = "0.18"
 
 # Cryptography - Primary source of truth: saorsa-pqc
-saorsa-pqc = { path = "../saorsa-pqc" }
+saorsa-pqc = "0.5"
 # Classical crypto for backward compatibility only
 # Classical crypto removed from production; PQC-only via saorsa-pqc and saorsa-transport
 # Password hashing
