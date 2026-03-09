@@ -9,7 +9,8 @@ name = "saorsa-core"
 # 0.12.1: patch release
 # 0.13.0: multi-channel transport, PeerId ownership, BLAKE3 migration (PR #32)
 # 0.14.0: user-agent DHT gating — exclude ephemeral clients from DHT routing table
-version = "0.14.0"
+# 0.14.1: fix deterministic identity generation to use real ML-DSA keypairs
+version = "0.14.1"
 edition = "2024"
 authors = ["Saorsa Labs Limited <david@saorsalabs.com>"]
 license = "AGPL-3.0"
