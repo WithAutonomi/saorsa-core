@@ -11,7 +11,7 @@ name = "saorsa-core"
 # 0.14.0: user-agent DHT gating — exclude ephemeral clients from DHT routing table
 # 0.14.1: fix deterministic identity generation to use real ML-DSA keypairs
 # 0.15.0: routing table single-source-of-truth fixes
-version = "0.15.0"
+version = "0.15.1"
 edition = "2024"
 authors = ["Saorsa Labs Limited <david@saorsalabs.com>"]
 license = "AGPL-3.0"
