@@ -11,9 +11,9 @@
 // distributed under these licenses is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 
-//! Churn handling and recovery system
+//! Churn handling system
 //!
-//! This module implements churn detection and recovery mechanisms:
+//! This module implements churn detection mechanisms:
 //! - Node failure detection with 30-second heartbeat timeout
 //! - Routing table repair and maintenance
 //! - Trust score updates for unexpected departures
@@ -22,14 +22,14 @@
 
 use crate::PeerId;
 use crate::adaptive::{
-    ContentHash, TrustProvider,
+    TrustProvider,
     gossip::{AdaptiveGossipSub, GossipMessage},
     learning::ChurnPredictor,
     routing::AdaptiveRouter,
 };
 use anyhow::Result;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -45,9 +45,6 @@ pub struct ChurnHandler {
 
     /// Node monitoring system
     node_monitor: Arc<NodeMonitor>,
-
-    /// Recovery manager for content
-    recovery_manager: Arc<RecoveryManager>,
 
     /// Trust provider for reputation updates
     trust_provider: Arc<dyn TrustProvider>,
@@ -128,9 +125,6 @@ pub struct NodeStatus {
 
     /// Reliability score (0.0-1.0)
     pub reliability: f64,
-
-    /// Content stored by this node
-    pub stored_content: HashSet<ContentHash>,
 }
 
 /// Node state in the network
@@ -147,85 +141,6 @@ pub enum NodeState {
 
     /// Node has failed
     Failed,
-}
-
-/// Recovery manager for handling failures
-pub struct RecoveryManager {
-    /// Content tracking
-    content_tracker: Arc<RwLock<HashMap<ContentHash, ContentTracker>>>,
-
-    /// Recovery queue
-    recovery_queue: Arc<RwLock<Vec<RecoveryTask>>>,
-
-    /// Active recoveries
-    _active_recoveries: Arc<RwLock<HashMap<ContentHash, RecoveryStatus>>>,
-}
-
-/// Content tracking information
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-struct ContentTracker {
-    /// Content hash
-    hash: ContentHash,
-
-    /// Nodes storing this content
-    storing_nodes: HashSet<PeerId>,
-
-    /// Target replication factor
-    target_replicas: u32,
-
-    /// Last verification time
-    last_verified: Instant,
-}
-
-/// Recovery task
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-struct RecoveryTask {
-    /// Content to recover
-    content_hash: ContentHash,
-
-    /// Failed nodes
-    failed_nodes: Vec<PeerId>,
-
-    /// Priority level
-    priority: RecoveryPriority,
-
-    /// Creation time
-    created_at: Instant,
-}
-
-/// Recovery priority levels
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum RecoveryPriority {
-    /// Low priority - can wait
-    Low,
-
-    /// Normal priority
-    Normal,
-
-    /// High priority - important content
-    High,
-
-    /// Critical - immediate action needed
-    Critical,
-}
-
-/// Recovery status
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-struct RecoveryStatus {
-    /// Start time
-    started_at: Instant,
-
-    /// Nodes contacted for recovery
-    contacted_nodes: Vec<PeerId>,
-
-    /// Successful recoveries
-    successful_nodes: Vec<PeerId>,
-
-    /// Failed attempts
-    failed_attempts: u32,
 }
 
 /// Churn handling statistics
@@ -270,13 +185,11 @@ impl ChurnHandler {
         config: ChurnConfig,
     ) -> Self {
         let node_monitor = Arc::new(NodeMonitor::new(config.clone()));
-        let recovery_manager = Arc::new(RecoveryManager::new());
 
         Self {
             node_id,
             predictor,
             node_monitor,
-            recovery_manager,
             trust_provider,
             router,
             gossip,
@@ -365,20 +278,10 @@ impl ChurnHandler {
             .update_node_state(node_id, NodeState::Departing)
             .await;
 
-        // 2. Get content stored by this node
-        let stored_content = self.get_content_stored_by(node_id).await?;
-
-        // 3. Start aggressive replication
-        for content_hash in stored_content {
-            self.recovery_manager
-                .increase_replication(&content_hash, RecoveryPriority::High)
-                .await?;
-        }
-
-        // 4. Reroute ongoing connections
+        // 2. Reroute ongoing connections
         self.router.mark_node_unreliable(node_id).await;
 
-        // 5. Notify network via gossip
+        // 3. Notify network via gossip
         let message = GossipMessage {
             topic: "node_departing".to_string(),
             data: postcard::to_stdvec(&node_id)
@@ -407,24 +310,10 @@ impl ChurnHandler {
         // 2. Remove from all routing structures
         self.remove_from_routing_tables(node_id).await?;
 
-        // 3. Identify lost content and queue recovery
-        let lost_content = self.identify_lost_content(node_id).await?;
-        tracing::info!(
-            "Node {} failed, queuing recovery for {} content items",
-            node_id,
-            lost_content.len(),
-        );
-
-        for content_hash in lost_content {
-            self.recovery_manager
-                .queue_recovery(content_hash, vec![*node_id], RecoveryPriority::Critical)
-                .await?;
-        }
-
-        // 4. Update trust scores
+        // 3. Update trust scores
         self.penalize_unexpected_departure(node_id).await;
 
-        // 5. Trigger topology rebalancing
+        // 4. Trigger topology rebalancing
         self.trigger_topology_rebalance().await?;
 
         // Update stats
@@ -481,32 +370,6 @@ impl ChurnHandler {
         Ok(())
     }
 
-    /// Get content stored by a specific node
-    async fn get_content_stored_by(&self, node_id: &PeerId) -> Result<Vec<ContentHash>> {
-        let status = self.node_monitor.get_node_status(node_id).await;
-        Ok(status.stored_content.into_iter().collect())
-    }
-
-    /// Identify content that may be lost due to node failure
-    async fn identify_lost_content(&self, failed_node: &PeerId) -> Result<Vec<ContentHash>> {
-        let all_content = self.get_content_stored_by(failed_node).await?;
-        let mut at_risk_content = Vec::new();
-
-        for content_hash in all_content {
-            let remaining_replicas = self
-                .recovery_manager
-                .get_remaining_replicas(&content_hash, failed_node)
-                .await?;
-
-            // If below minimum replication factor, mark as at risk
-            if remaining_replicas < 5 {
-                at_risk_content.push(content_hash);
-            }
-        }
-
-        Ok(at_risk_content)
-    }
-
     /// Penalize node for unexpected departure
     async fn penalize_unexpected_departure(&self, node_id: &PeerId) {
         self.trust_provider.update_trust(
@@ -553,7 +416,6 @@ impl ChurnHandler {
             node_id: self.node_id,
             predictor: self.predictor.clone(),
             node_monitor: self.node_monitor.clone(),
-            recovery_manager: self.recovery_manager.clone(),
             trust_provider: self.trust_provider.clone(),
             router: self.router.clone(),
             gossip: self.gossip.clone(),
@@ -592,7 +454,6 @@ impl NodeMonitor {
                 last_gossip: None,
                 status: NodeState::Failed,
                 reliability: 0.0,
-                stored_content: HashSet::new(),
             })
     }
 
@@ -616,7 +477,6 @@ impl NodeMonitor {
             last_gossip: None,
             status: NodeState::Active,
             reliability: 1.0,
-            stored_content: HashSet::new(),
         });
         status.last_heartbeat = Some(now);
         status.last_seen = now;
@@ -639,74 +499,6 @@ impl NodeMonitor {
             last_heartbeat.elapsed() < self.config.heartbeat_timeout
         } else {
             false
-        }
-    }
-}
-
-impl Default for RecoveryManager {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl RecoveryManager {
-    /// Create a new recovery manager
-    pub fn new() -> Self {
-        Self {
-            content_tracker: Arc::new(RwLock::new(HashMap::new())),
-            recovery_queue: Arc::new(RwLock::new(Vec::new())),
-            _active_recoveries: Arc::new(RwLock::new(HashMap::new())),
-        }
-    }
-
-    /// Increase replication for content
-    pub async fn increase_replication(
-        &self,
-        content_hash: &ContentHash,
-        priority: RecoveryPriority,
-    ) -> Result<()> {
-        // Queue a replication task
-        self.queue_recovery(*content_hash, vec![], priority).await
-    }
-
-    /// Queue content for recovery
-    pub async fn queue_recovery(
-        &self,
-        content_hash: ContentHash,
-        failed_nodes: Vec<PeerId>,
-        priority: RecoveryPriority,
-    ) -> Result<()> {
-        let task = RecoveryTask {
-            content_hash,
-            failed_nodes,
-            priority,
-            created_at: Instant::now(),
-        };
-
-        let mut queue = self.recovery_queue.write().await;
-        queue.push(task);
-
-        // Sort by priority
-        queue.sort_by_key(|task| std::cmp::Reverse(task.priority));
-
-        Ok(())
-    }
-
-    /// Get remaining replicas for content
-    pub async fn get_remaining_replicas(
-        &self,
-        content_hash: &ContentHash,
-        exclude_node: &PeerId,
-    ) -> Result<u32> {
-        if let Some(tracker) = self.content_tracker.read().await.get(content_hash) {
-            let remaining = tracker
-                .storing_nodes
-                .iter()
-                .filter(|&n| n != exclude_node)
-                .count() as u32;
-            Ok(remaining)
-        } else {
-            Ok(0)
         }
     }
 }

@@ -109,7 +109,7 @@ let node = Arc::new(P2PNode::new(node_config).await?);
 let dht_net = DhtNetworkConfig::default();
 
 // Dependencies can be provided from your adaptive stack
-let deps = AdaptiveDhtDependencies::with_defaults(identity, trust_provider, router);
+let deps = AdaptiveDhtDependencies::with_defaults(identity, trust_provider);
 
 // Attach AdaptiveDHT to the running node
 let dht = AdaptiveDHT::attach_to_node(node, dht_net, AdaptiveDhtConfig::default(), deps).await?;

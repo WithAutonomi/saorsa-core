@@ -55,7 +55,7 @@ pub mod trust;
 
 // Re-export commonly used types
 pub use crate::identity::NodeIdentity;
-pub use churn::{ChurnConfig, ChurnHandler, NodeMonitor, NodeState, RecoveryManager};
+pub use churn::{ChurnConfig, ChurnHandler, NodeMonitor, NodeState};
 pub use client::{
     AdaptiveP2PClient, Client, ClientConfig, ClientProfile, NetworkStats as ClientNetworkStats,
 };
@@ -236,8 +236,6 @@ pub struct NetworkStats {
     pub average_trust_score: f64,
     pub cache_hit_rate: f64,
     pub churn_rate: f64,
-    pub total_storage: u64,
-    pub total_bandwidth: u64,
 }
 
 /// Routing strategy trait for different routing algorithms

@@ -94,17 +94,11 @@ impl ProductionTestFramework {
     async fn test_data_operations(&self) -> Result<usize> {
         let mut successful_operations = 0;
 
-        // Test store and retrieve operations
+        // Test publish operations (storage is handled by saorsa-node)
         for i in 0..10 {
-            let value = format!("test_value_{}", i).into_bytes();
-            // Store via first client, get content hash
-            if let Ok(hash) = self.clients[0].store(value.clone()).await {
-                // Retrieve from another client using the hash
-                if let Ok(retrieved) = self.clients[1].retrieve(&hash).await
-                    && retrieved == value
-                {
-                    successful_operations += 1;
-                }
+            let message = format!("test_message_{}", i).into_bytes();
+            if self.clients[0].publish("test_topic", message).await.is_ok() {
+                successful_operations += 1;
             }
         }
 
@@ -156,14 +150,14 @@ impl ProductionTestFramework {
         let operations_count = 50;
         let start_time = std::time::Instant::now();
 
-        // Concurrent operations
+        // Concurrent publish operations (storage is handled by saorsa-node)
         let mut tasks = Vec::new();
 
         for i in 0..operations_count {
             let client = self.clients[i % self.clients.len()].clone();
             let task = tokio::spawn(async move {
-                let value = format!("perf_value_{}", i).into_bytes();
-                client.store(value).await.is_ok()
+                let message = format!("perf_message_{}", i).into_bytes();
+                client.publish("perf_topic", message).await.is_ok()
             });
             tasks.push(task);
         }

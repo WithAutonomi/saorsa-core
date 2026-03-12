@@ -20,9 +20,7 @@
 //! - Network statistics and monitoring
 
 use crate::PeerId;
-use crate::adaptive::{
-    AdaptiveGossipSub, AdaptiveRouter, ChurnHandler, ContentHash, MonitoringSystem,
-};
+use crate::adaptive::{AdaptiveGossipSub, AdaptiveRouter, ChurnHandler, MonitoringSystem};
 use anyhow::Result;
 use async_trait::async_trait;
 use futures::Stream;
@@ -203,12 +201,6 @@ pub struct NetworkStats {
 
     /// Current churn rate
     pub churn_rate: f64,
-
-    /// Total storage in bytes
-    pub total_storage: u64,
-
-    /// Total bandwidth in bytes/sec
-    pub total_bandwidth: u64,
 }
 
 /// Compute job for distributed processing
@@ -268,12 +260,6 @@ pub enum ClientError {
     #[error("Connection error: {0}")]
     Connection(String),
 
-    #[error("Storage error: {0}")]
-    Storage(String),
-
-    #[error("Retrieval error: {0}")]
-    Retrieval(String),
-
     #[error("Messaging error: {0}")]
     Messaging(String),
 
@@ -297,11 +283,6 @@ pub trait AdaptiveP2PClient: Send + Sync {
     async fn connect(config: ClientConfig) -> Result<Self>
     where
         Self: Sized;
-
-    /// Storage operations
-    async fn store(&self, data: Vec<u8>) -> Result<ContentHash>;
-    async fn retrieve(&self, hash: &ContentHash) -> Result<Vec<u8>>;
-    async fn delete(&self, hash: &ContentHash) -> Result<()>;
 
     /// Computation operations
     async fn submit_compute_job(&self, job: ComputeJob) -> Result<JobId>;
@@ -513,30 +494,6 @@ impl AdaptiveP2PClient for Client {
         Ok(client)
     }
 
-    async fn store(&self, _data: Vec<u8>) -> Result<ContentHash> {
-        // Storage is handled by saorsa-node, not saorsa-core
-        Err(ClientError::Storage(
-            "Storage is handled by the application layer (saorsa-node)".to_string(),
-        )
-        .into())
-    }
-
-    async fn retrieve(&self, _hash: &ContentHash) -> Result<Vec<u8>> {
-        // Retrieval is handled by saorsa-node, not saorsa-core
-        Err(ClientError::Retrieval(
-            "Retrieval is handled by the application layer (saorsa-node)".to_string(),
-        )
-        .into())
-    }
-
-    async fn delete(&self, _hash: &ContentHash) -> Result<()> {
-        // Storage is handled by saorsa-node, not saorsa-core
-        Err(ClientError::Storage(
-            "Storage is handled by the application layer (saorsa-node)".to_string(),
-        )
-        .into())
-    }
-
     async fn submit_compute_job(&self, _job: ComputeJob) -> Result<JobId> {
         let state = self.state.read().await;
         if !state.connected {
@@ -641,8 +598,6 @@ impl AdaptiveP2PClient for Client {
             average_trust_score: health.score,
             cache_hit_rate: 0.0, // TODO: Get from cache manager
             churn_rate: health.churn_rate,
-            total_storage: 0,   // Storage is handled by saorsa-node
-            total_bandwidth: 0, // TODO: Track bandwidth
         })
     }
 
@@ -791,22 +746,6 @@ mod tests {
         let state = client.state.read().await;
         assert!(state.connected);
         assert!(state.node_info.is_some());
-    }
-
-    #[tokio::test]
-    async fn test_storage_operations_unsupported() {
-        let client = new_test_client(ClientConfig::default()).await.unwrap();
-
-        // Storage operations should return errors since storage is handled by saorsa-node
-        let data = b"Hello, P2P world!".to_vec();
-        let result = client.store(data).await;
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("application layer")
-        );
     }
 
     #[tokio::test]

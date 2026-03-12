@@ -293,9 +293,6 @@ struct CoordinatorState {
     /// Active connections
     connections: usize,
 
-    /// Stored content count
-    _stored_items: usize,
-
     /// Current network health
     health: NetworkHealthStatus,
 
@@ -341,17 +338,8 @@ pub struct SystemMetrics {
     /// Failed operations
     failed_ops: u64,
 
-    /// Current throughput (ops/sec)
-    _throughput: f64,
-
     /// Cache hit rate
     cache_hit_rate: f64,
-
-    /// Replication health
-    _replication_health: f64,
-
-    /// Trust network convergence
-    _trust_convergence: f64,
 }
 
 use futures::future::BoxFuture;
@@ -390,7 +378,6 @@ impl NetworkCoordinator {
         let dht_dependencies = AdaptiveDhtDependencies::new(
             identity.clone(),
             trust_engine.clone(),
-            router.clone(),
             hyperbolic_space.clone(),
             som.clone(),
             churn_predictor.clone(),
@@ -535,7 +522,6 @@ impl NetworkCoordinator {
             state: Arc::new(RwLock::new(CoordinatorState {
                 joined: false,
                 connections: 0,
-                _stored_items: 0,
                 health: NetworkHealthStatus::Healthy,
                 shutting_down: false,
             })),
@@ -626,8 +612,6 @@ impl NetworkCoordinator {
             average_trust_score: self.routing.trust_engine.get_average_trust().await,
             cache_hit_rate: metrics.cache_hit_rate,
             churn_rate: self.operations.churn_handler.get_stats().await.churn_rate,
-            total_storage: 0,   // Storage is handled by saorsa-node
-            total_bandwidth: 0, // TODO: Implement bandwidth tracking
         }
     }
 

@@ -54,9 +54,7 @@ impl NetworkComponents {
         let router = Arc::new(AdaptiveRouter::new(trust_engine.clone()));
 
         // Initialize DHT
-        let dht = Arc::new(
-            AdaptiveDHT::new(identity.clone(), trust_engine.clone(), router.clone()).await?,
-        );
+        let dht = Arc::new(AdaptiveDHT::new(identity.clone(), trust_engine.clone()).await?);
 
         // Initialize gossip
         let gossip = Arc::new(AdaptiveGossipSub::new(

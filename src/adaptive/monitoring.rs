@@ -134,14 +134,6 @@ pub(crate) struct NetworkMetrics {
     routing_latency: Histogram,
 
     #[cfg(feature = "metrics")]
-    // Storage metrics
-    stored_items: IntGauge,
-    #[cfg(feature = "metrics")]
-    storage_bytes: IntGauge,
-    #[cfg(feature = "metrics")]
-    replication_factor: Gauge,
-
-    #[cfg(feature = "metrics")]
     // Network traffic metrics
     messages_sent: Counter,
     #[cfg(feature = "metrics")]
@@ -515,25 +507,6 @@ impl MonitoringSystem {
             ))?;
             registry.register(Box::new(routing_latency.clone()))?;
 
-            // Storage metrics
-            let stored_items = IntGauge::new(
-                format!("{}stored_items", metric_prefix),
-                "Number of stored items",
-            )?;
-            registry.register(Box::new(stored_items.clone()))?;
-
-            let storage_bytes = IntGauge::new(
-                format!("{}storage_bytes", metric_prefix),
-                "Total storage in bytes",
-            )?;
-            registry.register(Box::new(storage_bytes.clone()))?;
-
-            let replication_factor = Gauge::new(
-                format!("{}replication_factor", metric_prefix),
-                "Average replication factor",
-            )?;
-            registry.register(Box::new(replication_factor.clone()))?;
-
             // Network traffic metrics
             let messages_sent = Counter::new(
                 format!("{}messages_sent_total", metric_prefix),
@@ -649,9 +622,6 @@ impl MonitoringSystem {
                 routing_requests,
                 routing_success,
                 routing_latency,
-                stored_items,
-                storage_bytes,
-                replication_factor,
                 messages_sent,
                 messages_received,
                 bytes_sent,
@@ -703,20 +673,6 @@ impl MonitoringSystem {
                 routing_latency: register_histogram!(
                     &format!("{}routing_latency_seconds", metric_prefix),
                     "Routing request latency in seconds"
-                )?,
-
-                // Storage metrics
-                stored_items: register_int_gauge!(
-                    &format!("{}stored_items", metric_prefix),
-                    "Number of stored items"
-                )?,
-                storage_bytes: register_int_gauge!(
-                    &format!("{}storage_bytes", metric_prefix),
-                    "Total storage in bytes"
-                )?,
-                replication_factor: register_gauge!(
-                    &format!("{}replication_factor", metric_prefix),
-                    "Average replication factor"
                 )?,
 
                 // Network traffic metrics

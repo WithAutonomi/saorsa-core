@@ -134,7 +134,6 @@ impl Default for AdaptiveDhtConfig {
 pub struct AdaptiveDhtDependencies {
     pub identity: Arc<NodeIdentity>,
     pub trust_provider: Arc<dyn TrustProvider>,
-    pub router: Arc<AdaptiveRouter>,
     pub hyperbolic_space: Arc<HyperbolicSpace>,
     pub som: Arc<SelfOrganizingMap>,
     pub churn_predictor: Arc<ChurnPredictor>,
@@ -144,7 +143,6 @@ impl AdaptiveDhtDependencies {
     pub fn new(
         identity: Arc<NodeIdentity>,
         trust_provider: Arc<dyn TrustProvider>,
-        router: Arc<AdaptiveRouter>,
         hyperbolic_space: Arc<HyperbolicSpace>,
         som: Arc<SelfOrganizingMap>,
         churn_predictor: Arc<ChurnPredictor>,
@@ -152,7 +150,6 @@ impl AdaptiveDhtDependencies {
         Self {
             identity,
             trust_provider,
-            router,
             hyperbolic_space,
             som,
             churn_predictor,
@@ -162,7 +159,6 @@ impl AdaptiveDhtDependencies {
     pub fn with_defaults(
         identity: Arc<NodeIdentity>,
         trust_provider: Arc<dyn TrustProvider>,
-        router: Arc<AdaptiveRouter>,
     ) -> Self {
         let hyperbolic_space = Arc::new(HyperbolicSpace::new());
         let som = Arc::new(SelfOrganizingMap::new(super::som::SomConfig {
@@ -175,7 +171,6 @@ impl AdaptiveDhtDependencies {
         Self {
             identity,
             trust_provider,
-            router,
             hyperbolic_space,
             som,
             churn_predictor,
@@ -206,8 +201,6 @@ pub struct AdaptiveDHT {
 pub struct DHTMetrics {
     pub lookups_total: u64,
     pub lookups_successful: u64,
-    pub stores_total: u64,
-    pub stores_successful: u64,
     pub average_lookup_hops: f64,
     pub trust_rejections: u64,
 }
@@ -243,9 +236,8 @@ impl AdaptiveDHT {
     pub async fn new(
         identity: Arc<NodeIdentity>,
         trust_provider: Arc<dyn TrustProvider>,
-        router: Arc<AdaptiveRouter>,
     ) -> Result<Self> {
-        let dependencies = AdaptiveDhtDependencies::with_defaults(identity, trust_provider, router);
+        let dependencies = AdaptiveDhtDependencies::with_defaults(identity, trust_provider);
         Self::new_with_dependencies(AdaptiveDhtConfig::default(), dependencies).await
     }
 
@@ -724,18 +716,11 @@ mod tests {
 
         let identity = Arc::new(NodeIdentity::generate().unwrap());
         let trust_provider = Arc::new(MockTrustProvider);
-        let router = Arc::new(AdaptiveRouter::new_with_id(
-            *identity.peer_id(),
-            trust_provider.clone(),
-        ));
 
-        let dht = AdaptiveDHT::new(identity, trust_provider, router)
-            .await
-            .unwrap();
+        let dht = AdaptiveDHT::new(identity, trust_provider).await.unwrap();
         let metrics = dht.get_metrics().await;
 
         assert_eq!(metrics.lookups_total, 0);
-        assert_eq!(metrics.stores_total, 0);
     }
 
     #[tokio::test]
