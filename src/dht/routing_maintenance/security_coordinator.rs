@@ -2,7 +2,7 @@
 //!
 //! Integrates:
 //! - Close group validation during bucket refresh
-//! - Sybil and collusion detection
+//! - Sybil detection for routing table protection
 //! - EigenTrust reputation integration
 //! - Geographic diversity enforcement
 //! - Metrics collection and alerting
@@ -18,7 +18,6 @@ use parking_lot::RwLock;
 use tokio::sync::broadcast;
 
 use crate::PeerId;
-use crate::dht::collusion_detector::{CollusionDetector, CollusionDetectorConfig};
 use crate::dht::metrics::security_metrics::SecurityMetricsCollector;
 use crate::dht::sybil_detector::{SybilDetector, SybilDetectorConfig};
 
@@ -163,8 +162,6 @@ pub struct SecurityCoordinatorConfig {
     pub close_group_config: CloseGroupValidatorConfig,
     /// Sybil detector config
     pub sybil_config: SybilDetectorConfig,
-    /// Collusion detector config
-    pub collusion_config: CollusionDetectorConfig,
     /// Maintenance config
     pub maintenance_config: MaintenanceConfig,
     /// Minimum trust for participation in security decisions
@@ -182,7 +179,6 @@ impl Default for SecurityCoordinatorConfig {
         Self {
             close_group_config: CloseGroupValidatorConfig::default(),
             sybil_config: SybilDetectorConfig::default(),
-            collusion_config: CollusionDetectorConfig::default(),
             maintenance_config: MaintenanceConfig::default(),
             min_participation_trust: 0.3,
             min_geographic_regions: 3,
@@ -203,8 +199,6 @@ pub struct SecurityCoordinator {
     close_group_validator: Arc<RwLock<CloseGroupValidator>>,
     /// Sybil detector
     sybil_detector: Arc<RwLock<SybilDetector>>,
-    /// Collusion detector
-    collusion_detector: Arc<RwLock<CollusionDetector>>,
     /// Eviction manager
     eviction_manager: Arc<RwLock<EvictionManager>>,
     /// Close group eviction tracker
@@ -228,9 +222,6 @@ impl SecurityCoordinator {
                 config.close_group_config.clone(),
             ))),
             sybil_detector: Arc::new(RwLock::new(SybilDetector::new(config.sybil_config.clone()))),
-            collusion_detector: Arc::new(RwLock::new(CollusionDetector::new(
-                config.collusion_config.clone(),
-            ))),
             eviction_manager: Arc::new(RwLock::new(EvictionManager::new(
                 config.maintenance_config.clone(),
             ))),
@@ -324,9 +315,6 @@ impl SecurityCoordinator {
             self.handle_validation_failure(node_id, &result);
         }
 
-        // Check for collusion in responses
-        self.check_response_collusion(responses);
-
         result
     }
 
@@ -358,31 +346,6 @@ impl SecurityCoordinator {
         }
     }
 
-    /// Check for collusion patterns in responses
-    fn check_response_collusion(&self, responses: &[CloseGroupResponse]) {
-        // Build temporal data for collusion check
-        // Convert PeerId to PeerId (identity::PeerId)
-        let temporal_data: Vec<(PeerId, Duration, Instant)> = responses
-            .iter()
-            .map(|r| (r.peer_id, r.response_latency, r.received_at))
-            .collect();
-
-        // Check for temporal correlation
-        if self
-            .collusion_detector
-            .write()
-            .analyze_temporal_correlation(&temporal_data)
-            .is_some()
-        {
-            self.metrics.record_collusion_detection();
-
-            // Update collusion score
-            let group_count = self.collusion_detector.read().group_count();
-            self.metrics
-                .set_collusion_score((group_count as f64 * 0.1).min(1.0));
-        }
-    }
-
     /// Run periodic security analysis
     pub fn run_analysis(&self) {
         let now = Instant::now();
@@ -401,9 +364,6 @@ impl SecurityCoordinator {
         // Run Sybil analysis
         self.sybil_detector.write().run_analysis();
 
-        // Run collusion analysis
-        self.collusion_detector.write().run_analysis();
-
         // Update attack indicators
         self.update_attack_indicators();
 
@@ -414,7 +374,6 @@ impl SecurityCoordinator {
     /// Update attack indicators based on detector state
     fn update_attack_indicators(&self) {
         let sybil_risk = self.sybil_detector.read().overall_risk_score();
-        let collusion_groups = self.collusion_detector.read().group_count();
 
         let indicators = AttackIndicators {
             eclipse_risk: 0.0, // Would need eclipse detection
@@ -432,8 +391,6 @@ impl SecurityCoordinator {
 
         // Update metrics
         self.metrics.set_sybil_score(sybil_risk);
-        self.metrics
-            .set_collusion_score((collusion_groups as f64 * 0.1).min(1.0));
 
         // Check for BFT escalation
         if self.close_group_validator.read().is_attack_mode() {
@@ -444,7 +401,6 @@ impl SecurityCoordinator {
     /// Clean up old records from all detectors
     fn cleanup_old_records(&self) {
         self.sybil_detector.write().cleanup_old_records();
-        self.collusion_detector.write().cleanup_old_records();
         self.eviction_tracker.write().cleanup_old_records();
     }
 
@@ -463,11 +419,6 @@ impl SecurityCoordinator {
 
         // Check if suspected Sybil
         if self.sybil_detector.read().is_peer_suspected(node_id) {
-            return true;
-        }
-
-        // Check if suspected collusion
-        if self.collusion_detector.read().is_peer_suspected(node_id) {
             return true;
         }
 
@@ -522,20 +473,6 @@ impl SecurityCoordinator {
             }
         }
 
-        // Add collusion suspects
-        for group in self.collusion_detector.read().get_suspected_groups() {
-            if group.confidence >= 0.7 {
-                for member in &group.members {
-                    if !candidates.iter().any(|(id, _)| id == member) {
-                        candidates.push((
-                            *member,
-                            EvictionReason::LowTrust("Collusion suspected".to_string()),
-                        ));
-                    }
-                }
-            }
-        }
-
         candidates
     }
 
@@ -554,10 +491,9 @@ impl SecurityCoordinator {
         let base_trust = self.get_trust_score(node_id).unwrap_or(0.5);
 
         let sybil_penalty = self.sybil_detector.read().sybil_risk_score(node_id);
-        let collusion_penalty = self.collusion_detector.read().collusion_risk_score(node_id);
 
-        // Composite score with penalties
-        let score = base_trust * (1.0 - sybil_penalty * 0.5) * (1.0 - collusion_penalty * 0.5);
+        // Composite score with Sybil penalty
+        let score = base_trust * (1.0 - sybil_penalty * 0.5);
         score.clamp(0.0, 1.0)
     }
 
@@ -566,7 +502,6 @@ impl SecurityCoordinator {
     pub fn is_eligible_for_critical_ops(&self, node_id: &PeerId) -> bool {
         self.get_security_score(node_id) >= 0.7
             && !self.sybil_detector.read().is_peer_suspected(node_id)
-            && !self.collusion_detector.read().is_peer_suspected(node_id)
             && !self
                 .eviction_tracker
                 .read()
@@ -634,7 +569,7 @@ impl SecurityCoordinator {
             }
         }
 
-        // Step 3: Run cross-node analysis (Sybil, collusion patterns)
+        // Step 3: Run cross-node analysis (Sybil patterns, geographic diversity)
         self.analyze_node_set(&valid_nodes);
 
         // Step 4: Check for de-escalation if attack mode
@@ -660,18 +595,6 @@ impl SecurityCoordinator {
         // Additional Sybil check
         if self.sybil_detector.read().is_peer_suspected(node_id) {
             // Return a modified result if Sybil suspected
-            let mut modified = result.clone();
-            if modified.is_valid {
-                modified.is_valid = false;
-                modified
-                    .failure_reasons
-                    .push(CloseGroupFailure::SuspectedCollusion);
-            }
-            return modified;
-        }
-
-        // Additional collusion check
-        if self.collusion_detector.read().is_peer_suspected(node_id) {
             let mut modified = result.clone();
             if modified.is_valid {
                 modified.is_valid = false;
@@ -744,16 +667,14 @@ impl SecurityCoordinator {
     /// Check if we should escalate to attack mode.
     fn check_attack_escalation(&self) {
         let sybil_risk = self.sybil_detector.read().overall_risk_score();
-        let collusion_groups = self.collusion_detector.read().group_count();
 
-        // Thresholds for escalation
-        let should_escalate = sybil_risk > 0.7 || collusion_groups >= 3;
+        // Threshold for escalation
+        let should_escalate = sybil_risk > 0.7;
 
         if should_escalate && !self.is_attack_mode() {
             tracing::warn!(
                 sybil_risk = %sybil_risk,
-                collusion_groups = %collusion_groups,
-                "Escalating to BFT mode due to high attack indicators"
+                "Escalating to BFT mode due to high Sybil risk"
             );
             self.escalate_to_bft();
         }
@@ -766,15 +687,13 @@ impl SecurityCoordinator {
         }
 
         let sybil_risk = self.sybil_detector.read().overall_risk_score();
-        let collusion_groups = self.collusion_detector.read().group_count();
 
-        // Lower thresholds for de-escalation (hysteresis)
-        let can_deescalate = sybil_risk < 0.3 && collusion_groups < 2;
+        // Lower threshold for de-escalation (hysteresis)
+        let can_deescalate = sybil_risk < 0.3;
 
         if can_deescalate {
             tracing::info!(
                 sybil_risk = %sybil_risk,
-                collusion_groups = %collusion_groups,
                 "De-escalating from BFT mode - attack indicators cleared"
             );
             self.deescalate_from_bft();
@@ -842,12 +761,10 @@ impl SecurityCoordinator {
 
                 // Log security status periodically
                 let sybil_risk = coordinator.sybil_detector.read().overall_risk_score();
-                let collusion_groups = coordinator.collusion_detector.read().group_count();
                 let eviction_count = coordinator.eviction_tracker.read().total_evictions();
 
                 tracing::debug!(
                     sybil_risk = %format!("{:.2}", sybil_risk),
-                    collusion_groups = %collusion_groups,
                     recent_evictions = %eviction_count,
                     attack_mode = coordinator.is_attack_mode(),
                     "Security monitor status"
@@ -868,12 +785,6 @@ impl SecurityCoordinator {
         &self.sybil_detector
     }
 
-    /// Get the collusion detector for direct access.
-    #[must_use]
-    pub fn collusion_detector(&self) -> &Arc<RwLock<CollusionDetector>> {
-        &self.collusion_detector
-    }
-
     /// Get the eviction manager for direct access.
     #[must_use]
     pub fn eviction_manager(&self) -> &Arc<RwLock<EvictionManager>> {
@@ -884,7 +795,6 @@ impl SecurityCoordinator {
     #[must_use]
     pub fn get_attack_indicators_summary(&self) -> AttackIndicatorsSummary {
         let sybil_risk = self.sybil_detector.read().overall_risk_score();
-        let collusion_groups = self.collusion_detector.read().group_count();
         let recent_evictions = self
             .eviction_tracker
             .read()
@@ -893,7 +803,6 @@ impl SecurityCoordinator {
 
         AttackIndicatorsSummary {
             sybil_risk,
-            collusion_group_count: collusion_groups,
             recent_eviction_count: recent_evictions,
             is_attack_mode: self.is_attack_mode(),
             geographic_diversity_ok: true, // Placeholder - would need context
@@ -906,8 +815,6 @@ impl SecurityCoordinator {
 pub struct AttackIndicatorsSummary {
     /// Sybil attack risk score (0.0 - 1.0)
     pub sybil_risk: f64,
-    /// Number of detected collusion groups
-    pub collusion_group_count: usize,
     /// Number of evictions in last 5 minutes
     pub recent_eviction_count: usize,
     /// Whether system is in BFT attack mode

@@ -1,7 +1,7 @@
 //! Trust-weighted Kademlia DHT with EigenTrust integration
 //!
-//! Implements XOR-based Kademlia with trust bias for routing, eviction, and provider selection.
-//! Includes capacity signaling for PUT pricing and EigenTrust computation.
+//! Implements XOR-based Kademlia with trust bias for routing, eviction, and peer selection.
+//! Includes capacity signaling and EigenTrust computation for peer discovery.
 //!
 //! ## Security Properties
 //!
@@ -24,7 +24,6 @@
 
 use crate::identity::node_identity::PeerId;
 use anyhow::Result;
-use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -55,21 +54,6 @@ pub struct CapacityGossip {
     pub epoch: u64,
 }
 
-/// PUT operation policy
-#[derive(Debug, Clone)]
-pub struct PutPolicy {
-    pub ttl: Option<Duration>,
-    pub quorum: usize,
-}
-
-/// PUT operation receipt
-#[derive(Debug, Clone)]
-pub struct PutReceipt {
-    pub key: Key,
-    pub providers: Vec<PeerId>,
-    pub proof: Vec<u8>,
-}
-
 /// Interaction outcome for trust recording
 #[derive(Debug, Clone, Copy)]
 pub enum Outcome {
@@ -85,14 +69,8 @@ pub struct TrustWeightedKademlia {
     local_id: PeerId,
     /// Kademlia routing table (160 buckets for 160-bit prefix)
     routing_table: Arc<RwLock<[KBucket; 160]>>,
-    /// Content storage
-    storage: Arc<RwLock<HashMap<Key, (Bytes, SystemTime)>>>,
-    /// Provider registry (what keys are provided by which peers)
-    providers: Arc<RwLock<HashMap<Key, HashSet<PeerId>>>>,
     /// Trust matrix for EigenTrust computation
     trust_matrix: Arc<RwLock<HashMap<PeerId, HashMap<PeerId, f32>>>>,
-    /// Capacity information
-    capacities: Arc<RwLock<HashMap<PeerId, CapacityGossip>>>,
     /// Recent interactions for trust computation
     interactions: Arc<RwLock<VecDeque<(PeerId, Outcome, SystemTime)>>>,
     /// EigenTrust scores
@@ -153,10 +131,7 @@ impl TrustWeightedKademlia {
         Self {
             local_id,
             routing_table,
-            storage: Arc::new(RwLock::new(HashMap::new())),
-            providers: Arc::new(RwLock::new(HashMap::new())),
             trust_matrix: Arc::new(RwLock::new(HashMap::new())),
-            capacities: Arc::new(RwLock::new(HashMap::new())),
             interactions: Arc::new(RwLock::new(VecDeque::new())),
             eigen_trust_scores: Arc::new(RwLock::new(HashMap::new())),
             k: 20,
@@ -366,58 +341,6 @@ impl TrustWeightedKademlia {
 /// DHT trait implementation
 #[async_trait::async_trait]
 impl super::Dht for TrustWeightedKademlia {
-    async fn put(
-        &self,
-        key: super::Key,
-        value: Bytes,
-        policy: super::PutPolicy,
-    ) -> Result<super::PutReceipt> {
-        // Find providers with capacity and trust bias
-        // Convert key type
-        let local_key: Key = key;
-        let providers = self.select_providers(&local_key, policy.quorum).await?;
-
-        // Store locally if we're a provider
-        if providers.contains(&self.local_id) {
-            let mut storage = self.storage.write().await;
-            let ttl = policy.ttl.unwrap_or(Duration::from_secs(3600));
-            storage.insert(local_key, (value.clone(), SystemTime::now() + ttl));
-        }
-
-        // Generate proof (simplified)
-        let proof = vec![0u8; 32]; // TODO: Implement proper proof generation
-
-        Ok(super::PutReceipt {
-            key,
-            providers,
-            proof,
-        })
-    }
-
-    async fn get(&self, key: super::Key, quorum: usize) -> Result<Bytes> {
-        // Check local storage first
-        let local_key: Key = key;
-        {
-            let storage = self.storage.read().await;
-            if let Some((value, expiry)) = storage.get(&local_key)
-                && SystemTime::now() < *expiry
-            {
-                return Ok(value.clone());
-            }
-        }
-
-        // Find providers
-        let providers = self.find_providers(&local_key, quorum).await?;
-
-        // Try to retrieve from providers (simplified)
-        for _provider in providers {
-            // In a real implementation, this would make network requests
-            // For now, just return an error
-        }
-
-        Err(anyhow::anyhow!("Value not found"))
-    }
-
     async fn find_node(&self, target: super::PeerId) -> Result<Vec<super::Contact>> {
         let closest = self.find_closest_nodes(&target, self.k).await;
         let converted: Vec<super::Contact> = closest
@@ -428,62 +351,6 @@ impl super::Dht for TrustWeightedKademlia {
             })
             .collect();
         Ok(converted)
-    }
-
-    async fn provide(&self, key: super::Key) -> Result<()> {
-        let local_key: Key = key;
-        let mut providers = self.providers.write().await;
-        providers
-            .entry(local_key)
-            .or_insert_with(HashSet::new)
-            .insert(self.local_id);
-        Ok(())
-    }
-}
-
-impl TrustWeightedKademlia {
-    /// Select providers based on capacity and trust
-    async fn select_providers(&self, key: &Key, count: usize) -> Result<Vec<PeerId>> {
-        // Create a PeerId from the key bytes for XOR distance calculation
-        let target_node = PeerId::from_bytes(*key);
-        let providers = self.find_closest_nodes(&target_node, count * 2).await;
-
-        let capacities = self.capacities.read().await;
-        let eigen_trust_scores = self.eigen_trust_scores.read().await;
-
-        // Filter by capacity and sort by trust
-        let mut candidates: Vec<_> = providers
-            .into_iter()
-            .filter(|contact| {
-                if let Some(capacity) = capacities.get(&contact.peer) {
-                    capacity.free_bytes > 0
-                } else {
-                    false
-                }
-            })
-            .collect();
-
-        candidates.sort_by(|a, b| {
-            let a_trust = eigen_trust_scores.get(&a.peer).copied().unwrap_or(0.5);
-            let b_trust = eigen_trust_scores.get(&b.peer).copied().unwrap_or(0.5);
-            b_trust
-                .partial_cmp(&a_trust)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-
-        Ok(candidates.into_iter().take(count).map(|c| c.peer).collect())
-    }
-
-    /// Find providers for a key
-    async fn find_providers(&self, key: &Key, count: usize) -> Result<Vec<PeerId>> {
-        let providers = self.providers.read().await;
-        if let Some(key_providers) = providers.get(key) {
-            let mut result: Vec<_> = key_providers.iter().cloned().collect();
-            result.truncate(count);
-            Ok(result)
-        } else {
-            Ok(Vec::new())
-        }
     }
 }
 

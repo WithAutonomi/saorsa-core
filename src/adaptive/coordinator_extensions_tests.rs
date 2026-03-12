@@ -95,23 +95,7 @@ mod tests {
         assert_eq!(format!("{:?}", evict), "Evict");
     }
 
-    // ==================== StorageStrategy Tests ====================
-
-    #[test]
-    fn test_storage_strategy_debug_clone() {
-        let perf = StorageStrategy::Performance;
-        let high = StorageStrategy::HighReplication;
-        let balanced = StorageStrategy::Balanced;
-
-        // Test Clone
-        let perf_clone = perf.clone();
-        assert!(matches!(perf_clone, StorageStrategy::Performance));
-
-        // Test Debug
-        assert_eq!(format!("{:?}", perf), "Performance");
-        assert_eq!(format!("{:?}", high), "HighReplication");
-        assert_eq!(format!("{:?}", balanced), "Balanced");
-    }
+    // (StorageStrategy tests removed — storage is handled by saorsa-node)
 
     // ==================== ChurnStats Tests ====================
 
@@ -147,55 +131,5 @@ mod tests {
         assert!(debug_str.contains("0.2"));
     }
 
-    // ==================== ContentStoreExtensions Tests ====================
-
-    #[tokio::test]
-    async fn test_content_store_get_total_size() {
-        use crate::adaptive::storage::{ContentMetadata, ContentStore, StorageConfig};
-
-        let config = StorageConfig::default();
-        let store = ContentStore::new(config).await.unwrap();
-
-        // Initially empty
-        let initial_size = store.get_total_size().await;
-        assert_eq!(initial_size, 0);
-
-        // Store some data - metadata size must match actual data length
-        let data = vec![1u8; 1000]; // 1000 bytes
-        let metadata = ContentMetadata {
-            size: 1000,
-            ..Default::default()
-        };
-        store.store(data, metadata).await.unwrap();
-
-        // Size should reflect stored data
-        let size_after = store.get_total_size().await;
-        assert_eq!(size_after, 1000, "Size should be 1000 after storing data");
-    }
-
-    #[tokio::test]
-    async fn test_content_store_with_strategy() {
-        use crate::adaptive::storage::{ContentStore, StorageConfig};
-
-        let config = StorageConfig::default();
-        let store = ContentStore::new(config).await.unwrap();
-
-        // Store with different strategies
-        let data = b"test data for storage";
-
-        let result = store
-            .store_with_strategy(data, StorageStrategy::Performance)
-            .await;
-        assert!(result.is_ok());
-
-        let result = store
-            .store_with_strategy(data, StorageStrategy::HighReplication)
-            .await;
-        assert!(result.is_ok());
-
-        let result = store
-            .store_with_strategy(data, StorageStrategy::Balanced)
-            .await;
-        assert!(result.is_ok());
-    }
+    // (ContentStoreExtensions tests removed — storage is handled by saorsa-node)
 }

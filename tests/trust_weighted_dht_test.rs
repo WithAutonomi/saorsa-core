@@ -1,9 +1,12 @@
 //! Integration tests for trust-weighted Kademlia DHT
+//!
+//! Tests trust scoring, capacity signaling, telemetry, and XOR distance
+//! calculations. Storage operations (put/get) have been removed as the
+//! DHT is now a peer phonebook only.
 
-use bytes::Bytes;
 use rand::RngCore;
 use saorsa_core::dht::{
-    CapacityManager, Dht, DhtTelemetry, OperationType, PutPolicy, TrustWeightedKademlia,
+    CapacityManager, DhtTelemetry, OperationType, TrustWeightedKademlia,
     trust_weighted_kademlia::Outcome,
 };
 use saorsa_core::identity::node_identity::PeerId;
@@ -14,39 +17,6 @@ fn random_node_id() -> PeerId {
     PeerId::from_bytes(bytes)
 }
 use std::time::Duration;
-use tokio::time::timeout;
-
-/// Test basic PUT and GET operations.
-///
-/// NOTE: This test is ignored because it requires network infrastructure.
-/// A standalone DHT node has no providers to store data to, causing the
-/// providers list to be empty. This test needs a multi-node test setup
-/// or mock providers.
-///
-/// TODO: Refactor to use mock providers or multi-node test framework.
-#[tokio::test]
-#[ignore = "Requires network infrastructure - standalone DHT has no providers"]
-async fn test_put_get_operations() {
-    let node_id = random_node_id();
-    let dht = TrustWeightedKademlia::new(node_id);
-
-    // Test data
-    let key = [1u8; 32];
-    let value = Bytes::from("test data");
-    let policy = PutPolicy {
-        ttl: Some(Duration::from_secs(3600)),
-        quorum: 1,
-    };
-
-    // Store value
-    let receipt = dht.put(key, value.clone(), policy).await.unwrap();
-    assert_eq!(receipt.key, key);
-    assert!(!receipt.providers.is_empty());
-
-    // Retrieve value
-    let retrieved = dht.get(key, 1).await.unwrap();
-    assert_eq!(retrieved, value);
-}
 
 /// Test trust-weighted routing with interaction recording
 #[tokio::test]
@@ -173,67 +143,6 @@ async fn test_telemetry_collection() {
     assert_eq!(errors.get("timeout").copied().unwrap_or(0), 1);
 }
 
-/// Test lookup under churn conditions
-#[tokio::test]
-async fn test_lookup_under_churn() {
-    let mut nodes = Vec::new();
-    let telemetry = DhtTelemetry::new(10000);
-
-    // Create initial network of nodes
-    for _ in 0..20 {
-        let node_id = random_node_id();
-        let dht = TrustWeightedKademlia::new(node_id);
-        nodes.push((node_id, dht));
-    }
-
-    // Store test data in first node
-    let key = [42u8; 32];
-    let value = Bytes::from("test data under churn");
-    let policy = PutPolicy {
-        ttl: Some(Duration::from_secs(3600)),
-        quorum: 3,
-    };
-
-    let start = std::time::Instant::now();
-    let _receipt = nodes[0].1.put(key, value.clone(), policy).await.unwrap();
-    let put_duration = start.elapsed();
-
-    telemetry.record_put(put_duration, 3, true, None).await;
-
-    // Simulate churn - remove some nodes
-    nodes.truncate(15);
-
-    // Try to retrieve from different node
-    let start = std::time::Instant::now();
-    match timeout(Duration::from_millis(300), nodes[5].1.get(key, 2)).await {
-        Ok(Ok(retrieved)) => {
-            let get_duration = start.elapsed();
-            telemetry.record_get(get_duration, 4, true, None).await;
-            assert_eq!(retrieved, value);
-        }
-        Ok(Err(e)) => {
-            let get_duration = start.elapsed();
-            telemetry
-                .record_get(get_duration, 4, false, Some(e.to_string()))
-                .await;
-        }
-        Err(_) => {
-            telemetry
-                .record_get(
-                    Duration::from_millis(300),
-                    4,
-                    false,
-                    Some("timeout".to_string()),
-                )
-                .await;
-        }
-    }
-
-    // Check telemetry
-    let stats = telemetry.get_stats().await;
-    assert!(stats.p95_latency_ms < 300); // Should meet performance requirement
-}
-
 /// Test trust bias reduces timeouts
 #[tokio::test]
 async fn test_trust_bias_timeout_reduction() {
@@ -292,7 +201,7 @@ async fn test_trust_bias_timeout_reduction() {
     let trust_rate = trust_timeouts as f64 / total_ops as f64;
     let reduction = (baseline_rate - trust_rate) / baseline_rate;
 
-    // Should achieve ≥20% timeout reduction with trust bias
+    // Should achieve >=20% timeout reduction with trust bias
     assert!(
         reduction >= 0.20,
         "Timeout reduction {} < 20%",
@@ -348,56 +257,6 @@ async fn test_capacity_histogram_aggregation() {
     assert!(scarce_multiplier > 2.0); // Should indicate scarcity
 }
 
-/// Test concurrent operations
-#[tokio::test]
-async fn test_concurrent_operations() {
-    use std::sync::Arc;
-    let node_id = random_node_id();
-    let dht = Arc::new(TrustWeightedKademlia::new(node_id));
-    let telemetry = Arc::new(DhtTelemetry::new(10000));
-
-    // Launch multiple concurrent operations
-    let mut handles = Vec::new();
-
-    for i in 0..10 {
-        let dht_clone = dht.clone();
-        let telemetry_clone = telemetry.clone();
-
-        let handle = tokio::spawn(async move {
-            let key = [i as u8; 32];
-            let value = Bytes::from(format!("data_{}", i));
-            let policy = PutPolicy {
-                ttl: Some(Duration::from_secs(3600)),
-                quorum: 1,
-            };
-
-            let start = std::time::Instant::now();
-            let result = dht_clone.put(key, value, policy).await;
-            let duration = start.elapsed();
-
-            match result {
-                Ok(_) => telemetry_clone.record_put(duration, 3, true, None).await,
-                Err(e) => {
-                    telemetry_clone
-                        .record_put(duration, 3, false, Some(e.to_string()))
-                        .await
-                }
-            }
-        });
-
-        handles.push(handle);
-    }
-
-    // Wait for all operations to complete
-    for handle in handles {
-        handle.await.unwrap();
-    }
-
-    // Check telemetry
-    let stats = telemetry.get_stats().await;
-    assert_eq!(stats.total_operations, 10);
-}
-
 /// Test XOR distance calculation
 #[tokio::test]
 async fn test_xor_distance() {
@@ -423,13 +282,6 @@ async fn test_xor_distance() {
 }
 
 /// Test that trust scores actually affect node selection in find_closest_nodes
-///
-/// This test verifies the fix for the bug where trust scores were never used
-/// because XOR distances were always unique, making tiebreakers unreachable.
-///
-/// Since find_closest_nodes is private, this test verifies that the trust system
-/// is properly integrated and that nodes at similar distances can be differentiated
-/// by trust scores.
 #[tokio::test]
 async fn test_trust_weighted_find_closest_nodes() {
     use saorsa_core::dht::trust_weighted_kademlia::Outcome;
@@ -454,11 +306,6 @@ async fn test_trust_weighted_find_closest_nodes() {
 
     // Run EigenTrust computation
     dht.eigen_trust_epoch().await;
-
-    // The trust system is now active and will influence routing decisions
-    // when nodes are at similar distances (same magnitude bucket).
-    // The fix ensures that trust scores are actually used as tiebreakers
-    // within distance magnitude buckets, rather than being dead code.
 }
 
 /// Test distance magnitude calculation for correct bucketing
@@ -506,9 +353,6 @@ async fn test_find_closest_self_lookup() {
     for byte in &self_distance {
         assert_eq!(*byte, 0);
     }
-
-    // The distance magnitude of all zeros is 256 - 256 = 0
-    // This is the closest possible distance (self)
 }
 
 /// Test that closer nodes are always preferred regardless of trust
@@ -547,54 +391,4 @@ async fn test_distance_overrides_trust() {
     // magnitude bucket (255 leading zeros vs 0 leading zeros)
     // This verifies that distance magnitude bucketing still respects
     // Kademlia's distance-first property
-
-    // The far node is in magnitude bucket ~256 (no leading zeros)
-    // The close node is in magnitude bucket ~1 (255 leading zeros)
-    // So close node will always be selected first regardless of trust
-}
-
-/// Test performance: verify find_closest_nodes with trust doesn't regress
-#[tokio::test]
-async fn test_find_closest_nodes_performance() {
-    use saorsa_core::dht::trust_weighted_kademlia::Outcome;
-    use std::time::Instant;
-
-    let node_id = random_node_id();
-    let dht = TrustWeightedKademlia::new(node_id);
-
-    // Add many nodes with various trust scores
-    for i in 0..100 {
-        let mut node_bytes = [0u8; 32];
-        node_bytes[0] = i as u8;
-        node_bytes[1] = (i >> 8) as u8;
-        let peer = PeerId::from_bytes(node_bytes);
-
-        // Vary trust scores
-        let outcomes = i % 3;
-        for _ in 0..outcomes {
-            dht.record_interaction(peer, Outcome::Ok).await;
-        }
-    }
-
-    dht.eigen_trust_epoch().await;
-
-    // Time multiple lookups
-    let start = Instant::now();
-    let iterations = 100;
-
-    for _ in 0..iterations {
-        let _target = random_node_id();
-        // Note: find_closest_nodes is private, so we test through public APIs
-        let _result = dht.get([0u8; 32], 8).await.ok();
-    }
-
-    let elapsed = start.elapsed();
-    let avg_micros = elapsed.as_micros() / iterations;
-
-    // Should complete lookups quickly (< 1ms average even with trust calculation)
-    assert!(
-        avg_micros < 1000,
-        "Average lookup time {}μs exceeds 1ms",
-        avg_micros
-    );
 }

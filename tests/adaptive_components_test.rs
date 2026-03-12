@@ -8,16 +8,11 @@ use saorsa_core::adaptive::{
     learning::{ChurnPredictor, QLearnCacheManager, ThompsonSampling},
     multi_armed_bandit::{MABConfig, MultiArmedBandit},
     q_learning_cache::{AccessInfo, StateVector},
-    replication::ReplicationManager,
-    routing::AdaptiveRouter,
     security::{SecurityConfig, SecurityManager},
-    storage::ReplicationConfig,
-    trust::MockTrustProvider,
 };
 use saorsa_core::identity::NodeIdentity;
 use std::{
     collections::HashMap,
-    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tempfile::TempDir;
@@ -90,31 +85,6 @@ async fn test_security_manager_basic() -> anyhow::Result<()> {
         "Security metrics: blacklisted_nodes={}, audit_entries={}",
         metrics.blacklisted_nodes, metrics.audit_entries
     );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_replication_manager_basic() -> anyhow::Result<()> {
-    println!("Testing Replication Manager basic functionality...");
-
-    // Create dependencies
-    let config = ReplicationConfig::default();
-    let trust_provider = Arc::new(MockTrustProvider::new());
-    let churn_predictor = Arc::new(ChurnPredictor::new());
-    let router = Arc::new(AdaptiveRouter::new(trust_provider.clone()));
-
-    let replication = ReplicationManager::new(config, trust_provider, churn_predictor, router);
-
-    println!("✓ Replication Manager instance created successfully");
-
-    // Test replication factor calculation
-    let content_hash = ContentHash([1u8; 32]);
-    let factor = replication
-        .calculate_replication_factor(&content_hash)
-        .await;
-    println!("Calculated replication factor: {}", factor);
-    assert!(factor > 0, "Replication factor should be positive");
 
     Ok(())
 }

@@ -91,7 +91,6 @@ async fn create_test_dht_config(
         node_config,
         request_timeout: Duration::from_secs(10),
         max_concurrent_operations: 10,
-        replication_factor: 3,
         enable_security: false,
     };
 

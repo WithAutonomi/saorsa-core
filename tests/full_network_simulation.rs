@@ -17,6 +17,9 @@
 //!
 //! This test simulates a complete P2P network with multiple nodes
 //! demonstrating all adaptive layers working together.
+//!
+//! Storage operations (store/retrieve) have been removed from the coordinator.
+//! The DHT is now a peer phonebook only; storage is handled by saorsa-node.
 
 use saorsa_core::PeerId;
 use saorsa_core::adaptive::coordinator::DegradationReason;
@@ -89,51 +92,6 @@ impl NetworkSimulation {
         for (node_id, coordinator) in &self.nodes {
             println!("Node {:?} joining network...", node_id);
             let _ = coordinator.join_network().await;
-        }
-    }
-
-    async fn simulate_data_operations(&self) {
-        if self.nodes.is_empty() {
-            return;
-        }
-        // Store data from different nodes
-        let data_items = [
-            b"Important document".to_vec(),
-            b"Video file chunk 1".to_vec(),
-            b"Configuration data".to_vec(),
-            b"User profile information".to_vec(),
-            b"Cached web content".to_vec(),
-        ];
-
-        let mut stored_hashes = vec![];
-
-        // Store data from random nodes
-        for (i, data) in data_items.iter().enumerate() {
-            let Some(node) = self.nodes.values().nth(i % self.nodes.len()) else {
-                continue;
-            };
-            match node.store(data.clone()).await {
-                Ok(hash) => {
-                    println!("Stored data item {} with hash {:?}", i, hash);
-                    stored_hashes.push(hash);
-                }
-                Err(e) => eprintln!("Failed to store data: {:?}", e),
-            }
-        }
-
-        // Simulate time passing for replication
-        tokio::time::sleep(Duration::from_millis(500)).await;
-
-        // Retrieve data from different nodes
-        for (i, hash) in stored_hashes.iter().enumerate() {
-            let Some(node) = self.nodes.values().nth((i + 2) % self.nodes.len()) else {
-                continue;
-            };
-
-            match node.retrieve(hash).await {
-                Ok(_data) => println!("Retrieved data item {} successfully", i),
-                Err(e) => eprintln!("Failed to retrieve data {}: {:?}", i, e),
-            }
         }
     }
 
@@ -221,9 +179,8 @@ async fn test_full_network_simulation() {
     simulation.join_all_nodes().await;
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // Phase 2: Normal operations
+    // Phase 2: Normal operations (gossip only, no storage)
     println!("\n[Phase 2] Normal Operations");
-    simulation.simulate_data_operations().await;
     simulation.simulate_gossip_communication().await;
 
     // Phase 3: Stress testing
@@ -287,42 +244,22 @@ async fn test_ml_optimization_impact() -> Result<()> {
         ..Default::default()
     };
 
-    let Ok(coordinator_ml) = NetworkCoordinator::new(identity1, config_ml).await else {
+    let Ok(_coordinator_ml) = NetworkCoordinator::new(identity1, config_ml).await else {
         println!("Skipping ML optimization test: unable to create ML-enabled coordinator");
         return Ok(());
     };
-    let Ok(coordinator_no_ml) = NetworkCoordinator::new(identity2, config_no_ml).await else {
+    let Ok(_coordinator_no_ml) = NetworkCoordinator::new(identity2, config_no_ml).await else {
         println!("Skipping ML optimization test: unable to create baseline coordinator");
         return Ok(());
     };
 
     println!("\n=== ML Optimization Impact Test ===");
 
-    // Perform same operations on both
-    let test_data = vec![1u8; 1000];
-    let iterations = 10;
+    // Both coordinators can be constructed successfully.
+    // Storage operations have been removed; ML optimization is verified
+    // through the adaptive routing and strategy selection layers.
+    println!("Both ML and non-ML coordinators created successfully");
 
-    // With ML
-    let start = std::time::Instant::now();
-    for _ in 0..iterations {
-        let hash = coordinator_ml.store(test_data.clone()).await.unwrap();
-        let _ = coordinator_ml.retrieve(&hash).await;
-    }
-    let ml_duration = start.elapsed();
-
-    // Without ML
-    let start = std::time::Instant::now();
-    for _ in 0..iterations {
-        let hash = coordinator_no_ml.store(test_data.clone()).await.unwrap();
-        let _ = coordinator_no_ml.retrieve(&hash).await;
-    }
-    let no_ml_duration = start.elapsed();
-
-    println!("With ML optimization: {:?}", ml_duration);
-    println!("Without ML optimization: {:?}", no_ml_duration);
-
-    // In a real network, ML should improve performance
-    // In this simulation, we just verify both work
     Ok(())
 }
 
@@ -343,15 +280,6 @@ async fn test_trust_based_interactions() {
             nodes.len()
         );
         return;
-    }
-
-    // Good interactions between nodes 0-2
-    for _ in 0..5 {
-        let data = b"trusted data".to_vec();
-        if let Ok(hash) = nodes[0].store(data.clone()).await {
-            let _ = nodes[1].retrieve(&hash).await;
-            let _ = nodes[2].retrieve(&hash).await;
-        }
     }
 
     // Check network stats to see trust impact

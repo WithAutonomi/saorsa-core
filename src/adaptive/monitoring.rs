@@ -23,7 +23,7 @@
 
 use super::*;
 use crate::adaptive::{
-    AdaptiveGossipSub, AdaptiveRouter, ChurnHandler, ContentStore, ReplicationManager,
+    AdaptiveGossipSub, AdaptiveRouter, ChurnHandler,
     learning::{QLearnCacheManager, ThompsonSampling},
 };
 use anyhow::Result;
@@ -195,8 +195,6 @@ pub struct MonitoredComponents {
     pub router: Arc<AdaptiveRouter>,
     pub churn_handler: Arc<ChurnHandler>,
     pub gossip: Arc<AdaptiveGossipSub>,
-    pub storage: Arc<ContentStore>,
-    pub replication: Arc<ReplicationManager>,
     pub thompson: Arc<ThompsonSampling>,
     pub cache: Arc<QLearnCacheManager>,
 }
@@ -885,18 +883,7 @@ impl MonitoringSystem {
                 .inc_by(routing_stats.successful_requests as f64);
         }
 
-        // Collect storage statistics
-        let storage_stats = self.components.storage.get_stats().await;
-
-        #[cfg(feature = "metrics")]
-        {
-            self.metrics
-                .stored_items
-                .set(storage_stats.total_items as i64);
-            self.metrics
-                .storage_bytes
-                .set(storage_stats.total_bytes as i64);
-        }
+        // (Storage metrics removed — storage is handled by saorsa-node)
 
         // Collect gossip statistics
         let gossip_stats = self.components.gossip.get_stats().await;
@@ -949,10 +936,8 @@ impl MonitoringSystem {
     pub async fn get_health(&self) -> NetworkHealth {
         let churn_stats = self.components.churn_handler.get_stats().await;
         let routing_stats = self.components.router.get_stats().await;
-        let storage_stats = self.components.storage.get_stats().await;
 
-        let health_score =
-            self.calculate_health_score(&churn_stats, &routing_stats, &storage_stats);
+        let health_score = self.calculate_health_score(&churn_stats, &routing_stats);
 
         NetworkHealth {
             score: health_score,
@@ -966,7 +951,7 @@ impl MonitoringSystem {
             active_nodes: churn_stats.active_nodes,
             churn_rate: churn_stats.churn_rate,
             routing_success_rate: routing_stats.success_rate(),
-            storage_utilization: storage_stats.utilization(),
+            storage_utilization: 0.0, // Storage is handled by saorsa-node
             active_alerts: self.alert_manager.get_active_alerts().await.len(),
         }
     }
@@ -976,7 +961,6 @@ impl MonitoringSystem {
         &self,
         churn_stats: &crate::adaptive::churn::ChurnStats,
         routing_stats: &crate::adaptive::routing::RoutingStats,
-        storage_stats: &crate::adaptive::storage::StorageStats,
     ) -> f64 {
         let mut score = 1.0;
 
@@ -991,12 +975,6 @@ impl MonitoringSystem {
         let routing_success = routing_stats.success_rate();
         if routing_success < 0.9 {
             score *= routing_success;
-        }
-
-        // Penalize high storage utilization
-        let storage_util = storage_stats.utilization();
-        if storage_util > 0.9 {
-            score *= 0.8;
         }
 
         score
@@ -1108,10 +1086,7 @@ impl MonitoringSystem {
             .update_metric("routing_success_rate", routing_stats.success_rate())
             .await;
 
-        let storage_stats = self.components.storage.get_stats().await;
-        self.anomaly_detector
-            .update_metric("storage_utilization", storage_stats.utilization())
-            .await;
+        // (Storage anomaly detection removed — storage is handled by saorsa-node)
 
         Ok(())
     }
@@ -1142,15 +1117,7 @@ impl MonitoringSystem {
             routing_stats.success_rate(),
         );
 
-        let storage_stats = self.components.storage.get_stats().await;
-        metrics.insert(
-            "storage_items".to_string(),
-            storage_stats.total_items as f64,
-        );
-        metrics.insert(
-            "storage_bytes".to_string(),
-            storage_stats.total_bytes as f64,
-        );
+        // (Storage metrics removed — storage is handled by saorsa-node)
 
         metrics
     }

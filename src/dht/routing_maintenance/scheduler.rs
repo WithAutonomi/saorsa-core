@@ -12,15 +12,13 @@ use std::time::{Duration, Instant};
 
 use super::config::MaintenanceConfig;
 
-/// Types of maintenance tasks
+/// Types of maintenance tasks (routing table only — no record storage)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MaintenanceTask {
     /// Refresh k-buckets
     BucketRefresh,
     /// Validate nodes via close group consensus
     CloseGroupValidation,
-    /// Republish stored records
-    RecordRepublish,
 }
 
 impl MaintenanceTask {
@@ -30,7 +28,6 @@ impl MaintenanceTask {
         vec![
             MaintenanceTask::BucketRefresh,
             MaintenanceTask::CloseGroupValidation,
-            MaintenanceTask::RecordRepublish,
         ]
     }
 
@@ -40,7 +37,6 @@ impl MaintenanceTask {
         match self {
             MaintenanceTask::BucketRefresh => config.bucket_refresh_interval,
             MaintenanceTask::CloseGroupValidation => Duration::from_secs(300), // Every 5 minutes
-            MaintenanceTask::RecordRepublish => config.republish_interval,
         }
     }
 }
@@ -253,7 +249,7 @@ mod tests {
     #[test]
     fn test_maintenance_task_all() {
         let all_tasks = MaintenanceTask::all();
-        assert_eq!(all_tasks.len(), 3);
+        assert_eq!(all_tasks.len(), 2);
     }
 
     #[test]
@@ -297,8 +293,7 @@ mod tests {
 
     #[test]
     fn test_scheduled_task_fail() {
-        let mut task =
-            ScheduledTask::new(MaintenanceTask::RecordRepublish, Duration::from_secs(60));
+        let mut task = ScheduledTask::new(MaintenanceTask::BucketRefresh, Duration::from_secs(60));
 
         task.start();
         task.fail();
@@ -313,7 +308,7 @@ mod tests {
         let config = MaintenanceConfig::default();
         let scheduler = MaintenanceScheduler::new(config);
 
-        assert_eq!(scheduler.tasks.len(), 3);
+        assert_eq!(scheduler.tasks.len(), 2);
         assert!(!scheduler.is_active());
     }
 
@@ -347,7 +342,7 @@ mod tests {
         }
 
         let due = scheduler.get_due_tasks();
-        assert_eq!(due.len(), 3);
+        assert_eq!(due.len(), 2);
     }
 
     #[test]
@@ -381,7 +376,7 @@ mod tests {
         let scheduler = MaintenanceScheduler::new(config);
 
         let stats = scheduler.get_stats();
-        assert_eq!(stats.len(), 3);
+        assert_eq!(stats.len(), 2);
 
         for stat in stats {
             assert_eq!(stat.run_count, 0);

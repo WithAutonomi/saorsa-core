@@ -5,7 +5,7 @@
 //! - Ill-behaving node removal from routing table
 //! - Node validity verification via close group consensus
 //! - Close group validation with hybrid trust/BFT approach
-//! - Security coordination integrating Sybil/collusion detection
+//! - Security coordination integrating Sybil detection
 //!
 //! Copyright 2024 Saorsa Labs
 //! SPDX-License-Identifier: AGPL-3.0-or-later OR Commercial

@@ -7,7 +7,7 @@
 
 use anyhow::Result;
 use saorsa_core::dht::DHTConfig;
-use saorsa_core::dht_network_manager::{DhtNetworkConfig, DhtNetworkManager, DhtNetworkResult};
+use saorsa_core::dht_network_manager::{DhtNetworkConfig, DhtNetworkManager};
 use saorsa_core::identity::node_identity::NodeIdentity;
 use saorsa_core::network::NodeConfig;
 use saorsa_core::transport_handle::{TransportConfig, TransportHandle};
@@ -41,18 +41,10 @@ async fn create_node_with_transport(
         node_config,
         request_timeout: Duration::from_secs(5),
         max_concurrent_operations: 10,
-        replication_factor: 3,
         enable_security: false,
     };
 
     Ok((transport, config))
-}
-
-fn key_from_str(s: &str) -> [u8; 32] {
-    let hash = blake3::hash(s.as_bytes());
-    let mut key = [0u8; 32];
-    key.copy_from_slice(hash.as_bytes());
-    key
 }
 
 /// Step 1: Can we create a single DhtNetworkManager?
@@ -202,132 +194,6 @@ async fn step4_connect_managers() -> Result<()> {
         !peers2.is_empty(),
         "Manager 2 should have at least one connected peer"
     );
-
-    let _ = manager1.stop().await;
-    let _ = manager2.stop().await;
-    Ok(())
-}
-
-/// Step 5: Local put/get (no network needed)
-#[tokio::test]
-async fn step5_local_put_get() -> Result<()> {
-    println!("STEP 5: Local put/get (single node)...");
-
-    let manager = Arc::new(
-        timeout(Duration::from_secs(10), async {
-            let (transport, config) = create_node_with_transport("diag_node_5").await?;
-            transport.start_network_listeners().await?;
-            DhtNetworkManager::new(transport, None, config).await
-        })
-        .await??,
-    );
-    timeout(Duration::from_secs(10), manager.start()).await??;
-
-    let key = key_from_str("diagnostic_test_key");
-    let value = b"diagnostic_test_value".to_vec();
-
-    println!("  Storing key locally...");
-    let put_result = timeout(Duration::from_secs(10), manager.put(key, value.clone())).await;
-
-    match &put_result {
-        Ok(Ok(DhtNetworkResult::PutSuccess { replicated_to, .. })) => {
-            println!("  ✓ Put succeeded, replicated to {} nodes", replicated_to);
-        }
-        Ok(Ok(other)) => println!("  ? Put returned: {:?}", other),
-        Ok(Err(e)) => println!("  ✗ Put failed: {}", e),
-        Err(_) => println!("  ✗ Put timed out"),
-    }
-
-    println!("  Checking local storage...");
-    let has_local = manager.has_key_locally(&key).await;
-    println!("  Has key locally: {}", has_local);
-
-    if has_local {
-        let local_value = manager.get_local(&key).await;
-        if let Ok(Some(v)) = local_value {
-            if v == value {
-                println!("  ✓ Local value matches!");
-            } else {
-                println!("  ✗ Local value mismatch!");
-            }
-        }
-    }
-
-    let _ = manager.stop().await;
-    Ok(())
-}
-
-/// Step 6: Local put/get on a connected two-node cluster
-///
-/// Tests that a local put on manager1 succeeds and manager1 can retrieve
-/// the value.  Cross-node replication is not yet implemented (store returns
-/// `success: false` for remote targets), so we only assert the local path.
-#[tokio::test]
-async fn step6_local_put_on_connected_cluster() -> Result<()> {
-    println!("STEP 6: Local put on connected two-node cluster...");
-
-    let manager1 = Arc::new(
-        timeout(Duration::from_secs(10), async {
-            let (transport, config) = create_node_with_transport("diag_node_6a").await?;
-            transport.start_network_listeners().await?;
-            DhtNetworkManager::new(transport, None, config).await
-        })
-        .await??,
-    );
-    let manager2 = Arc::new(
-        timeout(Duration::from_secs(10), async {
-            let (transport, config) = create_node_with_transport("diag_node_6b").await?;
-            transport.start_network_listeners().await?;
-            DhtNetworkManager::new(transport, None, config).await
-        })
-        .await??,
-    );
-
-    timeout(Duration::from_secs(10), manager1.start()).await??;
-    timeout(Duration::from_secs(10), manager2.start()).await??;
-
-    let addr1 = manager1
-        .local_addr()
-        .ok_or_else(|| anyhow::anyhow!("No addr"))?;
-
-    let _peer_id = timeout(Duration::from_secs(15), manager2.connect_to_peer(&addr1))
-        .await
-        .map_err(|_| anyhow::anyhow!("Connection timed out"))??;
-    tokio::time::sleep(Duration::from_secs(1)).await;
-
-    // Store on manager1
-    let key = key_from_str("cross_node_test_key");
-    let value = b"cross_node_test_value".to_vec();
-
-    let put_result = timeout(Duration::from_secs(30), manager1.put(key, value.clone()))
-        .await
-        .map_err(|_| anyhow::anyhow!("put() timed out after 30s"))??;
-
-    match put_result {
-        DhtNetworkResult::PutSuccess { replicated_to, .. } => {
-            assert!(replicated_to >= 1, "Should replicate to at least 1 node");
-            println!("  Put succeeded, replicated_to={}", replicated_to);
-        }
-        other => {
-            panic!("Expected PutSuccess, got: {:?}", other);
-        }
-    }
-
-    // Note: the originating node only stores locally if it is among the
-    // K-closest nodes to the key.  We verify has_key_locally if it is
-    // stored, and gracefully accept if it isn't (the key landed on
-    // remote targets instead).
-    if manager1.has_key_locally(&key).await {
-        let retrieved = manager1
-            .get_local(&key)
-            .await
-            .expect("get_local should not error");
-        assert_eq!(
-            retrieved,
-            Some(value),
-            "Retrieved value should match stored value"
-        );
-    }
 
     let _ = manager1.stop().await;
     let _ = manager2.stop().await;

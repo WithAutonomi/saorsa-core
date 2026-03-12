@@ -925,12 +925,9 @@ impl P2PNode {
 
         // Initialize DHT manager (owns local DHT core and network DHT behavior)
         let manager_dht_config = crate::dht::DHTConfig {
-            replication_factor: config.dht_config.k_value,
             bucket_size: config.dht_config.k_value,
             alpha: config.dht_config.alpha_value,
-            record_ttl: config.dht_config.record_ttl,
             bucket_refresh_interval: config.dht_config.refresh_interval,
-            republish_interval: config.dht_config.refresh_interval,
             max_distance: DHT_MAX_DISTANCE,
         };
         let dht_manager_config = DhtNetworkConfig {
@@ -939,7 +936,6 @@ impl P2PNode {
             node_config: config.clone(),
             request_timeout: config.connection_timeout,
             max_concurrent_operations: MAX_ACTIVE_REQUESTS,
-            replication_factor: config.dht_config.k_value,
             enable_security: true,
         };
         let dht_manager = Arc::new(
@@ -1697,22 +1693,6 @@ impl P2PNode {
     /// Backwards-compatible alias for `dht_manager()`.
     pub fn dht(&self) -> &Arc<DhtNetworkManager> {
         self.dht_manager()
-    }
-
-    /// Store a value in the local DHT
-    ///
-    /// This method stores data in the local DHT core through the attached manager.
-    /// For network-wide replication across multiple nodes, use `DhtNetworkManager::put`.
-    pub async fn dht_put(&self, key: crate::dht::Key, value: Vec<u8>) -> Result<()> {
-        self.dht_manager.store_local(key, value).await
-    }
-
-    /// Retrieve a value from the local DHT
-    ///
-    /// This method retrieves data from the local DHT core through the attached manager.
-    /// For network-wide lookups across multiple nodes, use `DhtNetworkManager::get`.
-    pub async fn dht_get(&self, key: crate::dht::Key) -> Result<Option<Vec<u8>>> {
-        self.dht_manager.get_local(&key).await
     }
 
     /// Add a discovered peer to the bootstrap cache

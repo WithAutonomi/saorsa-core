@@ -8,15 +8,11 @@ use saorsa_core::adaptive::{
     learning::{ChurnPredictor, NodeEvent, NodeFeatures, QLearnCacheManager, ThompsonSampling},
     multi_armed_bandit::{MABConfig, MultiArmedBandit},
     q_learning_cache::{AccessInfo, StateVector},
-    replication::ReplicationManager,
-    routing::AdaptiveRouter,
     security::{BlacklistReason, SecurityConfig, SecurityError, SecurityManager},
 };
-use saorsa_core::adaptive::{storage::ReplicationConfig, trust::MockTrustProvider};
 use saorsa_core::quantum_crypto::saorsa_transport_integration::MlDsaPublicKey;
 use std::{
     collections::HashMap,
-    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tempfile::TempDir;
@@ -252,58 +248,6 @@ async fn test_security_manager_real_api() -> anyhow::Result<()> {
         metrics.blacklisted_nodes > 0,
         "Should have blacklisted nodes"
     );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_replication_manager_real_api() -> anyhow::Result<()> {
-    println!("Testing Replication Manager with real API...");
-
-    // Create dependencies
-    let config = ReplicationConfig::default();
-    let trust_provider = Arc::new(MockTrustProvider::new());
-    let churn_predictor = Arc::new(ChurnPredictor::new());
-    let router = Arc::new(AdaptiveRouter::new(trust_provider.clone()));
-
-    let replication = ReplicationManager::new(config, trust_provider, churn_predictor, router);
-
-    // Test replication factor calculation
-    let content_hash = ContentHash([1u8; 32]);
-    let factor = replication
-        .calculate_replication_factor(&content_hash)
-        .await;
-    println!("Calculated replication factor: {}", factor);
-    assert!(factor > 0, "Replication factor should be positive");
-
-    // Test content replication
-    let content = b"Test content for replication";
-    let metadata = saorsa_core::adaptive::storage::ContentMetadata {
-        size: content.len(),
-        content_type: ContentType::DataRetrieval,
-        created_at: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
-        chunk_count: None,
-        replication_factor: factor,
-    };
-
-    let replica_info = replication
-        .replicate_content(&content_hash, content, metadata)
-        .await?;
-    println!("Replica info: {:?}", replica_info);
-    assert!(
-        !replica_info.storing_nodes.is_empty(),
-        "Should have storing nodes"
-    );
-
-    // Test node departure handling
-    if let Some(departed_node) = replica_info.storing_nodes.iter().next() {
-        replication.handle_node_departure(departed_node).await?;
-        println!("Handled node departure for: {:?}", departed_node);
-    }
-
-    // Check replication statistics
-    let stats = replication.get_stats().await;
-    println!("Replication stats: {:?}", stats);
 
     Ok(())
 }

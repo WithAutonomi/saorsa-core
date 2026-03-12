@@ -45,7 +45,7 @@ pub use crate::network::{
 pub use crate::bootstrap::{BootstrapManager, CacheConfig, ContactEntry, QualityMetrics};
 
 /// DHT types
-pub use crate::dht::{Key, Record};
+pub use crate::dht::Key;
 
 // ============================================================================
 // Identity & Authentication

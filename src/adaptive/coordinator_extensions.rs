@@ -28,7 +28,6 @@
 
 use super::*;
 use crate::PeerId;
-use crate::adaptive::storage::ContentMetadata;
 use crate::{P2PError, Result};
 use std::time::Duration;
 
@@ -50,45 +49,7 @@ impl TransportExtensions for TransportManager {
     }
 }
 
-// Storage strategy type needed by coordinator
-#[derive(Debug, Clone)]
-pub enum StorageStrategy {
-    Performance,
-    HighReplication,
-    Balanced,
-}
-
-// Extension trait for ContentStore - add missing methods needed by coordinator
-pub trait ContentStoreExtensions {
-    async fn store_with_strategy(&self, data: &[u8], strategy: StorageStrategy) -> Result<()>;
-    async fn get_total_size(&self) -> u64;
-    async fn flush(&self) -> Result<()>;
-    async fn get_heat_score(&self, hash: &ContentHash) -> f64;
-}
-
-impl ContentStoreExtensions for ContentStore {
-    async fn store_with_strategy(&self, data: &[u8], _strategy: StorageStrategy) -> Result<()> {
-        let metadata = ContentMetadata::default();
-        let _ = self.store(data.to_vec(), metadata).await.map_err(|e| {
-            P2PError::Storage(crate::error::StorageError::Database(e.to_string().into()))
-        })?;
-        Ok(())
-    }
-
-    async fn get_total_size(&self) -> u64 {
-        self.get_stats().await.total_bytes
-    }
-
-    async fn flush(&self) -> Result<()> {
-        // TODO: Implement flush operation
-        Ok(())
-    }
-
-    async fn get_heat_score(&self, _hash: &ContentHash) -> f64 {
-        // TODO: Implement heat score calculation
-        0.0
-    }
-}
+// (ContentStore and StorageStrategy removed — storage is handled by saorsa-node)
 
 // Cache decision type
 #[derive(Debug)]
@@ -161,30 +122,10 @@ impl QLearningCacheExtensions for QLearningCacheManager {
 
 // Extension trait for MultiArmedBandit
 pub trait MultiArmedBanditExtensions {
-    async fn select_retrieval_strategy(&self, hash: &ContentHash) -> RetrievalStrategy;
-    async fn update_strategy_performance(
-        &self,
-        strategy: RetrievalStrategy,
-        success: bool,
-        latency: Duration,
-    );
     async fn select_route(&self, paths: Vec<(RouteId, Vec<PeerId>)>) -> Result<RouteDecision>;
 }
 
 impl MultiArmedBanditExtensions for MultiArmedBandit {
-    async fn select_retrieval_strategy(&self, _hash: &ContentHash) -> RetrievalStrategy {
-        RetrievalStrategy::Parallel
-    }
-
-    async fn update_strategy_performance(
-        &self,
-        _strategy: RetrievalStrategy,
-        _success: bool,
-        _latency: Duration,
-    ) {
-        // TODO: Implement performance update
-    }
-
     async fn select_route(&self, paths: Vec<(RouteId, Vec<PeerId>)>) -> Result<RouteDecision> {
         // Select first available path
         if let Some((route_id, _)) = paths.first() {
@@ -405,42 +346,7 @@ pub struct ChurnStats {
     pub nodes_left_last_hour: usize,
 }
 
-// Extension trait for ReplicationManager
-pub trait ReplicationManagerExtensions {
-    async fn determine_strategy(&self, hash: &ContentHash) -> Result<ReplicationStrategy>;
-    async fn replicate(
-        &self,
-        hash: &ContentHash,
-        data: Vec<u8>,
-        strategy: ReplicationStrategy,
-    ) -> Result<()>;
-    async fn start_monitoring(&self);
-    async fn increase_global_replication(&self, factor: f64);
-}
-
-impl ReplicationManagerExtensions for ReplicationManager {
-    async fn determine_strategy(&self, _hash: &ContentHash) -> Result<ReplicationStrategy> {
-        Ok(ReplicationStrategy::Composite)
-    }
-
-    async fn replicate(
-        &self,
-        _hash: &ContentHash,
-        _data: Vec<u8>,
-        _strategy: ReplicationStrategy,
-    ) -> Result<()> {
-        // TODO: Implement replication
-        Ok(())
-    }
-
-    async fn start_monitoring(&self) {
-        // TODO: Implement monitoring
-    }
-
-    async fn increase_global_replication(&self, _factor: f64) {
-        // TODO: Implement global replication increase
-    }
-}
+// (ReplicationManager extensions removed — replication is handled by saorsa-node)
 
 // Extension trait for AdaptiveGossipSub (add reduce_fanout)
 pub trait AdaptiveGossipSubMoreExtensions {

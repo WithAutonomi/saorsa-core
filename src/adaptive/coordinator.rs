@@ -20,7 +20,6 @@
 //! - Identity management
 //! - DHT operations
 //! - Adaptive routing (Kademlia, Hyperbolic, SOM, Trust-based)
-//! - Storage and replication
 //! - Gossip protocol
 //! - Machine learning systems (MAB, Q-Learning, LSTM)
 //! - Monitoring and security
@@ -30,9 +29,8 @@ use crate::PeerId;
 use crate::adaptive::StrategyChoice;
 use crate::adaptive::coordinator_extensions::{
     AdaptiveDHTExtensions, AdaptiveGossipSubExtensions, AdaptiveRouterExtensions,
-    ChurnPredictorExtensions, ContentStoreExtensions, EigenTrustEngineExtensions,
-    MonitoringSystemExtensions, MultiArmedBanditExtensions, QLearningCacheExtensions,
-    ReplicationManagerExtensions, SecurityManagerExtensions, StorageStrategy, TransportExtensions,
+    EigenTrustEngineExtensions, MonitoringSystemExtensions, MultiArmedBanditExtensions,
+    SecurityManagerExtensions, TransportExtensions,
 };
 use crate::adaptive::gossip::GossipMessage;
 use crate::adaptive::learning::{QLearnCacheManager, ThompsonSampling};
@@ -42,17 +40,15 @@ use crate::adaptive::performance::CacheConfig;
 use crate::adaptive::q_learning_cache::{
     QLearnCacheManager as QLearningCacheManager, QLearningConfig,
 };
-use crate::adaptive::retrieval::RetrievalManager;
 use crate::adaptive::security::{
     AuditConfig, BlacklistConfig, EclipseDetectionConfig, IntegrityConfig, RateLimitConfig,
 };
-use crate::adaptive::storage::ContentMetadata;
 use crate::{P2PError, Result};
 use log::{error, info};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::RwLock;
 
 // ============================================================================
@@ -85,16 +81,7 @@ pub struct RoutingComponents {
     pub trust_engine: Arc<EigenTrustEngine>,
 }
 
-/// Storage and data management components
-#[derive(Clone)]
-pub struct StorageComponents {
-    /// Storage system
-    pub storage: Arc<ContentStore>,
-    /// Replication manager
-    pub replication: Arc<ReplicationManager>,
-    /// Retrieval manager
-    pub retrieval: Arc<RetrievalManager>,
-}
+// (StorageComponents removed — storage/replication/retrieval is handled by saorsa-node)
 
 /// Machine learning and adaptive components
 #[derive(Clone)]
@@ -138,9 +125,6 @@ pub struct NetworkCoordinator {
 
     /// Routing strategy components
     pub routing: RoutingComponents,
-
-    /// Storage and data management
-    pub storage: StorageComponents,
 
     /// Machine learning components
     pub learning: LearningComponents,
@@ -218,24 +202,7 @@ impl NetworkCoordinator {
         &self.network.gossip
     }
 
-    /// Get the content store
-    ///
-    /// **Deprecated**: Use `coordinator.storage.storage` directly instead.
-    #[deprecated(since = "0.3.16", note = "Use `coordinator.storage.storage` directly")]
-    pub fn content_store(&self) -> &Arc<ContentStore> {
-        &self.storage.storage
-    }
-
-    /// Get the replication manager
-    ///
-    /// **Deprecated**: Use `coordinator.storage.replication` directly instead.
-    #[deprecated(
-        since = "0.3.16",
-        note = "Use `coordinator.storage.replication` directly"
-    )]
-    pub fn replication(&self) -> &Arc<ReplicationManager> {
-        &self.storage.replication
-    }
+    // (content_store and replication accessors removed — storage is handled by saorsa-node)
 
     /// Get the monitoring system
     ///
@@ -374,9 +341,6 @@ pub struct SystemMetrics {
     /// Failed operations
     failed_ops: u64,
 
-    /// Average latency in ms
-    avg_latency_ms: f64,
-
     /// Current throughput (ops/sec)
     _throughput: f64,
 
@@ -423,7 +387,6 @@ impl NetworkCoordinator {
         let churn_predictor = Arc::new(ChurnPredictor::new());
 
         // Initialize DHT with shared adaptive layers
-        let dht_config = crate::dht::DHTConfig::default();
         let dht_dependencies = AdaptiveDhtDependencies::new(
             identity.clone(),
             trust_engine.clone(),
@@ -433,12 +396,8 @@ impl NetworkCoordinator {
             churn_predictor.clone(),
         );
         let dht = Arc::new(
-            AdaptiveDHT::new_with_dependencies(
-                dht_config,
-                AdaptiveDhtConfig::default(),
-                dht_dependencies,
-            )
-            .await?,
+            AdaptiveDHT::new_with_dependencies(AdaptiveDhtConfig::default(), dht_dependencies)
+                .await?,
         );
 
         // Initialize gossip
@@ -447,42 +406,13 @@ impl NetworkCoordinator {
             trust_engine.clone(),
         ));
 
-        // Initialize storage
-        let storage_config = StorageConfig {
-            db_path: "./data/storage".to_string(),
-            chunk_size: 1024 * 1024, // 1MB chunks
-            replication_config: ReplicationConfig::default(),
-            cache_size: (config.storage_capacity * 1024 * 1024) as usize, // Convert GB to MB
-        };
-        let storage = Arc::new(ContentStore::new(storage_config).await.map_err(|e| {
-            P2PError::Storage(crate::error::StorageError::Database(e.to_string().into()))
-        })?);
-
-        let replication_config = ReplicationConfig {
-            min_replicas: 3,
-            base_replicas: config.replication_factor as u32,
-            max_replicas: 10,
-            churn_threshold: 0.2,
-        };
-        let replication = Arc::new(ReplicationManager::new(
-            replication_config,
-            trust_engine.clone(),
-            churn_predictor.clone(),
-            router.clone(),
-        ));
-
-        // Initialize ML optimizers first (needed by retrieval)
+        // Initialize ML optimizers
         let mab_config = MABConfig::default();
         let mab = Arc::new(
             MultiArmedBandit::new(mab_config)
                 .await
                 .map_err(|e| P2PError::Internal(format!("Failed to create MAB: {}", e).into()))?,
         );
-
-        // Create cache for retrieval (from learning module)
-        let retrieval_cache = Arc::new(QLearnCacheManager::new(
-            (config.storage_capacity * 1024 * 1024) as usize,
-        ));
 
         // Create Q-learning cache for coordinator (from q_learning_cache module)
         let q_config = QLearningConfig::default();
@@ -491,20 +421,12 @@ impl NetworkCoordinator {
             config.storage_capacity * 1024 * 1024,
         ));
 
-        // Initialize retrieval with QLearnCacheManager from learning module
-        let retrieval = Arc::new(RetrievalManager::new(
-            router.clone(),
-            storage.clone(),
-            retrieval_cache.clone(),
-        ));
-
         // Initialize churn handler
         let churn_config = ChurnConfig::default();
         let churn_handler = Arc::new(ChurnHandler::new(
             *identity.peer_id(),
             churn_predictor.clone(),
             trust_engine.clone(),
-            replication.clone(),
             router.clone(),
             gossip.clone(),
             churn_config,
@@ -512,6 +434,11 @@ impl NetworkCoordinator {
 
         // Create ThompsonSampling for monitoring
         let thompson = Arc::new(ThompsonSampling::new());
+
+        // Create cache for monitoring (from learning module)
+        let retrieval_cache = Arc::new(QLearnCacheManager::new(
+            (config.storage_capacity * 1024 * 1024) as usize,
+        ));
 
         // Initialize monitoring
         let monitoring_config = MonitoringConfig {
@@ -527,8 +454,6 @@ impl NetworkCoordinator {
             router: router.clone(),
             churn_handler: churn_handler.clone(),
             gossip: gossip.clone(),
-            storage: storage.clone(),
-            replication: replication.clone(),
             thompson: thompson.clone(),
             cache: retrieval_cache.clone(),
         };
@@ -587,12 +512,6 @@ impl NetworkCoordinator {
             trust_engine,
         };
 
-        let storage_components = StorageComponents {
-            storage,
-            replication,
-            retrieval,
-        };
-
         let learning_components = LearningComponents {
             mab,
             q_learning_cache,
@@ -610,7 +529,6 @@ impl NetworkCoordinator {
         let coordinator = Self {
             network: network_components,
             routing: routing_components,
-            storage: storage_components,
             learning: learning_components,
             operations: operations_components,
             routing_handlers: Arc::new(RwLock::new(HashMap::new())),
@@ -674,85 +592,7 @@ impl NetworkCoordinator {
         Ok(())
     }
 
-    /// Store data in the network
-    pub async fn store(&self, data: Vec<u8>) -> Result<ContentHash> {
-        // Security check
-        self.operations
-            .security
-            .check_rate_limit(&self.network.identity.peer_id().clone(), None)
-            .await
-            .map_err(|e| {
-                P2PError::Network(crate::error::NetworkError::ProtocolError(
-                    e.to_string().into(),
-                ))
-            })?;
-
-        // Store locally first
-        let metadata = ContentMetadata::default();
-        let hash = self
-            .storage
-            .storage
-            .store(data.clone(), metadata)
-            .await
-            .map_err(|e| {
-                P2PError::Storage(crate::error::StorageError::Database(e.to_string().into()))
-            })?;
-
-        // Use Q-learning to decide caching strategy
-        let _cache_decision = self.learning.q_learning_cache.decide_caching(&hash).await;
-
-        // Replicate based on ML predictions
-        let replication_strategy = self.storage.replication.determine_strategy(&hash).await?;
-        self.storage
-            .replication
-            .replicate(&hash, data, replication_strategy)
-            .await?;
-
-        // Update metrics
-        let mut metrics = self.metrics.write().await;
-        metrics.successful_ops += 1;
-
-        Ok(hash)
-    }
-
-    /// Retrieve data from the network
-    pub async fn retrieve(&self, hash: &ContentHash) -> Result<Vec<u8>> {
-        let start = Instant::now();
-
-        // Check local cache first (with Q-learning optimization)
-        if let Some(data) = self.learning.q_learning_cache.get(hash).await {
-            self.update_latency_metric(start.elapsed()).await;
-            return Ok(data);
-        }
-
-        // Use MAB to select retrieval strategy
-        let strategy = self.learning.mab.select_retrieval_strategy(hash).await;
-
-        // Retrieve using selected strategy
-        let result = self
-            .storage
-            .retrieval
-            .retrieve(hash, strategy.clone())
-            .await
-            .map_err(|e| {
-                P2PError::Storage(crate::error::StorageError::Database(
-                    format!("Retrieval failed: {}", e).into(),
-                ))
-            });
-
-        // Update MAB with outcome
-        let success = result.is_ok();
-        let latency = start.elapsed();
-        self.learning
-            .mab
-            .update_strategy_performance(strategy, success, latency)
-            .await;
-
-        // Update metrics
-        self.update_latency_metric(latency).await;
-
-        result
-    }
+    // (store and retrieve methods removed — storage is handled by saorsa-node)
 
     /// Publish a message to the gossip network
     pub async fn publish(&self, topic: &str, message: Vec<u8>) -> Result<()> {
@@ -786,7 +626,7 @@ impl NetworkCoordinator {
             average_trust_score: self.routing.trust_engine.get_average_trust().await,
             cache_hit_rate: metrics.cache_hit_rate,
             churn_rate: self.operations.churn_handler.get_stats().await.churn_rate,
-            total_storage: self.storage.storage.get_total_size().await,
+            total_storage: 0,   // Storage is handled by saorsa-node
             total_bandwidth: 0, // TODO: Implement bandwidth tracking
         }
     }
@@ -818,12 +658,6 @@ impl NetworkCoordinator {
         // Start churn monitoring
         self.operations.churn_handler.start_monitoring().await;
 
-        // Start replication monitoring
-        let replication = self.storage.replication.clone();
-        tokio::spawn(async move {
-            replication.start_monitoring().await;
-        });
-
         // Start metrics collection
         let _monitoring = self.operations.monitoring.clone();
         let _metrics = self.metrics.clone();
@@ -846,26 +680,12 @@ impl NetworkCoordinator {
         Ok(())
     }
 
-    /// Update latency metric
-    async fn update_latency_metric(&self, latency: Duration) {
-        let mut metrics = self.metrics.write().await;
-        let latency_ms = latency.as_millis() as f64;
-
-        // Exponential moving average
-        metrics.avg_latency_ms = metrics.avg_latency_ms * 0.9 + latency_ms * 0.1;
-    }
-
     /// Handle graceful degradation
     pub async fn handle_degradation(&self, reason: DegradationReason) -> Result<()> {
         error!("Network degradation detected: {:?}", reason);
 
         match reason {
             DegradationReason::HighChurn => {
-                // Increase replication factor
-                self.storage
-                    .replication
-                    .increase_global_replication(1.5)
-                    .await;
                 // Reduce gossip fanout
                 self.network.gossip.reduce_fanout(0.75).await;
             }
@@ -911,11 +731,6 @@ impl NetworkCoordinator {
 
         // Stop accepting new requests
         self.network.transport.stop_accepting().await?;
-
-        // Flush pending operations
-        self.storage.storage.flush().await.map_err(|e| {
-            P2PError::Storage(crate::error::StorageError::Database(e.to_string().into()))
-        })?;
 
         // Save ML models
         // TODO: Add model paths or use extension traits
@@ -1045,30 +860,7 @@ impl NetworkCoordinator {
             .ok_or_else(|| AdaptiveNetworkError::Routing("No path selected".into()).into())
     }
 
-    /// Coordinate storage decisions
-    pub async fn coordinate_storage(&self, hash: &ContentHash, data: &[u8]) -> Result<()> {
-        // Get storage recommendations
-        let heat_score = self.storage.storage.get_heat_score(hash).await;
-        let churn_prediction = self.learning.churn_predictor.predict_network_churn().await;
-        let _trust_scores = self.routing.trust_engine.get_storage_candidates(10).await;
-
-        // Determine optimal storage strategy
-        let strategy = if heat_score > 0.8 {
-            StorageStrategy::Performance
-        } else if churn_prediction.probability_24h > 0.3 {
-            StorageStrategy::HighReplication
-        } else {
-            StorageStrategy::Balanced
-        };
-
-        // Execute storage with strategy
-        self.storage
-            .storage
-            .store_with_strategy(data, strategy)
-            .await?;
-
-        Ok(())
-    }
+    // (coordinate_storage removed — storage is handled by saorsa-node)
 
     /// Collect metrics from all components
     pub async fn collect_metrics(&self) -> Result<SystemMetrics> {

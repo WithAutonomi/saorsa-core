@@ -7,13 +7,11 @@ use std::time::Duration;
 
 use crate::dht::DHTConfig;
 
-/// Configuration for routing table maintenance
+/// Configuration for routing table maintenance (peer phonebook only)
 #[derive(Debug, Clone)]
 pub struct MaintenanceConfig {
     /// How often to refresh buckets (from DHTConfig.bucket_refresh_interval)
     pub bucket_refresh_interval: Duration,
-    /// How often to republish stored records (from DHTConfig.republish_interval)
-    pub republish_interval: Duration,
     /// Ping timeout for liveness checks
     pub ping_timeout: Duration,
     /// Max consecutive failures before eviction
@@ -29,7 +27,6 @@ impl Default for MaintenanceConfig {
     fn default() -> Self {
         Self {
             bucket_refresh_interval: Duration::from_secs(3600),
-            republish_interval: Duration::from_secs(3600),
             ping_timeout: Duration::from_secs(5),
             max_consecutive_failures: 3,
             min_trust_threshold: 0.15,
@@ -57,7 +54,6 @@ impl From<&DHTConfig> for MaintenanceConfig {
     fn from(dht_config: &DHTConfig) -> Self {
         Self {
             bucket_refresh_interval: dht_config.bucket_refresh_interval,
-            republish_interval: dht_config.republish_interval,
             ..Default::default()
         }
     }
@@ -81,17 +77,12 @@ mod tests {
     fn test_maintenance_config_from_dht_config() {
         let dht_config = DHTConfig {
             bucket_refresh_interval: Duration::from_secs(1800),
-            republish_interval: Duration::from_secs(7200),
             ..Default::default()
         };
         let maintenance_config = MaintenanceConfig::from(&dht_config);
         assert_eq!(
             maintenance_config.bucket_refresh_interval,
             Duration::from_secs(1800)
-        );
-        assert_eq!(
-            maintenance_config.republish_interval,
-            Duration::from_secs(7200)
         );
         // Other fields should use defaults
         assert_eq!(maintenance_config.ping_timeout, Duration::from_secs(5));

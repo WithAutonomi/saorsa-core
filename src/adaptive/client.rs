@@ -16,14 +16,12 @@
 //! This module provides a simple, ergonomic async API for applications to interact
 //! with the adaptive P2P network. It abstracts away the complexity of the underlying
 //! distributed systems and provides straightforward methods for:
-//! - Content storage and retrieval
 //! - Pub/sub messaging
 //! - Network statistics and monitoring
 
 use crate::PeerId;
 use crate::adaptive::{
-    AdaptiveGossipSub, AdaptiveRouter, ChurnHandler, ContentHash, ContentStore, MonitoringSystem,
-    ReplicationManager, RetrievalManager, StorageConfig,
+    AdaptiveGossipSub, AdaptiveRouter, ChurnHandler, ContentHash, MonitoringSystem,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -32,6 +30,9 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::{sync::Arc, time::Duration};
 use tokio::sync::{RwLock, mpsc};
+
+/// Default cache capacity when storage configuration is not available (64 MB).
+const DEFAULT_CACHE_CAPACITY_BYTES: usize = 64 * 1024 * 1024;
 
 /// Client configuration
 #[derive(Debug, Clone)]
@@ -127,15 +128,6 @@ struct NetworkComponents {
 
     /// Gossip protocol
     gossip: Arc<AdaptiveGossipSub>,
-
-    /// Content store
-    storage: Arc<ContentStore>,
-
-    /// Retrieval manager
-    retrieval: Arc<RetrievalManager>,
-
-    /// Replication manager
-    replication: Arc<ReplicationManager>,
 
     /// Churn handler
     churn: Arc<ChurnHandler>,
@@ -368,7 +360,7 @@ impl Client {
 
     /// Initialize network components with optional monitoring
     async fn initialize_components_with_monitoring(
-        config: &ClientConfig,
+        _config: &ClientConfig,
         enable_monitoring: bool,
     ) -> Result<NetworkComponents> {
         // Create trust provider
@@ -393,48 +385,17 @@ impl Client {
         let node_id = PeerId::from_bytes([0u8; 32]); // Temporary node ID
         let gossip = Arc::new(AdaptiveGossipSub::new(node_id, trust_provider.clone()));
 
-        // Create storage
-        let storage_config = match config.profile {
-            ClientProfile::Full => StorageConfig::default(),
-            ClientProfile::Light => StorageConfig {
-                cache_size: 10 * 1024 * 1024, // 10MB only
-                ..Default::default()
-            },
-            ClientProfile::Compute => StorageConfig {
-                cache_size: 100 * 1024 * 1024, // 100MB
-                ..Default::default()
-            },
-            ClientProfile::Mobile => StorageConfig {
-                cache_size: 5 * 1024 * 1024, // 5MB
-                chunk_size: 256 * 1024,      // 256KB chunks
-                ..Default::default()
-            },
-        };
-        let storage = Arc::new(ContentStore::new(storage_config).await?);
-
         // Create other components
         let churn_predictor = Arc::new(crate::adaptive::learning::ChurnPredictor::new());
-        let replication = Arc::new(ReplicationManager::new(
-            Default::default(),
-            trust_provider.clone(),
-            churn_predictor.clone(),
-            router.clone(),
-        ));
 
         let cache_manager = Arc::new(crate::adaptive::learning::QLearnCacheManager::new(
-            storage.get_config().cache_size,
-        ));
-        let retrieval = Arc::new(RetrievalManager::new(
-            router.clone(),
-            storage.clone(),
-            cache_manager.clone(),
+            DEFAULT_CACHE_CAPACITY_BYTES,
         ));
 
         let churn = Arc::new(ChurnHandler::new(
             node_id,
             churn_predictor,
             trust_provider.clone(),
-            replication.clone(),
             router.clone(),
             gossip.clone(),
             Default::default(),
@@ -453,8 +414,6 @@ impl Client {
                     router: router.clone(),
                     churn_handler: churn.clone(),
                     gossip: gossip.clone(),
-                    storage: storage.clone(),
-                    replication: replication.clone(),
                     thompson: Arc::new(crate::adaptive::learning::ThompsonSampling::new()),
                     cache: cache_manager.clone(),
                 },
@@ -473,8 +432,6 @@ impl Client {
                     router: router.clone(),
                     churn_handler: churn.clone(),
                     gossip: gossip.clone(),
-                    storage: storage.clone(),
-                    replication: replication.clone(),
                     thompson: Arc::new(crate::adaptive::learning::ThompsonSampling::new()),
                     cache: cache_manager.clone(),
                 },
@@ -487,9 +444,6 @@ impl Client {
             node_id,
             router,
             gossip,
-            storage,
-            retrieval,
-            replication,
             churn,
             monitoring,
         })
@@ -559,72 +513,28 @@ impl AdaptiveP2PClient for Client {
         Ok(client)
     }
 
-    async fn store(&self, data: Vec<u8>) -> Result<ContentHash> {
-        let state = self.state.read().await;
-        if !state.connected {
-            return Err(ClientError::NotConnected.into());
-        }
-
-        // Store data with automatic chunking and replication
-        let metadata = crate::adaptive::storage::ContentMetadata {
-            size: data.len(),
-            content_type: crate::adaptive::ContentType::DataRetrieval,
-            created_at: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0),
-            chunk_count: None,
-            replication_factor: 8,
-        };
-
-        let hash = self
-            .components
-            .storage
-            .store(data.clone(), metadata.clone())
-            .await
-            .map_err(|e| ClientError::Storage(e.to_string()))?;
-
-        // Trigger replication
-        self.components
-            .replication
-            .replicate_content(&hash, &data, metadata)
-            .await
-            .map_err(|e| ClientError::Storage(format!("Replication failed: {e}")))?;
-
-        Ok(hash)
-    }
-
-    async fn retrieve(&self, hash: &ContentHash) -> Result<Vec<u8>> {
-        let state = self.state.read().await;
-        if !state.connected {
-            return Err(ClientError::NotConnected.into());
-        }
-
-        // Use parallel retrieval strategies
-        tokio::time::timeout(
-            self.config.request_timeout,
-            self.components.retrieval.retrieve(
-                hash,
-                crate::adaptive::retrieval::RetrievalStrategy::Parallel,
-            ),
+    async fn store(&self, _data: Vec<u8>) -> Result<ContentHash> {
+        // Storage is handled by saorsa-node, not saorsa-core
+        Err(ClientError::Storage(
+            "Storage is handled by the application layer (saorsa-node)".to_string(),
         )
-        .await
-        .map_err(|_| ClientError::Timeout)?
-        .map_err(|e| ClientError::Retrieval(e.to_string()).into())
+        .into())
     }
 
-    async fn delete(&self, hash: &ContentHash) -> Result<()> {
-        let state = self.state.read().await;
-        if !state.connected {
-            return Err(ClientError::NotConnected.into());
-        }
+    async fn retrieve(&self, _hash: &ContentHash) -> Result<Vec<u8>> {
+        // Retrieval is handled by saorsa-node, not saorsa-core
+        Err(ClientError::Retrieval(
+            "Retrieval is handled by the application layer (saorsa-node)".to_string(),
+        )
+        .into())
+    }
 
-        // Delete from local storage
-        self.components
-            .storage
-            .delete(hash)
-            .await
-            .map_err(|e| ClientError::Storage(e.to_string()).into())
+    async fn delete(&self, _hash: &ContentHash) -> Result<()> {
+        // Storage is handled by saorsa-node, not saorsa-core
+        Err(ClientError::Storage(
+            "Storage is handled by the application layer (saorsa-node)".to_string(),
+        )
+        .into())
     }
 
     async fn submit_compute_job(&self, _job: ComputeJob) -> Result<JobId> {
@@ -723,7 +633,6 @@ impl AdaptiveP2PClient for Client {
         // Get stats from various components
         let health = self.components.monitoring.get_health().await;
         let routing_stats = self.components.router.get_stats().await;
-        let storage_stats = self.components.storage.get_stats().await;
         let gossip_stats = self.components.gossip.get_stats().await;
 
         Ok(NetworkStats {
@@ -732,7 +641,7 @@ impl AdaptiveP2PClient for Client {
             average_trust_score: health.score,
             cache_hit_rate: 0.0, // TODO: Get from cache manager
             churn_rate: health.churn_rate,
-            total_storage: storage_stats.total_bytes,
+            total_storage: 0,   // Storage is handled by saorsa-node
             total_bandwidth: 0, // TODO: Track bandwidth
         })
     }
@@ -804,52 +713,21 @@ mod tests {
 
         // Create minimal components for testing
         let trust_provider = Arc::new(crate::adaptive::trust::MockTrustProvider::new());
-        let hyperbolic = Arc::new(crate::adaptive::hyperbolic::HyperbolicSpace::new());
-        let som = Arc::new(crate::adaptive::som::SelfOrganizingMap::new(
-            crate::adaptive::som::SomConfig {
-                initial_learning_rate: 0.3,
-                initial_radius: 5.0,
-                iterations: 1000,
-                grid_size: crate::adaptive::som::GridSize::Fixed(10, 10),
-            },
-        ));
         let router = Arc::new(AdaptiveRouter::new(trust_provider.clone()));
-        // Store hyperbolic and som for potential future use
-        let _hyperbolic = hyperbolic;
-        let _som = som;
 
         let node_id = PeerId::from_bytes([0u8; 32]);
         let gossip = Arc::new(AdaptiveGossipSub::new(node_id, trust_provider.clone()));
 
-        // Create storage with minimal config
-        let storage_config = StorageConfig {
-            cache_size: 1024 * 1024, // 1MB for tests
-            ..Default::default()
-        };
-        let storage = Arc::new(ContentStore::new(storage_config).await?);
-
         let churn_predictor = Arc::new(crate::adaptive::learning::ChurnPredictor::new());
-        let replication = Arc::new(ReplicationManager::new(
-            Default::default(),
-            trust_provider.clone(),
-            churn_predictor.clone(),
-            router.clone(),
-        ));
 
         let cache = Arc::new(crate::adaptive::learning::QLearnCacheManager::new(
-            storage.get_config().cache_size,
-        ));
-        let retrieval = Arc::new(RetrievalManager::new(
-            router.clone(),
-            storage.clone(),
-            cache.clone(),
+            1024 * 1024, // 1MB for tests
         ));
 
         let churn = Arc::new(ChurnHandler::new(
             node_id,
             churn_predictor,
             trust_provider.clone(),
-            replication.clone(),
             router.clone(),
             gossip.clone(),
             Default::default(),
@@ -870,8 +748,6 @@ mod tests {
                     router: router.clone(),
                     churn_handler: churn.clone(),
                     gossip: gossip.clone(),
-                    storage: storage.clone(),
-                    replication: replication.clone(),
                     thompson: thompson.clone(),
                     cache: cache.clone(),
                 },
@@ -885,9 +761,6 @@ mod tests {
             node_id,
             router,
             gossip,
-            storage,
-            retrieval,
-            replication,
             churn,
             monitoring,
         };
@@ -921,29 +794,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_storage_operations() {
+    async fn test_storage_operations_unsupported() {
         let client = new_test_client(ClientConfig::default()).await.unwrap();
 
-        // Connect first
-        client.connect_to_node("127.0.0.1:8000").await.unwrap();
-
-        // Store data
+        // Storage operations should return errors since storage is handled by saorsa-node
         let data = b"Hello, P2P world!".to_vec();
-        let hash = client.store(data.clone()).await.unwrap();
-
-        // Retrieve data
-        let retrieved = client.retrieve(&hash).await.unwrap();
-        assert_eq!(retrieved, data);
-    }
-
-    #[tokio::test]
-    async fn test_not_connected_error() {
-        let client = new_test_client(ClientConfig::default()).await.unwrap();
-
-        // Operations should fail when not connected
-        let result = client.store(vec![1, 2, 3]).await;
+        let result = client.store(data).await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Not connected"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("application layer")
+        );
     }
 
     #[tokio::test]

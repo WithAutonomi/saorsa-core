@@ -14,12 +14,14 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 //! Integration tests for NetworkCoordinator
+//!
+//! Storage operations (store/retrieve) have been removed from the coordinator.
+//! The DHT is now a peer phonebook only; storage is handled by saorsa-node.
 
 use saorsa_core::adaptive::{
-    ContentHash, NetworkConfig, NetworkCoordinator, NodeIdentity, coordinator::DegradationReason,
+    NetworkConfig, NetworkCoordinator, NodeIdentity, coordinator::DegradationReason,
 };
 use std::time::Duration;
-use tokio::time::timeout;
 
 #[tokio::test]
 async fn test_full_system_integration() {
@@ -59,27 +61,6 @@ async fn test_full_system_integration() {
     let _ = coordinator1.join_network().await;
     let _ = coordinator2.join_network().await;
     let _ = coordinator3.join_network().await;
-
-    // Test data storage and retrieval
-    let test_data = b"Hello, P2P Network!".to_vec();
-    let hash = match coordinator1.store(test_data.clone()).await {
-        Ok(hash) => Some(hash),
-        Err(err) => {
-            println!("store failed (expected in test env): {err}");
-            None
-        }
-    };
-
-    // Allow time for replication
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    // Retrieve from different node
-    if let Some(hash) = hash
-        && let Ok(Ok(retrieved_data)) =
-            timeout(Duration::from_secs(5), coordinator2.retrieve(&hash)).await
-    {
-        assert_eq!(retrieved_data, test_data);
-    }
 
     // Test gossip messaging
     let _ = coordinator1
@@ -141,23 +122,6 @@ async fn test_layer_coordination() {
 }
 
 #[tokio::test]
-async fn test_storage_coordination() {
-    let identity = NodeIdentity::generate().unwrap();
-    let config = NetworkConfig::default();
-    let Some(coordinator) = maybe_coordinator(identity, config, "storage_coordination").await
-    else {
-        return;
-    };
-
-    let test_data = b"coordination test data";
-    let hash = ContentHash::from(test_data);
-
-    // Test storage coordination
-    let result = coordinator.coordinate_storage(&hash, test_data).await;
-    assert!(result.is_ok());
-}
-
-#[tokio::test]
 async fn test_metrics_collection() {
     let identity = NodeIdentity::generate().unwrap();
     let config = NetworkConfig {
@@ -167,10 +131,6 @@ async fn test_metrics_collection() {
     let Some(coordinator) = maybe_coordinator(identity, config, "metrics_collection").await else {
         return;
     };
-
-    // Store some data to generate metrics
-    let _ = coordinator.store(vec![1, 2, 3]).await;
-    let _ = coordinator.store(vec![4, 5, 6]).await;
 
     // Wait for metrics collection
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -186,18 +146,12 @@ async fn test_ml_integration() {
         ml_enabled: true,
         ..Default::default()
     };
-    let Some(coordinator) = maybe_coordinator(identity, config, "ml_integration").await else {
+    let Some(_coordinator) = maybe_coordinator(identity, config, "ml_integration").await else {
         return;
     };
 
-    // Test that ML components are integrated
-    let hash = ContentHash::from(b"ml test data");
-
-    // Retrieve should use MAB for strategy selection
-    let _ = coordinator.retrieve(&hash).await;
-
-    // Store should use Q-learning for caching
-    let _ = coordinator.store(b"cached data".to_vec()).await;
+    // ML components are integrated and initialized during construction.
+    // Storage operations have been removed from the coordinator.
 }
 
 #[tokio::test]
@@ -207,15 +161,13 @@ async fn test_security_integration() {
         security_level: 10, // Maximum security
         ..Default::default()
     };
-    let Some(coordinator) = maybe_coordinator(identity, config, "security_integration").await
+    let Some(_coordinator) = maybe_coordinator(identity, config, "security_integration").await
     else {
         return;
     };
 
-    // Rapid requests should be rate limited
-    for _ in 0..10 {
-        let _ = coordinator.store(vec![1]).await;
-    }
+    // Security components are initialized during construction.
+    // Rate limiting is tested through the security manager directly.
 }
 
 #[tokio::test]
@@ -232,7 +184,7 @@ async fn test_concurrent_operations() {
     for i in 0..10 {
         let data = vec![i as u8; 100];
         handles.push(tokio::spawn(async move {
-            // Each task stores and retrieves data
+            // Each task processes data concurrently
             data
         }));
     }
@@ -253,9 +205,6 @@ async fn test_graceful_shutdown() {
 
     // Join network
     let _ = coordinator.join_network().await;
-
-    // Store some data
-    let _ = coordinator.store(b"shutdown test".to_vec()).await;
 
     // Graceful shutdown
     let _ = coordinator.shutdown().await;

@@ -23,16 +23,15 @@ use super::security::{
 use super::som::{GridSize, SomConfig};
 use super::{
     AdaptiveDHT, AdaptiveGossipSub, AdaptiveRouter, ChurnConfig, ChurnHandler, ChurnPredictor,
-    ContentHash, ContentStore, EigenTrustEngine, HyperbolicSpace, MABConfig, MonitoringConfig,
-    MonitoringSystem, MultiArmedBandit, NodeIdentity, PerformanceCache, QLearnCacheManager,
-    QLearningCacheManager, QLearningConfig, ReplicationConfig, ReplicationManager, SecurityConfig,
-    SecurityManager, SelfOrganizingMap, StorageConfig, ThompsonSampling, TransportManager,
+    ContentHash, EigenTrustEngine, HyperbolicSpace, MABConfig, MonitoringConfig, MonitoringSystem,
+    MultiArmedBandit, NodeIdentity, PerformanceCache, QLearnCacheManager, QLearningCacheManager,
+    QLearningConfig, SecurityConfig, SecurityManager, SelfOrganizingMap, ThompsonSampling,
+    TransportManager,
 };
 use crate::{P2PError, Result};
 
 use super::coordinator::{
     LearningComponents, NetworkComponents, NetworkConfig, OperationsComponents, RoutingComponents,
-    StorageComponents,
 };
 
 // ============================================================================
@@ -55,15 +54,8 @@ impl NetworkComponents {
         let router = Arc::new(AdaptiveRouter::new(trust_engine.clone()));
 
         // Initialize DHT
-        let dht_config = crate::dht::DHTConfig::default();
         let dht = Arc::new(
-            AdaptiveDHT::new(
-                dht_config,
-                identity.clone(),
-                trust_engine.clone(),
-                router.clone(),
-            )
-            .await?,
+            AdaptiveDHT::new(identity.clone(), trust_engine.clone(), router.clone()).await?,
         );
 
         // Initialize gossip
@@ -116,73 +108,7 @@ impl RoutingComponents {
     }
 }
 
-// ============================================================================
-// Storage Components Builder
-// ============================================================================
-
-impl StorageComponents {
-    /// Build storage components from configuration
-    ///
-    /// Creates: storage, replication, retrieval
-    pub async fn build(
-        config: &NetworkConfig,
-        trust_engine: Arc<EigenTrustEngine>,
-        churn_predictor: Arc<ChurnPredictor>,
-        router: Arc<AdaptiveRouter>,
-    ) -> Result<(
-        Self,
-        Arc<ContentStore>,
-        Arc<ReplicationManager>,
-        Arc<QLearnCacheManager>,
-    )> {
-        // Initialize storage
-        let storage_config = StorageConfig {
-            db_path: "./data/storage".to_string(),
-            chunk_size: 1024 * 1024, // 1MB chunks
-            replication_config: ReplicationConfig::default(),
-            cache_size: (config.storage_capacity * 1024 * 1024) as usize,
-        };
-
-        let storage = Arc::new(ContentStore::new(storage_config).await.map_err(|e| {
-            P2PError::Storage(crate::error::StorageError::Database(e.to_string().into()))
-        })?);
-
-        // Initialize replication
-        let replication_config = ReplicationConfig {
-            min_replicas: 3,
-            base_replicas: config.replication_factor as u32,
-            max_replicas: 10,
-            churn_threshold: 0.2,
-        };
-
-        let replication = Arc::new(ReplicationManager::new(
-            replication_config,
-            trust_engine,
-            churn_predictor,
-            router.clone(),
-        ));
-
-        // Create cache for retrieval
-        let retrieval_cache = Arc::new(QLearnCacheManager::new(
-            (config.storage_capacity * 1024 * 1024) as usize,
-        ));
-
-        // Initialize retrieval
-        let retrieval = Arc::new(super::RetrievalManager::new(
-            router,
-            storage.clone(),
-            retrieval_cache.clone(),
-        ));
-
-        let components = Self {
-            storage: storage.clone(),
-            replication: replication.clone(),
-            retrieval,
-        };
-
-        Ok((components, storage, replication, retrieval_cache))
-    }
-}
+// (StorageComponents builder removed — storage is handled by saorsa-node)
 
 // ============================================================================
 // Learning Components Builder
@@ -234,10 +160,8 @@ impl OperationsComponents {
         identity: &NodeIdentity,
         churn_predictor: Arc<ChurnPredictor>,
         trust_engine: Arc<EigenTrustEngine>,
-        replication: Arc<ReplicationManager>,
         router: Arc<AdaptiveRouter>,
         gossip: Arc<AdaptiveGossipSub>,
-        storage: Arc<ContentStore>,
         retrieval_cache: Arc<QLearnCacheManager>,
     ) -> Result<Self> {
         // Initialize churn handler
@@ -246,7 +170,6 @@ impl OperationsComponents {
             *identity.peer_id(),
             churn_predictor,
             trust_engine,
-            replication.clone(),
             router.clone(),
             gossip.clone(),
             churn_config,
@@ -269,8 +192,6 @@ impl OperationsComponents {
             router,
             churn_handler: churn_handler.clone(),
             gossip,
-            storage,
-            replication,
             thompson,
             cache: retrieval_cache,
         };
@@ -390,33 +311,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_storage_components_build() {
-        let config = NetworkConfig::default();
-        let (_, trust_engine) = RoutingComponents::build(&config).unwrap();
-        let (_, churn_predictor) = LearningComponents::build(&config).await.unwrap();
-        let router = Arc::new(AdaptiveRouter::new(trust_engine.clone()));
-
-        let result = tokio::time::timeout(
-            Duration::from_secs(5),
-            StorageComponents::build(&config, trust_engine, churn_predictor, router),
-        )
-        .await;
-
-        match result {
-            Ok(Ok((components, storage, _replication, _cache))) => {
-                assert!(Arc::strong_count(&components.storage) >= 1);
-                assert!(Arc::strong_count(&storage) >= 1);
-            }
-            Ok(Err(e)) => {
-                println!("Storage components build failed (may be expected): {}", e);
-            }
-            Err(_) => {
-                println!("Storage components build timed out (expected in test environment)");
-            }
-        }
-    }
-
-    #[tokio::test]
     async fn test_full_coordinator_build_sequence() {
         // Test the full build sequence that the coordinator would use
         let config = NetworkConfig::default();
@@ -425,10 +319,9 @@ mod tests {
         let (_, trust_engine) = RoutingComponents::build(&config).unwrap();
 
         // 2. Build learning (provides churn_predictor)
-        let (_, churn_predictor) = LearningComponents::build(&config).await.unwrap();
+        let (learning, churn_predictor) = LearningComponents::build(&config).await.unwrap();
 
         // 3. Build network (needs trust_engine, provides router)
-        // Generate two identities - one for network, one for ops
         let identity_for_network = NodeIdentity::generate().unwrap();
         let identity_for_ops = NodeIdentity::generate().unwrap();
 
@@ -440,37 +333,23 @@ mod tests {
 
         match network_result {
             Ok(Ok((network, router))) => {
-                // 4. Build storage (needs trust_engine, churn_predictor, router)
-                let storage_result = tokio::time::timeout(
-                    Duration::from_secs(5),
-                    StorageComponents::build(
-                        &config,
-                        trust_engine.clone(),
-                        churn_predictor.clone(),
-                        router.clone(),
-                    ),
-                )
-                .await;
+                // 4. Build operations (needs trust_engine, churn_predictor, router, gossip, cache)
+                let cache = Arc::new(QLearnCacheManager::new(
+                    (config.storage_capacity * 1024 * 1024) as usize,
+                ));
+                let ops_result = OperationsComponents::build(
+                    &config,
+                    &identity_for_ops,
+                    churn_predictor,
+                    trust_engine,
+                    router,
+                    network.gossip.clone(),
+                    cache,
+                );
 
-                match storage_result {
-                    Ok(Ok((_storage, content_store, replication, cache))) => {
-                        // 5. Build operations (needs everything)
-                        let ops_result = OperationsComponents::build(
-                            &config,
-                            &identity_for_ops,
-                            churn_predictor,
-                            trust_engine,
-                            replication,
-                            router,
-                            network.gossip.clone(),
-                            content_store,
-                            cache,
-                        );
-
-                        assert!(ops_result.is_ok(), "Operations build should succeed");
-                    }
-                    _ => println!("Storage build skipped due to timeout or error"),
-                }
+                assert!(ops_result.is_ok(), "Operations build should succeed");
+                // Verify learning components were built
+                assert!(Arc::strong_count(&learning.mab) >= 1);
             }
             _ => println!("Network build skipped due to timeout or error"),
         }

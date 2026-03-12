@@ -172,10 +172,9 @@ pub use auth::{
     DelegatedWriteAuth, MlsWriteAuth, PubKey, Sig, SingleWriteAuth, ThresholdWriteAuth, WriteAuth,
 };
 pub use bootstrap::{BootstrapConfig, BootstrapManager, CacheConfig, ContactEntry, QualityMetrics};
-pub use dht::{Key, Record};
+pub use dht::Key;
 pub use dht_network_manager::{
     DhtNetworkConfig, DhtNetworkEvent, DhtNetworkManager, DhtNetworkOperation, DhtNetworkResult,
-    PeerStoreOutcome,
 };
 pub use encrypted_key_storage::{
     Argon2Config, DerivationPriority as KeyDerivationPriority, EncryptedKeyStorageManager,

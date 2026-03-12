@@ -16,10 +16,7 @@
 //!
 //! | Type | Byte | Purpose |
 //! |------|------|---------|
-//! | DhtQuery | 0x10 | GET, FIND_NODE, FIND_VALUE requests |
-//! | DhtStore | 0x11 | PUT, STORE requests with data |
-//! | DhtWitness | 0x12 | (removed) |
-//! | DhtReplication | 0x13 | Background replication traffic |
+//! | DhtQuery | 0x10 | FIND_NODE, Ping requests |
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -32,22 +29,17 @@ use tracing::{debug, error, trace, warn};
 
 use crate::dht::core_engine::DhtCoreEngine;
 use crate::dht::network_integration::{DhtMessage, DhtResponse, ErrorCode};
-// witness system removed
 
 /// DHT stream types handled by this handler.
-const DHT_STREAM_TYPES: &[StreamType] = &[
-    StreamType::DhtQuery,
-    StreamType::DhtStore,
-    StreamType::DhtReplication,
-];
+///
+/// Only DhtQuery remains — store and replication are handled by the
+/// application layer (saorsa-node).
+const DHT_STREAM_TYPES: &[StreamType] = &[StreamType::DhtQuery];
 
 /// DHT protocol handler for SharedTransport.
 ///
 /// Routes incoming DHT streams to the appropriate handlers based on stream type:
-/// - DhtQuery: Handles GET, FIND_NODE, FIND_VALUE requests
-/// - DhtStore: Handles PUT, STORE requests with data payloads
-/// - DhtWitness: Removed
-/// - DhtReplication: Handles background replication and repair traffic
+/// - DhtQuery: Handles FIND_NODE, Ping requests (peer phonebook)
 pub struct DhtStreamHandler {
     /// Reference to the DHT engine for processing requests.
     dht_engine: Arc<RwLock<DhtCoreEngine>>,
@@ -95,87 +87,9 @@ impl DhtStreamHandler {
         Ok(Some(Bytes::from(response_bytes)))
     }
 
-    /// Handle a DHT store request.
-    async fn handle_store(
-        &self,
-        remote_addr: SocketAddr,
-        data: Bytes,
-    ) -> LinkResult<Option<Bytes>> {
-        trace!(remote_addr = %remote_addr, size = data.len(), "Processing DHT store");
-
-        let message: DhtMessage = postcard::from_bytes(&data)
-            .map_err(|e| LinkError::Internal(format!("Failed to deserialize store: {e}")))?;
-
-        let response = self.process_message(message).await?;
-
-        let response_bytes = postcard::to_stdvec(&response)
-            .map_err(|e| LinkError::Internal(format!("Failed to serialize response: {e}")))?;
-
-        Ok(Some(Bytes::from(response_bytes)))
-    }
-
-    /// Handle a DHT replication request.
-    async fn handle_replication(
-        &self,
-        remote_addr: SocketAddr,
-        data: Bytes,
-    ) -> LinkResult<Option<Bytes>> {
-        trace!(remote_addr = %remote_addr, size = data.len(), "Processing DHT replication");
-
-        let message: DhtMessage = postcard::from_bytes(&data)
-            .map_err(|e| LinkError::Internal(format!("Failed to deserialize replication: {e}")))?;
-
-        let response = self.process_message(message).await?;
-
-        let response_bytes = postcard::to_stdvec(&response)
-            .map_err(|e| LinkError::Internal(format!("Failed to serialize response: {e}")))?;
-
-        Ok(Some(Bytes::from(response_bytes)))
-    }
-
     /// Process a DHT message and return the response.
     async fn process_message(&self, message: DhtMessage) -> LinkResult<DhtResponse> {
         match message {
-            DhtMessage::Store { key, value, .. } => {
-                let mut engine = self.dht_engine.write().await;
-
-                match engine.store(&key, value).await {
-                    Ok(receipt) => {
-                        debug!(key = ?key, "DHT store successful");
-                        Ok(DhtResponse::StoreAck {
-                            replicas: receipt.stored_at,
-                        })
-                    }
-                    Err(e) => {
-                        warn!(key = ?key, error = %e, "DHT store failed");
-                        Ok(DhtResponse::Error {
-                            code: ErrorCode::InternalError,
-                            message: format!("Store failed: {e}"),
-                            retry_after: None,
-                        })
-                    }
-                }
-            }
-
-            DhtMessage::Retrieve { key, .. } => {
-                let engine = self.dht_engine.read().await;
-
-                match engine.retrieve(&key).await {
-                    Ok(value) => {
-                        debug!(key = ?key, found = value.is_some(), "DHT retrieve completed");
-                        Ok(DhtResponse::RetrieveReply { value })
-                    }
-                    Err(e) => {
-                        warn!(key = ?key, error = %e, "DHT retrieve failed");
-                        Ok(DhtResponse::Error {
-                            code: ErrorCode::InternalError,
-                            message: format!("Retrieve failed: {e}"),
-                            retry_after: None,
-                        })
-                    }
-                }
-            }
-
             DhtMessage::FindNode { target, count } => {
                 let engine = self.dht_engine.read().await;
 
@@ -192,32 +106,6 @@ impl DhtStreamHandler {
                         Ok(DhtResponse::Error {
                             code: ErrorCode::NodeNotFound,
                             message: format!("FindNode failed: {e}"),
-                            retry_after: None,
-                        })
-                    }
-                }
-            }
-
-            DhtMessage::FindValue { key } => {
-                let engine = self.dht_engine.read().await;
-
-                match engine.retrieve(&key).await {
-                    Ok(value) => {
-                        if value.is_some() {
-                            Ok(DhtResponse::FindValueReply {
-                                value,
-                                nodes: Vec::new(),
-                            })
-                        } else {
-                            let nodes = engine.find_nodes(&key, 8).await.unwrap_or_default();
-                            Ok(DhtResponse::FindValueReply { value: None, nodes })
-                        }
-                    }
-                    Err(e) => {
-                        warn!(key = ?key, error = %e, "DHT find_value failed");
-                        Ok(DhtResponse::Error {
-                            code: ErrorCode::InternalError,
-                            message: format!("FindValue failed: {e}"),
                             retry_after: None,
                         })
                     }
@@ -245,38 +133,6 @@ impl DhtStreamHandler {
                 debug!(node = ?node_id, "DHT leave notification");
                 Ok(DhtResponse::LeaveAck { confirmed: true })
             }
-
-            DhtMessage::Replicate {
-                key,
-                value,
-                version,
-            } => {
-                debug!(key = ?key, version = version, "DHT replication request");
-                let mut engine = self.dht_engine.write().await;
-
-                match engine.store(&key, value).await {
-                    Ok(receipt) => Ok(DhtResponse::StoreAck {
-                        replicas: receipt.stored_at,
-                    }),
-                    Err(e) => Ok(DhtResponse::Error {
-                        code: ErrorCode::InternalError,
-                        message: format!("Replication failed: {e}"),
-                        retry_after: None,
-                    }),
-                }
-            }
-
-            DhtMessage::RepairRequest {
-                key,
-                missing_shards,
-            } => {
-                debug!(key = ?key, shards = ?missing_shards, "DHT repair request");
-                Ok(DhtResponse::Error {
-                    code: ErrorCode::InvalidMessage,
-                    message: "Repair not yet implemented".to_string(),
-                    retry_after: Some(std::time::Duration::from_secs(60)),
-                })
-            }
         }
     }
 }
@@ -296,8 +152,6 @@ impl ProtocolHandler for DhtStreamHandler {
     ) -> LinkResult<Option<Bytes>> {
         match stream_type {
             StreamType::DhtQuery => self.handle_query(remote_addr, data).await,
-            StreamType::DhtStore => self.handle_store(remote_addr, data).await,
-            StreamType::DhtReplication => self.handle_replication(remote_addr, data).await,
             _ => {
                 error!(
                     stream_type = %stream_type,
@@ -346,12 +200,8 @@ pub struct TypedDhtMessage {
 /// DHT-specific stream type mapping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DhtStreamType {
-    /// Query operations (GET, FIND_NODE, FIND_VALUE).
+    /// Query operations (FIND_NODE, Ping).
     Query,
-    /// Store operations (PUT, STORE).
-    Store,
-    /// Background replication.
-    Replication,
 }
 
 impl DhtStreamType {
@@ -359,25 +209,12 @@ impl DhtStreamType {
     pub fn to_stream_type(self) -> StreamType {
         match self {
             Self::Query => StreamType::DhtQuery,
-            Self::Store => StreamType::DhtStore,
-            Self::Replication => StreamType::DhtReplication,
         }
     }
 
     /// Determine the appropriate stream type for a DHT message.
-    pub fn for_message(message: &DhtMessage) -> Self {
-        match message {
-            DhtMessage::Retrieve { .. }
-            | DhtMessage::FindNode { .. }
-            | DhtMessage::FindValue { .. }
-            | DhtMessage::Ping { .. } => Self::Query,
-
-            DhtMessage::Store { .. } | DhtMessage::Join { .. } | DhtMessage::Leave { .. } => {
-                Self::Store
-            }
-
-            DhtMessage::Replicate { .. } | DhtMessage::RepairRequest { .. } => Self::Replication,
-        }
+    pub fn for_message(_message: &DhtMessage) -> Self {
+        Self::Query
     }
 }
 
@@ -393,19 +230,12 @@ mod tests {
 
     #[test]
     fn test_dht_stream_types() {
-        assert_eq!(DHT_STREAM_TYPES.len(), 3);
+        assert_eq!(DHT_STREAM_TYPES.len(), 1);
         assert!(DHT_STREAM_TYPES.contains(&StreamType::DhtQuery));
-        assert!(DHT_STREAM_TYPES.contains(&StreamType::DhtStore));
-        assert!(DHT_STREAM_TYPES.contains(&StreamType::DhtReplication));
     }
 
     #[test]
     fn test_dht_stream_type_conversion() {
         assert_eq!(DhtStreamType::Query.to_stream_type(), StreamType::DhtQuery);
-        assert_eq!(DhtStreamType::Store.to_stream_type(), StreamType::DhtStore);
-        assert_eq!(
-            DhtStreamType::Replication.to_stream_type(),
-            StreamType::DhtReplication
-        );
     }
 }

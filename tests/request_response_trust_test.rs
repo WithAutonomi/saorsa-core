@@ -13,12 +13,10 @@
 //!
 //! Tests cover:
 //! - `PeerFailureReason` enum semantics
-//! - `PeerStoreOutcome` construction and enriched `DhtNetworkResult` variants
 //! - `RequestResponseEnvelope` serialization round-trip
 //! - `P2PNode::parse_request_envelope` helper
 
 use saorsa_core::error::PeerFailureReason;
-use saorsa_core::{DhtNetworkResult, PeerStoreOutcome};
 
 /// Mirror of the private `RequestResponseEnvelope` for constructing test bytes.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -107,163 +105,6 @@ fn test_failure_reason_serde_roundtrip() {
         let json = serde_json::to_string(reason).unwrap();
         let roundtripped: PeerFailureReason = serde_json::from_str(&json).unwrap();
         assert_eq!(*reason, roundtripped);
-    }
-}
-
-// ---- PeerStoreOutcome tests ----
-
-#[test]
-fn test_peer_store_outcome_success() {
-    let outcome = PeerStoreOutcome {
-        peer_id: saorsa_core::PeerId::from_name("peer_abc123"),
-        success: true,
-        error: None,
-    };
-    assert!(outcome.success);
-    assert!(outcome.error.is_none());
-}
-
-#[test]
-fn test_peer_store_outcome_failure() {
-    let outcome = PeerStoreOutcome {
-        peer_id: saorsa_core::PeerId::from_name("peer_def456"),
-        success: false,
-        error: Some("Connection refused".to_string()),
-    };
-    assert!(!outcome.success);
-    assert_eq!(outcome.error.as_deref(), Some("Connection refused"));
-}
-
-#[test]
-fn test_peer_store_outcome_serde_roundtrip() {
-    let peer_test = saorsa_core::PeerId::from_name("peer_test");
-    let outcome = PeerStoreOutcome {
-        peer_id: peer_test,
-        success: false,
-        error: Some("timeout".to_string()),
-    };
-    let json = serde_json::to_string(&outcome).unwrap();
-    let roundtripped: PeerStoreOutcome = serde_json::from_str(&json).unwrap();
-    assert_eq!(roundtripped.peer_id, peer_test);
-    assert!(!roundtripped.success);
-    assert_eq!(roundtripped.error.as_deref(), Some("timeout"));
-}
-
-#[test]
-fn test_peer_store_outcome_serde_default_fields() {
-    // Construct a PeerStoreOutcome without optional error field and roundtrip it
-    let peer_old = saorsa_core::PeerId::from_name("peer_old");
-    let outcome = PeerStoreOutcome {
-        peer_id: peer_old,
-        success: true,
-        error: None,
-    };
-    let json = serde_json::to_string(&outcome).unwrap();
-    let roundtripped: PeerStoreOutcome = serde_json::from_str(&json).unwrap();
-    assert_eq!(roundtripped.peer_id, peer_old);
-    assert!(roundtripped.success);
-    assert!(roundtripped.error.is_none());
-}
-
-// ---- Enriched DhtNetworkResult tests ----
-
-#[test]
-fn test_put_success_with_peer_outcomes() {
-    let key = [42u8; 32];
-    let outcomes = vec![
-        PeerStoreOutcome {
-            peer_id: saorsa_core::PeerId::from_name("peer_a"),
-            success: true,
-            error: None,
-        },
-        PeerStoreOutcome {
-            peer_id: saorsa_core::PeerId::from_name("peer_b"),
-            success: false,
-            error: Some("timeout".to_string()),
-        },
-    ];
-
-    let result = DhtNetworkResult::PutSuccess {
-        key,
-        replicated_to: 2,
-        peer_outcomes: outcomes.clone(),
-    };
-
-    match result {
-        DhtNetworkResult::PutSuccess {
-            replicated_to,
-            peer_outcomes,
-            ..
-        } => {
-            assert_eq!(replicated_to, 2);
-            assert_eq!(peer_outcomes.len(), 2);
-            assert!(peer_outcomes[0].success);
-            assert!(!peer_outcomes[1].success);
-        }
-        _ => panic!("Expected PutSuccess"),
-    }
-}
-
-#[test]
-fn test_put_success_backward_compat_serde() {
-    // Old wire format without peer_outcomes
-    let json = r#"{"PutSuccess":{"key":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"replicated_to":1}}"#;
-    let result: DhtNetworkResult = serde_json::from_str(json).unwrap();
-    match result {
-        DhtNetworkResult::PutSuccess {
-            peer_outcomes,
-            replicated_to,
-            ..
-        } => {
-            assert_eq!(replicated_to, 1);
-            assert!(peer_outcomes.is_empty());
-        }
-        _ => panic!("Expected PutSuccess"),
-    }
-}
-
-#[test]
-fn test_get_not_found_with_diagnostics() {
-    let key = [7u8; 32];
-    let result = DhtNetworkResult::GetNotFound {
-        key,
-        peers_queried: 5,
-        peers_failed: 2,
-        last_error: Some("connection timeout".to_string()),
-    };
-
-    match result {
-        DhtNetworkResult::GetNotFound {
-            peers_queried,
-            peers_failed,
-            last_error,
-            ..
-        } => {
-            assert_eq!(peers_queried, 5);
-            assert_eq!(peers_failed, 2);
-            assert_eq!(last_error.as_deref(), Some("connection timeout"));
-        }
-        _ => panic!("Expected GetNotFound"),
-    }
-}
-
-#[test]
-fn test_get_not_found_backward_compat_serde() {
-    // Old wire format without diagnostic fields
-    let json = r#"{"GetNotFound":{"key":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}}"#;
-    let result: DhtNetworkResult = serde_json::from_str(json).unwrap();
-    match result {
-        DhtNetworkResult::GetNotFound {
-            peers_queried,
-            peers_failed,
-            last_error,
-            ..
-        } => {
-            assert_eq!(peers_queried, 0);
-            assert_eq!(peers_failed, 0);
-            assert!(last_error.is_none());
-        }
-        _ => panic!("Expected GetNotFound"),
     }
 }
 

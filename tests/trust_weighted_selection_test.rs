@@ -15,7 +15,7 @@
 
 use saorsa_core::PeerId;
 use saorsa_core::adaptive::{EigenTrustEngine, NodeStatisticsUpdate};
-use saorsa_core::dht::{DhtCoreEngine, DhtKey, TrustSelectionConfig};
+use saorsa_core::dht::{DhtCoreEngine, TrustSelectionConfig};
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -58,46 +58,6 @@ async fn test_trust_selection_with_custom_config() {
 
     dht.enable_trust_selection(trust_engine, custom_config);
     assert!(dht.has_trust_selection());
-}
-
-#[tokio::test]
-async fn test_trust_selection_with_separate_storage_config() {
-    let mut dht = make_dht_engine();
-    let trust_engine = Arc::new(EigenTrustEngine::new(HashSet::new()));
-
-    let query_config = TrustSelectionConfig {
-        trust_weight: 0.3,
-        min_trust_threshold: 0.1,
-        exclude_untrusted: false,
-    };
-
-    let storage_config = TrustSelectionConfig {
-        trust_weight: 0.5,
-        min_trust_threshold: 0.3,
-        exclude_untrusted: true,
-    };
-
-    dht.enable_trust_selection_with_storage_config(trust_engine, query_config, storage_config);
-    assert!(dht.has_trust_selection());
-}
-
-#[tokio::test]
-async fn test_basic_store_retrieve_with_trust_enabled() {
-    let mut dht = make_dht_engine();
-
-    // Enable trust selection
-    let trust_engine = Arc::new(EigenTrustEngine::new(HashSet::new()));
-    dht.enable_trust_selection(trust_engine, TrustSelectionConfig::default());
-
-    // Store and retrieve should still work
-    let key = DhtKey::new(b"test_key");
-    let value = b"test_value".to_vec();
-
-    let receipt = dht.store(&key, value.clone()).await.expect("Store failed");
-    assert!(receipt.is_successful());
-
-    let retrieved = dht.retrieve(&key).await.expect("Retrieve failed");
-    assert_eq!(retrieved, Some(value));
 }
 
 #[tokio::test]
@@ -158,24 +118,6 @@ async fn test_storage_config_stricter_than_query_config() {
         storage_config.trust_weight > query_config.trust_weight,
         "Storage should weight trust more heavily"
     );
-}
-
-#[tokio::test]
-async fn test_fallback_to_distance_only_when_disabled() {
-    let mut dht = make_dht_engine();
-
-    // Don't enable trust selection - should use distance-only fallback
-    assert!(!dht.has_trust_selection());
-
-    // Store and retrieve should work with distance-only selection
-    let key = DhtKey::new(b"fallback_test");
-    let value = b"fallback_value".to_vec();
-
-    let receipt = dht.store(&key, value.clone()).await.expect("Store failed");
-    assert!(receipt.is_successful());
-
-    let retrieved = dht.retrieve(&key).await.expect("Retrieve failed");
-    assert_eq!(retrieved, Some(value));
 }
 
 #[tokio::test]

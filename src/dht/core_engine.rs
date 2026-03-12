@@ -1,6 +1,7 @@
-//! Enhanced DHT Core Engine with Kademlia routing and intelligent data distribution
+//! DHT Core Engine with Kademlia routing
 //!
-//! Provides the main DHT functionality with k=8 replication, load balancing, and fault tolerance.
+//! Provides peer discovery and routing via a Kademlia DHT with k=8 buckets,
+//! trust-weighted peer selection, and security-hardened maintenance tasks.
 
 use crate::PeerId;
 use crate::adaptive::EigenTrustEngine;
@@ -15,19 +16,14 @@ use crate::dht::routing_maintenance::{
     BucketRefreshManager, EvictionManager, EvictionReason, MaintenanceConfig,
 };
 use crate::dht::trust_peer_selector::{TrustAwarePeerSelector, TrustSelectionConfig};
-use crate::network::NetworkSender;
 use crate::security::IPDiversityConfig;
-use anyhow::{Context, Result, anyhow};
-use lru::LruCache;
+use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
-use tokio::sync::{RwLock, oneshot};
+use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
-use uuid::Uuid;
 
 /// DHT key type — now a direct alias for [`PeerId`].
 ///
@@ -284,130 +280,6 @@ impl KademliaRoutingTable {
     }
 }
 
-/// Consistency level for operations
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub enum ConsistencyLevel {
-    One,    // At least 1 replica
-    Quorum, // Majority of replicas
-    All,    // All replicas
-}
-
-/// Load metrics for a node
-#[derive(Debug, Clone)]
-pub struct LoadMetric {
-    pub storage_used_percent: f64,
-    pub bandwidth_used_percent: f64,
-    pub request_rate: f64,
-}
-
-/// Store receipt for DHT operations
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StoreReceipt {
-    pub key: DhtKey,
-    pub stored_at: Vec<PeerId>,
-    pub timestamp: SystemTime,
-    pub success: bool,
-}
-
-impl StoreReceipt {
-    pub fn is_successful(&self) -> bool {
-        self.success
-    }
-}
-
-/// Data store for local storage
-struct DataStore {
-    data: HashMap<DhtKey, Vec<u8>>,
-    metadata: HashMap<DhtKey, DataMetadata>,
-}
-
-#[derive(Debug, Clone)]
-struct DataMetadata {
-    _size: usize,
-    _stored_at: SystemTime,
-}
-
-impl DataStore {
-    fn new() -> Self {
-        Self {
-            data: HashMap::new(),
-            metadata: HashMap::new(),
-        }
-    }
-
-    fn put(&mut self, key: DhtKey, value: Vec<u8>) {
-        let metadata = DataMetadata {
-            _size: value.len(),
-            _stored_at: SystemTime::now(),
-        };
-
-        self.data.insert(key, value);
-        self.metadata.insert(key, metadata);
-    }
-
-    /// Look up a value without updating access metadata (read-only).
-    fn get(&self, key: &DhtKey) -> Option<Vec<u8>> {
-        self.data.get(key).cloned()
-    }
-}
-
-/// Replication manager for maintaining data redundancy
-struct ReplicationManager {
-    _replication_factor: usize,
-    _consistency_level: ConsistencyLevel,
-    _pending_repairs: Vec<DhtKey>,
-}
-
-impl ReplicationManager {
-    fn new(replication_factor: usize) -> Self {
-        Self {
-            _replication_factor: replication_factor,
-            _consistency_level: ConsistencyLevel::Quorum,
-            _pending_repairs: Vec::new(),
-        }
-    }
-}
-
-/// Load balancer for intelligent data distribution
-struct LoadBalancer {
-    node_loads: HashMap<PeerId, LoadMetric>,
-    _rebalance_threshold: f64,
-}
-
-impl LoadBalancer {
-    fn new() -> Self {
-        Self {
-            node_loads: HashMap::new(),
-            _rebalance_threshold: 0.8,
-        }
-    }
-
-    fn select_least_loaded(&self, candidates: &[NodeInfo], count: usize) -> Vec<PeerId> {
-        // Filter NaN values during collection to avoid intermediate allocations with invalid data
-        let mut sorted: Vec<_> = candidates
-            .iter()
-            .filter_map(|node| {
-                let load = self
-                    .node_loads
-                    .get(&node.id)
-                    .map(|l| l.storage_used_percent)
-                    .unwrap_or(0.0);
-                // Filter NaN during collection rather than after
-                if load.is_nan() {
-                    None
-                } else {
-                    Some((node.id, load))
-                }
-            })
-            .collect();
-
-        // Use total_cmp for safe float comparison
-        sorted.sort_by(|a, b| a.1.total_cmp(&b.1));
-
-        sorted.into_iter().take(count).map(|(id, _)| id).collect()
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Address parsing and subnet masking helpers for diversity checks
 // ---------------------------------------------------------------------------
@@ -454,27 +326,12 @@ fn mask_ipv6(addr: Ipv6Addr, prefix_len: u8) -> Ipv6Addr {
 /// `GeographicRoutingConfig::max_nodes_per_region` default.
 const GEO_DEFAULT_MAX_PER_REGION: usize = 50;
 
-/// DHT query timeout duration
-const DHT_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Alpha parameter from Kademlia - max parallel queries
-const MAX_PARALLEL_QUERIES: usize = 3;
-
-/// K parameter - replication factor
+/// K parameter - number of closest nodes per bucket
 const K: usize = 8;
-
-/// Maximum value size for DHT store operations (512 bytes)
-/// The DHT is designed as a "phonebook" for peer discovery, not general storage.
-/// Record types (NODE_AD, GROUP_BEACON, DATA_POINTER) should fit within 512 bytes.
-/// Larger data should be stored via send_message() in the application layer.
-const MAX_DHT_VALUE_SIZE: usize = 512;
 
 /// Maximum node count for FindNode requests
 /// Prevents amplification attacks by limiting response size
 const MAX_FIND_NODE_COUNT: usize = 20;
-
-/// Maximum pending DHT requests before evicting oldest (prevents memory DoS)
-const MAX_PENDING_DHT_REQUESTS: usize = 10_000;
 
 /// Number of K-buckets in Kademlia routing table (one per bit in 256-bit key space)
 const KADEMLIA_BUCKET_COUNT: usize = 256;
@@ -509,9 +366,6 @@ pub struct DhtResponseWrapper {
 pub struct DhtCoreEngine {
     node_id: PeerId,
     routing_table: Arc<RwLock<KademliaRoutingTable>>,
-    data_store: Arc<RwLock<DataStore>>,
-    replication_manager: Arc<RwLock<ReplicationManager>>,
-    load_balancer: Arc<RwLock<LoadBalancer>>,
 
     // Security Components
     security_metrics: Arc<SecurityMetricsCollector>,
@@ -530,13 +384,6 @@ pub struct DhtCoreEngine {
     allow_loopback: bool,
     /// Maximum nodes per geographic region.
     geo_max_per_region: usize,
-
-    // Network query components
-    /// Transport handle for sending messages to remote peers
-    transport: Option<Arc<dyn NetworkSender>>,
-    /// Pending requests waiting for responses (request_id -> response sender)
-    /// LRU cache with max 10k entries to prevent memory DoS
-    pending_requests: Arc<RwLock<LruCache<String, oneshot::Sender<DhtResponse>>>>,
 
     // Trust-weighted peer selection
     /// Optional trust-aware peer selector for combining distance with trust scores
@@ -597,9 +444,6 @@ impl DhtCoreEngine {
         Ok(Self {
             node_id,
             routing_table: Arc::new(RwLock::new(KademliaRoutingTable::new(node_id, K))),
-            data_store: Arc::new(RwLock::new(DataStore::new())),
-            replication_manager: Arc::new(RwLock::new(ReplicationManager::new(K))),
-            load_balancer: Arc::new(RwLock::new(LoadBalancer::new())),
             security_metrics,
             bucket_refresh_manager,
             close_group_validator,
@@ -607,27 +451,9 @@ impl DhtCoreEngine {
             ip_diversity_config: IPDiversityConfig::default(),
             allow_loopback,
             geo_max_per_region: GEO_DEFAULT_MAX_PER_REGION,
-            transport: None,
-            pending_requests: Arc::new(RwLock::new(LruCache::new(
-                NonZeroUsize::new(MAX_PENDING_DHT_REQUESTS)
-                    .context("MAX_PENDING_DHT_REQUESTS must be non-zero")?,
-            ))),
             trust_peer_selector: None,
             shutdown: CancellationToken::new(),
         })
-    }
-
-    /// Set the transport handle for network operations
-    ///
-    /// Once set, `retrieve()` will query remote peers when a key is not found locally.
-    pub fn set_transport(&mut self, transport: Arc<dyn NetworkSender>) {
-        self.transport = Some(transport);
-    }
-
-    /// Check if network operations are available
-    #[must_use]
-    pub fn has_transport(&self) -> bool {
-        self.transport.is_some()
     }
 
     /// Get this node's ID
@@ -660,24 +486,6 @@ impl DhtCoreEngine {
         tracing::info!("DHT trust-weighted peer selection enabled");
     }
 
-    /// Enable trust-weighted peer selection with separate configs for queries and storage
-    ///
-    /// Storage operations use stricter trust requirements since data persistence
-    /// depends on node reliability.
-    pub fn enable_trust_selection_with_storage_config(
-        &mut self,
-        trust_engine: Arc<EigenTrustEngine>,
-        query_config: TrustSelectionConfig,
-        storage_config: TrustSelectionConfig,
-    ) {
-        self.trust_peer_selector = Some(TrustAwarePeerSelector::with_storage_config(
-            trust_engine,
-            query_config,
-            storage_config,
-        ));
-        tracing::info!("DHT trust-weighted peer selection enabled with separate storage config");
-    }
-
     /// Disable trust-weighted peer selection
     ///
     /// Falls back to pure distance-based selection.
@@ -690,42 +498,6 @@ impl DhtCoreEngine {
     #[must_use]
     pub fn has_trust_selection(&self) -> bool {
         self.trust_peer_selector.is_some()
-    }
-
-    /// Select peers for a query operation, considering trust if enabled
-    ///
-    /// If trust selection is enabled, combines XOR distance with trust scores.
-    /// Otherwise, returns closest nodes by XOR distance only.
-    async fn select_query_peers(&self, key: &DhtKey, count: usize) -> Vec<NodeInfo> {
-        let routing = self.routing_table.read().await;
-        // Get 2x candidates to allow trust-based filtering
-        let candidates = routing.find_closest_nodes(key, count * 2);
-        drop(routing);
-
-        if let Some(ref selector) = self.trust_peer_selector {
-            selector.select_peers(key, &candidates, count)
-        } else {
-            // Fallback: take closest by distance
-            candidates.into_iter().take(count).collect()
-        }
-    }
-
-    /// Select peers for a storage operation, considering trust if enabled
-    ///
-    /// Storage operations use stricter trust requirements when trust selection
-    /// is enabled, as data persistence depends on node reliability.
-    async fn select_storage_peers(&self, key: &DhtKey, count: usize) -> Vec<NodeInfo> {
-        let routing = self.routing_table.read().await;
-        // Get 3x candidates for storage to allow stricter trust filtering
-        let candidates = routing.find_closest_nodes(key, count * 3);
-        drop(routing);
-
-        if let Some(ref selector) = self.trust_peer_selector {
-            selector.select_storage_peers(key, &candidates, count)
-        } else {
-            // Fallback: take closest by distance
-            candidates.into_iter().take(count).collect()
-        }
     }
 
     /// Signal background maintenance tasks to stop
@@ -882,282 +654,11 @@ impl DhtCoreEngine {
         self.security_metrics.clone()
     }
 
-    /// Store data in the DHT
-    ///
-    /// When trust-weighted selection is enabled, storage targets are selected
-    /// by combining XOR distance with trust scores, using stricter requirements
-    /// than query operations since data persistence depends on node reliability.
-    ///
-    /// # Errors
-    /// Returns an error if the value exceeds `MAX_DHT_VALUE_SIZE` (512 bytes).
-    ///
-    /// **Note:** When the local node is not among the selected storage targets,
-    /// the receipt will have `success: false` and an empty `stored_at` list
-    /// because network store-forwarding is not yet implemented.  Callers
-    /// should check [`StoreReceipt::is_successful`] and handle this case.
-    pub async fn store(&mut self, key: &DhtKey, value: Vec<u8>) -> Result<StoreReceipt> {
-        // Security: Reject oversized values to prevent memory exhaustion
-        if value.len() > MAX_DHT_VALUE_SIZE {
-            return Err(anyhow::anyhow!(
-                "Value too large: {} bytes (max: {} bytes)",
-                value.len(),
-                MAX_DHT_VALUE_SIZE
-            ));
-        }
-
-        // Find nodes to store at using trust-aware selection if enabled
-        let target_nodes = self.select_storage_peers(key, K).await;
-
-        // Select nodes based on load (secondary filter)
-        let load_balancer = self.load_balancer.read().await;
-        let selected_nodes = load_balancer.select_least_loaded(&target_nodes, K);
-
-        tracing::debug!(
-            key = ?hex::encode(key.as_bytes()),
-            num_targets = selected_nodes.len(),
-            trust_selection = self.has_trust_selection(),
-            "Selected storage targets"
-        );
-
-        // Store locally if we're one of the selected nodes or if no nodes are available (test/single-node mode)
-        if selected_nodes.contains(&self.node_id) || selected_nodes.is_empty() {
-            let mut store = self.data_store.write().await;
-            // Avoid unnecessary clone of value: key is cloned for ownership, value is consumed by this branch
-            store.put(*key, value);
-            // Return early since we've consumed value
-            return Ok(StoreReceipt {
-                key: *key,
-                stored_at: selected_nodes,
-                timestamp: SystemTime::now(),
-                success: true,
-            });
-        }
-
-        // TODO: send data to selected_nodes via transport when network
-        //       store-forwarding is implemented.  Until then, the receipt
-        //       must not claim success for a remote store that never happened.
-        Ok(StoreReceipt {
-            key: *key,
-            stored_at: Vec::new(),
-            timestamp: SystemTime::now(),
-            success: false,
-        })
-    }
-
-    /// Retrieve data from the DHT
-    ///
-    /// First checks local storage. If not found locally and a transport is configured,
-    /// queries the K closest nodes in parallel and returns the first successful response.
-    pub async fn retrieve(&self, key: &DhtKey) -> Result<Option<Vec<u8>>> {
-        // Step 1: Check local store first (read-only lock)
-        {
-            let store = self.data_store.read().await;
-            if let Some(value) = store.get(key) {
-                tracing::debug!(key = ?hex::encode(key.as_bytes()), "Key found in local store");
-                return Ok(Some(value));
-            }
-        }
-
-        // Step 2: Get transport or return None if not available
-        let transport = match &self.transport {
-            Some(t) => Arc::clone(t),
-            None => {
-                tracing::debug!("No transport available for network query");
-                return Ok(None);
-            }
-        };
-
-        // Step 3: Select peers using trust-aware selection if enabled
-        let closest_nodes = self.select_query_peers(key, K).await;
-
-        if closest_nodes.is_empty() {
-            tracing::debug!("No nodes in routing table to query");
-            return Ok(None);
-        }
-
-        tracing::debug!(
-            key = ?hex::encode(key.as_bytes()),
-            num_nodes = closest_nodes.len().min(MAX_PARALLEL_QUERIES),
-            trust_selection = self.has_trust_selection(),
-            "Querying nodes for key"
-        );
-
-        // Step 4: Query nodes in parallel (up to alpha at a time)
-        let nodes_to_query: Vec<_> = closest_nodes
-            .into_iter()
-            .take(MAX_PARALLEL_QUERIES)
-            .collect();
-
-        let query_futures: Vec<_> = nodes_to_query
-            .iter()
-            .map(|node| self.query_node_for_key(Arc::clone(&transport), node, key))
-            .collect();
-
-        // Step 5: Wait for responses (each query has its own DHT_QUERY_TIMEOUT)
-        let responses = futures::future::join_all(query_futures).await;
-
-        // Return first successful response
-        for response in responses {
-            if let Ok(Some(value)) = response {
-                tracing::debug!(key = ?hex::encode(key.as_bytes()), "Key found on remote node");
-                return Ok(Some(value));
-            }
-        }
-        tracing::debug!(key = ?hex::encode(key.as_bytes()), "Key not found on any queried node");
-        Ok(None)
-    }
-
-    /// Query a single node for a key value
-    async fn query_node_for_key(
-        &self,
-        transport: Arc<dyn NetworkSender>,
-        node: &NodeInfo,
-        key: &DhtKey,
-    ) -> Result<Option<Vec<u8>>> {
-        // Generate unique request ID
-        let request_id = Uuid::new_v4().to_string();
-
-        // Create response channel
-        let (tx, rx) = oneshot::channel();
-
-        // Register pending request - reject if at capacity to avoid evicting in-flight requests
-        {
-            let mut pending = self.pending_requests.write().await;
-            if pending.len() >= MAX_PENDING_DHT_REQUESTS {
-                return Err(anyhow!(
-                    "DHT request capacity exceeded ({} pending requests). Too many concurrent requests.",
-                    MAX_PENDING_DHT_REQUESTS
-                ));
-            }
-            pending.put(request_id.clone(), tx);
-        }
-
-        // Create the DHT message
-        let message = DhtMessage::Retrieve {
-            key: *key,
-            consistency: ConsistencyLevel::One,
-        };
-
-        // Wrap with request ID
-        let wrapped_request = DhtRequestWrapper {
-            id: request_id.clone(),
-            message,
-        };
-
-        // Serialize the request using postcard
-        let request_bytes = match postcard::to_stdvec(&wrapped_request) {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                // Clean up pending request
-                let mut pending = self.pending_requests.write().await;
-                pending.pop(&request_id);
-                return Err(anyhow!(
-                    "Failed to serialize DHT request for key {}: {e}",
-                    hex::encode(key.as_bytes())
-                ));
-            }
-        };
-
-        // Send request via transport
-        if let Err(e) = transport
-            .send_message(&node.id, "/dht/1.0.0", request_bytes)
-            .await
-        {
-            // Clean up pending request
-            let mut pending = self.pending_requests.write().await;
-            pending.pop(&request_id);
-            tracing::debug!(peer_id = %node.id, error = %e, "Failed to send DHT request");
-            return Err(anyhow!(
-                "Failed to send DHT request to peer {}: {e}",
-                node.id
-            ));
-        }
-
-        // Wait for response with timeout
-        match tokio::time::timeout(DHT_QUERY_TIMEOUT, rx).await {
-            Ok(Ok(response)) => {
-                // Clean up happens automatically when channel completes
-                match response {
-                    DhtResponse::RetrieveReply { value } => Ok(value),
-                    DhtResponse::Error { message, .. } => {
-                        tracing::debug!(peer_id = %node.id, error = %message, "DHT error response");
-                        Ok(None)
-                    }
-                    _ => {
-                        tracing::debug!(peer_id = %node.id, "Unexpected DHT response type");
-                        Ok(None)
-                    }
-                }
-            }
-            Ok(Err(_recv_error)) => {
-                // Channel closed without response
-                tracing::debug!(peer_id = %node.id, "Response channel closed");
-                Ok(None)
-            }
-            Err(_timeout) => {
-                // Timeout - clean up pending request
-                let mut pending = self.pending_requests.write().await;
-                pending.pop(&request_id);
-                tracing::debug!(peer_id = %node.id, "DHT request timed out");
-                Ok(None)
-            }
-        }
-    }
-
-    /// Handle an incoming DHT response from the network
-    ///
-    /// This method should be called by the transport layer when a DHT response
-    /// message is received. It routes the response to the waiting caller.
-    pub async fn handle_response(&self, response_wrapper: DhtResponseWrapper) {
-        let mut pending = self.pending_requests.write().await;
-        if let Some(tx) = pending.pop(&response_wrapper.id) {
-            // Send response - log if receiver dropped (timeout or cancelled request)
-            if tx.send(response_wrapper.response).is_err() {
-                tracing::debug!(
-                    request_id = %response_wrapper.id,
-                    "Response receiver dropped (request likely timed out)"
-                );
-            }
-        } else {
-            tracing::trace!(
-                request_id = %response_wrapper.id,
-                "Received response for unknown or timed-out request"
-            );
-        }
-    }
-
     /// Handle an incoming DHT request from the network
     ///
     /// Processes the request and returns a response wrapper ready to be sent back.
     pub async fn handle_request(&self, request_wrapper: DhtRequestWrapper) -> DhtResponseWrapper {
         let response = match request_wrapper.message {
-            DhtMessage::Retrieve { ref key, .. } => match self.data_store.read().await.get(key) {
-                Some(value) => DhtResponse::RetrieveReply { value: Some(value) },
-                None => DhtResponse::RetrieveReply { value: None },
-            },
-            DhtMessage::Store {
-                ref key, ref value, ..
-            } => {
-                // Security: Reject oversized values to prevent memory exhaustion
-                if value.len() > MAX_DHT_VALUE_SIZE {
-                    return DhtResponseWrapper {
-                        id: request_wrapper.id,
-                        response: DhtResponse::Error {
-                            code: crate::dht::network_integration::ErrorCode::InvalidMessage,
-                            message: format!(
-                                "Value too large: {} bytes (max: {} bytes)",
-                                value.len(),
-                                MAX_DHT_VALUE_SIZE
-                            ),
-                            retry_after: None,
-                        },
-                    };
-                }
-                self.data_store.write().await.put(*key, value.clone());
-                DhtResponse::StoreAck {
-                    replicas: vec![self.node_id],
-                }
-            }
             DhtMessage::FindNode { ref target, count } => {
                 // Security: Cap count to prevent amplification attacks
                 let capped_count = count.min(MAX_FIND_NODE_COUNT);
@@ -1166,19 +667,6 @@ impl DhtCoreEngine {
                 DhtResponse::FindNodeReply {
                     nodes,
                     distances: Vec::new(),
-                }
-            }
-            DhtMessage::FindValue { ref key } => {
-                let value = self.data_store.read().await.get(key);
-                if value.is_some() {
-                    DhtResponse::FindValueReply {
-                        value,
-                        nodes: Vec::new(),
-                    }
-                } else {
-                    let routing = self.routing_table.read().await;
-                    let nodes = routing.find_closest_nodes(key, K);
-                    DhtResponse::FindValueReply { value: None, nodes }
                 }
             }
             DhtMessage::Ping { timestamp } => DhtResponse::Pong { timestamp },
@@ -1230,13 +718,6 @@ impl DhtCoreEngine {
 
     /// Leave the DHT network gracefully
     pub async fn leave_network(&mut self) -> Result<()> {
-        // Transfer data to other nodes before leaving
-        // In a real implementation, would redistribute stored data
-
-        let mut store = self.data_store.write().await;
-        store.data.clear();
-        store.metadata.clear();
-
         Ok(())
     }
 
@@ -1262,16 +743,10 @@ impl DhtCoreEngine {
         routing.touch_node(node_id, address)
     }
 
-    /// Handle node failure
+    /// Handle node failure by removing it from the routing table.
     pub async fn handle_node_failure(&mut self, failed_node: PeerId) -> Result<()> {
-        // Remove from routing table
         let mut routing = self.routing_table.write().await;
         routing.remove_node(&failed_node);
-
-        // Schedule repairs for affected data
-        let _replication = self.replication_manager.write().await;
-        // In real implementation, would identify affected keys and schedule repairs
-
         Ok(())
     }
 
@@ -1571,9 +1046,6 @@ impl std::fmt::Debug for DhtCoreEngine {
         f.debug_struct("DhtCoreEngine")
             .field("node_id", &self.node_id)
             .field("routing_table", &"Arc<RwLock<KademliaRoutingTable>>")
-            .field("data_store", &"Arc<RwLock<DataStore>>")
-            .field("replication_manager", &"Arc<RwLock<ReplicationManager>>")
-            .field("load_balancer", &"Arc<RwLock<LoadBalancer>>")
             .field("security_metrics", &"Arc<SecurityMetricsCollector>")
             .field(
                 "bucket_refresh_manager",
@@ -1591,21 +1063,6 @@ impl std::fmt::Debug for DhtCoreEngine {
 mod tests {
     use super::*;
     use std::collections::HashSet;
-
-    #[tokio::test]
-    async fn test_basic_store_retrieve() -> Result<()> {
-        let mut dht = DhtCoreEngine::new(PeerId::from_bytes([42u8; 32]))?;
-        let key = DhtKey::new(b"test_key");
-        let value = b"test_value".to_vec();
-
-        let receipt = dht.store(&key, value.clone()).await?;
-        assert!(receipt.is_successful());
-
-        let retrieved = dht.retrieve(&key).await?;
-        assert_eq!(retrieved, Some(value));
-
-        Ok(())
-    }
 
     #[tokio::test]
     async fn test_xor_distance() {

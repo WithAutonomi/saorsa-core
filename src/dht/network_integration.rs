@@ -4,7 +4,7 @@
 //! efficient protocol handling, connection management, and network optimization.
 
 use crate::PeerId;
-use crate::dht::core_engine::{ConsistencyLevel, DhtCoreEngine, DhtKey, NodeCapacity, NodeInfo};
+use crate::dht::core_engine::{DhtCoreEngine, DhtKey, NodeCapacity, NodeInfo};
 use anyhow::{Result, anyhow};
 use lru::LruCache;
 use serde::{Deserialize, Serialize};
@@ -33,27 +33,13 @@ const MAX_BATCH_SIZE: usize = 65536; // 64KB
 const MAX_RETRIES: u32 = 5;
 const INITIAL_RETRY_DELAY: Duration = Duration::from_millis(100);
 
-/// DHT protocol messages
+/// DHT protocol messages (peer phonebook only — no data storage)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum DhtMessage {
-    // Data Operations
-    Store {
-        key: DhtKey,
-        value: Vec<u8>,
-        ttl: Duration,
-    },
-    Retrieve {
-        key: DhtKey,
-        consistency: ConsistencyLevel,
-    },
-
     // Node Discovery
     FindNode {
         target: DhtKey,
         count: usize,
-    },
-    FindValue {
-        key: DhtKey,
     },
 
     // Network Management
@@ -66,40 +52,16 @@ pub enum DhtMessage {
     },
     Leave {
         node_id: PeerId,
-        handoff_data: Vec<(DhtKey, PeerId)>,
-    },
-
-    // Replication
-    Replicate {
-        key: DhtKey,
-        value: Vec<u8>,
-        version: u64,
-    },
-    RepairRequest {
-        key: DhtKey,
-        missing_shards: Vec<u32>,
     },
 }
 
 /// DHT protocol responses
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum DhtResponse {
-    // Data Responses
-    StoreAck {
-        replicas: Vec<PeerId>,
-    },
-    RetrieveReply {
-        value: Option<Vec<u8>>,
-    },
-
     // Discovery Responses
     FindNodeReply {
         nodes: Vec<NodeInfo>,
         distances: Vec<u32>,
-    },
-    FindValueReply {
-        value: Option<Vec<u8>>,
-        nodes: Vec<NodeInfo>,
     },
 
     // Management Responses
@@ -455,22 +417,6 @@ impl DhtProtocolHandler {
 
     pub async fn handle_message(&self, message: DhtMessage) -> Result<DhtResponse> {
         match message {
-            DhtMessage::Store { key, value, .. } => {
-                let mut engine = self.dht_engine.write().await;
-                let receipt = engine.store(&key, value).await?;
-
-                Ok(DhtResponse::StoreAck {
-                    replicas: receipt.stored_at,
-                })
-            }
-
-            DhtMessage::Retrieve { key, .. } => {
-                let engine = self.dht_engine.read().await;
-                let value = engine.retrieve(&key).await?;
-
-                Ok(DhtResponse::RetrieveReply { value })
-            }
-
             DhtMessage::FindNode { target, count } => {
                 let engine = self.dht_engine.read().await;
                 let nodes = engine.find_nodes(&target, count).await?;

@@ -1,11 +1,9 @@
 //! Trust-weighted DHT trait definition
 //!
-//! Defines the interface for DHT operations with trust bias and capacity signaling.
+//! Defines the interface for DHT peer discovery with trust bias.
 
 pub use crate::identity::node_identity::PeerId;
 use anyhow::Result;
-use bytes::Bytes;
-use std::time::Duration;
 
 /// DHT key type (256-bit)
 pub type Key = [u8; 32];
@@ -17,35 +15,11 @@ pub struct Contact {
     pub address: String,
 }
 
-/// PUT operation policy
-#[derive(Debug, Clone)]
-pub struct PutPolicy {
-    pub ttl: Option<Duration>,
-    pub quorum: usize,
-}
-
-/// PUT operation receipt
-#[derive(Debug, Clone)]
-pub struct PutReceipt {
-    pub key: Key,
-    pub providers: Vec<PeerId>,
-    pub proof: Vec<u8>,
-}
-
-/// DHT trait for trust-weighted operations
+/// DHT trait for trust-weighted peer discovery (phonebook only)
 #[async_trait::async_trait]
 pub trait Dht {
-    /// Store a value with the given policy
-    async fn put(&self, key: Key, value: Bytes, policy: PutPolicy) -> Result<PutReceipt>;
-
-    /// Retrieve a value with quorum requirement
-    async fn get(&self, key: Key, quorum: usize) -> Result<Bytes>;
-
     /// Find nodes closest to the target
     async fn find_node(&self, target: PeerId) -> Result<Vec<Contact>>;
-
-    /// Advertise that this node provides the given key
-    async fn provide(&self, key: Key) -> Result<()>;
 }
 
 /// Interaction outcome for trust recording

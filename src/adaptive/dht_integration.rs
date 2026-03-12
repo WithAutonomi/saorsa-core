@@ -24,12 +24,10 @@ use crate::PeerId;
 use crate::address::MultiAddr;
 use crate::dht::geographic_network_integration::GeographicNetworkIntegration;
 use crate::dht::geographic_routing::GeographicRegion;
-use crate::dht::{DHT, DHTConfig, DhtKey, Key as DhtKeyBytes};
-use crate::dht_network_manager::{
-    DhtNetworkConfig, DhtNetworkManager, DhtNetworkOperation, DhtNetworkResult,
-};
+use crate::dht::{DHT, DhtKey, Key as DhtKeyBytes};
+use crate::dht_network_manager::{DhtNetworkConfig, DhtNetworkManager};
 use async_trait::async_trait;
-use futures::stream::{FuturesUnordered, StreamExt};
+
 use std::collections::HashMap;
 use std::f64::consts::PI;
 use std::sync::Arc;
@@ -89,11 +87,15 @@ impl Default for AdaptiveDhtWeights {
     }
 }
 
+/// Default number of closest nodes for DHT lookups (Kademlia K parameter).
+const DEFAULT_CLOSEST_NODES_COUNT: usize = 8;
+
 /// Adaptive DHT configuration used for layer-aware selection.
 #[derive(Debug, Clone)]
 pub struct AdaptiveDhtConfig {
     pub local_region: GeographicRegion,
-    pub replication_factor: usize,
+    /// How many closest nodes to return from lookups.
+    pub closest_nodes_count: usize,
     pub candidate_multiplier: usize,
     pub max_per_region: usize,
     pub min_trust_threshold: f64,
@@ -102,16 +104,8 @@ pub struct AdaptiveDhtConfig {
 }
 
 impl AdaptiveDhtConfig {
-    fn effective_replication_factor(&self, dht_config: &DHTConfig) -> usize {
-        if self.replication_factor > 0 {
-            self.replication_factor
-        } else {
-            dht_config.replication_factor
-        }
-    }
-
-    fn candidate_count(&self, dht_config: &DHTConfig) -> usize {
-        let base = self.effective_replication_factor(dht_config).max(1);
+    fn candidate_count(&self) -> usize {
+        let base = self.closest_nodes_count.max(1);
         let multiplier = self.candidate_multiplier.max(1);
         base.saturating_mul(multiplier)
     }
@@ -125,7 +119,7 @@ impl Default for AdaptiveDhtConfig {
     fn default() -> Self {
         Self {
             local_region: GeographicRegion::Unknown,
-            replication_factor: DHTConfig::default().replication_factor,
+            closest_nodes_count: DEFAULT_CLOSEST_NODES_COUNT,
             candidate_multiplier: 3,
             max_per_region: 3,
             min_trust_threshold: 0.2,
@@ -197,12 +191,8 @@ enum AdaptiveDhtBackend {
 /// Adaptive DHT that integrates S/Kademlia with trust scoring
 pub struct AdaptiveDHT {
     backend: AdaptiveDhtBackend,
-    dht_config: DHTConfig,
     config: AdaptiveDhtConfig,
     trust_provider: Arc<dyn TrustProvider>,
-    /// Router for adaptive path selection. Used by pub(crate) DHT methods
-    /// reserved for future internal use (put, get, etc.).
-    router: Arc<AdaptiveRouter>,
     hyperbolic_space: Arc<HyperbolicSpace>,
     som: Arc<SelfOrganizingMap>,
     churn_predictor: Arc<ChurnPredictor>,
@@ -251,18 +241,16 @@ struct CandidateNode {
 impl AdaptiveDHT {
     /// Create new adaptive DHT instance (local-only backend)
     pub async fn new(
-        dht_config: DHTConfig,
         identity: Arc<NodeIdentity>,
         trust_provider: Arc<dyn TrustProvider>,
         router: Arc<AdaptiveRouter>,
     ) -> Result<Self> {
         let dependencies = AdaptiveDhtDependencies::with_defaults(identity, trust_provider, router);
-        Self::new_with_dependencies(dht_config, AdaptiveDhtConfig::default(), dependencies).await
+        Self::new_with_dependencies(AdaptiveDhtConfig::default(), dependencies).await
     }
 
     /// Create new adaptive DHT instance with explicit dependencies (local backend).
     pub async fn new_with_dependencies(
-        dht_config: DHTConfig,
         config: AdaptiveDhtConfig,
         dependencies: AdaptiveDhtDependencies,
     ) -> Result<Self> {
@@ -278,10 +266,8 @@ impl AdaptiveDHT {
 
         Ok(Self {
             backend: AdaptiveDhtBackend::Local { dht: base_dht },
-            dht_config,
             config,
             trust_provider: dependencies.trust_provider,
-            router: dependencies.router,
             hyperbolic_space: dependencies.hyperbolic_space,
             som: dependencies.som,
             churn_predictor: dependencies.churn_predictor,
@@ -298,7 +284,6 @@ impl AdaptiveDHT {
         config: AdaptiveDhtConfig,
         dependencies: AdaptiveDhtDependencies,
     ) -> Result<Self> {
-        let dht_config = network_config.dht_config.clone();
         let manager = Arc::new(
             DhtNetworkManager::new(
                 node.transport().clone(),
@@ -320,10 +305,8 @@ impl AdaptiveDHT {
 
         Ok(Self {
             backend: AdaptiveDhtBackend::Network { manager },
-            dht_config,
             config,
             trust_provider: dependencies.trust_provider,
-            router: dependencies.router,
             hyperbolic_space: dependencies.hyperbolic_space,
             som: dependencies.som,
             churn_predictor: dependencies.churn_predictor,
@@ -628,179 +611,13 @@ impl AdaptiveDHT {
         key: &DhtKeyBytes,
         count: usize,
     ) -> Result<Vec<ScoredCandidate>> {
-        let candidate_count = self.config.candidate_count(&self.dht_config).max(count);
+        let candidate_count = self.config.candidate_count().max(count);
         let candidates = self.candidate_nodes(key, candidate_count).await?;
         if candidates.is_empty() {
             return Ok(Vec::new());
         }
         let scored = self.score_candidates(key, candidates).await?;
         Ok(self.select_diverse_candidates(scored, count))
-    }
-
-    /// Store value in the DHT with adaptive replication.
-    ///
-    /// Reserved for potential future use beyond peer phonebook/routing.
-    #[allow(dead_code)]
-    pub(crate) async fn put(&self, key: DhtKeyBytes, value: Vec<u8>) -> Result<()> {
-        let mut metrics = self.metrics.write().await;
-        metrics.stores_total += 1;
-        drop(metrics);
-
-        let target_id = Self::key_to_node_id(&key);
-        let _ = self.router.route(&target_id, ContentType::DHTLookup).await;
-
-        let replication_factor = self.config.effective_replication_factor(&self.dht_config);
-        let selected = self.select_targets(&key, replication_factor).await?;
-
-        let result = match &self.backend {
-            AdaptiveDhtBackend::Local { dht } => dht
-                .write()
-                .await
-                .store(&DhtKey::from_bytes(key), value)
-                .await
-                .map(|_| DhtNetworkResult::PutSuccess {
-                    key,
-                    replicated_to: 1,
-                    peer_outcomes: Vec::new(),
-                })
-                .map_err(|e| AdaptiveNetworkError::Other(e.to_string())),
-            AdaptiveDhtBackend::Network { manager } => {
-                if selected.is_empty() {
-                    manager
-                        .put(key, value)
-                        .await
-                        .map_err(|e| AdaptiveNetworkError::Other(e.to_string()))
-                } else {
-                    let targets: Vec<crate::PeerId> = selected.iter().map(|c| c.peer_id).collect();
-                    manager
-                        .put_with_targets(key, value, &targets)
-                        .await
-                        .map_err(|e| AdaptiveNetworkError::Other(e.to_string()))
-                }
-            }
-        };
-
-        let mut metrics = self.metrics.write().await;
-        match result {
-            Ok(_) => {
-                metrics.stores_successful += 1;
-                Ok(())
-            }
-            Err(err) => Err(err),
-        }
-    }
-
-    /// Retrieve value from the DHT using adaptive routing.
-    ///
-    /// Reserved for potential future use beyond peer phonebook/routing.
-    #[allow(dead_code)]
-    pub(crate) async fn get(&self, key: DhtKeyBytes) -> Result<Option<Vec<u8>>> {
-        let mut metrics = self.metrics.write().await;
-        metrics.lookups_total += 1;
-        drop(metrics);
-
-        let target_id = Self::key_to_node_id(&key);
-        let _ = self
-            .router
-            .route(&target_id, ContentType::DataRetrieval)
-            .await;
-
-        let replication_factor = self.config.effective_replication_factor(&self.dht_config);
-
-        let mut attempted_hops = 0usize;
-
-        let result = match &self.backend {
-            AdaptiveDhtBackend::Local { dht } => dht
-                .read()
-                .await
-                .retrieve(&DhtKey::from_bytes(key))
-                .await
-                .map_err(|e| AdaptiveNetworkError::Other(e.to_string())),
-            AdaptiveDhtBackend::Network { manager } => {
-                if let Ok(Some(value)) = manager.get_local(&key).await {
-                    return Ok(Some(value));
-                }
-
-                let selected = self.select_targets(&key, replication_factor).await?;
-                if selected.is_empty() {
-                    return Ok(None);
-                }
-
-                let mut futures = FuturesUnordered::new();
-                for candidate in selected {
-                    let op = DhtNetworkOperation::Get { key };
-                    let manager = Arc::clone(manager);
-                    let peer_id = candidate.peer_id;
-                    attempted_hops += 1;
-                    futures.push(async move {
-                        let result = manager.send_request(&peer_id, op).await;
-                        (peer_id, result)
-                    });
-                }
-
-                while let Some((_peer_id, result)) = futures.next().await {
-                    match result {
-                        Ok(DhtNetworkResult::GetSuccess { value, .. })
-                        | Ok(DhtNetworkResult::ValueFound { value, .. }) => {
-                            let _ = manager.store_local(key, value.clone()).await;
-                            return Ok(Some(value));
-                        }
-                        Ok(DhtNetworkResult::GetNotFound { .. }) => continue,
-                        Ok(_) => continue,
-                        Err(_) => continue,
-                    }
-                }
-
-                Ok(None)
-            }
-        };
-
-        let mut metrics = self.metrics.write().await;
-        let total = metrics.lookups_total as f64;
-        if total > 0.0 {
-            let hops = attempted_hops as f64;
-            metrics.average_lookup_hops =
-                (metrics.average_lookup_hops * (total - 1.0) + hops) / total;
-        }
-        if matches!(&result, Ok(Some(_))) {
-            metrics.lookups_successful += 1;
-        }
-
-        result
-    }
-
-    /// Store value in the DHT using content-addressed key derivation.
-    ///
-    /// Reserved for potential future use beyond peer phonebook/routing.
-    #[allow(dead_code)]
-    pub(crate) async fn store(&self, key: Vec<u8>, value: Vec<u8>) -> Result<ContentHash> {
-        let dht_key = if key.len() == 32 {
-            let mut bytes = [0u8; 32];
-            bytes.copy_from_slice(&key[..32]);
-            bytes
-        } else {
-            *blake3::hash(&key).as_bytes()
-        };
-
-        self.put(dht_key, value.clone()).await?;
-
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(&dht_key);
-        hasher.update(&value);
-        let hash = hasher.finalize();
-
-        Ok(ContentHash(*hash.as_bytes()))
-    }
-
-    /// Retrieve value from DHT using a content hash key.
-    ///
-    /// Reserved for potential future use beyond peer phonebook/routing.
-    #[allow(dead_code)]
-    pub(crate) async fn retrieve(&self, hash: &ContentHash) -> Result<Vec<u8>> {
-        match self.get(hash.0).await? {
-            Some(value) => Ok(value),
-            None => Err(AdaptiveNetworkError::Other("Record not found".to_string())),
-        }
     }
 
     /// Find nodes close to a key using trust-weighted selection
@@ -905,7 +722,6 @@ mod tests {
             fn remove_node(&self, _node: &PeerId) {}
         }
 
-        let config = DHTConfig::default();
         let identity = Arc::new(NodeIdentity::generate().unwrap());
         let trust_provider = Arc::new(MockTrustProvider);
         let router = Arc::new(AdaptiveRouter::new_with_id(
@@ -913,7 +729,7 @@ mod tests {
             trust_provider.clone(),
         ));
 
-        let dht = AdaptiveDHT::new(config, identity, trust_provider, router)
+        let dht = AdaptiveDHT::new(identity, trust_provider, router)
             .await
             .unwrap();
         let metrics = dht.get_metrics().await;

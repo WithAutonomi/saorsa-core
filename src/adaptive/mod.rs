@@ -47,13 +47,9 @@ pub mod monitoring;
 pub mod multi_armed_bandit;
 pub mod performance;
 pub mod q_learning_cache;
-pub mod replica_planner;
-pub mod replication;
-pub mod retrieval;
 pub mod routing;
 pub mod security;
 pub mod som;
-pub mod storage;
 pub mod transport;
 pub mod trust;
 
@@ -94,16 +90,12 @@ pub use q_learning_cache::{
     AccessInfo, CacheAction, CacheStatistics, QLearnCacheManager as QLearningCacheManager,
     QLearningConfig, StateVector,
 };
-pub use replica_planner::ReplicaPlanner;
-pub use replication::{ReplicaInfo, ReplicationManager, ReplicationStrategy};
-pub use retrieval::{RetrievalManager, RetrievalStrategy};
 pub use routing::AdaptiveRouter;
 pub use security::{
     BlacklistManager, EclipseDetector, RateLimiter, SecurityAuditor, SecurityConfig,
     SecurityManager,
 };
 pub use som::{FeatureExtractor, GridSize, SOMRoutingStrategy, SelfOrganizingMap, SomConfig};
-pub use storage::{ChunkManager, ContentStore, ReplicationConfig, StorageConfig};
 pub use transport::{ConnectionInfo, Transport, TransportManager, TransportProtocol};
 pub use trust::{
     EigenTrustEngine, MockTrustProvider, NodeStatistics, NodeStatisticsUpdate,
@@ -211,17 +203,11 @@ pub struct NodeCapabilities {
     pub bandwidth: u64, // Mbps available
 }
 
-/// Core trait for adaptive P2P network nodes
+/// Core trait for adaptive P2P network nodes (peer phonebook only)
 #[async_trait]
 pub trait AdaptiveNetworkNode: Send + Sync {
     /// Join the network using bootstrap nodes
     async fn join(&mut self, bootstrap: Vec<NodeDescriptor>) -> Result<()>;
-
-    /// Store data with adaptive replication
-    async fn store(&self, data: Vec<u8>) -> Result<ContentHash>;
-
-    /// Retrieve data using parallel strategies
-    async fn retrieve(&self, hash: &ContentHash) -> Result<Vec<u8>>;
 
     /// Publish a message to a gossip topic
     async fn publish(&self, topic: &str, message: Vec<u8>) -> Result<()>;
