@@ -674,62 +674,6 @@ pub enum ConnectionStatus {
     Failed(String),
 }
 
-/// Network events that can occur
-#[derive(Debug, Clone)]
-pub enum NetworkEvent {
-    /// A new peer has connected
-    PeerConnected {
-        /// The identifier of the newly connected peer
-        peer_id: PeerId,
-        /// The network addresses where the peer can be reached
-        addresses: Vec<String>,
-    },
-
-    /// A peer has disconnected
-    PeerDisconnected {
-        /// The identifier of the disconnected peer
-        peer_id: PeerId,
-        /// The reason for the disconnection
-        reason: String,
-    },
-
-    /// A message was received from a peer
-    MessageReceived {
-        /// The identifier of the sending peer
-        peer_id: PeerId,
-        /// The protocol used for the message
-        protocol: String,
-        /// The raw message data
-        data: Vec<u8>,
-    },
-
-    /// A connection attempt failed
-    ConnectionFailed {
-        /// The identifier of the peer (if known)
-        peer_id: Option<PeerId>,
-        /// The address where connection was attempted
-        address: String,
-        /// The error message describing the failure
-        error: String,
-    },
-
-    /// DHT record was stored
-    DHTRecordStored {
-        /// The DHT key where the record was stored
-        key: Vec<u8>,
-        /// The value that was stored
-        value: Vec<u8>,
-    },
-
-    /// DHT record was retrieved
-    DHTRecordRetrieved {
-        /// The DHT key that was queried
-        key: Vec<u8>,
-        /// The retrieved value, if found
-        value: Option<Vec<u8>>,
-    },
-}
-
 /// Network events that can occur in the P2P system
 ///
 /// Events are broadcast to all listeners and provide real-time
@@ -2648,45 +2592,6 @@ mod tests {
         assert!(result.unwrap_err().to_string().contains("not enabled"));
 
         Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_network_event_variants() {
-        // Test that all network event variants can be created
-        let peer_id = PeerId::from_name("test_peer");
-        let address = "/ip4/127.0.0.1/tcp/9000".to_string();
-
-        let _peer_connected = NetworkEvent::PeerConnected {
-            peer_id,
-            addresses: vec![address.clone()],
-        };
-
-        let _peer_disconnected = NetworkEvent::PeerDisconnected {
-            peer_id,
-            reason: "test disconnect".to_string(),
-        };
-
-        let _message_received = NetworkEvent::MessageReceived {
-            peer_id,
-            protocol: "test-protocol".to_string(),
-            data: vec![1, 2, 3],
-        };
-
-        let _connection_failed = NetworkEvent::ConnectionFailed {
-            peer_id: Some(peer_id),
-            address: address.clone(),
-            error: "connection refused".to_string(),
-        };
-
-        let _dht_stored = NetworkEvent::DHTRecordStored {
-            key: vec![1, 2, 3],
-            value: vec![4, 5, 6],
-        };
-
-        let _dht_retrieved = NetworkEvent::DHTRecordRetrieved {
-            key: vec![1, 2, 3],
-            value: Some(vec![4, 5, 6]),
-        };
     }
 
     #[tokio::test]
