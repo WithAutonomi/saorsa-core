@@ -65,8 +65,9 @@ impl EncryptedStore {
         // Load master key from environment (hex-encoded 32 bytes)
         let master_key = match std::env::var("SAORSA_MASTER_KEY_HEX") {
             Ok(hex_str) => {
-                let bytes = hex::decode(hex_str)
-                    .map_err(|e| PersistenceError::Encryption(format!("Invalid SAORSA_MASTER_KEY_HEX: {}", e)))?;
+                let bytes = hex::decode(hex_str).map_err(|e| {
+                    PersistenceError::Encryption(format!("Invalid SAORSA_MASTER_KEY_HEX: {}", e))
+                })?;
                 if bytes.len() != 32 {
                     return Err(PersistenceError::Encryption(
                         "SAORSA_MASTER_KEY_HEX must be 32 bytes of hex".into(),
@@ -95,8 +96,13 @@ impl EncryptedStore {
     fn derive_key(master_key: &[u8], salt: &[u8]) -> Result<[u8; 32]> {
         let mut derived_key = [0u8; 32];
 
-        HkdfSha3_256::derive(master_key, Some(salt), b"saorsa-storage-encryption", &mut derived_key)
-            .map_err(|e| PersistenceError::Encryption(e.to_string()))?;
+        HkdfSha3_256::derive(
+            master_key,
+            Some(salt),
+            b"saorsa-storage-encryption",
+            &mut derived_key,
+        )
+        .map_err(|e| PersistenceError::Encryption(e.to_string()))?;
         Ok(derived_key)
     }
 

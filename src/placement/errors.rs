@@ -142,18 +142,6 @@ pub enum PlacementError {
     #[error("DHT operation failed: {0}")]
     DhtOperation(String),
 
-    /// Audit system error
-    #[error("Audit system error: {0}")]
-    AuditSystem(String),
-
-    /// Repair system error
-    #[error("Repair system error: {0}")]
-    RepairSystem(String),
-
-    /// Orchestration error
-    #[error("Orchestration error: {0}")]
-    Orchestration(String),
-
     /// External dependency error
     #[error("External dependency error: {0}")]
     ExternalDependency(String),
@@ -189,9 +177,6 @@ impl PlacementError {
             PlacementError::InternalConsistency(_) => 5,
             PlacementError::Serialization(_) => 2,
             PlacementError::DhtOperation(_) => 3,
-            PlacementError::AuditSystem(_) => 2,
-            PlacementError::RepairSystem(_) => 2,
-            PlacementError::Orchestration(_) => 4,
             PlacementError::ExternalDependency(_) => 3,
             PlacementError::InvalidMetrics { .. } => 2,
             PlacementError::InvalidWeight { .. } => 2,
@@ -225,9 +210,6 @@ impl PlacementError {
             PlacementError::InternalConsistency(_) => false,
             PlacementError::Serialization(_) => false,
             PlacementError::DhtOperation(_) => true,
-            PlacementError::AuditSystem(_) => true,
-            PlacementError::RepairSystem(_) => true,
-            PlacementError::Orchestration(_) => true,
             PlacementError::ExternalDependency(_) => true,
             PlacementError::InvalidMetrics { .. } => false,
             PlacementError::InvalidWeight { .. } => false,
@@ -294,10 +276,6 @@ impl PlacementError {
             }
 
             PlacementError::Serialization(_) => ErrorCategory::Serialization,
-
-            PlacementError::AuditSystem(_)
-            | PlacementError::RepairSystem(_)
-            | PlacementError::Orchestration(_) => ErrorCategory::System,
 
             PlacementError::ConcurrentModification(_) => ErrorCategory::Concurrency,
 

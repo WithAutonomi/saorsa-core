@@ -12,19 +12,13 @@
 //! - Byzantine fault tolerance
 //! - Diversity enforcement (geographic, ASN, region)
 //! - EigenTrust integration
-//! - Audit system
-//! - Repair system with hysteresis
-//! - End-to-end placement lifecycle scenarios
 
 use saorsa_core::PeerId;
-use saorsa_core::adaptive::learning::ChurnPredictor;
 use saorsa_core::adaptive::performance::PerformanceMonitor;
 use saorsa_core::adaptive::trust::EigenTrustEngine;
-use saorsa_core::dht::core_engine::DhtCoreEngine;
-use saorsa_core::placement::orchestrator::AuditStatus;
 use saorsa_core::placement::{
     ByzantineTolerance, GeographicLocation, NetworkRegion, OptimizationWeights, PlacementConfig,
-    PlacementEngine, PlacementError, PlacementOrchestrator, ReplicationFactor, StorageOrchestrator,
+    PlacementEngine, PlacementError, ReplicationFactor,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -153,13 +147,6 @@ fn calculate_trust_distribution(selections: &[Vec<PeerId>]) -> HashMap<PeerId, u
     distribution
 }
 
-/// Create mock DHT engine for testing
-fn create_mock_dht_engine() -> Arc<DhtCoreEngine> {
-    let node_id = saorsa_core::PeerId::from_bytes([1u8; 32]);
-    let engine = DhtCoreEngine::new(node_id).expect("DHT engine creation should succeed");
-    Arc::new(engine)
-}
-
 /// Create mock trust system
 fn create_mock_trust_system() -> Arc<EigenTrustEngine> {
     Arc::new(EigenTrustEngine::new(HashSet::new()))
@@ -170,13 +157,8 @@ fn create_mock_performance_monitor() -> Arc<PerformanceMonitor> {
     Arc::new(PerformanceMonitor::new())
 }
 
-/// Create mock churn predictor
-fn create_mock_churn_predictor() -> Arc<ChurnPredictor> {
-    Arc::new(ChurnPredictor::new())
-}
-
 // ============================================================================
-// Test Suite 1: Basic Placement Operations (2 tests)
+// Test Suite 1: Basic Placement Operations
 // ============================================================================
 
 #[tokio::test]
@@ -221,64 +203,6 @@ async fn test_basic_placement_selection() {
     assert!(
         decision.diversity_score >= 0.0 && decision.diversity_score <= 1.0,
         "Diversity score should be in [0,1]"
-    );
-}
-
-#[tokio::test]
-async fn test_placement_with_storage() {
-    let nodes = create_test_nodes(20);
-    let node_set: HashSet<PeerId> = nodes.iter().cloned().collect();
-    let metadata = create_diverse_node_metadata(&nodes);
-
-    let mut engine = create_test_placement_engine();
-    let trust_system = create_mock_trust_system();
-    let performance_monitor = create_mock_performance_monitor();
-
-    // Perform placement
-    let decision = engine
-        .select_nodes(&node_set, 8, &trust_system, &performance_monitor, &metadata)
-        .await
-        .expect("Placement should succeed");
-
-    // Create storage orchestrator
-    let dht_engine = create_mock_dht_engine();
-    let storage = StorageOrchestrator::new(
-        dht_engine.clone(),
-        trust_system.clone(),
-        performance_monitor.clone(),
-    )
-    .await
-    .expect("Storage orchestrator creation should succeed");
-
-    // Store test data
-    let test_data = vec![1u8, 2, 3, 4, 5, 6, 7, 8];
-    let shard_ids = storage
-        .store_shards(&test_data, &decision, &metadata)
-        .await
-        .expect("Shard storage should succeed");
-
-    // Verify shards distributed to selected nodes
-    assert_eq!(
-        shard_ids.len(),
-        decision.selected_nodes.len(),
-        "Should create shard for each selected node"
-    );
-
-    // Verify shard metadata is recorded
-    for shard_id in &shard_ids {
-        let shard_info = storage
-            .get_shard_info(shard_id)
-            .await
-            .expect("Shard info should exist");
-        assert_eq!(shard_info.shard_id, *shard_id);
-        assert!(decision.selected_nodes.contains(&shard_info.node_id));
-    }
-
-    // Verify replication factor satisfied
-    assert_eq!(
-        shard_ids.len(),
-        8,
-        "Should maintain replication factor of 8"
     );
 }
 
@@ -602,265 +526,8 @@ async fn test_trust_updates_affect_placement() {
 }
 
 // ============================================================================
-// Test Suite 5: Audit System (3 tests)
+// Test Suite 5: Placement Under Churn
 // ============================================================================
-
-#[tokio::test]
-async fn test_shard_audit_success() {
-    let nodes = create_test_nodes(10);
-    let node_set: HashSet<PeerId> = nodes.iter().cloned().collect();
-    let metadata = create_diverse_node_metadata(&nodes);
-
-    let mut engine = create_test_placement_engine();
-    let trust_system = create_mock_trust_system();
-    let performance_monitor = create_mock_performance_monitor();
-
-    let decision = engine
-        .select_nodes(&node_set, 8, &trust_system, &performance_monitor, &metadata)
-        .await
-        .expect("Placement should succeed");
-
-    // Create storage and store shards
-    let dht_engine = create_mock_dht_engine();
-    let storage = Arc::new(
-        StorageOrchestrator::new(
-            dht_engine.clone(),
-            trust_system.clone(),
-            performance_monitor,
-        )
-        .await
-        .expect("Storage creation should succeed"),
-    );
-
-    let test_data = vec![1u8; 1024];
-    let shard_ids = storage
-        .store_shards(&test_data, &decision, &metadata)
-        .await
-        .expect("Shard storage should succeed");
-
-    // Verify all shards are present
-    for shard_id in &shard_ids {
-        let shard_info = storage.get_shard_info(shard_id).await;
-        assert!(shard_info.is_some(), "Shard should be present");
-    }
-
-    // All shards present = audit would be healthy
-    assert_eq!(shard_ids.len(), 8, "All shards should be stored");
-}
-
-#[tokio::test]
-async fn test_audit_detects_missing_shards() {
-    // This test simulates a scenario where shards would be missing
-    let nodes = create_test_nodes(10);
-    let _node_set: HashSet<PeerId> = nodes.iter().cloned().collect();
-
-    // Create audit system components
-    let dht_engine = create_mock_dht_engine();
-    let trust_system = create_mock_trust_system();
-    let churn_predictor = create_mock_churn_predictor();
-
-    let audit_system =
-        saorsa_core::placement::AuditSystem::new(dht_engine, trust_system, churn_predictor)
-            .await
-            .expect("Audit system creation should succeed");
-
-    // In a real scenario, we would:
-    // 1. Place shards
-    // 2. Simulate node failures
-    // 3. Run audit to detect missing shards
-    // For now, we verify the audit system is properly constructed
-    drop(audit_system);
-}
-
-#[tokio::test]
-async fn test_audit_loop_respects_interval() {
-    // This test would verify audit loop timing
-    // For integration testing, we verify the audit system can be created and configured
-    let dht_engine = create_mock_dht_engine();
-    let trust_system = create_mock_trust_system();
-    let churn_predictor = create_mock_churn_predictor();
-
-    let audit_system =
-        saorsa_core::placement::AuditSystem::new(dht_engine, trust_system, churn_predictor)
-            .await
-            .expect("Audit system creation should succeed");
-
-    // Verify audit system is created properly
-    drop(audit_system);
-}
-
-// ============================================================================
-// Test Suite 6: Repair System (3 tests)
-// ============================================================================
-
-#[tokio::test]
-async fn test_automatic_repair_trigger() {
-    let nodes = create_test_nodes(15);
-    let _node_set: HashSet<PeerId> = nodes.iter().cloned().collect();
-
-    let dht_engine = create_mock_dht_engine();
-    let trust_system = create_mock_trust_system();
-    let performance_monitor = create_mock_performance_monitor();
-    let churn_predictor = create_mock_churn_predictor();
-
-    let storage = Arc::new(
-        StorageOrchestrator::new(
-            dht_engine.clone(),
-            trust_system.clone(),
-            performance_monitor.clone(),
-        )
-        .await
-        .expect("Storage creation should succeed"),
-    );
-
-    let audit_system = Arc::new(
-        saorsa_core::placement::AuditSystem::new(
-            dht_engine.clone(),
-            trust_system.clone(),
-            churn_predictor.clone(),
-        )
-        .await
-        .expect("Audit system creation should succeed"),
-    );
-
-    let repair_system = saorsa_core::placement::RepairSystem::new(
-        dht_engine.clone(),
-        storage.clone(),
-        audit_system.clone(),
-    )
-    .await
-    .expect("Repair system creation should succeed");
-
-    // Verify repair system is properly constructed
-    drop(repair_system);
-}
-
-#[tokio::test]
-async fn test_repair_hysteresis() {
-    // Test that repair hysteresis prevents unnecessary re-replication
-    let dht_engine = create_mock_dht_engine();
-    let trust_system = create_mock_trust_system();
-    let performance_monitor = create_mock_performance_monitor();
-    let churn_predictor = create_mock_churn_predictor();
-
-    let storage = Arc::new(
-        StorageOrchestrator::new(
-            dht_engine.clone(),
-            trust_system.clone(),
-            performance_monitor,
-        )
-        .await
-        .expect("Storage creation should succeed"),
-    );
-
-    let audit_system = Arc::new(
-        saorsa_core::placement::AuditSystem::new(
-            dht_engine.clone(),
-            trust_system.clone(),
-            churn_predictor.clone(),
-        )
-        .await
-        .expect("Audit system creation should succeed"),
-    );
-
-    let repair_system = saorsa_core::placement::RepairSystem::new(
-        dht_engine.clone(),
-        storage.clone(),
-        audit_system.clone(),
-    )
-    .await
-    .expect("Repair system creation should succeed");
-
-    // Verify repair system has hysteresis configured
-    // (Internal state verification would happen through repair behavior)
-    drop(repair_system);
-}
-
-#[tokio::test]
-async fn test_repair_coordination() {
-    // Test that multiple repairs are coordinated properly
-    let dht_engine = create_mock_dht_engine();
-    let trust_system = create_mock_trust_system();
-    let performance_monitor = create_mock_performance_monitor();
-    let churn_predictor = create_mock_churn_predictor();
-
-    let storage = Arc::new(
-        StorageOrchestrator::new(
-            dht_engine.clone(),
-            trust_system.clone(),
-            performance_monitor,
-        )
-        .await
-        .expect("Storage creation should succeed"),
-    );
-
-    let audit_system = Arc::new(
-        saorsa_core::placement::AuditSystem::new(
-            dht_engine.clone(),
-            trust_system.clone(),
-            churn_predictor.clone(),
-        )
-        .await
-        .expect("Audit system creation should succeed"),
-    );
-
-    let repair_system = saorsa_core::placement::RepairSystem::new(
-        dht_engine.clone(),
-        storage.clone(),
-        audit_system.clone(),
-    )
-    .await
-    .expect("Repair system creation should succeed");
-
-    // Repair coordination would be tested through concurrent repair operations
-    drop(repair_system);
-}
-
-// ============================================================================
-// Test Suite 7: End-to-End Scenarios (3 tests)
-// ============================================================================
-
-#[tokio::test]
-async fn test_full_placement_lifecycle() {
-    let nodes = create_test_nodes(20);
-    let metadata = create_diverse_node_metadata(&nodes);
-
-    // Create full orchestrator
-    let config = PlacementConfig::default();
-    let dht_engine = create_mock_dht_engine();
-    let trust_system = create_mock_trust_system();
-    let performance_monitor = create_mock_performance_monitor();
-    let churn_predictor = create_mock_churn_predictor();
-
-    let orchestrator = PlacementOrchestrator::new(
-        config,
-        dht_engine,
-        trust_system,
-        performance_monitor,
-        churn_predictor,
-    )
-    .await
-    .expect("Orchestrator creation should succeed");
-
-    // Place data
-    let test_data = vec![1u8; 1024];
-    let decision = orchestrator
-        .place_data(test_data, 8, Some(NetworkRegion::NorthAmerica))
-        .await
-        .expect("Data placement should succeed");
-
-    // Verify placement
-    assert_eq!(decision.selected_nodes.len(), 8);
-    assert!(verify_diversity_constraints(
-        &decision.selected_nodes,
-        &metadata
-    ));
-
-    // Get metrics
-    let metrics = orchestrator.get_metrics().await;
-    assert_eq!(metrics.successful_placements, 1);
-    assert_eq!(metrics.failed_placements, 0);
-}
 
 #[tokio::test]
 async fn test_placement_under_high_churn() {
@@ -906,57 +573,6 @@ async fn test_placement_under_high_churn() {
             }
         }
     }
-}
-
-#[tokio::test]
-async fn test_network_partition_recovery() {
-    let nodes = create_test_nodes(20);
-    let metadata = create_diverse_node_metadata(&nodes);
-
-    // Create orchestrator
-    let config = PlacementConfig::default();
-    let dht_engine = create_mock_dht_engine();
-    let trust_system = create_mock_trust_system();
-    let performance_monitor = create_mock_performance_monitor();
-    let churn_predictor = create_mock_churn_predictor();
-
-    let orchestrator = PlacementOrchestrator::new(
-        config,
-        dht_engine,
-        trust_system,
-        performance_monitor,
-        churn_predictor,
-    )
-    .await
-    .expect("Orchestrator creation should succeed");
-
-    // Place data before partition
-    let test_data = vec![1u8; 2048];
-    let decision_before = orchestrator
-        .place_data(test_data.clone(), 8, None)
-        .await
-        .expect("Pre-partition placement should succeed");
-
-    assert_eq!(decision_before.selected_nodes.len(), 8);
-
-    // Simulate network partition by placing data again
-    // (In a real scenario, we would simulate actual partition)
-    let decision_after = orchestrator
-        .place_data(test_data, 8, None)
-        .await
-        .expect("Post-partition placement should succeed");
-
-    assert_eq!(decision_after.selected_nodes.len(), 8);
-
-    // Both placements should maintain diversity
-    assert!(verify_diversity_constraints(
-        &decision_before.selected_nodes,
-        &metadata
-    ));
-    assert!(verify_diversity_constraints(
-        &decision_after.selected_nodes,
-        &metadata
-    ));
 }
 
 // ============================================================================
@@ -1025,13 +641,4 @@ fn test_trust_distribution_calculation() {
     assert_eq!(*distribution.get(&nodes[2]).unwrap_or(&0), 2);
     assert_eq!(*distribution.get(&nodes[3]).unwrap_or(&0), 0);
     assert_eq!(*distribution.get(&nodes[4]).unwrap_or(&0), 0);
-}
-
-#[test]
-fn test_audit_status_values() {
-    // Verify AuditStatus enum values exist
-    let _healthy = AuditStatus::Healthy;
-    let _degraded = AuditStatus::Degraded;
-    let _critical = AuditStatus::Critical;
-    let _missing = AuditStatus::Missing;
 }

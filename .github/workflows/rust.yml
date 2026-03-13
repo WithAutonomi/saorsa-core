@@ -12,7 +12,7 @@ env:
 # Note: Main test suites are in separate workflows:
 # - lint.yml: Format and clippy checks
 # - unit-tests.yml: Library unit tests (all platforms)
-# - integration-core.yml: DHT, storage, adaptive tests
+# - integration-core.yml: DHT peer discovery, adaptive tests
 # - integration-identity.yml: Identity and security tests
 # - integration-network.yml: Network and protocol tests
 

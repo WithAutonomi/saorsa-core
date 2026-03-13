@@ -20,8 +20,6 @@ pub mod backend;
 pub mod encryption;
 pub mod metrics;
 pub mod migration;
-pub mod replication;
-
 #[cfg(test)]
 mod tests;
 
@@ -579,4 +577,3 @@ impl StorageFactory {
 /// Re-export commonly used types
 pub use backend::{MemoryStore, RocksDbStore, SqliteStore};
 pub use encryption::EncryptedStore;
-pub use replication::ReplicatedStore;

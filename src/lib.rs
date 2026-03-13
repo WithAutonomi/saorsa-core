@@ -316,10 +316,9 @@ pub use quantum_crypto::types::{
 
 // Placement system exports
 pub use crate::placement::{
-    AuditSystem, DataPointer, DhtRecord, DiversityEnforcer, GeographicLocation, GroupBeacon,
-    NetworkRegion, NodeAd, PlacementConfig, PlacementDecision, PlacementEngine, PlacementMetrics,
-    PlacementOrchestrator, RegisterPointer, RepairSystem, StorageOrchestrator,
-    WeightedPlacementStrategy,
+    DataPointer, DhtRecord, DiversityEnforcer, GeographicLocation, GroupBeacon, NetworkRegion,
+    NodeAd, PlacementConfig, PlacementDecision, PlacementEngine, PlacementMetrics,
+    PlacementOrchestrator, RegisterPointer, WeightedPlacementStrategy,
 };
 
 // Canonical peer identity type — 32-byte BLAKE3 hash of ML-DSA-65 public key.

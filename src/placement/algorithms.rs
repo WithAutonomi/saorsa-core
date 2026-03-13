@@ -11,8 +11,7 @@
 //! to ensure optimal placement of erasure-coded shards across the network.
 
 use std::collections::{HashMap, HashSet};
-//use std::net::SocketAddr;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use async_trait::async_trait;
 
@@ -22,8 +21,6 @@ use crate::placement::{
     GeographicLocation, NetworkRegion, PlacementConfig, PlacementDecision, PlacementError,
     PlacementResult, PlacementStrategy,
 };
-//use crate::placement::traits::NodePerformanceMetrics;
-
 // ============================================================================
 // Validation Helpers
 // ============================================================================
@@ -81,18 +78,7 @@ fn validate_non_negative(node_id: &PeerId, value: f64, name: &'static str) -> Pl
 /// Efraimidis-Spirakis weighted sampling algorithm implementation
 #[derive(Debug, Clone)]
 pub struct WeightedSampler {
-    /// Random number generator state
-    #[allow(dead_code)]
-    rng_state: u64,
-    /// Cached weights for performance
-    #[allow(dead_code)]
-    weight_cache: HashMap<PeerId, f64>,
-    /// Last update timestamp for cache invalidation
-    #[allow(dead_code)]
-    cache_updated: Instant,
-    /// Cache TTL
-    #[allow(dead_code)]
-    cache_ttl: Duration,
+    _private: (),
 }
 
 impl Default for WeightedSampler {
@@ -104,12 +90,7 @@ impl Default for WeightedSampler {
 impl WeightedSampler {
     /// Create new weighted sampler
     pub fn new() -> Self {
-        Self {
-            rng_state: fastrand::u64(..),
-            weight_cache: HashMap::new(),
-            cache_updated: Instant::now(),
-            cache_ttl: Duration::from_secs(300), // 5 minutes
-        }
+        Self { _private: () }
     }
 
     /// Calculate composite weight for a node

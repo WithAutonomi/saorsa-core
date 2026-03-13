@@ -126,7 +126,7 @@ trust_engine
 
 ### Multi-Layer P2P Architecture
 
-The system combines distributed hash table (DHT) storage with machine learning for optimal routing:
+The system combines a DHT peer phonebook with machine learning for optimal routing:
 
 #### 1. Transport Layer (`src/transport/`)
 - **Primary**: `saorsa-transport` (0.8+) for QUIC transport with NAT traversal
@@ -139,18 +139,18 @@ Central to the system's intelligence, using ML for dynamic strategy selection:
 - **ML Components**: Q-Learning cache optimization, Churn prediction
 
 #### 3. DHT Layer (`src/dht/`)
-Distributed storage with geographic awareness:
-- **Core Engine**: Kademlia-based with K=8 replication
+Peer phonebook with geographic awareness (no data storage):
+- **Core Engine**: Kademlia-based routing table and peer discovery
 - **Geographic Routing**: Region-aware peer selection
-- **Witness System**: Byzantine fault tolerance
-- **Optimizations**: RSPS (Root-Scoped Provider Summaries) via `saorsa-rsps`
+- **Trust-Weighted Selection**: EigenTrust-integrated peer scoring
+- **Security**: S/Kademlia extensions, Sybil detection, authenticated sibling broadcast
 
 #### 4. Identity System (`src/identity/`)
 - **Cryptography**: ML-DSA-65 for post-quantum signatures
 - **No PoW**: Pure cryptographic identity without proof-of-work
 
 #### 5. Placement System (`src/placement/`)
-Advanced storage orchestration with EigenTrust integration:
+Node selection and orchestration with EigenTrust integration:
 - **Weighted Selection Formula**: `w_i = (τ_i^α) * (p_i^β) * (c_i^γ) * d_i`
 - **Byzantine Tolerance**: Configurable f-out-of-3f+1 fault tolerance
 - **DHT Records**: NODE_AD, GROUP_BEACON, DATA_POINTER (≤512B)
@@ -178,18 +178,30 @@ metrics = ["dep:prometheus"]  # Prometheus monitoring
 
 ### Key Integration Tests
 ```bash
-# New API Tests (v0.3.16+)
-cargo test --test api_implementation_tests       # Clean API implementation
-cargo test --test storage_tests                  # Storage strategies & replication
+# DHT & peer discovery
+cargo test --test dht_connectivity_diagnostic_test       # DHT connectivity diagnostics
+cargo test --test dht_node_mode_gating_test              # Node mode gating
+cargo test --test dht_peer_address_population_test       # Peer address population
+cargo test --test config_test                            # Configuration tests
 
-# Core functionality  
+# Adaptive networking
+cargo test --test adaptive_components_test               # Adaptive component tests
+cargo test --test adaptive_integration_tests             # Adaptive integration
+cargo test --test multi_armed_bandit_integration_test    # Multi-armed bandit
+cargo test --test q_learning_cache_integration_test      # Q-Learning cache
+cargo test --test hyperbolic_routing_test                # Hyperbolic routing
+
+# Transport
 cargo test --test saorsa_transport_integration_test      # QUIC transport
-cargo test --test dht_core_operations_test        # DHT operations
-cargo test --test adaptive_components_test        # Adaptive networking
 
 # Security & trust
-cargo test --test eigentrust_integration_test     # Trust system
-cargo test --test security_comprehensive_test     # Security validation
+cargo test --test eigentrust_integration_test            # Trust system
+cargo test --test security_comprehensive_test            # Security validation
+cargo test --test trust_weighted_dht_test                # Trust-weighted DHT
+cargo test --test trust_weighted_selection_test           # Trust-weighted selection
+
+# Placement
+cargo test --test placement_integration_test             # Placement integration
 ```
 
 ## Common Development Workflows
@@ -208,25 +220,13 @@ cargo test --test security_comprehensive_test     # Security validation
 4. Add EigenTrust integration hooks
 5. Write comprehensive tests with property-based testing
 
-### DHT Operation with Witnesses
-```rust
-// Store with witness validation
-let witnesses = engine.select_witnesses(&key, 3)?;
-let receipt = engine.store_with_witnesses(
-    key,
-    value,
-    &witnesses,
-    Duration::from_secs(3600)
-).await?;
-```
-
 ## Important Implementation Details
 
 ### DHT Configuration
-- **Replication Factor**: K=8 (8 replicas per key)
-- **Consistency Levels**: Eventual, Quorum, All
-- **Geographic Awareness**: Regional peer preference
-- **Witness System**: Byzantine fault tolerance
+- **Bucket Size**: 20 nodes per k-bucket
+- **Concurrency**: Alpha=3 parallel lookups
+- **Geographic Awareness**: Region-aware peer selection
+- **Trust Integration**: EigenTrust-weighted peer scoring
 
 ### Placement System Configuration
 - **Weighted Selection Formula**: `w_i = (τ_i^α) * (p_i^β) * (c_i^γ) * d_i`
@@ -235,8 +235,6 @@ let receipt = engine.store_with_witnesses(
   - `c_i`: Capacity score (0.0-1.0)
   - `d_i`: Diversity bonus multiplier (1.0-2.0)
 - **Byzantine Tolerance**: f-out-of-3f+1 nodes (configurable f)
-- **DHT Record Limits**: ≤512 bytes
-- **Audit Frequency**: 5-minute intervals with concurrent limits
 
 ### Performance Optimizations
 - **Connection Pooling**: Max 100 connections with LRU eviction

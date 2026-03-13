@@ -12,7 +12,7 @@ env:
 
 jobs:
   integration-dht:
-    name: DHT & Storage Tests
+    name: DHT & Peer Discovery Tests
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -64,11 +64,14 @@ jobs:
           find target -name "incremental" -type d -exec rm -rf {} + 2>/dev/null || true
           df -h
 
-      - name: DHT Core Operations
-        run: cargo nextest run --test dht_core_operations_test --features "mocks,h2_greedy,test-utils" --no-fail-fast
+      - name: DHT Connectivity Diagnostics
+        run: cargo nextest run --test dht_connectivity_diagnostic_test --features "mocks,h2_greedy,test-utils" --no-fail-fast
 
-      - name: DHT Property Tests
-        run: cargo nextest run --test dht_property_tests --features "mocks,h2_greedy,test-utils" --no-fail-fast
+      - name: DHT Node Mode Gating
+        run: cargo nextest run --test dht_node_mode_gating_test --features "mocks,h2_greedy,test-utils" --no-fail-fast
+
+      - name: DHT Peer Address Population
+        run: cargo nextest run --test dht_peer_address_population_test --features "mocks,h2_greedy,test-utils" --no-fail-fast
 
       - name: Config Tests
         run: cargo nextest run --test config_test --features "mocks,h2_greedy,test-utils" --no-fail-fast

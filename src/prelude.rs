@@ -156,10 +156,9 @@ pub use crate::rate_limit::{
 
 /// Placement system
 pub use crate::placement::{
-    AuditSystem, DataPointer, DhtRecord, DiversityEnforcer, GeographicLocation, GroupBeacon,
-    NetworkRegion, NodeAd, PlacementConfig, PlacementDecision, PlacementEngine, PlacementMetrics,
-    PlacementOrchestrator, RegisterPointer, RepairSystem, StorageOrchestrator,
-    WeightedPlacementStrategy,
+    DataPointer, DhtRecord, DiversityEnforcer, GeographicLocation, GroupBeacon, NetworkRegion,
+    NodeAd, PlacementConfig, PlacementDecision, PlacementEngine, PlacementMetrics,
+    PlacementOrchestrator, RegisterPointer, WeightedPlacementStrategy,
 };
 
 // ============================================================================

@@ -19,38 +19,9 @@
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use saorsa_core::PeerId;
 use saorsa_core::adaptive::{TrustProvider, trust::MockTrustProvider};
-use saorsa_core::dht::{Key, Record};
 use saorsa_core::identity::NodeIdentity;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::runtime::Runtime;
-
-/// Benchmark storage performance with DHT operations
-fn benchmark_storage_performance(c: &mut Criterion) {
-    let rt = Runtime::new().unwrap();
-
-    let mut group = c.benchmark_group("storage_performance");
-    group.measurement_time(Duration::from_secs(20));
-
-    for data_size in [1024, 10240, 102400].iter() {
-        group.bench_with_input(
-            BenchmarkId::new("store_retrieve", data_size),
-            data_size,
-            |b, &data_size| {
-                b.iter_custom(|iters| {
-                    let start = std::time::Instant::now();
-                    for _ in 0..iters {
-                        let _ =
-                            rt.block_on(async { benchmark_storage_operations(data_size).await });
-                    }
-                    start.elapsed()
-                });
-            },
-        );
-    }
-
-    group.finish();
-}
 
 /// Benchmark crypto performance with identity operations
 fn benchmark_crypto_performance(c: &mut Criterion) {
@@ -98,29 +69,6 @@ fn benchmark_adaptive_operations(c: &mut Criterion) {
     group.finish();
 }
 
-async fn benchmark_storage_operations(data_size: usize) -> Result<(), Box<dyn std::error::Error>> {
-    // Simplified storage benchmark using available DHT functionality
-    let peer_id = create_test_peer_id([1u8; 32]);
-    let data = vec![0xAB; data_size];
-
-    // Create key from data hash
-    let mut key_bytes = [0u8; 32];
-    let hash = blake3::hash(&data);
-    key_bytes.copy_from_slice(hash.as_bytes());
-    let key: Key = key_bytes;
-
-    let record = Record::new(key, data, peer_id);
-
-    // Benchmark key operations
-    let key2: Key = [1u8; 32];
-    let _distance = xor_distance(&key, &key2);
-
-    // Check record validity
-    let _is_expired = record.is_expired();
-
-    Ok(())
-}
-
 async fn benchmark_encryption_operations(
     message_size: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -143,23 +91,8 @@ async fn benchmark_encryption_operations(
     Ok(())
 }
 
-/// Create a test PeerId from bytes
-fn create_test_peer_id(bytes: [u8; 32]) -> PeerId {
-    PeerId::from_bytes(bytes)
-}
-
-/// Calculate XOR distance between two keys
-fn xor_distance(a: &Key, b: &Key) -> [u8; 32] {
-    let mut result = [0u8; 32];
-    for i in 0..32 {
-        result[i] = a[i] ^ b[i];
-    }
-    result
-}
-
 criterion_group!(
     benches,
-    benchmark_storage_performance,
     benchmark_crypto_performance,
     benchmark_adaptive_operations
 );

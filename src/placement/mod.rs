@@ -94,9 +94,6 @@
 //!
 //! - **PlacementEngine**: Main orchestrator for placement decisions
 //! - **WeightedPlacementStrategy**: Implements the weighted selection algorithm
-//! - **StorageOrchestrator**: Manages shard storage and retrieval
-//! - **AuditSystem**: Continuous monitoring of shard health
-//! - **RepairSystem**: Automatic repair with hysteresis control
 //! - **DiversityEnforcer**: Geographic and network diversity constraints
 //!
 //! ## Performance Characteristics
@@ -128,7 +125,7 @@ pub use dht_records::{
     RegisterPointer,
 };
 pub use errors::{PlacementError, PlacementResult};
-pub use orchestrator::{AuditSystem, PlacementOrchestrator, RepairSystem, StorageOrchestrator};
+pub use orchestrator::PlacementOrchestrator;
 pub use traits::{
     NetworkTopology, NodePerformanceMetrics, PerformanceEstimator, PlacementConstraint,
     PlacementStrategy, PlacementValidator,

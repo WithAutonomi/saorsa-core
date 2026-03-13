@@ -2,7 +2,14 @@
 
 ## Status
 
-Accepted
+Superseded
+
+> **Note (2026-03):** The witness-based storage protocol described here was removed
+> as part of the DHT phonebook cleanup. The DHT is now a **peer phonebook only**
+> (routing, discovery, liveness). Data storage and replication are handled by the
+> application layer (saorsa-node). S/Kademlia routing extensions (disjoint paths,
+> Sybil detection, authenticated sibling broadcast) remain in the codebase, but the
+> witness attestation and quorum-based store/get operations have been removed.
 
 ## Context
 

@@ -49,8 +49,6 @@ impl TransportExtensions for TransportManager {
     }
 }
 
-// (ContentStore and StorageStrategy removed — storage is handled by saorsa-node)
-
 // Cache decision type
 #[derive(Debug)]
 pub enum CacheDecision {
@@ -345,8 +343,6 @@ pub struct ChurnStats {
     pub nodes_joined_last_hour: usize,
     pub nodes_left_last_hour: usize,
 }
-
-// (ReplicationManager extensions removed — replication is handled by saorsa-node)
 
 // Extension trait for AdaptiveGossipSub (add reduce_fanout)
 pub trait AdaptiveGossipSubMoreExtensions {
