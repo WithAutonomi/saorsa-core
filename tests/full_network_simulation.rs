@@ -48,7 +48,6 @@ impl NetworkSimulation {
                 bootstrap_nodes: bootstrap_nodes.clone(),
                 storage_capacity: 10,
                 max_connections: 50,
-                replication_factor: 3,
                 ml_enabled: true,
                 monitoring_interval: Duration::from_secs(10),
                 security_level: 7,

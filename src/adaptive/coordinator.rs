@@ -114,7 +114,6 @@ pub struct OperationsComponents {
 /// Components are organized into logical groups for maintainability:
 /// - `network`: Transport, DHT, routing, gossip
 /// - `routing`: Spatial algorithms and trust
-/// - `storage`: Content store, replication, retrieval
 /// - `learning`: ML-based optimization systems
 /// - `operations`: Monitoring, security, churn handling
 pub struct NetworkCoordinator {
@@ -155,9 +154,6 @@ pub struct NetworkConfig {
     /// Maximum connections
     pub max_connections: usize,
 
-    /// Replication factor
-    pub replication_factor: u8,
-
     /// Enable machine learning optimizations
     pub ml_enabled: bool,
 
@@ -177,7 +173,6 @@ impl Default for NetworkConfig {
             bootstrap_nodes: global_config.network.bootstrap_nodes.clone(),
             storage_capacity: 100, // 100 GB
             max_connections: global_config.network.max_connections,
-            replication_factor: global_config.dht.replication_factor,
             ml_enabled: true,
             monitoring_interval: Duration::from_secs(30),
             security_level: 7,
@@ -192,7 +187,6 @@ impl NetworkConfig {
             bootstrap_nodes: config.network.bootstrap_nodes.clone(),
             storage_capacity: 100, // 100 GB default for ML cache sizing
             max_connections: config.network.max_connections,
-            replication_factor: config.dht.replication_factor,
             ml_enabled: true,
             monitoring_interval: Duration::from_secs(30),
             security_level: 7,

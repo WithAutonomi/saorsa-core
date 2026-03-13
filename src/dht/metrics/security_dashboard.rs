@@ -133,10 +133,6 @@ pub struct AlertThresholds {
     pub churn_warning: f64,
     pub churn_critical: f64,
 
-    /// Replication health threshold (0-1)
-    pub replication_warning: f64,
-    pub replication_critical: f64,
-
     /// Trust score threshold (0-1)
     pub trust_warning: f64,
     pub trust_critical: f64,
@@ -148,10 +144,6 @@ pub struct AlertThresholds {
     /// Data health threshold (0-1)
     pub data_health_warning: f64,
     pub data_health_critical: f64,
-
-    /// Capacity usage threshold (0-1)
-    pub capacity_warning: f64,
-    pub capacity_critical: f64,
 }
 
 impl Default for AlertThresholds {
@@ -165,16 +157,12 @@ impl Default for AlertThresholds {
             collusion_critical: 0.6,
             churn_warning: 0.2,
             churn_critical: 0.4,
-            replication_warning: 0.8,
-            replication_critical: 0.6,
             trust_warning: 0.5,
             trust_critical: 0.3,
             success_rate_warning: 0.95,
             success_rate_critical: 0.85,
             data_health_warning: 0.8,
             data_health_critical: 0.6,
-            capacity_warning: 0.8,
-            capacity_critical: 0.95,
         }
     }
 }
@@ -219,8 +207,6 @@ pub struct ComponentStatus {
     pub trust_system: ComponentHealth,
     /// Routing table status
     pub routing_table: ComponentHealth,
-    /// Replication status
-    pub replication: ComponentHealth,
     /// Geographic diversity status
     pub geographic_diversity: ComponentHealth,
 }
@@ -359,8 +345,7 @@ impl SecurityDashboard {
 
         // Calculate scores
         let security_score = self.calculate_security_score(&security);
-        let data_integrity_score =
-            self.calculate_data_integrity_score(data_integrity.as_ref(), &dht_health);
+        let data_integrity_score = self.calculate_data_integrity_score(data_integrity.as_ref());
         let network_health_score = self.calculate_network_health_score(&dht_health, &placement);
         let trust_score = trust.eigentrust_avg;
 
@@ -592,37 +577,6 @@ impl SecurityDashboard {
         alerts: &mut Vec<SecurityAlert>,
         now: SystemTime,
     ) {
-        // Replication health
-        if dht_health.replication_health < self.thresholds.replication_critical {
-            alerts.push(SecurityAlert {
-                id: "replication_critical".to_string(),
-                severity: AlertSeverity::Critical,
-                category: AlertCategory::DataIntegrity,
-                message: format!(
-                    "Critical replication health: {:.1}%",
-                    dht_health.replication_health * 100.0
-                ),
-                recommendation: "Initiate emergency re-replication of affected data".to_string(),
-                triggered_at: now,
-                metric_value: dht_health.replication_health,
-                threshold: self.thresholds.replication_critical,
-            });
-        } else if dht_health.replication_health < self.thresholds.replication_warning {
-            alerts.push(SecurityAlert {
-                id: "replication_warning".to_string(),
-                severity: AlertSeverity::Warning,
-                category: AlertCategory::DataIntegrity,
-                message: format!(
-                    "Degraded replication health: {:.1}%",
-                    dht_health.replication_health * 100.0
-                ),
-                recommendation: "Monitor under-replicated keys and node availability".to_string(),
-                triggered_at: now,
-                metric_value: dht_health.replication_health,
-                threshold: self.thresholds.replication_warning,
-            });
-        }
-
         // Success rate
         if dht_health.success_rate < self.thresholds.success_rate_critical {
             alerts.push(SecurityAlert {
@@ -651,27 +605,6 @@ impl SecurityDashboard {
                 triggered_at: now,
                 metric_value: dht_health.success_rate,
                 threshold: self.thresholds.success_rate_warning,
-            });
-        }
-
-        // Under-replicated keys
-        if dht_health.under_replicated_keys > 0 {
-            alerts.push(SecurityAlert {
-                id: "under_replicated_keys".to_string(),
-                severity: if dht_health.under_replicated_keys > 100 {
-                    AlertSeverity::Critical
-                } else {
-                    AlertSeverity::Warning
-                },
-                category: AlertCategory::DataIntegrity,
-                message: format!(
-                    "{} keys are under-replicated",
-                    dht_health.under_replicated_keys
-                ),
-                recommendation: "Trigger re-replication for affected keys".to_string(),
-                triggered_at: now,
-                metric_value: dht_health.under_replicated_keys as f64,
-                threshold: 0.0,
             });
         }
     }
@@ -733,37 +666,6 @@ impl SecurityDashboard {
         alerts: &mut Vec<SecurityAlert>,
         now: SystemTime,
     ) {
-        // High capacity usage
-        if placement.used_capacity_ratio >= self.thresholds.capacity_critical {
-            alerts.push(SecurityAlert {
-                id: "capacity_critical".to_string(),
-                severity: AlertSeverity::Critical,
-                category: AlertCategory::Capacity,
-                message: format!(
-                    "Storage capacity nearly exhausted: {:.1}%",
-                    placement.used_capacity_ratio * 100.0
-                ),
-                recommendation: "Add storage nodes or implement data eviction policies".to_string(),
-                triggered_at: now,
-                metric_value: placement.used_capacity_ratio,
-                threshold: self.thresholds.capacity_critical,
-            });
-        } else if placement.used_capacity_ratio >= self.thresholds.capacity_warning {
-            alerts.push(SecurityAlert {
-                id: "capacity_warning".to_string(),
-                severity: AlertSeverity::Warning,
-                category: AlertCategory::Capacity,
-                message: format!(
-                    "Storage capacity high: {:.1}%",
-                    placement.used_capacity_ratio * 100.0
-                ),
-                recommendation: "Plan for capacity expansion".to_string(),
-                triggered_at: now,
-                metric_value: placement.used_capacity_ratio,
-                threshold: self.thresholds.capacity_warning,
-            });
-        }
-
         // Poor geographic diversity
         if placement.geographic_diversity < 0.5 {
             alerts.push(SecurityAlert {
@@ -812,19 +714,12 @@ impl SecurityDashboard {
     }
 
     /// Calculate data integrity score
-    fn calculate_data_integrity_score(
-        &self,
-        data_integrity: Option<&DataIntegrityMetrics>,
-        dht_health: &DhtHealthMetrics,
-    ) -> f64 {
+    fn calculate_data_integrity_score(&self, data_integrity: Option<&DataIntegrityMetrics>) -> f64 {
         if let Some(di) = data_integrity {
-            // Use actual data integrity metrics
-            let health_ratio = di.health_ratio();
-            let replication = dht_health.replication_health;
-            (health_ratio * 0.6 + replication * 0.4).clamp(0.0, 1.0)
+            di.health_ratio().clamp(0.0, 1.0)
         } else {
-            // Fall back to DHT metrics
-            dht_health.replication_health
+            // No data integrity monitor available; assume healthy
+            1.0
         }
     }
 
@@ -949,17 +844,6 @@ impl SecurityDashboard {
                 ),
                 last_check: now,
             },
-            replication: ComponentHealth {
-                name: "Replication",
-                operational: dht_health.replication_health > 0.5,
-                health_score: dht_health.replication_health,
-                message: format!(
-                    "Health: {:.1}%, {} under-replicated",
-                    dht_health.replication_health * 100.0,
-                    dht_health.under_replicated_keys
-                ),
-                last_check: now,
-            },
             geographic_diversity: ComponentHealth {
                 name: "Geographic Diversity",
                 operational: placement.regions_covered > 0,
@@ -1054,7 +938,6 @@ mod tests {
         let thresholds = AlertThresholds::default();
         assert!(thresholds.eclipse_critical > thresholds.eclipse_warning);
         assert!(thresholds.sybil_critical > thresholds.sybil_warning);
-        assert!(thresholds.capacity_critical > thresholds.capacity_warning);
     }
 
     #[test]
@@ -1374,7 +1257,6 @@ mod tests {
         );
         assert_eq!(snapshot.components.trust_system.name, "EigenTrust System");
         assert_eq!(snapshot.components.routing_table.name, "Routing Table");
-        assert_eq!(snapshot.components.replication.name, "Replication");
         assert_eq!(
             snapshot.components.geographic_diversity.name,
             "Geographic Diversity"

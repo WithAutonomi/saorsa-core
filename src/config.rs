@@ -95,14 +95,10 @@ pub struct SecurityConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DhtConfig {
-    /// Replication factor (K value)
-    pub replication_factor: u8,
     /// Alpha value for parallel queries
     pub alpha: u8,
     /// Beta value for routing
     pub beta: u8,
-    /// Record TTL in seconds
-    pub record_ttl: u64,
     /// Enable adaptive routing
     pub adaptive_routing: bool,
 
@@ -120,11 +116,6 @@ pub struct DhtConfig {
     /// Nodes below this trust score are deprioritized
     /// Default: 0.1
     pub min_trust_threshold: f64,
-
-    /// Exclude untrusted nodes from storage operations
-    /// When true, nodes below min_trust_threshold are excluded from storage targets
-    /// Default: false
-    pub exclude_untrusted_for_storage: bool,
 }
 
 /// Transport configuration
@@ -196,16 +187,13 @@ impl Default for SecurityConfig {
 impl Default for DhtConfig {
     fn default() -> Self {
         Self {
-            replication_factor: 8,
             alpha: 3,
             beta: 1,
-            record_ttl: 3600,
             adaptive_routing: true,
             // Trust selection defaults
             trust_selection_enabled: true,
             trust_weight: 0.3,
             min_trust_threshold: 0.1,
-            exclude_untrusted_for_storage: false,
         }
     }
 }

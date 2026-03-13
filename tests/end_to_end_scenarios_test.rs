@@ -120,7 +120,6 @@ async fn test_complete_social_network_scenario() -> Result<()> {
 #[tokio::test]
 #[ignore = "TODO: Implement once file sharing APIs are available"]
 async fn test_file_sharing_workflow() -> Result<()> {
-    // TODO: Implement when file sharing and DHT storage APIs are available
     let _framework = EndToEndTestFramework::new(3).await?;
     // Implementation pending...
     Ok(())

@@ -7,39 +7,23 @@
 // For AGPL-3.0 license, see LICENSE-AGPL-3.0
 // For commercial licensing, contact: david@saorsalabs.com
 
-//! Placement metrics for storage distribution and capacity management
+//! Placement metrics for peer distribution and load management
 //!
 //! Tracks metrics for:
-//! - Storage distribution (bytes, records, nodes)
 //! - Geographic diversity
-//! - Capacity utilization
 //! - Load balancing
-//! - Storage audits
+//! - Audits
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Placement metrics data structure
 #[derive(Debug, Clone, Default)]
 pub struct PlacementMetrics {
-    // Storage distribution metrics
-    /// Total bytes stored in DHT
-    pub total_stored_bytes: u64,
-    /// Total records stored in DHT
-    pub total_records: u64,
-    /// Number of nodes providing storage
-    pub storage_nodes: u64,
-
     // Geographic diversity metrics
     /// Geographic diversity score (0-1)
     pub geographic_diversity: f64,
     /// Number of geographic regions with nodes
     pub regions_covered: u64,
-
-    // Capacity metrics
-    /// Total available storage capacity in bytes
-    pub total_capacity_bytes: u64,
-    /// Used capacity ratio (0-1)
-    pub used_capacity_ratio: f64,
 
     // Load balancing metrics
     /// Load balance score (0-1, higher is better)
@@ -50,26 +34,17 @@ pub struct PlacementMetrics {
     pub rebalance_operations_total: u64,
 
     // Audit metrics
-    /// Total storage audits performed
+    /// Total audits performed
     pub audits_total: u64,
-    /// Total storage audit failures
+    /// Total audit failures
     pub audit_failures_total: u64,
 }
 
 /// Thread-safe placement metrics collector
 pub struct PlacementMetricsCollector {
-    // Storage distribution
-    total_stored_bytes: AtomicU64,
-    total_records: AtomicU64,
-    storage_nodes: AtomicU64,
-
     // Geographic diversity (stored as millipercent)
     geographic_diversity: AtomicU64,
     regions_covered: AtomicU64,
-
-    // Capacity metrics
-    total_capacity_bytes: AtomicU64,
-    used_capacity_ratio: AtomicU64, // Stored as millipercent
 
     // Load balancing
     load_balance_score: AtomicU64, // Stored as millipercent
@@ -85,51 +60,14 @@ impl PlacementMetricsCollector {
     /// Create a new placement metrics collector
     pub fn new() -> Self {
         Self {
-            total_stored_bytes: AtomicU64::new(0),
-            total_records: AtomicU64::new(0),
-            storage_nodes: AtomicU64::new(0),
             geographic_diversity: AtomicU64::new(1000), // Default 1.0
             regions_covered: AtomicU64::new(0),
-            total_capacity_bytes: AtomicU64::new(0),
-            used_capacity_ratio: AtomicU64::new(0),
             load_balance_score: AtomicU64::new(1000), // Default 1.0 (perfect balance)
             overloaded_nodes: AtomicU64::new(0),
             rebalance_operations_total: AtomicU64::new(0),
             audits_total: AtomicU64::new(0),
             audit_failures_total: AtomicU64::new(0),
         }
-    }
-
-    /// Update storage distribution metrics
-    pub fn set_storage_stats(&self, bytes: u64, records: u64, nodes: u64) {
-        self.total_stored_bytes.store(bytes, Ordering::Relaxed);
-        self.total_records.store(records, Ordering::Relaxed);
-        self.storage_nodes.store(nodes, Ordering::Relaxed);
-    }
-
-    /// Update total stored bytes
-    pub fn set_total_stored_bytes(&self, bytes: u64) {
-        self.total_stored_bytes.store(bytes, Ordering::Relaxed);
-    }
-
-    /// Increment total stored bytes
-    pub fn add_stored_bytes(&self, bytes: u64) {
-        self.total_stored_bytes.fetch_add(bytes, Ordering::Relaxed);
-    }
-
-    /// Update total records count
-    pub fn set_total_records(&self, count: u64) {
-        self.total_records.store(count, Ordering::Relaxed);
-    }
-
-    /// Increment total records
-    pub fn add_record(&self) {
-        self.total_records.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Update storage node count
-    pub fn set_storage_nodes(&self, count: u64) {
-        self.storage_nodes.store(count, Ordering::Relaxed);
     }
 
     /// Update geographic diversity score (0.0 - 1.0)
@@ -142,21 +80,6 @@ impl PlacementMetricsCollector {
     /// Update regions covered count
     pub fn set_regions_covered(&self, count: u64) {
         self.regions_covered.store(count, Ordering::Relaxed);
-    }
-
-    /// Update capacity metrics
-    pub fn set_capacity_stats(&self, total_bytes: u64, used_bytes: u64) {
-        self.total_capacity_bytes
-            .store(total_bytes, Ordering::Relaxed);
-
-        let ratio = if total_bytes > 0 {
-            (used_bytes as f64 / total_bytes as f64).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-        let millipercent = (ratio * 1000.0) as u64;
-        self.used_capacity_ratio
-            .store(millipercent, Ordering::Relaxed);
     }
 
     /// Update load balance score (0.0 - 1.0)
@@ -221,13 +144,8 @@ impl PlacementMetricsCollector {
     /// Get current metrics snapshot
     pub async fn get_metrics(&self) -> PlacementMetrics {
         PlacementMetrics {
-            total_stored_bytes: self.total_stored_bytes.load(Ordering::Relaxed),
-            total_records: self.total_records.load(Ordering::Relaxed),
-            storage_nodes: self.storage_nodes.load(Ordering::Relaxed),
             geographic_diversity: self.geographic_diversity.load(Ordering::Relaxed) as f64 / 1000.0,
             regions_covered: self.regions_covered.load(Ordering::Relaxed),
-            total_capacity_bytes: self.total_capacity_bytes.load(Ordering::Relaxed),
-            used_capacity_ratio: self.used_capacity_ratio.load(Ordering::Relaxed) as f64 / 1000.0,
             load_balance_score: self.load_balance_score.load(Ordering::Relaxed) as f64 / 1000.0,
             overloaded_nodes: self.overloaded_nodes.load(Ordering::Relaxed),
             rebalance_operations_total: self.rebalance_operations_total.load(Ordering::Relaxed),
@@ -238,13 +156,8 @@ impl PlacementMetricsCollector {
 
     /// Reset all metrics
     pub fn reset(&self) {
-        self.total_stored_bytes.store(0, Ordering::Relaxed);
-        self.total_records.store(0, Ordering::Relaxed);
-        self.storage_nodes.store(0, Ordering::Relaxed);
         self.geographic_diversity.store(1000, Ordering::Relaxed);
         self.regions_covered.store(0, Ordering::Relaxed);
-        self.total_capacity_bytes.store(0, Ordering::Relaxed);
-        self.used_capacity_ratio.store(0, Ordering::Relaxed);
         self.load_balance_score.store(1000, Ordering::Relaxed);
         self.overloaded_nodes.store(0, Ordering::Relaxed);
         self.rebalance_operations_total.store(0, Ordering::Relaxed);
@@ -268,36 +181,8 @@ mod tests {
         let collector = PlacementMetricsCollector::new();
         let metrics = collector.get_metrics().await;
 
-        assert_eq!(metrics.total_stored_bytes, 0);
-        assert_eq!(metrics.total_records, 0);
         assert!((metrics.geographic_diversity - 1.0).abs() < 0.01);
         assert!((metrics.load_balance_score - 1.0).abs() < 0.01);
-    }
-
-    #[tokio::test]
-    async fn test_storage_stats() {
-        let collector = PlacementMetricsCollector::new();
-
-        collector.set_storage_stats(1_000_000, 100, 10);
-
-        let metrics = collector.get_metrics().await;
-        assert_eq!(metrics.total_stored_bytes, 1_000_000);
-        assert_eq!(metrics.total_records, 100);
-        assert_eq!(metrics.storage_nodes, 10);
-    }
-
-    #[tokio::test]
-    async fn test_incremental_storage() {
-        let collector = PlacementMetricsCollector::new();
-
-        collector.add_stored_bytes(1000);
-        collector.add_stored_bytes(500);
-        collector.add_record();
-        collector.add_record();
-
-        let metrics = collector.get_metrics().await;
-        assert_eq!(metrics.total_stored_bytes, 1500);
-        assert_eq!(metrics.total_records, 2);
     }
 
     #[tokio::test]
@@ -310,28 +195,6 @@ mod tests {
         let metrics = collector.get_metrics().await;
         assert!((metrics.geographic_diversity - 0.75).abs() < 0.01);
         assert_eq!(metrics.regions_covered, 5);
-    }
-
-    #[tokio::test]
-    async fn test_capacity_stats() {
-        let collector = PlacementMetricsCollector::new();
-
-        collector.set_capacity_stats(1_000_000, 400_000);
-
-        let metrics = collector.get_metrics().await;
-        assert_eq!(metrics.total_capacity_bytes, 1_000_000);
-        assert!((metrics.used_capacity_ratio - 0.4).abs() < 0.01);
-    }
-
-    #[tokio::test]
-    async fn test_capacity_zero_total() {
-        let collector = PlacementMetricsCollector::new();
-
-        // Edge case: zero total capacity
-        collector.set_capacity_stats(0, 0);
-
-        let metrics = collector.get_metrics().await;
-        assert!((metrics.used_capacity_ratio - 0.0).abs() < 0.01);
     }
 
     #[tokio::test]
@@ -392,7 +255,6 @@ mod tests {
     async fn test_reset() {
         let collector = PlacementMetricsCollector::new();
 
-        collector.set_storage_stats(1000, 10, 5);
         collector.set_geographic_diversity(0.5);
         collector.record_audit(false);
         collector.record_rebalance();
@@ -400,8 +262,6 @@ mod tests {
         collector.reset();
 
         let metrics = collector.get_metrics().await;
-        assert_eq!(metrics.total_stored_bytes, 0);
-        assert_eq!(metrics.total_records, 0);
         assert!((metrics.geographic_diversity - 1.0).abs() < 0.01);
         assert_eq!(metrics.audits_total, 0);
         assert_eq!(metrics.rebalance_operations_total, 0);

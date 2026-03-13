@@ -7,11 +7,10 @@
 // For AGPL-3.0 license, see LICENSE-AGPL-3.0
 // For commercial licensing, contact: david@saorsalabs.com
 
-//! DHT health metrics for routing, replication, and operations
+//! DHT health metrics for routing and operations
 //!
 //! Tracks metrics for:
 //! - Routing table health and k-bucket status
-//! - Replication factor and health
 //! - Lookup latency (P50, P95, P99)
 //! - Operation success rates
 //! - Bucket refresh and liveness checks
@@ -32,14 +31,6 @@ pub struct DhtHealthMetrics {
     pub buckets_filled: u64,
     /// Average bucket fullness (0-1)
     pub bucket_fullness: f64,
-
-    // Replication metrics
-    /// Current replication factor (k)
-    pub replication_factor: u64,
-    /// Replication health score (0-1)
-    pub replication_health: f64,
-    /// Number of under-replicated keys
-    pub under_replicated_keys: u64,
 
     // Latency metrics
     /// P50 lookup latency in milliseconds
@@ -84,11 +75,6 @@ pub struct DhtMetricsCollector {
     buckets_filled: AtomicU64,
     bucket_fullness: AtomicU64, // Stored as millipercent
 
-    // Replication metrics
-    replication_factor: AtomicU64,
-    replication_health: AtomicU64, // Stored as millipercent
-    under_replicated_keys: AtomicU64,
-
     // Latency samples (rolling window)
     latency_samples: Arc<RwLock<VecDeque<LatencySample>>>,
     max_samples: usize,
@@ -116,9 +102,6 @@ impl DhtMetricsCollector {
             routing_table_size: AtomicU64::new(0),
             buckets_filled: AtomicU64::new(0),
             bucket_fullness: AtomicU64::new(0),
-            replication_factor: AtomicU64::new(8), // Default K=8
-            replication_health: AtomicU64::new(1000), // Default 1.0
-            under_replicated_keys: AtomicU64::new(0),
             latency_samples: Arc::new(RwLock::new(VecDeque::new())),
             max_samples,
             operations_total: AtomicU64::new(0),
@@ -144,23 +127,6 @@ impl DhtMetricsCollector {
     pub fn set_bucket_fullness(&self, fullness: f64) {
         let millipercent = (fullness.clamp(0.0, 1.0) * 1000.0) as u64;
         self.bucket_fullness.store(millipercent, Ordering::Relaxed);
-    }
-
-    /// Update replication factor
-    pub fn set_replication_factor(&self, factor: u64) {
-        self.replication_factor.store(factor, Ordering::Relaxed);
-    }
-
-    /// Update replication health (0.0 - 1.0)
-    pub fn set_replication_health(&self, health: f64) {
-        let millipercent = (health.clamp(0.0, 1.0) * 1000.0) as u64;
-        self.replication_health
-            .store(millipercent, Ordering::Relaxed);
-    }
-
-    /// Update under-replicated keys count
-    pub fn set_under_replicated_keys(&self, count: u64) {
-        self.under_replicated_keys.store(count, Ordering::Relaxed);
     }
 
     /// Record a lookup operation with latency and hops
@@ -247,9 +213,6 @@ impl DhtMetricsCollector {
             routing_table_size: self.routing_table_size.load(Ordering::Relaxed),
             buckets_filled: self.buckets_filled.load(Ordering::Relaxed),
             bucket_fullness: self.bucket_fullness.load(Ordering::Relaxed) as f64 / 1000.0,
-            replication_factor: self.replication_factor.load(Ordering::Relaxed),
-            replication_health: self.replication_health.load(Ordering::Relaxed) as f64 / 1000.0,
-            under_replicated_keys: self.under_replicated_keys.load(Ordering::Relaxed),
             lookup_latency_p50_ms: p50,
             lookup_latency_p95_ms: p95,
             lookup_latency_p99_ms: p99,
@@ -269,9 +232,6 @@ impl DhtMetricsCollector {
         self.routing_table_size.store(0, Ordering::Relaxed);
         self.buckets_filled.store(0, Ordering::Relaxed);
         self.bucket_fullness.store(0, Ordering::Relaxed);
-        self.replication_factor.store(8, Ordering::Relaxed);
-        self.replication_health.store(1000, Ordering::Relaxed);
-        self.under_replicated_keys.store(0, Ordering::Relaxed);
         self.operations_total.store(0, Ordering::Relaxed);
         self.operations_success_total.store(0, Ordering::Relaxed);
         self.operations_failed_total.store(0, Ordering::Relaxed);
@@ -298,8 +258,7 @@ mod tests {
         let metrics = collector.get_metrics().await;
 
         assert_eq!(metrics.routing_table_size, 0);
-        assert_eq!(metrics.replication_factor, 8);
-        assert!((metrics.replication_health - 1.0).abs() < 0.01);
+        assert!((metrics.success_rate - 1.0).abs() < 0.01);
     }
 
     #[tokio::test]
@@ -351,20 +310,6 @@ mod tests {
         assert_eq!(metrics.operations_success_total, 7);
         assert_eq!(metrics.operations_failed_total, 3);
         assert!((metrics.success_rate - 0.7).abs() < 0.01);
-    }
-
-    #[tokio::test]
-    async fn test_replication_metrics() {
-        let collector = DhtMetricsCollector::new();
-
-        collector.set_replication_factor(12);
-        collector.set_replication_health(0.85);
-        collector.set_under_replicated_keys(5);
-
-        let metrics = collector.get_metrics().await;
-        assert_eq!(metrics.replication_factor, 12);
-        assert!((metrics.replication_health - 0.85).abs() < 0.01);
-        assert_eq!(metrics.under_replicated_keys, 5);
     }
 
     #[tokio::test]

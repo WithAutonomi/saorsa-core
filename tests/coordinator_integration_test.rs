@@ -35,7 +35,6 @@ async fn test_full_system_integration() {
         bootstrap_nodes: vec![],
         storage_capacity: 10,
         max_connections: 100,
-        replication_factor: 3,
         ml_enabled: true,
         monitoring_interval: Duration::from_secs(5),
         security_level: 7,

@@ -166,7 +166,6 @@ impl ComponentChecker for DhtHealthChecker {
             Some(serde_json::json!({
                 "routing_table_size": size,
                 "min_nodes": self.min_nodes,
-                "replication_factor": 8, // Default K value
             }))
         } else {
             None
@@ -561,18 +560,14 @@ mod tests {
         async fn debug_info(&self) -> Result<DhtDebugInfo> {
             Ok(DhtDebugInfo {
                 routing_table_size: self.routing_table_size,
-                stored_values: 0,
                 pending_queries: 0,
-                replication_factor: 8,
             })
         }
     }
 
     struct DhtDebugInfo {
         routing_table_size: usize,
-        stored_values: usize,
         pending_queries: usize,
-        replication_factor: usize,
     }
 
     struct TestTransport {

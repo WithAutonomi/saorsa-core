@@ -2,7 +2,6 @@
 name = "saorsa-core"
 # 0.10.3: postcard serialization migration (PR #14)
 # 0.10.4: refocus on phonebook + trust signals, remove user-facing APIs (PR #15)
-# 0.10.5: replica planner helper for storage orchestration
 # 0.11.0: remove feature gates — adaptive/trust/placement always compiled
 # 0.11.1: fix Kademlia protocol violations in iterative lookups
 # 0.12.0: configurable max_message_size, bump saorsa-transport to 0.22.0

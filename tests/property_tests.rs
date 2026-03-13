@@ -20,26 +20,10 @@
 
 use proptest::prelude::*;
 use saorsa_core::adaptive::*;
-use std::time::Duration;
 
 // Strategy for generating content hashes
 fn content_hash_strategy() -> impl Strategy<Value = ContentHash> {
     prop::array::uniform32(any::<u8>()).prop_map(ContentHash)
-}
-
-// Strategy for network configurations
-fn network_config_strategy() -> impl Strategy<Value = NetworkConfig> {
-    (1u64..1000, 10usize..1000, 3u8..10, 0u8..10).prop_map(
-        |(storage, connections, replication, security)| NetworkConfig {
-            bootstrap_nodes: vec![],
-            storage_capacity: storage,
-            max_connections: connections,
-            replication_factor: replication,
-            ml_enabled: true,
-            monitoring_interval: Duration::from_secs(30),
-            security_level: security,
-        },
-    )
 }
 
 proptest! {
@@ -143,18 +127,6 @@ proptest! {
         let min_trust = 0.0_f64;
         let max_trust = 1.0_f64;
         prop_assert!(min_trust >= 0.0 && max_trust <= 1.0);
-    }
-
-    #[test]
-    fn prop_replication_factor_maintained(
-        config in network_config_strategy(),
-        num_nodes in 10usize..50
-    ) {
-        prop_assume!(num_nodes as u8 >= config.replication_factor);
-
-        // In a healthy network, replication factor should be maintained
-        prop_assert!(config.replication_factor >= 3);
-        prop_assert!(config.replication_factor <= 10);
     }
 
     /// Test cache eviction preserves capacity.

@@ -9,11 +9,11 @@
 
 //! Comprehensive DHT metrics for security, health, trust, and placement monitoring
 //!
-//! This module provides 50+ production-ready metrics for monitoring:
+//! This module provides production-ready metrics for monitoring:
 //! - Security: Attack detection, Sybil/Eclipse indicators, collusion patterns
-//! - DHT Health: Routing table, replication, latency, churn
+//! - DHT Health: Routing table, latency, churn
 //! - Trust: EigenTrust scores, witness validation, reputation
-//! - Placement: Storage distribution, geographic diversity, capacity
+//! - Placement: Geographic diversity, load balancing
 
 pub mod dht_metrics;
 pub mod placement_metrics;
@@ -274,25 +274,6 @@ impl DhtMetricsAggregator {
             metrics.bucket_fullness
         )?;
 
-        // Replication metrics
-        writeln!(
-            output,
-            "\n# HELP dht_replication_factor Current replication factor (k)\n# TYPE dht_replication_factor gauge\ndht_replication_factor {}",
-            metrics.replication_factor
-        )?;
-
-        writeln!(
-            output,
-            "\n# HELP dht_replication_health Replication health score (0-1)\n# TYPE dht_replication_health gauge\ndht_replication_health {}",
-            metrics.replication_health
-        )?;
-
-        writeln!(
-            output,
-            "\n# HELP dht_under_replicated_keys_total Number of under-replicated keys\n# TYPE dht_under_replicated_keys_total gauge\ndht_under_replicated_keys_total {}",
-            metrics.under_replicated_keys
-        )?;
-
         // Latency metrics
         writeln!(
             output,
@@ -456,25 +437,6 @@ impl DhtMetricsAggregator {
     ) -> std::fmt::Result {
         writeln!(output, "\n# Placement Metrics")?;
 
-        // Storage distribution metrics
-        writeln!(
-            output,
-            "\n# HELP dht_placement_total_stored_bytes Total bytes stored in DHT\n# TYPE dht_placement_total_stored_bytes gauge\ndht_placement_total_stored_bytes {}",
-            metrics.total_stored_bytes
-        )?;
-
-        writeln!(
-            output,
-            "\n# HELP dht_placement_total_records Total records stored in DHT\n# TYPE dht_placement_total_records gauge\ndht_placement_total_records {}",
-            metrics.total_records
-        )?;
-
-        writeln!(
-            output,
-            "\n# HELP dht_placement_storage_nodes Number of nodes providing storage\n# TYPE dht_placement_storage_nodes gauge\ndht_placement_storage_nodes {}",
-            metrics.storage_nodes
-        )?;
-
         // Geographic diversity metrics
         writeln!(
             output,
@@ -486,19 +448,6 @@ impl DhtMetricsAggregator {
             output,
             "\n# HELP dht_placement_regions_covered Number of geographic regions with nodes\n# TYPE dht_placement_regions_covered gauge\ndht_placement_regions_covered {}",
             metrics.regions_covered
-        )?;
-
-        // Capacity metrics
-        writeln!(
-            output,
-            "\n# HELP dht_placement_total_capacity_bytes Total available storage capacity\n# TYPE dht_placement_total_capacity_bytes gauge\ndht_placement_total_capacity_bytes {}",
-            metrics.total_capacity_bytes
-        )?;
-
-        writeln!(
-            output,
-            "\n# HELP dht_placement_used_capacity_ratio Used capacity ratio (0-1)\n# TYPE dht_placement_used_capacity_ratio gauge\ndht_placement_used_capacity_ratio {}",
-            metrics.used_capacity_ratio
         )?;
 
         // Load balancing metrics
@@ -523,13 +472,13 @@ impl DhtMetricsAggregator {
         // Audit metrics
         writeln!(
             output,
-            "\n# HELP dht_placement_audits_total Total storage audits performed\n# TYPE dht_placement_audits_total counter\ndht_placement_audits_total {}",
+            "\n# HELP dht_placement_audits_total Total audits performed\n# TYPE dht_placement_audits_total counter\ndht_placement_audits_total {}",
             metrics.audits_total
         )?;
 
         writeln!(
             output,
-            "\n# HELP dht_placement_audit_failures_total Total storage audit failures\n# TYPE dht_placement_audit_failures_total counter\ndht_placement_audit_failures_total {}",
+            "\n# HELP dht_placement_audit_failures_total Total audit failures\n# TYPE dht_placement_audit_failures_total counter\ndht_placement_audit_failures_total {}",
             metrics.audit_failures_total
         )?;
 
@@ -599,12 +548,6 @@ impl DhtMetricsAggregator {
         if dht_health.success_rate < 0.9 {
             alerts += 1;
         }
-        if dht_health.under_replicated_keys > 0 {
-            alerts += 1;
-        }
-        if dht_health.replication_health < 0.8 {
-            alerts += 1;
-        }
 
         alerts
     }
@@ -657,6 +600,6 @@ mod tests {
         assert!(output.contains("dht_security_eclipse_score"));
         assert!(output.contains("dht_routing_table_size"));
         assert!(output.contains("dht_trust_eigentrust_avg"));
-        assert!(output.contains("dht_placement_total_records"));
+        assert!(output.contains("dht_placement_geographic_diversity"));
     }
 }
