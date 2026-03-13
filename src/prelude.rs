@@ -120,12 +120,6 @@ pub use crate::dht::node_age_verifier::{
 // State Management
 // ============================================================================
 
-/// Persistent state
-pub use crate::persistent_state::{
-    FlushStrategy, IntegrityReport, PersistentStateManager, RecoveryMode, RecoveryStats,
-    StateChangeEvent, StateConfig, TransactionType, WalEntry,
-};
-
 /// Secure memory management
 pub use crate::secure_memory::{
     PoolStats, SecureMemory, SecureMemoryPool, SecureString, SecureVec, allocate_secure,
