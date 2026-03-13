@@ -442,7 +442,7 @@ impl MultiArmedBandit {
 
         // Try legacy tuple format first
         let parsed_legacy: Result<LegacyStatsFormat> = serde_json::from_str(&data).map_err(|e| {
-            P2PError::Storage(crate::error::StorageError::Database(
+            P2PError::State(crate::error::StateError::Database(
                 format!("Failed to deserialize legacy statistics: {}", e).into(),
             ))
         });
@@ -452,7 +452,7 @@ impl MultiArmedBandit {
         } else {
             // New format: {"statistics":[{route_id:{node_id, strategy}, content_type, stats}], "metrics":{...}}
             let v: serde_json::Value = serde_json::from_str(&data).map_err(|e| {
-                P2PError::Storage(crate::error::StorageError::Database(
+                P2PError::State(crate::error::StateError::Database(
                     format!("Failed to parse statistics JSON: {}", e).into(),
                 ))
             })?;
@@ -570,7 +570,7 @@ impl MultiArmedBandit {
         });
 
         let data = serde_json::to_string_pretty(&export).map_err(|e| {
-            P2PError::Storage(crate::error::StorageError::Database(
+            P2PError::State(crate::error::StateError::Database(
                 format!("Failed to serialize statistics: {}", e).into(),
             ))
         })?;

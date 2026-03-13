@@ -33,7 +33,7 @@
 
 #![allow(missing_docs)]
 
-use crate::error::{SecurityError, StorageError};
+use crate::error::{SecurityError, StateError};
 use crate::key_derivation::MasterSeed;
 use crate::secure_memory::{SecureMemory, SecureString};
 use crate::{P2PError, Result};
@@ -377,7 +377,7 @@ impl EncryptedKeyStorageManager {
         // Update statistics
         {
             let mut stats = self.stats.lock().map_err(|_| {
-                P2PError::Storage(StorageError::LockPoisoned(
+                P2PError::State(StateError::LockPoisoned(
                     "mutex lock failed".to_string().into(),
                 ))
             })?;
@@ -427,7 +427,7 @@ impl EncryptedKeyStorageManager {
         // Update cache
         {
             let mut cache = self.key_cache.write().map_err(|_| {
-                P2PError::Storage(StorageError::LockPoisoned(
+                P2PError::State(StateError::LockPoisoned(
                     "write lock failed".to_string().into(),
                 ))
             })?;
@@ -440,7 +440,7 @@ impl EncryptedKeyStorageManager {
         // Update statistics
         {
             let mut stats = self.stats.lock().map_err(|_| {
-                P2PError::Storage(StorageError::LockPoisoned(
+                P2PError::State(StateError::LockPoisoned(
                     "mutex lock failed".to_string().into(),
                 ))
             })?;
@@ -463,13 +463,13 @@ impl EncryptedKeyStorageManager {
         // Check cache first
         {
             let cache = self.key_cache.read().map_err(|_| {
-                P2PError::Storage(StorageError::LockPoisoned(
+                P2PError::State(StateError::LockPoisoned(
                     "read lock failed".to_string().into(),
                 ))
             })?;
             if let Some(cached_seed) = cache.get(seed_id) {
                 let mut stats = self.stats.lock().map_err(|_| {
-                    P2PError::Storage(StorageError::LockPoisoned(
+                    P2PError::State(StateError::LockPoisoned(
                         "mutex lock failed".to_string().into(),
                     ))
                 })?;
@@ -482,7 +482,7 @@ impl EncryptedKeyStorageManager {
         let key_data = self.load_and_decrypt(password).await?;
 
         let seed_bytes = key_data.master_seeds.get(seed_id).ok_or_else(|| {
-            P2PError::Storage(crate::error::StorageError::FileNotFound(
+            P2PError::State(crate::error::StateError::FileNotFound(
                 format!("seed:{}", seed_id).into(),
             ))
         })?;
@@ -492,7 +492,7 @@ impl EncryptedKeyStorageManager {
         // Update cache
         {
             let mut cache = self.key_cache.write().map_err(|_| {
-                P2PError::Storage(StorageError::LockPoisoned(
+                P2PError::State(StateError::LockPoisoned(
                     "write lock failed".to_string().into(),
                 ))
             })?;
@@ -502,7 +502,7 @@ impl EncryptedKeyStorageManager {
         // Update statistics
         {
             let mut stats = self.stats.lock().map_err(|_| {
-                P2PError::Storage(StorageError::LockPoisoned(
+                P2PError::State(StateError::LockPoisoned(
                     "mutex lock failed".to_string().into(),
                 ))
             })?;
@@ -555,7 +555,7 @@ impl EncryptedKeyStorageManager {
         // Update statistics
         {
             let mut stats = self.stats.lock().map_err(|_| {
-                P2PError::Storage(StorageError::LockPoisoned(
+                P2PError::State(StateError::LockPoisoned(
                     "mutex lock failed".to_string().into(),
                 ))
             })?;
@@ -669,7 +669,7 @@ impl EncryptedKeyStorageManager {
     /// Get storage statistics
     pub fn get_stats(&self) -> Result<StorageStats> {
         let stats = self.stats.lock().map_err(|_| {
-            P2PError::Storage(StorageError::LockPoisoned(
+            P2PError::State(StateError::LockPoisoned(
                 "mutex lock failed".to_string().into(),
             ))
         })?;
@@ -679,7 +679,7 @@ impl EncryptedKeyStorageManager {
     /// Clear key cache
     pub fn clear_cache(&self) -> Result<()> {
         let mut cache = self.key_cache.write().map_err(|_| {
-            P2PError::Storage(StorageError::LockPoisoned(
+            P2PError::State(StateError::LockPoisoned(
                 "write lock failed".to_string().into(),
             ))
         })?;
@@ -723,7 +723,7 @@ impl EncryptedKeyStorageManager {
         // Update statistics
         {
             let mut stats = self.stats.lock().map_err(|_| {
-                P2PError::Storage(StorageError::LockPoisoned(
+                P2PError::State(StateError::LockPoisoned(
                     "mutex lock failed".to_string().into(),
                 ))
             })?;
@@ -753,7 +753,7 @@ impl EncryptedKeyStorageManager {
 
         // Serialize key data
         let serialized_data = postcard::to_stdvec(key_data)
-            .map_err(|e| P2PError::Storage(StorageError::Database(e.to_string().into())))?;
+            .map_err(|e| P2PError::State(StateError::Database(e.to_string().into())))?;
 
         // Encrypt data using saorsa-pqc ChaCha20Poly1305
         let mut k = [0u8; 32];
@@ -790,7 +790,7 @@ impl EncryptedKeyStorageManager {
         // Write to file atomically
         let temp_path = self.storage_path.with_extension("tmp");
         let serialized_storage = postcard::to_stdvec(&storage)
-            .map_err(|e| P2PError::Storage(StorageError::Database(e.to_string().into())))?;
+            .map_err(|e| P2PError::State(StateError::Database(e.to_string().into())))?;
 
         {
             let mut file = OpenOptions::new()
@@ -821,15 +821,15 @@ impl EncryptedKeyStorageManager {
 
         // Deserialize storage
         let storage: EncryptedKeyStorage = postcard::from_bytes(&data).map_err(|e| {
-            P2PError::Storage(crate::error::StorageError::CorruptionDetected(
+            P2PError::State(crate::error::StateError::CorruptionDetected(
                 format!("Deserialization failed: {}", e).into(),
             ))
         })?;
 
         // Verify version
         if storage.header.version != STORAGE_FORMAT_VERSION {
-            return Err(P2PError::Storage(
-                crate::error::StorageError::CorruptionDetected(
+            return Err(P2PError::State(
+                crate::error::StateError::CorruptionDetected(
                     format!(
                         "Unsupported storage format version: {}",
                         storage.header.version
@@ -857,7 +857,7 @@ impl EncryptedKeyStorageManager {
 
         // Deserialize key data
         let key_data: KeyStorageData = postcard::from_bytes(&decrypted_data).map_err(|e| {
-            P2PError::Storage(crate::error::StorageError::CorruptionDetected(
+            P2PError::State(crate::error::StateError::CorruptionDetected(
                 format!("Deserialization failed: {}", e).into(),
             ))
         })?;
@@ -873,7 +873,7 @@ impl EncryptedKeyStorageManager {
         file.read_to_end(&mut data).map_err(P2PError::Io)?;
 
         let storage: EncryptedKeyStorage = postcard::from_bytes(&data).map_err(|e| {
-            P2PError::Storage(crate::error::StorageError::CorruptionDetected(
+            P2PError::State(crate::error::StateError::CorruptionDetected(
                 format!("Deserialization failed: {}", e).into(),
             ))
         })?;

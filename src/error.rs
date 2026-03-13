@@ -118,9 +118,9 @@ pub enum P2PError {
     #[error("Cryptography error: {0}")]
     Crypto(#[from] CryptoError),
 
-    // Storage errors
-    #[error("Storage error: {0}")]
-    Storage(#[from] StorageError),
+    // State management errors (locks, data integrity, file I/O)
+    #[error("State error: {0}")]
+    State(#[from] StateError),
 
     // Transport errors
     #[error("Transport error: {0}")]
@@ -347,9 +347,9 @@ pub enum CryptoError {
     HkdfError(Cow<'static, str>),
 }
 
-/// Storage-related errors
+/// State management errors (lock failures, data integrity, file I/O)
 #[derive(Debug, Error)]
-pub enum StorageError {
+pub enum StateError {
     #[error("Database error: {0}")]
     Database(Cow<'static, str>),
 
@@ -921,7 +921,7 @@ fn error_type_name(error: &P2PError) -> &'static str {
         P2PError::Dht(_) => "DHT",
         P2PError::Identity(_) => "Identity",
         P2PError::Crypto(_) => "Crypto",
-        P2PError::Storage(_) => "Storage",
+        P2PError::State(_) => "State",
         P2PError::Transport(_) => "Transport",
         P2PError::Config(_) => "Config",
         P2PError::Io(_) => "IO",
