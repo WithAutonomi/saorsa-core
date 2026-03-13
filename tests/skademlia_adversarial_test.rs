@@ -23,7 +23,7 @@ use saorsa_core::dht::authenticated_sibling_broadcast::{
     SiblingBroadcastConfig, SiblingBroadcastValidator, SignedSiblingEntry,
 };
 use saorsa_core::dht::core_engine::NodeCapacity;
-use saorsa_core::dht::{DHTNode, Key};
+use saorsa_core::dht::{Key, NodeInfo};
 use std::time::{Duration, SystemTime};
 
 // ============================================================================
@@ -46,8 +46,8 @@ fn random_key() -> Key {
     Key::from(bytes)
 }
 
-fn create_test_node() -> DHTNode {
-    DHTNode {
+fn create_test_node() -> NodeInfo {
+    NodeInfo {
         id: PeerId::random(),
         address: "127.0.0.1:8000".parse().unwrap(),
         last_seen: SystemTime::now(),

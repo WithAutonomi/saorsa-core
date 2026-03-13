@@ -18,7 +18,7 @@
 
 use crate::PeerId;
 use crate::adaptive::{EigenTrustEngine, NodeStatisticsUpdate, TrustProvider};
-use crate::bootstrap::{BootstrapManager, ContactEntry, QualityMetrics};
+use crate::bootstrap::{BootstrapConfig, BootstrapManager};
 use crate::config::Config;
 use crate::dht_network_manager::{DhtNetworkConfig, DhtNetworkManager};
 use crate::error::{NetworkError, P2PError, P2pResult as Result, PeerFailureReason};
@@ -91,12 +91,6 @@ pub fn user_agent_for_mode(mode: NodeMode) -> String {
     format!("{prefix}/{}", env!("CARGO_PKG_VERSION"))
 }
 
-/// Default user agent for full DHT-participant nodes.
-#[deprecated(note = "Use `user_agent_for_mode(NodeMode::Node)` instead")]
-pub fn default_node_user_agent() -> String {
-    user_agent_for_mode(NodeMode::Node)
-}
-
 /// Returns `true` if the user agent identifies a full DHT participant (prefix `"node/"`).
 pub fn is_dht_participant(user_agent: &str) -> bool {
     user_agent.starts_with("node/")
@@ -116,15 +110,6 @@ const DEFAULT_LISTEN_PORT: u16 = 9000;
 
 /// DHT max XOR distance (full 160-bit keyspace).
 const DHT_MAX_DISTANCE: u8 = 160;
-
-/// Quality score for successful bootstrap connections.
-const BOOTSTRAP_QUALITY_SCORE_SUCCESS: f64 = 0.8;
-/// Quality score for failed bootstrap connections.
-const BOOTSTRAP_QUALITY_SCORE_FAILURE: f64 = 0.2;
-/// Default uptime score for new bootstrap contacts.
-const BOOTSTRAP_DEFAULT_UPTIME_SCORE: f64 = 0.5;
-/// Penalty duration for failed bootstrap connections.
-const BOOTSTRAP_FAILURE_PENALTY_HOURS: i64 = 1;
 
 /// Default neutral trust score when trust engine is unavailable.
 const DEFAULT_NEUTRAL_TRUST: f64 = 0.5;
@@ -173,7 +158,7 @@ pub struct NodeConfig {
     pub production_config: Option<ProductionConfig>,
 
     /// Bootstrap cache configuration
-    pub bootstrap_cache_config: Option<crate::bootstrap::CacheConfig>,
+    pub bootstrap_cache_config: Option<BootstrapConfig>,
 
     /// Optional IP diversity configuration for Sybil protection tuning.
     ///
@@ -835,20 +820,15 @@ impl P2PNode {
             .map(|prod_config| Arc::new(ResourceManager::new(prod_config)));
 
         // Initialize bootstrap cache manager
-        let cache_config = config.bootstrap_cache_config.clone().unwrap_or_default();
-        let bootstrap_manager = match BootstrapManager::with_full_config(
-            cache_config,
-            crate::rate_limit::JoinRateLimiterConfig::default(),
-            &config,
-        )
-        .await
-        {
-            Ok(manager) => Some(Arc::new(RwLock::new(manager))),
-            Err(e) => {
-                warn!("Failed to initialize bootstrap manager: {e}, continuing without cache");
-                None
-            }
-        };
+        let bootstrap_config = config.bootstrap_cache_config.clone().unwrap_or_default();
+        let bootstrap_manager =
+            match BootstrapManager::with_node_config(bootstrap_config, &config).await {
+                Ok(manager) => Some(Arc::new(RwLock::new(manager))),
+                Err(e) => {
+                    warn!("Failed to initialize bootstrap manager: {e}, continuing without cache");
+                    None
+                }
+            };
 
         // Initialize EigenTrust engine for reputation management.
         // The pre-trusted set starts empty — real PeerIds are learned
@@ -1225,8 +1205,7 @@ impl P2PNode {
         if let Some(ref bootstrap_manager) = self.bootstrap_manager {
             let mut manager = bootstrap_manager.write().await;
             manager
-                .start_background_tasks()
-                .await
+                .start_maintenance()
                 .map_err(|e| protocol_error(format!("Failed to start bootstrap manager: {e}")))?;
             info!("Bootstrap cache manager started");
         }
@@ -1640,17 +1619,25 @@ impl P2PNode {
     }
 
     /// Add a discovered peer to the bootstrap cache
-    pub async fn add_discovered_peer(&self, peer_id: PeerId, addresses: Vec<String>) -> Result<()> {
+    pub async fn add_discovered_peer(
+        &self,
+        _peer_id: PeerId,
+        addresses: Vec<String>,
+    ) -> Result<()> {
         if let Some(ref bootstrap_manager) = self.bootstrap_manager {
-            let manager = bootstrap_manager.write().await;
+            let manager = bootstrap_manager.read().await;
             let socket_addresses: Vec<std::net::SocketAddr> = addresses
                 .iter()
                 .filter_map(|addr| addr.parse().ok())
                 .collect();
-            let contact = ContactEntry::new(peer_id, socket_addresses);
-            manager.add_contact(contact).await.map_err(|e| {
-                protocol_error(format!("Failed to add peer to bootstrap cache: {e}"))
-            })?;
+            if let Some(&primary) = socket_addresses.first() {
+                manager
+                    .add_peer(&primary, socket_addresses)
+                    .await
+                    .map_err(|e| {
+                        protocol_error(format!("Failed to add peer to bootstrap cache: {e}"))
+                    })?;
+            }
         }
         Ok(())
     }
@@ -1664,43 +1651,24 @@ impl P2PNode {
         _error: Option<String>,
     ) -> Result<()> {
         if let Some(ref bootstrap_manager) = self.bootstrap_manager {
-            let manager = bootstrap_manager.write().await;
-
-            // Create quality metrics based on the connection result
-            let metrics = QualityMetrics {
-                success_rate: if success { 1.0 } else { 0.0 },
-                avg_latency_ms: latency_ms.unwrap_or(0) as f64,
-                quality_score: if success {
-                    BOOTSTRAP_QUALITY_SCORE_SUCCESS
-                } else {
-                    BOOTSTRAP_QUALITY_SCORE_FAILURE
-                },
-                last_connection_attempt: chrono::Utc::now(),
-                last_successful_connection: if success {
-                    chrono::Utc::now()
-                } else {
-                    chrono::Utc::now() - chrono::Duration::hours(BOOTSTRAP_FAILURE_PENALTY_HOURS)
-                },
-                uptime_score: BOOTSTRAP_DEFAULT_UPTIME_SCORE,
-            };
-
-            manager
-                .update_contact_metrics(addr, metrics)
-                .await
-                .map_err(|e| protocol_error(format!("Failed to update peer metrics: {e}")))?;
+            let manager = bootstrap_manager.read().await;
+            if success {
+                let rtt_ms = latency_ms.unwrap_or(0) as u32;
+                manager.record_success(addr, rtt_ms).await;
+            } else {
+                manager.record_failure(addr).await;
+            }
         }
         Ok(())
     }
 
     /// Get bootstrap cache statistics
-    pub async fn get_bootstrap_cache_stats(&self) -> Result<Option<crate::bootstrap::CacheStats>> {
+    pub async fn get_bootstrap_cache_stats(
+        &self,
+    ) -> Result<Option<crate::bootstrap::BootstrapStats>> {
         if let Some(ref bootstrap_manager) = self.bootstrap_manager {
             let manager = bootstrap_manager.read().await;
-            let stats = manager
-                .get_stats()
-                .await
-                .map_err(|e| protocol_error(format!("Failed to get bootstrap stats: {e}")))?;
-            Ok(Some(stats))
+            Ok(Some(manager.stats().await))
         } else {
             Ok(None)
         }
@@ -1711,18 +1679,19 @@ impl P2PNode {
         if let Some(ref _bootstrap_manager) = self.bootstrap_manager
             && let Ok(Some(stats)) = self.get_bootstrap_cache_stats().await
         {
-            return stats.total_contacts;
+            return stats.total_peers;
         }
         0
     }
 
     /// Connect to bootstrap peers and perform initial peer discovery
     async fn connect_bootstrap_peers(&self) -> Result<()> {
-        let mut bootstrap_contacts = Vec::new();
+        // Each entry is a list of addresses for a single peer.
+        let mut bootstrap_addr_sets: Vec<Vec<std::net::SocketAddr>> = Vec::new();
         let mut used_cache = false;
         let mut seen_addresses = std::collections::HashSet::new();
 
-        // Configured bootstrap peers take priority — always include them first.
+        // Configured bootstrap peers take priority -- always include them first.
         if !self.config.bootstrap_peers.is_empty() {
             info!(
                 "Using {} configured bootstrap peers (priority)",
@@ -1731,60 +1700,44 @@ impl P2PNode {
             for multiaddr in &self.config.bootstrap_peers {
                 let socket_addr = multiaddr.socket_addr;
                 seen_addresses.insert(socket_addr);
-                // Use a zero sentinel PeerId — the real identity comes
-                // from wait_for_peer_identity() after connecting.
-                let contact = ContactEntry::new(PeerId::from_bytes([0u8; 32]), vec![socket_addr]);
-                bootstrap_contacts.push(contact);
+                bootstrap_addr_sets.push(vec![socket_addr]);
             }
         }
 
         // Supplement with cached bootstrap peers (after CLI peers)
-        // Use QUIC-specific peer selection since we're using saorsa-transport transport
         if let Some(ref bootstrap_manager) = self.bootstrap_manager {
             let manager = bootstrap_manager.read().await;
-            match manager
-                .get_quic_bootstrap_peers(BOOTSTRAP_PEER_BATCH_SIZE)
-                .await
-            {
-                // Try to get top 20 quality QUIC-enabled peers
-                Ok(contacts) => {
-                    if !contacts.is_empty() {
-                        let mut added_from_cache = 0;
-                        for contact in contacts {
-                            // Only add if we haven't already added this address from CLI
-                            let new_addresses: Vec<_> = contact
-                                .addresses
-                                .iter()
-                                .filter(|addr| !seen_addresses.contains(addr))
-                                .copied()
-                                .collect();
+            let cached_peers = manager.select_peers(BOOTSTRAP_PEER_BATCH_SIZE).await;
+            if !cached_peers.is_empty() {
+                let mut added_from_cache = 0;
+                for cached in cached_peers {
+                    let mut addrs = vec![cached.primary_address];
+                    addrs.extend(cached.addresses);
+                    // Only add addresses we haven't seen from CLI peers
+                    let new_addresses: Vec<_> = addrs
+                        .into_iter()
+                        .filter(|a| !seen_addresses.contains(a))
+                        .collect();
 
-                            if !new_addresses.is_empty() {
-                                for addr in &new_addresses {
-                                    seen_addresses.insert(*addr);
-                                }
-                                let mut contact = contact.clone();
-                                contact.addresses = new_addresses;
-                                bootstrap_contacts.push(contact);
-                                added_from_cache += 1;
-                            }
+                    if !new_addresses.is_empty() {
+                        for addr in &new_addresses {
+                            seen_addresses.insert(*addr);
                         }
-                        if added_from_cache > 0 {
-                            info!(
-                                "Added {} cached bootstrap peers (supplementing CLI peers)",
-                                added_from_cache
-                            );
-                            used_cache = true;
-                        }
+                        bootstrap_addr_sets.push(new_addresses);
+                        added_from_cache += 1;
                     }
                 }
-                Err(e) => {
-                    warn!("Failed to get cached bootstrap peers: {}", e);
+                if added_from_cache > 0 {
+                    info!(
+                        "Added {} cached bootstrap peers (supplementing CLI peers)",
+                        added_from_cache
+                    );
+                    used_cache = true;
                 }
             }
         }
 
-        if bootstrap_contacts.is_empty() {
+        if bootstrap_addr_sets.is_empty() {
             info!("No bootstrap peers configured and no cached peers available");
             return Ok(());
         }
@@ -1795,8 +1748,8 @@ impl P2PNode {
         let mut successful_connections = 0;
         let mut connected_peer_ids: Vec<PeerId> = Vec::new();
 
-        for contact in bootstrap_contacts.iter() {
-            for addr in &contact.addresses {
+        for addrs in &bootstrap_addr_sets {
+            for addr in addrs {
                 match self.connect_peer(&addr.to_string()).await {
                     Ok(channel_id) => {
                         // Wait for the remote peer's signed identity announce
@@ -1812,16 +1765,10 @@ impl P2PNode {
 
                                 // Update bootstrap cache with successful connection
                                 if let Some(ref bootstrap_manager) = self.bootstrap_manager {
-                                    let manager = bootstrap_manager.write().await;
-                                    let mut updated_contact = contact.clone();
-                                    updated_contact.peer_id = real_peer_id;
-                                    updated_contact.update_connection_result(true, Some(100), None);
-
-                                    if let Err(e) = manager.add_contact(updated_contact).await {
-                                        warn!("Failed to update bootstrap cache: {}", e);
-                                    }
+                                    let manager = bootstrap_manager.read().await;
+                                    manager.record_success(addr, 100).await;
                                 }
-                                break; // Successfully connected, move to next contact
+                                break; // Successfully connected, move to next peer
                             }
                             Err(e) => {
                                 warn!(
@@ -1838,17 +1785,8 @@ impl P2PNode {
 
                         // Update bootstrap cache with failed connection
                         if used_cache && let Some(ref bootstrap_manager) = self.bootstrap_manager {
-                            let manager = bootstrap_manager.write().await;
-                            let mut updated_contact = contact.clone();
-                            updated_contact.update_connection_result(
-                                false,
-                                None,
-                                Some(e.to_string()),
-                            );
-
-                            if let Err(e) = manager.add_contact(updated_contact).await {
-                                warn!("Failed to update bootstrap cache: {}", e);
-                            }
+                            let manager = bootstrap_manager.read().await;
+                            manager.record_failure(addr).await;
                         }
                     }
                 }
@@ -2038,16 +1976,12 @@ mod diversity_tests {
     async fn build_bootstrap_manager_like_prod(config: &NodeConfig) -> BootstrapManager {
         // Use a temp dir to avoid conflicts with cached files from old format
         let temp_dir = tempfile::TempDir::new().expect("temp dir");
-        let mut cache_config = config.bootstrap_cache_config.clone().unwrap_or_default();
-        cache_config.cache_dir = temp_dir.path().to_path_buf();
+        let mut bootstrap_config = config.bootstrap_cache_config.clone().unwrap_or_default();
+        bootstrap_config.cache_dir = temp_dir.path().to_path_buf();
 
-        BootstrapManager::with_full_config(
-            cache_config,
-            crate::rate_limit::JoinRateLimiterConfig::default(),
-            config,
-        )
-        .await
-        .expect("bootstrap manager")
+        BootstrapManager::with_node_config(bootstrap_config, config)
+            .await
+            .expect("bootstrap manager")
     }
 
     #[tokio::test]

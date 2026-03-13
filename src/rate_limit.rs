@@ -130,7 +130,7 @@ pub enum JoinRateLimitError {
 }
 
 /// Configuration for join rate limiting
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct JoinRateLimiterConfig {
     /// Maximum joins per /64 subnet per hour (default: 1)
     /// This is the strictest limit to prevent Sybil attacks

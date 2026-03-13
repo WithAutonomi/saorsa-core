@@ -30,15 +30,6 @@ pub use core_engine::{
     DhtCoreEngine, DhtKey, DhtRequestWrapper, DhtResponseWrapper, NodeCapacity, NodeInfo,
 };
 
-// Legacy type aliases for backward compatibility
-pub type DHT = DhtCoreEngine;
-pub type DHTNode = NodeInfo;
-pub type SerializableDHTNode = NodeInfo;
-
-// Re-export types from trust_weighted_dht
-pub use trust_weighted_dht::Key as DHT_Key;
-
-// Import additional types for compatibility
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 

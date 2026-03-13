@@ -17,7 +17,7 @@
 //! S/Kademlia provides enhanced security through disjoint path routing, sibling lists,
 //! and cryptographic verification mechanisms to resist various attacks on the DHT.
 
-use crate::dht::{DHTNode, DhtKey, Key, PeerId};
+use crate::dht::{DhtKey, Key, NodeInfo, PeerId};
 use crate::error::{P2PError, P2pResult as Result};
 use crate::quantum_crypto::saorsa_transport_integration::{
     MlDsaPublicKey, MlDsaSignature, ml_dsa_verify,
@@ -45,9 +45,9 @@ pub trait NetworkQuerier: Send + Sync {
     /// A list of nodes that the queried node knows about that are close to the target
     fn query_closest_nodes(
         &self,
-        node: &DHTNode,
+        node: &NodeInfo,
         target: &Key,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<DHTNode>>> + Send + '_>>;
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<NodeInfo>>> + Send + '_>>;
 
     /// Query a node for distance measurement (for witness verification)
     ///
@@ -75,9 +75,9 @@ pub trait NetworkQuerier: Send + Sync {
     /// A list of nodes from the queried node's routing table
     fn query_routing_table(
         &self,
-        node: &DHTNode,
+        node: &NodeInfo,
         bucket_index: Option<usize>,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<DHTNode>>> + Send + '_>>;
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<NodeInfo>>> + Send + '_>>;
 }
 
 /// S/Kademlia configuration parameters
@@ -122,7 +122,7 @@ pub struct DisjointPathLookup {
     /// Target key
     pub target: Key,
     /// Multiple independent paths
-    pub paths: Vec<Vec<DHTNode>>,
+    pub paths: Vec<Vec<NodeInfo>>,
     /// Number of disjoint paths to maintain
     pub path_count: usize,
     /// Maximum nodes shared between paths
@@ -139,15 +139,15 @@ pub struct PathState {
     /// Path ID
     pub path_id: usize,
     /// Nodes in this path
-    pub nodes: Vec<DHTNode>,
+    pub nodes: Vec<NodeInfo>,
     /// Nodes queried in this path
     pub queried: HashSet<PeerId>,
     /// Nodes to query next
-    pub to_query: VecDeque<DHTNode>,
+    pub to_query: VecDeque<NodeInfo>,
     /// Path completion status
     pub completed: bool,
     /// Results found by this path
-    pub results: Vec<DHTNode>,
+    pub results: Vec<NodeInfo>,
 }
 
 /// Sibling list for enhanced routing verification
@@ -156,7 +156,7 @@ pub struct SiblingList {
     /// Local node ID
     pub local_id: Key,
     /// Closest nodes (siblings)
-    pub siblings: Vec<DHTNode>,
+    pub siblings: Vec<NodeInfo>,
     /// Maximum size of sibling list
     pub max_size: usize,
     /// Last update time
@@ -167,9 +167,9 @@ pub struct SiblingList {
 #[derive(Debug, Clone)]
 pub struct SecurityBucket {
     /// Trusted nodes for critical operations
-    pub trusted_nodes: Vec<DHTNode>,
+    pub trusted_nodes: Vec<NodeInfo>,
     /// Alternative routing paths
-    pub backup_routes: Vec<Vec<DHTNode>>,
+    pub backup_routes: Vec<Vec<NodeInfo>>,
     /// Maximum size
     pub max_size: usize,
     /// Last validation time
@@ -312,7 +312,7 @@ impl DisjointPathLookup {
     }
 
     /// Add initial nodes to paths ensuring disjointness
-    pub fn initialize_paths(&mut self, initial_nodes: Vec<DHTNode>) -> Result<()> {
+    pub fn initialize_paths(&mut self, initial_nodes: Vec<NodeInfo>) -> Result<()> {
         if initial_nodes.len() < self.path_count {
             return Err(P2PError::Dht(crate::error::DhtError::InsufficientReplicas(
                 format!(
@@ -359,7 +359,7 @@ impl DisjointPathLookup {
     }
 
     /// Get next node to query for a specific path
-    pub fn get_next_node(&mut self, path_id: usize) -> Option<DHTNode> {
+    pub fn get_next_node(&mut self, path_id: usize) -> Option<NodeInfo> {
         if path_id >= self.path_count {
             return None;
         }
@@ -412,7 +412,7 @@ impl DisjointPathLookup {
     }
 
     /// Add nodes from query results to appropriate paths
-    pub fn add_query_results(&mut self, path_id: usize, nodes: Vec<DHTNode>) {
+    pub fn add_query_results(&mut self, path_id: usize, nodes: Vec<NodeInfo>) {
         if path_id >= self.path_count {
             return;
         }
@@ -470,7 +470,7 @@ impl DisjointPathLookup {
     }
 
     /// Get consolidated results from all paths
-    pub fn get_results(&self) -> Vec<DHTNode> {
+    pub fn get_results(&self) -> Vec<NodeInfo> {
         let mut all_results = Vec::new();
 
         for path_state in &self.path_states {
@@ -504,7 +504,7 @@ impl DisjointPathLookup {
 
     /// Validate consistency of results across paths
     pub fn validate_results(&self) -> Result<bool> {
-        let mut path_results: Vec<Vec<&DHTNode>> = Vec::new();
+        let mut path_results: Vec<Vec<&NodeInfo>> = Vec::new();
 
         for path_state in &self.path_states {
             let mut sorted_results: Vec<_> = path_state.results.iter().collect();
@@ -575,7 +575,7 @@ impl SiblingList {
     }
 
     /// Add or update a node in the sibling list
-    pub fn add_node(&mut self, node: DHTNode) {
+    pub fn add_node(&mut self, node: NodeInfo) {
         // Remove if already exists
         self.siblings.retain(|n| n.address != node.address);
 
@@ -610,12 +610,12 @@ impl SiblingList {
     }
 
     /// Get closest siblings for verification
-    pub fn get_closest_siblings(&self, count: usize) -> Vec<&DHTNode> {
+    pub fn get_closest_siblings(&self, count: usize) -> Vec<&NodeInfo> {
         self.siblings.iter().take(count).collect()
     }
 
     /// Verify a routing decision against sibling knowledge
-    pub fn verify_routing_decision(&self, target: &Key, proposed_nodes: &[DHTNode]) -> bool {
+    pub fn verify_routing_decision(&self, target: &Key, proposed_nodes: &[NodeInfo]) -> bool {
         // If we have no sibling knowledge yet, accept proposed nodes by default
         if self.siblings.is_empty() {
             return true;
@@ -726,7 +726,7 @@ impl SecurityBucket {
     }
 
     /// Add a trusted node to the security bucket
-    pub fn add_trusted_node(&mut self, node: DHTNode) {
+    pub fn add_trusted_node(&mut self, node: NodeInfo) {
         // Remove if already exists
         // Use address for uniqueness to avoid test fixtures with identical IDs
         self.trusted_nodes.retain(|n| n.address != node.address);
@@ -742,12 +742,12 @@ impl SecurityBucket {
     }
 
     /// Get trusted nodes for secure operations
-    pub fn get_trusted_nodes(&self) -> &[DHTNode] {
+    pub fn get_trusted_nodes(&self) -> &[NodeInfo] {
         &self.trusted_nodes
     }
 
     /// Add a backup route
-    pub fn add_backup_route(&mut self, route: Vec<DHTNode>) {
+    pub fn add_backup_route(&mut self, route: Vec<NodeInfo>) {
         self.backup_routes.push(route);
 
         // Keep only a reasonable number of backup routes
@@ -757,7 +757,7 @@ impl SecurityBucket {
     }
 
     /// Get backup routes for redundancy
-    pub fn get_backup_routes(&self) -> &[Vec<DHTNode>] {
+    pub fn get_backup_routes(&self) -> &[Vec<NodeInfo>] {
         &self.backup_routes
     }
 }
@@ -795,8 +795,8 @@ impl SKademlia {
     pub async fn secure_lookup(
         &mut self,
         target: Key,
-        initial_nodes: Vec<DHTNode>,
-    ) -> Result<Vec<DHTNode>> {
+        initial_nodes: Vec<NodeInfo>,
+    ) -> Result<Vec<NodeInfo>> {
         info!("Starting secure lookup for target: {}", hex::encode(target));
 
         // Create disjoint path lookup
@@ -845,9 +845,9 @@ impl SKademlia {
     pub async fn secure_lookup_with_querier<Q: NetworkQuerier>(
         &mut self,
         target: Key,
-        initial_nodes: Vec<DHTNode>,
+        initial_nodes: Vec<NodeInfo>,
         querier: &Q,
-    ) -> Result<Vec<DHTNode>> {
+    ) -> Result<Vec<NodeInfo>> {
         info!(
             "Starting secure lookup with querier for target: {}",
             hex::encode(target)
@@ -954,7 +954,7 @@ impl SKademlia {
     }
 
     /// Update sibling list for a key range
-    pub fn update_sibling_list(&mut self, key: Key, nodes: Vec<DHTNode>) {
+    pub fn update_sibling_list(&mut self, key: Key, nodes: Vec<NodeInfo>) {
         let sibling_list = self
             .sibling_lists
             .entry(key)
@@ -1425,7 +1425,7 @@ impl SKademlia {
         let max_rounds = if suspected_attack { 5 } else { 3 }; // More rounds if attack suspected
 
         // Select witness nodes from routing table based on proximity and reputation
-        let mut candidate_nodes: Vec<(DHTNode, f64)> = Vec::new(); // (node, score)
+        let mut candidate_nodes: Vec<(NodeInfo, f64)> = Vec::new(); // (node, score)
 
         // 1. First, collect trusted nodes from security buckets (highest priority)
         for security_bucket in self.security_buckets.values() {
@@ -1532,14 +1532,14 @@ impl SKademlia {
     /// node's claimed neighbors. Detects inconsistencies that may indicate Sybil attacks.
     pub async fn validate_routing_consistency<Q: NetworkQuerier>(
         &self,
-        nodes: &[DHTNode],
+        nodes: &[NodeInfo],
         querier: &Q,
     ) -> Result<ConsistencyReport> {
         let mut inconsistencies = 0;
         let mut suspicious_nodes = Vec::new();
 
         // Collect trusted validators from security buckets for cross-validation
-        let mut validators: Vec<DHTNode> = Vec::new();
+        let mut validators: Vec<NodeInfo> = Vec::new();
         for security_bucket in self.security_buckets.values() {
             for trusted_node in &security_bucket.trusted_nodes {
                 // Only use nodes with good reputation as validators
@@ -1570,7 +1570,7 @@ impl SKademlia {
 
             // Cross-validation: Query multiple validators about this node's routing table
             if validators.len() >= 2 {
-                let mut validator_reports: Vec<Vec<DHTNode>> = Vec::new();
+                let mut validator_reports: Vec<Vec<NodeInfo>> = Vec::new();
                 let mut responding_validators = 0;
 
                 for validator in &validators {
@@ -1634,8 +1634,8 @@ impl SKademlia {
     /// Compares what different validators report about a node's neighbors.
     /// High score (>0.5) indicates suspicious inconsistencies.
     fn calculate_cross_validation_inconsistency(
-        validator_reports: &[Vec<DHTNode>],
-        target_node: &DHTNode,
+        validator_reports: &[Vec<NodeInfo>],
+        target_node: &NodeInfo,
     ) -> f64 {
         if validator_reports.len() < 2 {
             return 0.0;
@@ -1686,10 +1686,10 @@ impl SKademlia {
     /// Select nodes using security-aware criteria
     pub fn select_secure_nodes(
         &self,
-        candidates: &[DHTNode],
+        candidates: &[NodeInfo],
         target: &Key,
         count: usize,
-    ) -> Vec<DHTNode> {
+    ) -> Vec<NodeInfo> {
         let mut scored_nodes: Vec<_> = candidates
             .iter()
             .map(|node| {
@@ -1763,9 +1763,9 @@ mod tests {
     impl NetworkQuerier for MockNetworkQuerier {
         fn query_closest_nodes(
             &self,
-            _node: &DHTNode,
+            _node: &NodeInfo,
             _target: &Key,
-        ) -> Pin<Box<dyn Future<Output = Result<Vec<DHTNode>>> + Send + '_>> {
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<NodeInfo>>> + Send + '_>> {
             Box::pin(async { Ok(Vec::new()) })
         }
 
@@ -1787,9 +1787,9 @@ mod tests {
 
         fn query_routing_table(
             &self,
-            _node: &DHTNode,
+            _node: &NodeInfo,
             _bucket_index: Option<usize>,
-        ) -> Pin<Box<dyn Future<Output = Result<Vec<DHTNode>>> + Send + '_>> {
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<NodeInfo>>> + Send + '_>> {
             Box::pin(async { Ok(Vec::new()) })
         }
     }

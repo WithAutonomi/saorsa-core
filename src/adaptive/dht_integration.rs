@@ -24,7 +24,7 @@ use crate::PeerId;
 use crate::address::MultiAddr;
 use crate::dht::geographic_network_integration::GeographicNetworkIntegration;
 use crate::dht::geographic_routing::GeographicRegion;
-use crate::dht::{DHT, DhtKey, Key as DhtKeyBytes};
+use crate::dht::{DhtCoreEngine, DhtKey, Key as DhtKeyBytes};
 use crate::dht_network_manager::{DhtNetworkConfig, DhtNetworkManager};
 use async_trait::async_trait;
 
@@ -179,7 +179,7 @@ impl AdaptiveDhtDependencies {
 }
 
 enum AdaptiveDhtBackend {
-    Local { dht: Arc<RwLock<DHT>> },
+    Local { dht: Arc<RwLock<DhtCoreEngine>> },
     Network { manager: Arc<DhtNetworkManager> },
 }
 
@@ -249,7 +249,7 @@ impl AdaptiveDHT {
         let local_key = Self::node_id_to_key(&dependencies.identity.peer_id().clone());
         let node_id = PeerId::from_bytes(local_key);
         let base_dht = Arc::new(RwLock::new(
-            DHT::new(node_id).map_err(|e| AdaptiveNetworkError::Other(e.to_string()))?,
+            DhtCoreEngine::new(node_id).map_err(|e| AdaptiveNetworkError::Other(e.to_string()))?,
         ));
         let geo_integration = Arc::new(
             GeographicNetworkIntegration::new(config.local_region)

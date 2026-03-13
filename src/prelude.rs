@@ -42,7 +42,7 @@ pub use crate::network::{
 };
 
 /// Bootstrap management
-pub use crate::bootstrap::{BootstrapManager, CacheConfig, ContactEntry, QualityMetrics};
+pub use crate::bootstrap::{BootstrapConfig, BootstrapManager, BootstrapStats};
 
 /// DHT types
 pub use crate::dht::Key;

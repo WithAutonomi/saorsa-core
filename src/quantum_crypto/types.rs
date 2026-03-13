@@ -93,10 +93,6 @@ pub struct QuantumPeerIdentity {
     pub created_at: SystemTime,
 }
 
-// NOTE: ML-DSA and ML-KEM types removed - use saorsa-transport types exclusively
-// These were: MlDsaPublicKey, MlDsaPrivateKey, MlKemPublicKey, MlKemPrivateKey
-// Access these via: use saorsa_core::{MlDsaPublicKey, MlDsaSecretKey, MlKemPublicKey, MlKemSecretKey};
-
 /// FROST public key for threshold signatures
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FrostPublicKey(pub Vec<u8>);
@@ -163,15 +159,9 @@ impl fmt::Debug for Ed25519PrivateKey {
     }
 }
 
-// NOTE: MlDsaSignature removed - use saorsa-transport::crypto::pqc::types::MlDsaSignature
-
 /// FROST signature
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FrostSignature(pub Vec<u8>);
-
-// NOTE: MlKemCiphertext removed - use saorsa-transport::crypto::pqc::types::MlKemCiphertext
-
-// NOTE: SharedSecret removed - use saorsa-transport::crypto::pqc::types::SharedSecret
 
 /// Quantum-safe secure session
 #[derive(Debug)]
@@ -233,11 +223,6 @@ pub enum KeyPurpose {
     Authentication,
     KeyWrapping,
 }
-
-// NOTE: PublicKeySet and PrivateKeySet removed to avoid conflicts with saorsa-transport
-// Use saorsa-transport PQC types directly: MlDsaPublicKey, MlDsaSecretKey, MlKemPublicKey, MlKemSecretKey
-// For classical keys, use Ed25519PublicKey, Ed25519PrivateKey from this module
-// For threshold keys, use FrostPublicKey, FrostKeyShare from this module
 
 #[cfg(test)]
 mod tests {

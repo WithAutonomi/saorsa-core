@@ -81,8 +81,6 @@ pub struct RoutingComponents {
     pub trust_engine: Arc<EigenTrustEngine>,
 }
 
-// (StorageComponents removed — storage/replication/retrieval is handled by saorsa-node)
-
 /// Machine learning and adaptive components
 #[derive(Clone)]
 pub struct LearningComponents {
@@ -143,88 +141,6 @@ pub struct NetworkCoordinator {
 
     /// Configuration
     config: NetworkConfig,
-}
-
-// Legacy accessor methods for backward compatibility
-// TODO: Remove these in v0.4.0 - use component groups directly instead
-impl NetworkCoordinator {
-    /// Get the node identity
-    ///
-    /// **Deprecated**: Use `coordinator.network.identity` directly instead.
-    #[deprecated(since = "0.3.16", note = "Use `coordinator.network.identity` directly")]
-    pub fn identity(&self) -> &Arc<NodeIdentity> {
-        &self.network.identity
-    }
-
-    /// Get the transport manager
-    ///
-    /// **Deprecated**: Use `coordinator.network.transport` directly instead.
-    #[deprecated(
-        since = "0.3.16",
-        note = "Use `coordinator.network.transport` directly"
-    )]
-    pub fn transport(&self) -> &Arc<TransportManager> {
-        &self.network.transport
-    }
-
-    /// Get the DHT
-    ///
-    /// **Deprecated**: Use `coordinator.network.dht` directly instead.
-    #[deprecated(since = "0.3.16", note = "Use `coordinator.network.dht` directly")]
-    pub fn dht(&self) -> &Arc<AdaptiveDHT> {
-        &self.network.dht
-    }
-
-    /// Get the router
-    ///
-    /// **Deprecated**: Use `coordinator.network.router` directly instead.
-    #[deprecated(since = "0.3.16", note = "Use `coordinator.network.router` directly")]
-    pub fn router(&self) -> &Arc<AdaptiveRouter> {
-        &self.network.router
-    }
-
-    /// Get the trust engine
-    ///
-    /// **Deprecated**: Use `coordinator.routing.trust_engine` directly instead.
-    #[deprecated(
-        since = "0.3.16",
-        note = "Use `coordinator.routing.trust_engine` directly"
-    )]
-    pub fn trust_engine(&self) -> &Arc<EigenTrustEngine> {
-        &self.routing.trust_engine
-    }
-
-    /// Get the gossip system
-    ///
-    /// **Deprecated**: Use `coordinator.network.gossip` directly instead.
-    #[deprecated(since = "0.3.16", note = "Use `coordinator.network.gossip` directly")]
-    pub fn gossip(&self) -> &Arc<AdaptiveGossipSub> {
-        &self.network.gossip
-    }
-
-    // (content_store and replication accessors removed — storage is handled by saorsa-node)
-
-    /// Get the monitoring system
-    ///
-    /// **Deprecated**: Use `coordinator.operations.monitoring` directly instead.
-    #[deprecated(
-        since = "0.3.16",
-        note = "Use `coordinator.operations.monitoring` directly"
-    )]
-    pub fn monitoring(&self) -> &Arc<MonitoringSystem> {
-        &self.operations.monitoring
-    }
-
-    /// Get the security manager
-    ///
-    /// **Deprecated**: Use `coordinator.operations.security` directly instead.
-    #[deprecated(
-        since = "0.3.16",
-        note = "Use `coordinator.operations.security` directly"
-    )]
-    pub fn security(&self) -> &Arc<SecurityManager> {
-        &self.operations.security
-    }
 }
 
 /// Network configuration
@@ -578,8 +494,6 @@ impl NetworkCoordinator {
         Ok(())
     }
 
-    // (store and retrieve methods removed — storage is handled by saorsa-node)
-
     /// Publish a message to the gossip network
     pub async fn publish(&self, topic: &str, message: Vec<u8>) -> Result<()> {
         // Create gossip message
@@ -843,8 +757,6 @@ impl NetworkCoordinator {
             .map(|(_, path)| path)
             .ok_or_else(|| AdaptiveNetworkError::Routing("No path selected".into()).into())
     }
-
-    // (coordinate_storage removed — storage is handled by saorsa-node)
 
     /// Collect metrics from all components
     pub async fn collect_metrics(&self) -> Result<SystemMetrics> {

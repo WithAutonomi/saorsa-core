@@ -20,7 +20,7 @@
 //! This mirrors the IPv6 identity system to ensure security parity across both address families.
 
 use crate::PeerId;
-use crate::dht::{DHTNode, Key};
+use crate::dht::{Key, NodeInfo};
 use crate::error::SecurityError;
 use crate::security::{IPDiversityConfig, IPDiversityEnforcer, IPv4NodeID};
 use crate::{P2PError, Result};
@@ -32,9 +32,9 @@ use tracing::{debug, info, warn};
 
 /// IPv4-based DHT node identity that binds node ID to network location
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IPv4DHTNode {
+pub struct IPv4NodeInfo {
     /// Base DHT node information
-    pub base_node: DHTNode,
+    pub base_node: NodeInfo,
     /// IPv4-based node identity
     pub ipv4_identity: IPv4NodeID,
     /// IP diversity analysis (stored as IPv6 for unified handling)
@@ -74,7 +74,7 @@ pub struct IPv4DHTIdentityManager {
     /// IP diversity enforcer
     pub ip_enforcer: IPDiversityEnforcer,
     /// Verified IPv4 nodes
-    verified_nodes: HashMap<PeerId, IPv4DHTNode>,
+    verified_nodes: HashMap<PeerId, IPv4NodeInfo>,
     /// Node identity cache (keyed by IP address string, NOT peer ID)
     identity_cache: HashMap<String, (IPv4NodeID, SystemTime)>,
     /// IP analysis cache (keyed by IPv4 address)
@@ -238,9 +238,9 @@ impl IPv4DHTIdentityManager {
     /// Convert a regular DHT node to IPv4-enhanced node
     pub async fn enhance_dht_node(
         &mut self,
-        node: DHTNode,
+        node: NodeInfo,
         ipv4_identity: IPv4NodeID,
-    ) -> Result<IPv4DHTNode> {
+    ) -> Result<IPv4NodeInfo> {
         // Verify IPv4 identity
         let verification_result = self.verify_ipv4_identity(&ipv4_identity).await?;
 
@@ -277,7 +277,7 @@ impl IPv4DHTIdentityManager {
             })?;
         }
 
-        let enhanced_node = IPv4DHTNode {
+        let enhanced_node = IPv4NodeInfo {
             base_node: node,
             ipv4_identity,
             ip_analysis,
@@ -430,7 +430,7 @@ impl IPv4DHTIdentityManager {
     /// Validate node join with IPv4 security checks
     pub async fn validate_node_join(
         &mut self,
-        node: &DHTNode,
+        node: &NodeInfo,
         ipv4_identity: &IPv4NodeID,
     ) -> Result<IPv4SecurityEvent> {
         let node_peer_id = node.id;
@@ -490,7 +490,7 @@ impl IPv4DHTIdentityManager {
     }
 
     /// Get verified IPv4 node by peer ID
-    pub fn get_verified_node(&self, peer_id: &PeerId) -> Option<&IPv4DHTNode> {
+    pub fn get_verified_node(&self, peer_id: &PeerId) -> Option<&IPv4NodeInfo> {
         self.verified_nodes.get(peer_id)
     }
 
@@ -571,10 +571,10 @@ impl IPv4DHTIdentityManager {
     }
 }
 
-impl IPv4DHTNode {
+impl IPv4NodeInfo {
     /// Create a new IPv4 DHT node
     pub fn new(
-        base_node: DHTNode,
+        base_node: NodeInfo,
         ipv4_identity: IPv4NodeID,
         ip_analysis: crate::security::IPAnalysis,
     ) -> Self {
@@ -618,9 +618,9 @@ mod tests {
     use std::str::FromStr;
     use std::time::Duration;
 
-    fn create_test_dht_node(_peer_id: &str, id_bytes: [u8; 32]) -> DHTNode {
+    fn create_test_dht_node(_peer_id: &str, id_bytes: [u8; 32]) -> NodeInfo {
         let port = 8080u16 + id_bytes[0] as u16;
-        DHTNode {
+        NodeInfo {
             id: PeerId::from_bytes(id_bytes),
             address: format!("192.168.1.100:{port}").parse().unwrap(),
             last_seen: SystemTime::now(),
@@ -831,7 +831,7 @@ mod tests {
         let base_node = create_test_dht_node("test_peer", [1u8; 32]);
         let identity = create_test_ipv4_identity();
         let ip_analysis = create_test_ip_analysis();
-        let ipv4_node = IPv4DHTNode::new(base_node, identity, ip_analysis);
+        let ipv4_node = IPv4NodeInfo::new(base_node, identity, ip_analysis);
 
         manager.verified_nodes.insert(peer_id, ipv4_node);
 
@@ -848,7 +848,7 @@ mod tests {
         let base_node = create_test_dht_node("test_peer", [1u8; 32]);
         let identity = create_test_ipv4_identity();
         let ip_analysis = create_test_ip_analysis();
-        let ipv4_node = IPv4DHTNode::new(base_node, identity, ip_analysis);
+        let ipv4_node = IPv4NodeInfo::new(base_node, identity, ip_analysis);
 
         // Add verified node
         manager.verified_nodes.insert(peer_id, ipv4_node);
@@ -868,7 +868,7 @@ mod tests {
         let base_node = create_test_dht_node("test_peer", [1u8; 32]);
         let identity = create_test_ipv4_identity();
         let ip_analysis = create_test_ip_analysis();
-        let ipv4_node = IPv4DHTNode::new(base_node, identity, ip_analysis);
+        let ipv4_node = IPv4NodeInfo::new(base_node, identity, ip_analysis);
 
         manager.verified_nodes.insert(peer_id, ipv4_node);
 
@@ -961,7 +961,7 @@ mod tests {
         let identity = create_test_ipv4_identity();
         let ip_analysis = create_test_ip_analysis();
 
-        let ipv4_node = IPv4DHTNode::new(base_node.clone(), identity.clone(), ip_analysis.clone());
+        let ipv4_node = IPv4NodeInfo::new(base_node.clone(), identity.clone(), ip_analysis.clone());
 
         assert_eq!(ipv4_node.base_node.id, base_node.id);
         assert_eq!(ipv4_node.ipv4_identity.ipv4_addr, identity.ipv4_addr);
@@ -975,7 +975,7 @@ mod tests {
         let identity = create_test_ipv4_identity();
         let ip_analysis = create_test_ip_analysis();
 
-        let ipv4_node = IPv4DHTNode::new(base_node, identity.clone(), ip_analysis);
+        let ipv4_node = IPv4NodeInfo::new(base_node, identity.clone(), ip_analysis);
         let dht_key = ipv4_node.get_dht_key();
 
         // Should match the key generated from identity
@@ -989,7 +989,7 @@ mod tests {
         let identity = create_test_ipv4_identity();
         let ip_analysis = create_test_ip_analysis();
 
-        let ipv4_node = IPv4DHTNode::new(base_node, identity, ip_analysis);
+        let ipv4_node = IPv4NodeInfo::new(base_node, identity, ip_analysis);
 
         // Should not need refresh immediately
         assert!(!ipv4_node.needs_identity_refresh(Duration::from_secs(3600)));
@@ -1116,7 +1116,7 @@ mod tests {
         let identity = IPv4NodeID::generate(ipv4_addr, &secret, &public).unwrap();
         let ip_analysis = create_test_ip_analysis();
 
-        let ipv4_node = IPv4DHTNode::new(base_node, identity, ip_analysis);
+        let ipv4_node = IPv4NodeInfo::new(base_node, identity, ip_analysis);
         let (subnet_24, subnet_16, subnet_8) = ipv4_node.get_subnet_info();
 
         assert_eq!(subnet_24, Ipv4Addr::new(192, 168, 42, 0));

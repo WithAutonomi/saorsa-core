@@ -184,11 +184,6 @@ impl Default for ConnectionQuality {
     }
 }
 
-/// Legacy transport types module for backward compatibility
-pub mod transport_types {
-    pub use super::TransportType;
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

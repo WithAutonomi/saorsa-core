@@ -14,7 +14,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::dht::{DHTNode, Key, PeerId};
+use crate::dht::{Key, NodeInfo, PeerId};
 
 /// Configuration for sibling broadcast validation
 #[derive(Debug, Clone)]
@@ -47,7 +47,7 @@ impl Default for SiblingBroadcastConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignedSiblingEntry {
     /// The sibling node info
-    pub node: DHTNode,
+    pub node: NodeInfo,
     /// Distance from broadcaster
     pub distance: Key,
     /// Signature from the sibling confirming membership
@@ -608,8 +608,8 @@ mod tests {
         PeerId::random()
     }
 
-    fn create_test_node() -> DHTNode {
-        DHTNode {
+    fn create_test_node() -> NodeInfo {
+        NodeInfo {
             id: random_node_id(),
             address: "127.0.0.1:8000".parse().unwrap(),
             last_seen: SystemTime::now(),

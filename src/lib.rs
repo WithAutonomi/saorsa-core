@@ -171,7 +171,7 @@ pub use address::{AddressBook, MultiAddr};
 pub use auth::{
     DelegatedWriteAuth, MlsWriteAuth, PubKey, Sig, SingleWriteAuth, ThresholdWriteAuth, WriteAuth,
 };
-pub use bootstrap::{BootstrapConfig, BootstrapManager, CacheConfig, ContactEntry, QualityMetrics};
+pub use bootstrap::{BootstrapConfig, BootstrapManager, BootstrapStats};
 pub use dht::Key;
 pub use dht_network_manager::{
     DhtNetworkConfig, DhtNetworkEvent, DhtNetworkManager, DhtNetworkOperation, DhtNetworkResult,
@@ -195,8 +195,6 @@ pub use monotonic_counter::{
     BatchUpdateRequest, BatchUpdateResult, CounterStats, MonotonicCounterSystem, PeerCounter,
     SequenceValidationResult,
 };
-#[allow(deprecated)]
-pub use network::default_node_user_agent;
 pub use network::{
     ConnectionStatus, NetworkSender, NodeBuilder, NodeConfig, NodeMode, P2PEvent, P2PNode,
     PeerInfo, PeerResponse, is_dht_participant, user_agent_for_mode,
