@@ -16,8 +16,8 @@ use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::RwLock;
 
 use super::{
-    DhtHealthMetrics, DhtMetricsCollector, PlacementMetrics, PlacementMetricsCollector,
-    SecurityMetrics, SecurityMetricsCollector, TrustMetrics, TrustMetricsCollector,
+    DhtHealthMetrics, DhtMetricsCollector, SecurityMetrics, SecurityMetricsCollector, TrustMetrics,
+    TrustMetricsCollector,
 };
 use crate::dht::routing_maintenance::DataIntegrityMetrics;
 
@@ -234,8 +234,6 @@ pub struct SecurityDashboard {
     dht_collector: Arc<DhtMetricsCollector>,
     /// Trust metrics collector
     trust_collector: Arc<TrustMetricsCollector>,
-    /// Placement metrics collector
-    placement_collector: Arc<PlacementMetricsCollector>,
     /// Alert thresholds
     thresholds: AlertThresholds,
     /// Cached snapshot
@@ -254,13 +252,11 @@ impl SecurityDashboard {
         security_collector: Arc<SecurityMetricsCollector>,
         dht_collector: Arc<DhtMetricsCollector>,
         trust_collector: Arc<TrustMetricsCollector>,
-        placement_collector: Arc<PlacementMetricsCollector>,
     ) -> Self {
         Self {
             security_collector,
             dht_collector,
             trust_collector,
-            placement_collector,
             thresholds: AlertThresholds::default(),
             cached_snapshot: RwLock::new(None),
             cache_ttl: Duration::from_secs(5),
@@ -336,17 +332,16 @@ impl SecurityDashboard {
         let security = self.security_collector.get_metrics().await;
         let dht_health = self.dht_collector.get_metrics().await;
         let trust = self.trust_collector.get_metrics().await;
-        let placement = self.placement_collector.get_metrics().await;
         let data_integrity = self.data_integrity_metrics.read().await.clone();
         let bft_active = *self.bft_mode_active.read().await;
 
         // Generate alerts
-        let alerts = self.generate_alerts(&security, &dht_health, &trust, &placement, bft_active);
+        let alerts = self.generate_alerts(&security, &dht_health, &trust, bft_active);
 
         // Calculate scores
         let security_score = self.calculate_security_score(&security);
         let data_integrity_score = self.calculate_data_integrity_score(data_integrity.as_ref());
-        let network_health_score = self.calculate_network_health_score(&dht_health, &placement);
+        let network_health_score = self.calculate_network_health_score(&dht_health);
         let trust_score = trust.eigentrust_avg;
 
         // Calculate overall health
@@ -373,7 +368,6 @@ impl SecurityDashboard {
             &security,
             &dht_health,
             &trust,
-            &placement,
             data_integrity.as_ref(),
             now,
         );
@@ -400,7 +394,6 @@ impl SecurityDashboard {
         security: &SecurityMetrics,
         dht_health: &DhtHealthMetrics,
         trust: &TrustMetrics,
-        placement: &PlacementMetrics,
         bft_active: bool,
     ) -> Vec<SecurityAlert> {
         let mut alerts = Vec::new();
@@ -429,9 +422,6 @@ impl SecurityDashboard {
 
         // Trust alerts
         self.check_trust_alerts(trust, &mut alerts, now);
-
-        // Capacity alerts
-        self.check_capacity_alerts(placement, &mut alerts, now);
 
         alerts
     }
@@ -660,48 +650,6 @@ impl SecurityDashboard {
         }
     }
 
-    fn check_capacity_alerts(
-        &self,
-        placement: &PlacementMetrics,
-        alerts: &mut Vec<SecurityAlert>,
-        now: SystemTime,
-    ) {
-        // Poor geographic diversity
-        if placement.geographic_diversity < 0.5 {
-            alerts.push(SecurityAlert {
-                id: "geographic_diversity_low".to_string(),
-                severity: AlertSeverity::Warning,
-                category: AlertCategory::DataIntegrity,
-                message: format!(
-                    "Low geographic diversity: {:.1}%",
-                    placement.geographic_diversity * 100.0
-                ),
-                recommendation: "Encourage node deployment in underrepresented regions".to_string(),
-                triggered_at: now,
-                metric_value: placement.geographic_diversity,
-                threshold: 0.5,
-            });
-        }
-
-        // Overloaded nodes
-        if placement.overloaded_nodes > 0 {
-            alerts.push(SecurityAlert {
-                id: "overloaded_nodes".to_string(),
-                severity: if placement.overloaded_nodes > 5 {
-                    AlertSeverity::Critical
-                } else {
-                    AlertSeverity::Warning
-                },
-                category: AlertCategory::Capacity,
-                message: format!("{} nodes are overloaded", placement.overloaded_nodes),
-                recommendation: "Rebalance data distribution across nodes".to_string(),
-                triggered_at: now,
-                metric_value: placement.overloaded_nodes as f64,
-                threshold: 0.0,
-            });
-        }
-    }
-
     /// Calculate security score
     fn calculate_security_score(&self, security: &SecurityMetrics) -> f64 {
         let attack_score = 1.0
@@ -724,17 +672,11 @@ impl SecurityDashboard {
     }
 
     /// Calculate network health score
-    fn calculate_network_health_score(
-        &self,
-        dht_health: &DhtHealthMetrics,
-        placement: &PlacementMetrics,
-    ) -> f64 {
+    fn calculate_network_health_score(&self, dht_health: &DhtHealthMetrics) -> f64 {
         let success = dht_health.success_rate;
         let routing = (dht_health.routing_table_size as f64 / 160.0).min(1.0); // Normalize by max k-buckets
-        let balance = placement.load_balance_score;
-        let diversity = placement.geographic_diversity;
 
-        (success * 0.4 + routing * 0.2 + balance * 0.2 + diversity * 0.2).clamp(0.0, 1.0)
+        (success * 0.6 + routing * 0.4).clamp(0.0, 1.0)
     }
 
     /// Calculate overall health score
@@ -794,7 +736,6 @@ impl SecurityDashboard {
         security: &SecurityMetrics,
         dht_health: &DhtHealthMetrics,
         trust: &TrustMetrics,
-        placement: &PlacementMetrics,
         data_integrity: Option<&DataIntegrityMetrics>,
         now: SystemTime,
     ) -> ComponentStatus {
@@ -846,12 +787,11 @@ impl SecurityDashboard {
             },
             geographic_diversity: ComponentHealth {
                 name: "Geographic Diversity",
-                operational: placement.regions_covered > 0,
-                health_score: placement.geographic_diversity,
+                operational: dht_health.routing_table_size > 0,
+                health_score: dht_health.bucket_fullness,
                 message: format!(
-                    "Score: {:.1}%, {} regions",
-                    placement.geographic_diversity * 100.0,
-                    placement.regions_covered
+                    "{} nodes across {} buckets",
+                    dht_health.routing_table_size, dht_health.buckets_filled
                 ),
                 last_check: now,
             },
@@ -952,9 +892,7 @@ mod tests {
         let security = Arc::new(SecurityMetricsCollector::new());
         let dht = Arc::new(DhtMetricsCollector::new());
         let trust = Arc::new(TrustMetricsCollector::new());
-        let placement = Arc::new(PlacementMetricsCollector::new());
-
-        let dashboard = SecurityDashboard::new(security, dht, trust, placement);
+        let dashboard = SecurityDashboard::new(security, dht, trust);
         let snapshot = dashboard.get_snapshot().await;
 
         assert!(snapshot.health_score >= 0.0 && snapshot.health_score <= 1.0);
@@ -966,10 +904,8 @@ mod tests {
         let security = Arc::new(SecurityMetricsCollector::new());
         let dht = Arc::new(DhtMetricsCollector::new());
         let trust = Arc::new(TrustMetricsCollector::new());
-        let placement = Arc::new(PlacementMetricsCollector::new());
-
-        let dashboard = SecurityDashboard::new(security, dht, trust, placement)
-            .with_cache_ttl(Duration::from_secs(60));
+        let dashboard =
+            SecurityDashboard::new(security, dht, trust).with_cache_ttl(Duration::from_secs(60));
 
         let snapshot1 = dashboard.get_snapshot().await;
         let snapshot2 = dashboard.get_snapshot().await;
@@ -983,9 +919,7 @@ mod tests {
         let security = Arc::new(SecurityMetricsCollector::new());
         let dht = Arc::new(DhtMetricsCollector::new());
         let trust = Arc::new(TrustMetricsCollector::new());
-        let placement = Arc::new(PlacementMetricsCollector::new());
-
-        let dashboard = SecurityDashboard::new(security, dht, trust, placement);
+        let dashboard = SecurityDashboard::new(security, dht, trust);
         let json = dashboard.export_json().await;
 
         assert!(json.contains("\"status\":"));
@@ -998,9 +932,7 @@ mod tests {
         let security = Arc::new(SecurityMetricsCollector::new());
         let dht = Arc::new(DhtMetricsCollector::new());
         let trust = Arc::new(TrustMetricsCollector::new());
-        let placement = Arc::new(PlacementMetricsCollector::new());
-
-        let dashboard = SecurityDashboard::new(security, dht, trust, placement);
+        let dashboard = SecurityDashboard::new(security, dht, trust);
 
         // Set BFT mode active
         dashboard.set_bft_mode(true).await;
@@ -1024,9 +956,7 @@ mod tests {
         let security = Arc::new(SecurityMetricsCollector::new());
         let dht = Arc::new(DhtMetricsCollector::new());
         let trust = Arc::new(TrustMetricsCollector::new());
-        let placement = Arc::new(PlacementMetricsCollector::new());
-
-        let dashboard = SecurityDashboard::new(security, dht, trust, placement);
+        let dashboard = SecurityDashboard::new(security, dht, trust);
         let is_healthy = dashboard.is_healthy().await;
 
         // Default state should be healthy or degraded
@@ -1042,12 +972,10 @@ mod tests {
         let security = Arc::new(SecurityMetricsCollector::new());
         let dht = Arc::new(DhtMetricsCollector::new());
         let trust = Arc::new(TrustMetricsCollector::new());
-        let placement = Arc::new(PlacementMetricsCollector::new());
-
         // Set eclipse attack score (warning level: 0.3)
         security.set_eclipse_score(0.35);
 
-        let dashboard = SecurityDashboard::new(security, dht, trust, placement);
+        let dashboard = SecurityDashboard::new(security, dht, trust);
         let snapshot = dashboard.refresh().await;
 
         // Should have eclipse warning alert
@@ -1073,12 +1001,10 @@ mod tests {
         let security = Arc::new(SecurityMetricsCollector::new());
         let dht = Arc::new(DhtMetricsCollector::new());
         let trust = Arc::new(TrustMetricsCollector::new());
-        let placement = Arc::new(PlacementMetricsCollector::new());
-
         // Set eclipse attack score (critical level: 0.6)
         security.set_eclipse_score(0.7);
 
-        let dashboard = SecurityDashboard::new(security, dht, trust, placement);
+        let dashboard = SecurityDashboard::new(security, dht, trust);
         let snapshot = dashboard.refresh().await;
 
         // Should have critical eclipse alert
@@ -1100,12 +1026,10 @@ mod tests {
         let security = Arc::new(SecurityMetricsCollector::new());
         let dht = Arc::new(DhtMetricsCollector::new());
         let trust = Arc::new(TrustMetricsCollector::new());
-        let placement = Arc::new(PlacementMetricsCollector::new());
-
         // Set sybil attack score (critical level: 0.6)
         security.set_sybil_score(0.65);
 
-        let dashboard = SecurityDashboard::new(security, dht, trust, placement);
+        let dashboard = SecurityDashboard::new(security, dht, trust);
         let snapshot = dashboard.refresh().await;
 
         // Should have sybil critical alert
@@ -1131,12 +1055,10 @@ mod tests {
         let security = Arc::new(SecurityMetricsCollector::new());
         let dht = Arc::new(DhtMetricsCollector::new());
         let trust = Arc::new(TrustMetricsCollector::new());
-        let placement = Arc::new(PlacementMetricsCollector::new());
-
         // Set collusion score (warning level: 0.3)
         security.set_collusion_score(0.4);
 
-        let dashboard = SecurityDashboard::new(security, dht, trust, placement);
+        let dashboard = SecurityDashboard::new(security, dht, trust);
         let snapshot = dashboard.refresh().await;
 
         // Should have collusion warning alert
@@ -1157,10 +1079,8 @@ mod tests {
         let security = Arc::new(SecurityMetricsCollector::new());
         let dht = Arc::new(DhtMetricsCollector::new());
         let trust = Arc::new(TrustMetricsCollector::new());
-        let placement = Arc::new(PlacementMetricsCollector::new());
-
         // Set BFT mode to generate a Warning alert
-        let dashboard = SecurityDashboard::new(security, dht, trust, placement);
+        let dashboard = SecurityDashboard::new(security, dht, trust);
         dashboard.set_bft_mode(true).await;
 
         // Get only critical or higher alerts
@@ -1182,10 +1102,8 @@ mod tests {
         let security = Arc::new(SecurityMetricsCollector::new());
         let dht = Arc::new(DhtMetricsCollector::new());
         let trust = Arc::new(TrustMetricsCollector::new());
-        let placement = Arc::new(PlacementMetricsCollector::new());
-
         // Clean state should have high security score
-        let dashboard = SecurityDashboard::new(security.clone(), dht, trust, placement);
+        let dashboard = SecurityDashboard::new(security.clone(), dht, trust);
         let snapshot = dashboard.refresh().await;
 
         // With no attacks, security score should be high (close to 1.0)
@@ -1214,13 +1132,11 @@ mod tests {
         let security = Arc::new(SecurityMetricsCollector::new());
         let dht = Arc::new(DhtMetricsCollector::new());
         let trust = Arc::new(TrustMetricsCollector::new());
-        let placement = Arc::new(PlacementMetricsCollector::new());
-
         // Set multiple attack scores
         security.set_eclipse_score(0.7);
         security.set_sybil_score(0.7);
 
-        let dashboard = SecurityDashboard::new(security, dht, trust, placement);
+        let dashboard = SecurityDashboard::new(security, dht, trust);
         let snapshot = dashboard.refresh().await;
 
         // Should have alert counts populated
@@ -1241,9 +1157,7 @@ mod tests {
         let security = Arc::new(SecurityMetricsCollector::new());
         let dht = Arc::new(DhtMetricsCollector::new());
         let trust = Arc::new(TrustMetricsCollector::new());
-        let placement = Arc::new(PlacementMetricsCollector::new());
-
-        let dashboard = SecurityDashboard::new(security, dht, trust, placement);
+        let dashboard = SecurityDashboard::new(security, dht, trust);
         let snapshot = dashboard.refresh().await;
 
         // All components should be present
@@ -1268,9 +1182,7 @@ mod tests {
         let security = Arc::new(SecurityMetricsCollector::new());
         let dht = Arc::new(DhtMetricsCollector::new());
         let trust = Arc::new(TrustMetricsCollector::new());
-        let placement = Arc::new(PlacementMetricsCollector::new());
-
-        let dashboard = SecurityDashboard::new(security, dht, trust, placement);
+        let dashboard = SecurityDashboard::new(security, dht, trust);
         let snapshot = dashboard.refresh().await;
 
         // Health score should be weighted average of components
@@ -1286,9 +1198,7 @@ mod tests {
         let security = Arc::new(SecurityMetricsCollector::new());
         let dht = Arc::new(DhtMetricsCollector::new());
         let trust = Arc::new(TrustMetricsCollector::new());
-        let placement = Arc::new(PlacementMetricsCollector::new());
-
-        let dashboard = SecurityDashboard::new(security, dht, trust, placement);
+        let dashboard = SecurityDashboard::new(security, dht, trust);
         let snapshot = dashboard.refresh().await;
 
         // Status should be consistent with health score
@@ -1322,18 +1232,12 @@ mod tests {
         let security = Arc::new(SecurityMetricsCollector::new());
         let dht = Arc::new(DhtMetricsCollector::new());
         let trust = Arc::new(TrustMetricsCollector::new());
-        let placement = Arc::new(PlacementMetricsCollector::new());
-
         // Set attack score at 0.25 (below default warning of 0.3)
         security.set_eclipse_score(0.25);
 
         // With default thresholds, no alert
-        let dashboard_default = SecurityDashboard::new(
-            security.clone(),
-            dht.clone(),
-            trust.clone(),
-            placement.clone(),
-        );
+        let dashboard_default =
+            SecurityDashboard::new(security.clone(), dht.clone(), trust.clone());
         let snapshot1 = dashboard_default.refresh().await;
 
         let default_eclipse_alerts: Vec<_> = snapshot1
@@ -1354,8 +1258,8 @@ mod tests {
             ..Default::default()
         };
 
-        let dashboard_custom = SecurityDashboard::new(security, dht, trust, placement)
-            .with_thresholds(custom_thresholds);
+        let dashboard_custom =
+            SecurityDashboard::new(security, dht, trust).with_thresholds(custom_thresholds);
         let snapshot2 = dashboard_custom.refresh().await;
 
         let custom_eclipse_alerts: Vec<_> = snapshot2

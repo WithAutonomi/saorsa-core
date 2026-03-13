@@ -314,7 +314,7 @@ impl DisjointPathLookup {
     /// Add initial nodes to paths ensuring disjointness
     pub fn initialize_paths(&mut self, initial_nodes: Vec<NodeInfo>) -> Result<()> {
         if initial_nodes.len() < self.path_count {
-            return Err(P2PError::Dht(crate::error::DhtError::InsufficientReplicas(
+            return Err(P2PError::Dht(crate::error::DhtError::InsufficientPeers(
                 format!(
                     "Available: {}, Required: {}",
                     initial_nodes.len(),

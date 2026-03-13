@@ -7,7 +7,7 @@
 // For AGPL-3.0 license, see LICENSE-AGPL-3.0
 // For commercial licensing, contact: david@saorsalabs.com
 
-//! Compile-time + runtime test proving all adaptive/placement/geographic modules
+//! Compile-time + runtime test proving all adaptive/geographic modules
 //! are always available under default features.
 //!
 //! If any of these modules gets re-gated behind a feature flag, this test will
@@ -21,9 +21,6 @@ use saorsa_core::adaptive::{
     EigenTrustEngine, HyperbolicCoordinate, MultiArmedBandit, StrategyChoice, ThompsonSampling,
     TrustProvider,
 };
-
-// Placement module
-use saorsa_core::placement::PlacementConfig;
 
 // Geographic module
 use saorsa_core::geographic_enhanced_network::GeographicNetworkConfig;
@@ -57,11 +54,6 @@ fn adaptive_module_types_constructible() {
 
     // HyperbolicCoordinate (public fields)
     let _coord = HyperbolicCoordinate { r: 0.5, theta: 1.0 };
-}
-
-#[test]
-fn placement_module_accessible() {
-    let _config = PlacementConfig::default();
 }
 
 #[test]

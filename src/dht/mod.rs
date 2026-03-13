@@ -82,7 +82,7 @@ pub mod authenticated_sibling_broadcast;
 /// Routing table maintenance and node validation
 pub mod routing_maintenance;
 
-/// Comprehensive metrics for security, DHT health, trust, and placement
+/// Comprehensive metrics for security, DHT health, and trust
 pub mod metrics;
 
 /// Trust-aware peer selection combining XOR distance with EigenTrust scores
@@ -121,11 +121,10 @@ pub use authenticated_sibling_broadcast::{
     SiblingBroadcastValidator, SignedSiblingEntry,
 };
 
-// Re-export comprehensive metrics types for security, DHT health, trust, and placement
+// Re-export comprehensive metrics types for security, DHT health, and trust
 pub use metrics::{
-    DhtHealthMetrics, DhtMetricsAggregator, DhtMetricsCollector, MetricsSummary, PlacementMetrics,
-    PlacementMetricsCollector, SecurityMetrics, SecurityMetricsCollector, TrustMetrics,
-    TrustMetricsCollector,
+    DhtHealthMetrics, DhtMetricsAggregator, DhtMetricsCollector, MetricsSummary, SecurityMetrics,
+    SecurityMetricsCollector, TrustMetrics, TrustMetricsCollector,
 };
 
 #[cfg(test)]

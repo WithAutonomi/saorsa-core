@@ -872,7 +872,6 @@ impl P2PNode {
             security_metrics,
             Arc::new(crate::dht::metrics::DhtMetricsCollector::new()),
             Arc::new(crate::dht::metrics::TrustMetricsCollector::new()),
-            Arc::new(crate::dht::metrics::PlacementMetricsCollector::new()),
         )));
 
         let node = Self {

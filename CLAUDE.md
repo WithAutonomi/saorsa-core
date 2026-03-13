@@ -149,19 +149,11 @@ Peer phonebook with geographic awareness (no data storage):
 - **Cryptography**: ML-DSA-65 for post-quantum signatures
 - **No PoW**: Pure cryptographic identity without proof-of-work
 
-#### 5. Placement System (`src/placement/`)
-Node selection and orchestration with EigenTrust integration:
-- **Weighted Selection Formula**: `w_i = (τ_i^α) * (p_i^β) * (c_i^γ) * d_i`
-- **Byzantine Tolerance**: Configurable f-out-of-3f+1 fault tolerance
-- **DHT Records**: NODE_AD, GROUP_BEACON, DATA_POINTER (≤512B)
-
 ## External Crate Dependencies
 
 ### Saorsa Ecosystem
-- `saorsa-rsps` (0.2.0): DHT optimization with provider summaries
-- `saorsa-webrtc` (0.1.2): WebRTC with pluggable signaling
-- `saorsa-pqc` (0.3.12): Post-quantum cryptography
-- `saorsa-transport` (0.10+): QUIC transport with NAT traversal and PQC
+- `saorsa-pqc` (0.5): Post-quantum cryptography
+- `saorsa-transport` (0.25+): QUIC transport with NAT traversal and PQC
 
 ### Feature Flags
 ```toml
@@ -200,8 +192,6 @@ cargo test --test security_comprehensive_test            # Security validation
 cargo test --test trust_weighted_dht_test                # Trust-weighted DHT
 cargo test --test trust_weighted_selection_test           # Trust-weighted selection
 
-# Placement
-cargo test --test placement_integration_test             # Placement integration
 ```
 
 ## Common Development Workflows
@@ -213,13 +203,6 @@ cargo test --test placement_integration_test             # Placement integration
 4. Add performance metrics
 5. Write tests in `tests/adaptive_components_test.rs`
 
-### Adding New Placement Strategy
-1. Implement `PlacementStrategy` trait in `src/placement/algorithms.rs`
-2. Add strategy to placement engine configuration
-3. Ensure geographic diversity compliance
-4. Add EigenTrust integration hooks
-5. Write comprehensive tests with property-based testing
-
 ## Important Implementation Details
 
 ### DHT Configuration
@@ -227,14 +210,6 @@ cargo test --test placement_integration_test             # Placement integration
 - **Concurrency**: Alpha=3 parallel lookups
 - **Geographic Awareness**: Region-aware peer selection
 - **Trust Integration**: EigenTrust-weighted peer scoring
-
-### Placement System Configuration
-- **Weighted Selection Formula**: `w_i = (τ_i^α) * (p_i^β) * (c_i^γ) * d_i`
-  - `τ_i`: EigenTrust reputation score (0.0-1.0)
-  - `p_i`: Performance score (0.0-1.0)
-  - `c_i`: Capacity score (0.0-1.0)
-  - `d_i`: Diversity bonus multiplier (1.0-2.0)
-- **Byzantine Tolerance**: f-out-of-3f+1 nodes (configurable f)
 
 ### Performance Optimizations
 - **Connection Pooling**: Max 100 connections with LRU eviction

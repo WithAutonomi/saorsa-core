@@ -151,17 +151,6 @@ pub use crate::rate_limit::{
 };
 
 // ============================================================================
-// Placement & Orchestration
-// ============================================================================
-
-/// Placement system
-pub use crate::placement::{
-    DataPointer, DhtRecord, DiversityEnforcer, GeographicLocation, GroupBeacon, NetworkRegion,
-    NodeAd, PlacementConfig, PlacementDecision, PlacementEngine, PlacementMetrics, RegisterPointer,
-    WeightedPlacementStrategy,
-};
-
-// ============================================================================
 // Adaptive Networking
 // ============================================================================
 

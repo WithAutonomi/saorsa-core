@@ -245,20 +245,17 @@ pub enum DhtError {
     #[error("No suitable peers found")]
     NoPeersFound,
 
-    #[error("Replication failed: {0}")]
-    ReplicationFailed(Cow<'static, str>),
-
     #[error("Query timeout")]
     QueryTimeout,
 
     #[error("Routing error: {0}")]
     RoutingError(Cow<'static, str>),
 
-    #[error("Storage failed: {0}")]
-    StorageFailed(Cow<'static, str>),
+    #[error("Operation failed: {0}")]
+    OperationFailed(Cow<'static, str>),
 
-    #[error("Insufficient replicas: {0}")]
-    InsufficientReplicas(Cow<'static, str>),
+    #[error("Insufficient peers: {0}")]
+    InsufficientPeers(Cow<'static, str>),
 }
 
 /// Identity-related errors

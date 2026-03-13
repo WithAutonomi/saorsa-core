@@ -45,7 +45,6 @@ impl ProductionTestFramework {
             let mut config = Config::default();
             config.network.listen_address = format!("127.0.0.1:{}", 8000 + i);
             config.network.max_connections = 50;
-            // Storage replication factor removed - handled by placement system
             config.security.encryption_enabled = true;
 
             // Create identity for coordinator

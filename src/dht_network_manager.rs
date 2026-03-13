@@ -294,7 +294,7 @@ impl DhtNetworkManager {
             crate::dht::routing_maintenance::close_group_validator::CloseGroupEnforcementMode::LogOnly,
             allow_loopback,
         )
-            .map_err(|e| P2PError::Dht(DhtError::StorageFailed(e.to_string().into())))?;
+            .map_err(|e| P2PError::Dht(DhtError::OperationFailed(e.to_string().into())))?;
         dht_instance.start_maintenance_tasks();
         Ok(dht_instance)
     }

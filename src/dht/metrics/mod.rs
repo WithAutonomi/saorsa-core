@@ -7,23 +7,20 @@
 // For AGPL-3.0 license, see LICENSE-AGPL-3.0
 // For commercial licensing, contact: david@saorsalabs.com
 
-//! Comprehensive DHT metrics for security, health, trust, and placement monitoring
+//! Comprehensive DHT metrics for security, health, and trust monitoring
 //!
 //! This module provides production-ready metrics for monitoring:
 //! - Security: Attack detection, Sybil/Eclipse indicators, collusion patterns
 //! - DHT Health: Routing table, latency, churn
 //! - Trust: EigenTrust scores, witness validation, reputation
-//! - Placement: Geographic diversity, load balancing
 
 pub mod dht_metrics;
-pub mod placement_metrics;
 pub mod security_dashboard;
 pub mod security_metrics;
 pub mod trust_metrics;
 
 // Re-export main types
 pub use dht_metrics::{DhtHealthMetrics, DhtMetricsCollector};
-pub use placement_metrics::{PlacementMetrics, PlacementMetricsCollector};
 pub use security_dashboard::{
     AlertCategory, AlertSeverity, AlertThresholds, ComponentHealth, ComponentStatus,
     DashboardSnapshot, SecurityAlert, SecurityDashboard, SystemStatus,
@@ -40,7 +37,6 @@ pub struct DhtMetricsAggregator {
     security: Arc<SecurityMetricsCollector>,
     dht_health: Arc<DhtMetricsCollector>,
     trust: Arc<TrustMetricsCollector>,
-    placement: Arc<PlacementMetricsCollector>,
 }
 
 impl DhtMetricsAggregator {
@@ -50,7 +46,6 @@ impl DhtMetricsAggregator {
             security: Arc::new(SecurityMetricsCollector::new()),
             dht_health: Arc::new(DhtMetricsCollector::new()),
             trust: Arc::new(TrustMetricsCollector::new()),
-            placement: Arc::new(PlacementMetricsCollector::new()),
         }
     }
 
@@ -69,11 +64,6 @@ impl DhtMetricsAggregator {
         &self.trust
     }
 
-    /// Get the placement metrics collector
-    pub fn placement(&self) -> &Arc<PlacementMetricsCollector> {
-        &self.placement
-    }
-
     /// Export all metrics in Prometheus format
     pub async fn export_prometheus(&self) -> Result<String, std::fmt::Error> {
         let mut output = String::with_capacity(16384);
@@ -89,10 +79,6 @@ impl DhtMetricsAggregator {
         // Trust metrics
         let trust = self.trust.get_metrics().await;
         self.write_trust_metrics(&mut output, &trust)?;
-
-        // Placement metrics
-        let placement = self.placement.get_metrics().await;
-        self.write_placement_metrics(&mut output, &placement)?;
 
         // Add timestamp
         let timestamp = SystemTime::now()
@@ -430,74 +416,17 @@ impl DhtMetricsAggregator {
         Ok(())
     }
 
-    fn write_placement_metrics(
-        &self,
-        output: &mut String,
-        metrics: &PlacementMetrics,
-    ) -> std::fmt::Result {
-        writeln!(output, "\n# Placement Metrics")?;
-
-        // Geographic diversity metrics
-        writeln!(
-            output,
-            "\n# HELP dht_placement_geographic_diversity Geographic diversity score (0-1)\n# TYPE dht_placement_geographic_diversity gauge\ndht_placement_geographic_diversity {}",
-            metrics.geographic_diversity
-        )?;
-
-        writeln!(
-            output,
-            "\n# HELP dht_placement_regions_covered Number of geographic regions with nodes\n# TYPE dht_placement_regions_covered gauge\ndht_placement_regions_covered {}",
-            metrics.regions_covered
-        )?;
-
-        // Load balancing metrics
-        writeln!(
-            output,
-            "\n# HELP dht_placement_load_balance_score Load balance score (0-1, higher is better)\n# TYPE dht_placement_load_balance_score gauge\ndht_placement_load_balance_score {}",
-            metrics.load_balance_score
-        )?;
-
-        writeln!(
-            output,
-            "\n# HELP dht_placement_overloaded_nodes Number of overloaded nodes\n# TYPE dht_placement_overloaded_nodes gauge\ndht_placement_overloaded_nodes {}",
-            metrics.overloaded_nodes
-        )?;
-
-        writeln!(
-            output,
-            "\n# HELP dht_placement_rebalance_operations_total Total rebalance operations\n# TYPE dht_placement_rebalance_operations_total counter\ndht_placement_rebalance_operations_total {}",
-            metrics.rebalance_operations_total
-        )?;
-
-        // Audit metrics
-        writeln!(
-            output,
-            "\n# HELP dht_placement_audits_total Total audits performed\n# TYPE dht_placement_audits_total counter\ndht_placement_audits_total {}",
-            metrics.audits_total
-        )?;
-
-        writeln!(
-            output,
-            "\n# HELP dht_placement_audit_failures_total Total audit failures\n# TYPE dht_placement_audit_failures_total counter\ndht_placement_audit_failures_total {}",
-            metrics.audit_failures_total
-        )?;
-
-        Ok(())
-    }
-
     /// Get aggregated summary metrics
     pub async fn get_summary(&self) -> MetricsSummary {
         let security = self.security.get_metrics().await;
         let dht_health = self.dht_health.get_metrics().await;
         let trust = self.trust.get_metrics().await;
-        let placement = self.placement.get_metrics().await;
 
         MetricsSummary {
             overall_health_score: Self::calculate_health_score(&security, &dht_health, &trust),
             security_score: Self::calculate_security_score(&security),
             dht_health_score: dht_health.success_rate,
             trust_score: trust.eigentrust_avg,
-            placement_score: placement.load_balance_score,
             active_alerts: Self::count_active_alerts(&security, &dht_health),
         }
     }
@@ -570,8 +499,6 @@ pub struct MetricsSummary {
     pub dht_health_score: f64,
     /// Trust score (0-1)
     pub trust_score: f64,
-    /// Placement score (0-1)
-    pub placement_score: f64,
     /// Number of active alerts
     pub active_alerts: usize,
 }
@@ -600,6 +527,5 @@ mod tests {
         assert!(output.contains("dht_security_eclipse_score"));
         assert!(output.contains("dht_routing_table_size"));
         assert!(output.contains("dht_trust_eigentrust_avg"));
-        assert!(output.contains("dht_placement_geographic_diversity"));
     }
 }

@@ -42,7 +42,6 @@ An Architecture Decision Record (ADR) is a document that captures an important a
 |-----|-------|--------|---------|
 | [ADR-007](./ADR-007-adaptive-networking.md) | Adaptive Networking with ML | Accepted | Machine learning for dynamic routing optimization |
 | [ADR-008](./ADR-008-bootstrap-delegation.md) | Bootstrap Cache Delegation | Accepted | Delegating bootstrap to saorsa-transport with Sybil protection |
-| [ADR-011](./ADR-011-geographic-placement.md) | Geographic-Aware Placement | Accepted | Region-aware storage for regulatory compliance |
 
 ### Messaging
 

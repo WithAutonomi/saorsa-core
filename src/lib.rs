@@ -158,9 +158,6 @@ pub mod health;
 /// Geographic-aware networking enhancements for P2P routing optimization
 pub mod geographic_enhanced_network;
 
-/// Placement Loop & Storage Orchestration System
-pub mod placement;
-
 /// Auto-upgrade system for cross-platform binary updates
 pub mod upgrade;
 
@@ -310,13 +307,6 @@ pub use quantum_crypto::types::{
     SecureSession,
     SessionId,
     SessionState,
-};
-
-// Placement system exports
-pub use crate::placement::{
-    DataPointer, DhtRecord, DiversityEnforcer, GeographicLocation, GroupBeacon, NetworkRegion,
-    NodeAd, PlacementConfig, PlacementDecision, PlacementEngine, PlacementMetrics, RegisterPointer,
-    WeightedPlacementStrategy,
 };
 
 // Canonical peer identity type — 32-byte BLAKE3 hash of ML-DSA-65 public key.
