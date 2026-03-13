@@ -15,7 +15,6 @@ This module implements a comprehensive health check system for the P2P Foundatio
 2. **Component Health Checkers**
    - `NetworkHealthChecker` - Monitors peer connections
    - `DhtHealthChecker` - Monitors DHT routing table
-   - `StorageHealthChecker` - Monitors storage availability
    - `ResourceHealthChecker` - Monitors CPU/memory usage
    - `TransportHealthChecker` - Monitors transport status
    - `PeerHealthChecker` - Monitors peer count thresholds
@@ -95,7 +94,6 @@ The health checkers are designed to integrate with the actual P2P components onc
 - Network module for peer counts
 - DHT module for routing table size
 - Transport module for connection status
-- Storage module for disk operations
 - Resource manager for system metrics
 
 Currently, the checkers use function callbacks to allow flexible integration without hard dependencies.

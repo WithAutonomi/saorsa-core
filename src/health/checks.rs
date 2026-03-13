@@ -173,101 +173,6 @@ impl ComponentChecker for DhtHealthChecker {
     }
 }
 
-/// Storage access health checker
-pub struct StorageHealthChecker {
-    storage_path: std::path::PathBuf,
-    min_free_space: u64,
-    timeout_duration: Duration,
-}
-
-impl StorageHealthChecker {
-    /// Create a new storage health checker
-    pub fn new(storage_path: std::path::PathBuf) -> Self {
-        Self {
-            storage_path,
-            min_free_space: 100 * 1024 * 1024, // 100MB default
-            timeout_duration: Duration::from_millis(50),
-        }
-    }
-
-    /// Set minimum free space for healthy status
-    pub fn with_min_free_space(mut self, bytes: u64) -> Self {
-        self.min_free_space = bytes;
-        self
-    }
-}
-
-#[async_trait]
-impl ComponentChecker for StorageHealthChecker {
-    async fn check(&self) -> Result<HealthStatus> {
-        // Check storage accessibility and free space
-        let path = self.storage_path.clone();
-        let min_free = self.min_free_space;
-
-        match timeout(
-            self.timeout_duration,
-            tokio::task::spawn_blocking(move || check_storage_health(&path, min_free)),
-        )
-        .await
-        {
-            Ok(Ok(status)) => Ok(status),
-            Ok(Err(_)) => Ok(HealthStatus::Unhealthy),
-            Err(_) => Ok(HealthStatus::Unhealthy), // Timeout
-        }
-    }
-
-    async fn debug_info(&self) -> Option<JsonValue> {
-        if let Ok(metadata) = tokio::fs::metadata(&self.storage_path).await {
-            // Get disk usage info (simplified)
-            Some(serde_json::json!({
-                "path": self.storage_path.display().to_string(),
-                "exists": true,
-                "is_dir": metadata.is_dir(),
-                "min_free_space": self.min_free_space,
-            }))
-        } else {
-            Some(serde_json::json!({
-                "path": self.storage_path.display().to_string(),
-                "exists": false,
-            }))
-        }
-    }
-}
-
-/// Helper function to check storage health
-fn check_storage_health(path: &std::path::Path, min_free_space: u64) -> HealthStatus {
-    use std::fs;
-
-    // Check if path exists and is writable
-    if !path.exists() {
-        return HealthStatus::Unhealthy;
-    }
-
-    // Try to create a test file to verify write access
-    let test_file = path.join(".health_check");
-    match fs::write(&test_file, b"health_check") {
-        Ok(_) => {
-            // Clean up test file
-            let _ = fs::remove_file(&test_file);
-
-            // Check free space (platform-specific, simplified here)
-            // In production, use a crate like fs2 or sysinfo
-            if get_free_space(path) >= min_free_space {
-                HealthStatus::Healthy
-            } else {
-                HealthStatus::Degraded
-            }
-        }
-        Err(_) => HealthStatus::Unhealthy,
-    }
-}
-
-/// Get free space for a path (stub implementation)
-fn get_free_space(_path: &std::path::Path) -> u64 {
-    // In a real implementation, use platform-specific APIs or a crate
-    1024 * 1024 * 1024 // 1GB default
-}
-
 use crate::production::ResourceManager;
 use std::sync::Arc;
 
@@ -601,26 +506,6 @@ mod tests {
         bytes_sent: u64,
         bytes_received: u64,
     }
-
-    #[tokio::test]
-    async fn test_storage_health_checker() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let checker = StorageHealthChecker::new(temp_dir.path().to_path_buf());
-
-        let status = checker.check().await.unwrap();
-        assert_eq!(status, HealthStatus::Healthy);
-    }
-
-    // TODO: Uncomment when ResourceHealthChecker is implemented
-    // #[tokio::test]
-    // async fn test_resource_health_checker() {
-    //     let config = ProductionConfig::default();
-    //     let manager = Arc::new(ResourceManager::new(config));
-    //
-    //     let checker = ResourceHealthChecker::new(manager);
-    //     let status = checker.check().await.unwrap();
-    //     assert_eq!(status, HealthStatus::Healthy);
-    // }
 
     #[tokio::test]
     async fn test_composite_health_checker() {

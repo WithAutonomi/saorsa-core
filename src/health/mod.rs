@@ -33,7 +33,7 @@ mod metrics;
 
 pub use checks::{
     ComponentChecker, CompositeHealthChecker, DhtHealthChecker, NetworkHealthChecker,
-    PeerHealthChecker, ResourceHealthChecker, StorageHealthChecker, TransportHealthChecker,
+    PeerHealthChecker, ResourceHealthChecker, TransportHealthChecker,
 };
 pub use endpoints::{HealthEndpoints, HealthServer};
 pub use metrics::{HealthMetrics, PrometheusExporter};

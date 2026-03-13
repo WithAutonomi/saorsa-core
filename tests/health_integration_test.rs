@@ -18,7 +18,7 @@ use saorsa_core::Result;
 use saorsa_core::health::{
     ComponentChecker, CompositeHealthChecker, DhtHealthChecker, HealthManager, HealthServer,
     HealthStatus, NetworkHealthChecker, PeerHealthChecker, ResourceHealthChecker,
-    StorageHealthChecker, TransportHealthChecker,
+    TransportHealthChecker,
 };
 use saorsa_core::production::{ProductionConfig, ResourceManager};
 use std::sync::Arc;
@@ -187,21 +187,6 @@ async fn test_dht_health_checker() {
 
     let status = checker.check().await.unwrap();
     assert_eq!(status, HealthStatus::Degraded);
-}
-
-#[tokio::test]
-async fn test_storage_health_checker() {
-    let temp_dir = tempfile::tempdir().unwrap();
-    let checker =
-        StorageHealthChecker::new(temp_dir.path().to_path_buf()).with_min_free_space(1024); // 1KB minimum
-
-    let status = checker.check().await.unwrap();
-    assert_eq!(status, HealthStatus::Healthy);
-
-    // Test with non-existent path
-    let checker = StorageHealthChecker::new(std::path::PathBuf::from("/non/existent/path"));
-    let status = checker.check().await.unwrap();
-    assert_eq!(status, HealthStatus::Unhealthy);
 }
 
 #[tokio::test]
