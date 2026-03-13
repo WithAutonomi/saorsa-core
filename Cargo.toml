@@ -96,7 +96,6 @@ prometheus = { version = "0.14", optional = true, default-features = false }
 
 # Configuration
 toml = "0.8"
-regex = "1.11"
 log = "0.4"
 
 tokio-stream = "0.1"
@@ -110,7 +109,6 @@ tower = { version = "0.5", features = ["util"] }
 reqwest = { version = "0.12", features = ["stream", "rustls-tls"], default-features = false }
 num_cpus = "1.16"
 
-rusqlite = { version = "0.37", features = ["chrono", "serde_json", "uuid", "bundled"] }
 
 # Fix wyz 0.5.0 compatibility issue with tap 1.0 (CI build failure)
 # wyz 0.5.0 has incorrect import path for tap::Pipe, fixed in 0.5.1
