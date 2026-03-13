@@ -47,45 +47,12 @@
 //! ### Basic Placement
 //!
 //! ```rust,ignore
-//! use saorsa_core::placement::{PlacementConfig, PlacementOrchestrator};
-//! use std::time::Duration;
-//!
-//! async fn example() -> Result<(), Box<dyn std::error::Error>> {
-//!     // Create placement configuration
-//!     let config = PlacementConfig::default();
-//!
-//!     // Create orchestrator with required components
-//!     let orchestrator = PlacementOrchestrator::new(config).await?;
-//!
-//!     // Start the placement system
-//!     orchestrator.start().await?;
-//!     Ok(())
-//! }
-//! ```
-//!
-//! ### Advanced Configuration
-//!
-//! ```rust,ignore
-//! use saorsa_core::placement::{PlacementConfig, OptimizationWeights};
+//! use saorsa_core::placement::{PlacementConfig, PlacementEngine};
 //!
 //! // PlacementConfig uses Default for standard setups
 //! // See PlacementConfig documentation for available fields
 //! let config = PlacementConfig::default();
-//! ```
-//!
-//! ### Storage Orchestration
-//!
-//! ```rust,ignore
-//! use saorsa_core::placement::PlacementOrchestrator;
-//!
-//! async fn example() -> Result<(), Box<dyn std::error::Error>> {
-//!     // Create orchestrator with default configuration
-//!     let orchestrator = PlacementOrchestrator::new(Default::default()).await?;
-//!
-//!     // Start audit and repair systems
-//!     orchestrator.start().await?;
-//!     Ok(())
-//! }
+//! let engine = PlacementEngine::new(config);
 //! ```
 //!
 //! ## Architecture
@@ -114,7 +81,6 @@
 pub mod algorithms;
 pub mod dht_records;
 pub mod errors;
-pub mod orchestrator;
 pub mod traits;
 pub mod types;
 
@@ -125,7 +91,6 @@ pub use dht_records::{
     RegisterPointer,
 };
 pub use errors::{PlacementError, PlacementResult};
-pub use orchestrator::PlacementOrchestrator;
 pub use traits::{
     NetworkTopology, NodePerformanceMetrics, PerformanceEstimator, PlacementConstraint,
     PlacementStrategy, PlacementValidator,

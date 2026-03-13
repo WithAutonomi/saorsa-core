@@ -37,10 +37,6 @@ fn test_config_defaults() {
     assert_eq!(config.security.rate_limit, 1000);
     assert!(config.security.encryption_enabled);
     assert_eq!(config.security.min_tls_version, "1.3");
-
-    // Storage defaults
-    assert_eq!(config.storage.path.to_str().unwrap(), "./data");
-    assert_eq!(config.storage.max_size, "10GB");
 }
 
 #[test]
@@ -49,7 +45,6 @@ fn test_development_config() {
 
     assert_eq!(config.network.listen_address, "127.0.0.1:9000");
     assert_eq!(config.security.rate_limit, 10000);
-    assert_eq!(config.storage.path.to_str().unwrap(), "./dev-data");
 }
 
 #[test]
@@ -63,7 +58,6 @@ fn test_production_config() {
 
     assert_eq!(config.network.listen_address, "0.0.0.0:9000");
     assert_eq!(config.transport.buffer_size, 131072);
-    assert!(config.storage.compression_enabled);
 }
 
 #[test]
@@ -134,13 +128,8 @@ fn test_config_validation() {
     config.network.listen_address = "invalid_address".to_string();
     assert!(config.validate().is_err());
 
-    // Fix address but invalid storage size
+    // Fix address but invalid transport protocol
     config.network.listen_address = "127.0.0.1:9000".to_string();
-    config.storage.max_size = "10XB".to_string();
-    assert!(config.validate().is_err());
-
-    // Fix storage size but invalid transport
-    config.storage.max_size = "10GB".to_string();
     config.transport.protocol = "invalid".to_string();
     assert!(config.validate().is_err());
 }
@@ -170,8 +159,6 @@ fn test_bootstrap_address_parsing() {
     let addrs = config.bootstrap_addrs().unwrap();
     assert_eq!(addrs.len(), 3);
 }
-
-// Size format validation test removed - validate_size_format is a private method
 
 #[test]
 fn test_config_save_and_load() {

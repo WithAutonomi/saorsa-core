@@ -746,7 +746,7 @@ impl DhtNetworkManager {
                     Err(e) => {
                         trace!("[NETWORK] Query to {} failed: {}", peer_id.to_hex(), e);
                         self.record_peer_failure(&peer_id).await;
-                        // Don't add failed nodes to best_nodes - they can't be used for replication
+                        // Don't add failed nodes to best_nodes - they are unresponsive
                     }
                 }
             }

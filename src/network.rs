@@ -72,7 +72,7 @@ pub(crate) struct WireMessage {
 /// are treated as ephemeral and excluded from routing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum NodeMode {
-    /// Full DHT-participant node that stores data and routes messages.
+    /// Full DHT-participant node that maintains routing state and routes messages.
     #[default]
     Node,
     /// Ephemeral client that connects to perform operations without joining the DHT.
@@ -759,7 +759,7 @@ pub struct P2PNode {
     /// Shutdown token — cancelled when the node should stop
     shutdown: CancellationToken,
 
-    /// DHT manager for distributed hash table operations (peer discovery, routing, storage)
+    /// DHT manager for distributed hash table operations (peer discovery and routing)
     dht_manager: Arc<DhtNetworkManager>,
 
     /// Production resource manager (optional)
@@ -975,7 +975,7 @@ impl P2PNode {
     /// ```rust,ignore
     /// if let Some(engine) = node.trust_engine() {
     ///     // Update node statistics directly
-    ///     engine.update_node_stats(&peer_id, NodeStatisticsUpdate::StorageContributed(1024)).await;
+    ///     engine.update_node_stats(&peer_id, NodeStatisticsUpdate::CorrectResponse).await;
     ///
     ///     // Get global trust scores
     ///     let scores = engine.compute_global_trust().await;
@@ -998,8 +998,8 @@ impl P2PNode {
     /// # Example
     ///
     /// ```rust,ignore
-    /// // After successfully retrieving a chunk from a peer
-    /// if let Ok(chunk) = fetch_chunk_from(&peer_id).await {
+    /// // After a successful request to a peer
+    /// if let Ok(response) = node.send_request(&peer_id, "my_protocol", payload, timeout).await {
     ///     node.report_peer_success(&peer_id).await?;
     /// }
     /// ```
@@ -1028,9 +1028,9 @@ impl P2PNode {
     /// # Example
     ///
     /// ```rust,ignore
-    /// // After a chunk retrieval fails
-    /// match fetch_chunk_from(&peer_id).await {
-    ///     Ok(chunk) => node.report_peer_success(&peer_id).await?,
+    /// // After a request to a peer fails
+    /// match node.send_request(&peer_id, "my_protocol", payload, timeout).await {
+    ///     Ok(_) => node.report_peer_success(&peer_id).await?,
     ///     Err(_) => node.report_peer_failure(&peer_id).await?,
     /// }
     /// ```
@@ -1064,7 +1064,7 @@ impl P2PNode {
     /// ```rust,ignore
     /// use saorsa_core::error::PeerFailureReason;
     ///
-    /// // After a chunk retrieval returns corrupted data
+    /// // After a peer returns corrupted data
     /// node.report_peer_failure_with_reason(&peer_id, PeerFailureReason::CorruptedData).await?;
     /// ```
     pub async fn report_peer_failure_with_reason(
@@ -1136,7 +1136,7 @@ impl P2PNode {
     /// # Arguments
     ///
     /// * `peer_id` - Target peer
-    /// * `protocol` - Application protocol name (e.g. `"chunk_fetch"`)
+    /// * `protocol` - Application protocol name (e.g. `"peer_info"`)
     /// * `data` - Request payload bytes
     /// * `timeout` - Maximum time to wait for a response
     ///
@@ -1147,7 +1147,7 @@ impl P2PNode {
     /// # Example
     ///
     /// ```rust,ignore
-    /// let response = node.send_request(&peer_id, "chunk_fetch", chunk_id.to_vec(), Duration::from_secs(10)).await?;
+    /// let response = node.send_request(&peer_id, "peer_info", request_data, Duration::from_secs(10)).await?;
     /// println!("Got {} bytes from {}", response.data.len(), response.peer_id);
     /// ```
     pub async fn send_request(

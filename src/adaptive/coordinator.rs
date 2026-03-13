@@ -274,7 +274,7 @@ impl NetworkConfig {
     pub fn from_global_config(config: &crate::config::Config) -> Self {
         Self {
             bootstrap_nodes: config.network.bootstrap_nodes.clone(),
-            storage_capacity: 100, // TODO: parse from config.storage.max_size
+            storage_capacity: 100, // 100 GB default for ML cache sizing
             max_connections: config.network.max_connections,
             replication_factor: config.dht.replication_factor,
             ml_enabled: true,

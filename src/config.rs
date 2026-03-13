@@ -25,16 +25,13 @@
 
 use crate::address::MultiAddr;
 use crate::error::ConfigError;
-use crate::validation::{
-    ValidationContext, validate_config_value, validate_file_path, validate_network_address,
-};
+use crate::validation::{ValidationContext, validate_config_value, validate_network_address};
 use crate::{P2PError, Result};
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::str::FromStr;
 use tracing::info;
 
@@ -47,8 +44,6 @@ pub struct Config {
     pub network: NetworkConfig,
     /// Security configuration
     pub security: SecurityConfig,
-    /// Storage configuration
-    pub storage: StorageConfig,
 
     /// DHT configuration
     pub dht: DhtConfig,
@@ -94,20 +89,6 @@ pub struct SecurityConfig {
     pub min_tls_version: String,
     /// Security level for identity management
     pub identity_security_level: String,
-}
-
-/// Storage configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct StorageConfig {
-    /// Base path for data storage
-    pub path: PathBuf,
-    /// Maximum storage size (e.g., "10GB")
-    pub max_size: String,
-    /// Cache size in MB
-    pub cache_size: u64,
-    /// Enable compression
-    pub compression_enabled: bool,
 }
 
 /// DHT configuration
@@ -208,17 +189,6 @@ impl Default for SecurityConfig {
             encryption_enabled: true,
             min_tls_version: "1.3".to_string(),
             identity_security_level: "High".to_string(),
-        }
-    }
-}
-
-impl Default for StorageConfig {
-    fn default() -> Self {
-        Self {
-            path: PathBuf::from("./data"),
-            max_size: "10GB".to_string(),
-            cache_size: 256,
-            compression_enabled: true,
         }
     }
 }
@@ -397,14 +367,6 @@ impl Config {
             })?;
         }
 
-        // Storage overrides
-        if let Ok(val) = env::var("SAORSA_DATA_PATH") {
-            self.storage.path = PathBuf::from(val);
-        }
-        if let Ok(val) = env::var("SAORSA_MAX_STORAGE") {
-            self.storage.max_size = val;
-        }
-
         Ok(())
     }
 
@@ -449,24 +411,6 @@ impl Config {
             errors.push(P2PError::Config(ConfigError::InvalidValue {
                 field: "rate_limit".to_string().into(),
                 reason: e.to_string().into(),
-            }));
-        }
-
-        // Validate storage path only if it exists; skip strict checks in non-existent dirs
-        if self.storage.path.exists()
-            && let Err(e) = validate_file_path(&self.storage.path)
-        {
-            errors.push(P2PError::Config(ConfigError::InvalidValue {
-                field: "storage.path".to_string().into(),
-                reason: format!("{:?}: {}", self.storage.path, e).into(),
-            }));
-        }
-
-        // Validate storage size format
-        if !self.validate_size_format(&self.storage.max_size) {
-            errors.push(P2PError::Config(ConfigError::InvalidValue {
-                field: "max_size".to_string().into(),
-                reason: format!("Invalid storage size format: {}", self.storage.max_size).into(),
             }));
         }
 
@@ -530,23 +474,12 @@ impl Config {
         }))
     }
 
-    /// Validate size format (e.g., "10GB", "500MB")
-    fn validate_size_format(&self, size: &str) -> bool {
-        thread_local! {
-            // Raw string with single backslashes for regex tokens
-            static SIZE_REGEX: std::result::Result<Regex, P2PError> = Regex::new(r"^\d+(?:\.\d+)?\s*(?:B|KB|MB|GB|TB)$")
-                .map_err(|e| P2PError::Config(ConfigError::InvalidValue { field: "size".to_string().into(), reason: e.to_string().into() }));
-        }
-        SIZE_REGEX.with(|re| re.as_ref().ok().map(|r| r.is_match(size)).unwrap_or(false))
-    }
-
     /// Create development configuration
     pub fn development() -> Self {
         let mut config = Self::default();
         config.network.listen_address = "127.0.0.1:9000".to_string();
         config.security.rate_limit = 10000;
         config.security.connection_limit = 1000;
-        config.storage.path = PathBuf::from("./dev-data");
         config
     }
 
@@ -558,7 +491,6 @@ impl Config {
             env::var("SAORSA_LISTEN_ADDRESS").unwrap_or_else(|_| "0.0.0.0:9000".to_string());
         config.security.rate_limit = 1000;
         config.security.connection_limit = 100;
-        config.storage.path = PathBuf::from("/var/lib/saorsa");
         // Larger buffers in production
         config.transport.buffer_size = 131072;
         config
@@ -588,74 +520,6 @@ impl Config {
                 })
             })
             .collect()
-    }
-
-    /// Parse a size string (e.g., "10GB", "500MB") to bytes
-    ///
-    /// # Examples
-    ///
-    /// ```ignore
-    /// use saorsa_core::config::Config;
-    ///
-    /// assert_eq!(Config::parse_size("10B").unwrap(), 10);
-    /// assert_eq!(Config::parse_size("1KB").unwrap(), 1024);
-    /// assert_eq!(Config::parse_size("5MB").unwrap(), 5 * 1024 * 1024);
-    /// ```
-    pub fn parse_size(size: &str) -> Result<u64> {
-        thread_local! {
-            static SIZE_REGEX: std::result::Result<Regex, P2PError> = Regex::new(r"^(\d+(?:\.\d+)?)\s*(B|KB|MB|GB|TB)$")
-                .map_err(|e| P2PError::Config(ConfigError::InvalidValue { field: "size".to_string().into(), reason: e.to_string().into() }));
-        }
-
-        SIZE_REGEX.with(|re| -> Result<u64> {
-            let re = match re {
-                Ok(r) => r,
-                Err(e) => {
-                    return Err(P2PError::Config(ConfigError::InvalidValue {
-                        field: "size".to_string().into(),
-                        reason: e.to_string().into(),
-                    }));
-                }
-            };
-            if let Some(captures) = re.captures(size) {
-                let value: f64 = captures
-                    .get(1)
-                    .and_then(|m| m.as_str().parse().ok())
-                    .ok_or_else(|| {
-                        P2PError::Config(ConfigError::InvalidValue {
-                            field: "size".to_string().into(),
-                            reason: "Invalid numeric value".to_string().into(),
-                        })
-                    })?;
-
-                let unit = captures.get(2).map(|m| m.as_str()).unwrap_or("B");
-                let multiplier = match unit {
-                    "B" => 1u64,
-                    "KB" => 1024,
-                    "MB" => 1024 * 1024,
-                    "GB" => 1024 * 1024 * 1024,
-                    "TB" => 1024u64.pow(4),
-                    _ => {
-                        return Err(P2PError::Config(ConfigError::InvalidValue {
-                            field: "size".to_string().into(),
-                            reason: format!("Unknown unit: {}", unit).into(),
-                        }));
-                    }
-                };
-
-                Ok((value * multiplier as f64) as u64)
-            } else {
-                Err(P2PError::Config(ConfigError::InvalidValue {
-                    field: "size".to_string().into(),
-                    reason: format!("Invalid size format: {}", size).into(),
-                }))
-            }
-        })
-    }
-
-    /// Get storage max size in bytes
-    pub fn storage_max_size_bytes(&self) -> Result<u64> {
-        Self::parse_size(&self.storage.max_size)
     }
 }
 
@@ -756,30 +620,5 @@ mod tests {
                 None => env::remove_var("SAORSA_RATE_LIMIT"),
             }
         }
-    }
-
-    #[test]
-    fn test_size_validation() {
-        let config = Config::default();
-        assert!(config.validate_size_format("10GB"));
-        assert!(config.validate_size_format("500MB"));
-        assert!(config.validate_size_format("1.5TB"));
-        assert!(!config.validate_size_format("10XB"));
-        assert!(!config.validate_size_format("invalid"));
-    }
-
-    #[test]
-    fn test_size_parsing() {
-        assert_eq!(Config::parse_size("10B").unwrap(), 10);
-        assert_eq!(Config::parse_size("1KB").unwrap(), 1024);
-        assert_eq!(Config::parse_size("5MB").unwrap(), 5 * 1024 * 1024);
-        assert_eq!(Config::parse_size("1GB").unwrap(), 1024 * 1024 * 1024);
-        assert_eq!(Config::parse_size("1.5GB").unwrap(), 1610612736);
-        assert_eq!(Config::parse_size("1TB").unwrap(), 1024u64.pow(4));
-
-        // Test error cases
-        assert!(Config::parse_size("invalid").is_err());
-        assert!(Config::parse_size("10XB").is_err());
-        assert!(Config::parse_size("GB").is_err());
     }
 }
