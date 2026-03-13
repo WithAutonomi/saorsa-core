@@ -97,30 +97,6 @@ async fn test_trust_affects_peer_order_in_selection() {
 }
 
 #[tokio::test]
-async fn test_storage_config_stricter_than_query_config() {
-    // Verify that storage configs can exclude untrusted nodes while query configs don't
-    let storage_config = TrustSelectionConfig::for_storage();
-    let query_config = TrustSelectionConfig::for_queries();
-
-    assert!(
-        storage_config.exclude_untrusted,
-        "Storage should exclude untrusted"
-    );
-    assert!(
-        !query_config.exclude_untrusted,
-        "Query should not exclude untrusted"
-    );
-    assert!(
-        storage_config.min_trust_threshold > query_config.min_trust_threshold,
-        "Storage should have higher threshold"
-    );
-    assert!(
-        storage_config.trust_weight > query_config.trust_weight,
-        "Storage should weight trust more heavily"
-    );
-}
-
-#[tokio::test]
 async fn test_trust_engine_integration_with_statistics() {
     // Test that EigenTrust engine correctly processes node statistics updates
     let trust_engine = Arc::new(EigenTrustEngine::new(HashSet::new()));

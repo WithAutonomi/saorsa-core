@@ -198,10 +198,13 @@ async fn test_churn_predictor_basic() -> anyhow::Result<()> {
     let predictor = ChurnPredictor::new();
     println!("✓ Churn Predictor instance created successfully");
 
-    // Test basic functionality exists
+    // Test basic prediction exists
     let node_id = PeerId::from_bytes([1u8; 32]);
-    let should_replicate = predictor.should_replicate(&node_id).await;
-    println!("Should replicate from new node: {}", should_replicate);
+    let prediction = predictor.predict(&node_id).await;
+    println!(
+        "Churn prediction for new node: probability_1h={:.2}",
+        prediction.probability_1h
+    );
 
     Ok(())
 }

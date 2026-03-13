@@ -116,7 +116,7 @@ impl LearningComponents {
     /// Build ML/learning components from configuration
     ///
     /// Creates: mab, q_learning_cache, churn_predictor
-    pub async fn build(config: &NetworkConfig) -> Result<(Self, Arc<ChurnPredictor>)> {
+    pub async fn build(_config: &NetworkConfig) -> Result<(Self, Arc<ChurnPredictor>)> {
         // Initialize ML components
         let churn_predictor = Arc::new(ChurnPredictor::new());
 
@@ -132,7 +132,7 @@ impl LearningComponents {
         let q_config = QLearningConfig::default();
         let q_learning_cache = Arc::new(QLearningCacheManager::new(
             q_config,
-            config.storage_capacity * 1024 * 1024,
+            super::coordinator::DEFAULT_ML_CACHE_CAPACITY_BYTES,
         ));
 
         let components = Self {
@@ -333,7 +333,7 @@ mod tests {
             Ok(Ok((network, router))) => {
                 // 4. Build operations (needs trust_engine, churn_predictor, router, gossip, cache)
                 let cache = Arc::new(QLearnCacheManager::new(
-                    (config.storage_capacity * 1024 * 1024) as usize,
+                    crate::adaptive::coordinator::DEFAULT_ML_CACHE_CAPACITY_BYTES as usize,
                 ));
                 let ops_result = OperationsComponents::build(
                     &config,

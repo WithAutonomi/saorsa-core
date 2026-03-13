@@ -148,9 +148,6 @@ pub struct NetworkConfig {
     /// Bootstrap nodes for joining
     pub bootstrap_nodes: Vec<String>,
 
-    /// Storage capacity in GB
-    pub storage_capacity: u64,
-
     /// Maximum connections
     pub max_connections: usize,
 
@@ -171,7 +168,6 @@ impl Default for NetworkConfig {
 
         Self {
             bootstrap_nodes: global_config.network.bootstrap_nodes.clone(),
-            storage_capacity: 100, // 100 GB
             max_connections: global_config.network.max_connections,
             ml_enabled: true,
             monitoring_interval: Duration::from_secs(30),
@@ -185,7 +181,6 @@ impl NetworkConfig {
     pub fn from_global_config(config: &crate::config::Config) -> Self {
         Self {
             bootstrap_nodes: config.network.bootstrap_nodes.clone(),
-            storage_capacity: 100, // 100 GB default for ML cache sizing
             max_connections: config.network.max_connections,
             ml_enabled: true,
             monitoring_interval: Duration::from_secs(30),
@@ -224,8 +219,6 @@ enum NetworkHealthStatus {
 #[allow(dead_code)]
 enum MessageType {
     DHTLookup,
-    DataStore,
-    DataRetrieve,
     GossipBroadcast,
     TrustUpdate,
     ChurnNotification,
@@ -253,6 +246,13 @@ pub struct SystemMetrics {
 }
 
 use futures::future::BoxFuture;
+
+/// Default ML cache capacity in bytes (100 MB).
+///
+/// Used to size Q-learning and retrieval caches that the coordinator creates
+/// for adaptive routing decisions. This is purely an in-memory ML budget and
+/// has nothing to do with on-disk storage.
+pub(crate) const DEFAULT_ML_CACHE_CAPACITY_BYTES: u64 = 100 * 1024 * 1024;
 
 impl NetworkCoordinator {
     /// Create a new network coordinator
@@ -315,7 +315,7 @@ impl NetworkCoordinator {
         let q_config = QLearningConfig::default();
         let q_learning_cache = Arc::new(QLearningCacheManager::new(
             q_config.clone(),
-            config.storage_capacity * 1024 * 1024,
+            DEFAULT_ML_CACHE_CAPACITY_BYTES,
         ));
 
         // Initialize churn handler
@@ -334,7 +334,7 @@ impl NetworkCoordinator {
 
         // Create cache for monitoring (from learning module)
         let retrieval_cache = Arc::new(QLearnCacheManager::new(
-            (config.storage_capacity * 1024 * 1024) as usize,
+            DEFAULT_ML_CACHE_CAPACITY_BYTES as usize,
         ));
 
         // Initialize monitoring
@@ -649,7 +649,6 @@ impl NetworkCoordinator {
             som_position: None,
             trust: 0.0,
             capabilities: NodeCapabilities {
-                storage: self.config.storage_capacity,
                 compute: 0,
                 bandwidth: 0,
             },
@@ -700,7 +699,6 @@ impl NetworkCoordinator {
         // Simple classification based on content
         match message.msg_type {
             ContentType::DHTLookup => MessageType::DHTLookup,
-            ContentType::DataRetrieval => MessageType::DataRetrieve,
             _ => MessageType::GossipBroadcast,
         }
     }

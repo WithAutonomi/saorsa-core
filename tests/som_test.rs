@@ -28,7 +28,6 @@ fn create_test_features(seed: u8) -> NodeFeatures {
         content_vector: vec![seed as f64 / 255.0; 128],
         compute_capability: (seed as f64 * 4.0) % 1000.0,
         network_latency: (seed as f64 * 0.5) % 200.0,
-        storage_available: (seed as f64 * 10.0) % 5000.0,
     }
 }
 
@@ -49,7 +48,6 @@ mod feature_tests {
             content_vector: vec![0.0, 0.5, 1.0, 2.0],
             compute_capability: 500.0,
             network_latency: 100.0,
-            storage_available: 2500.0,
         };
 
         let normalized = features.normalize();
@@ -69,7 +67,6 @@ mod feature_tests {
         // Check other features are in [0, 1] range
         assert!(normalized.compute_capability >= 0.0 && normalized.compute_capability <= 1.0);
         assert!(normalized.network_latency >= 0.0 && normalized.network_latency <= 1.0);
-        assert!(normalized.storage_available >= 0.0 && normalized.storage_available <= 1.0);
     }
 
     #[test]
@@ -79,7 +76,6 @@ mod feature_tests {
             content_vector: vec![0.0; 128],
             compute_capability: 0.0,
             network_latency: 0.0,
-            storage_available: 0.0,
         };
 
         let normalized = features.normalize();
@@ -88,7 +84,6 @@ mod feature_tests {
         assert!(normalized.content_vector.iter().all(|&x| x == 0.0));
         assert_eq!(normalized.compute_capability, 0.0);
         assert_eq!(normalized.network_latency, 0.0);
-        assert_eq!(normalized.storage_available, 0.0);
     }
 
     #[test]
@@ -97,14 +92,12 @@ mod feature_tests {
             content_vector: vec![1.0, 0.0, 0.0, 0.0],
             compute_capability: 100.0,
             network_latency: 50.0,
-            storage_available: 1000.0,
         };
 
         let features2 = NodeFeatures {
             content_vector: vec![0.0, 1.0, 0.0, 0.0],
             compute_capability: 200.0,
             network_latency: 100.0,
-            storage_available: 2000.0,
         };
 
         let distance = features1.euclidean_distance(&features2);
@@ -131,7 +124,6 @@ mod feature_tests {
                 content_vector: vec![v1, v2, v3, v4],
                 compute_capability: 500.0,
                 network_latency: 100.0,
-                storage_available: 2000.0,
             };
 
             let normalized = features.normalize();
@@ -721,11 +713,11 @@ mod integration_tests {
             all_nodes.push((node_id, features));
         }
 
-        // Cluster 2: High storage, moderate latency (storage nodes)
+        // Cluster 2: High latency, moderate compute (edge nodes)
         for i in 20..40 {
             let mut features = create_test_features(i);
-            features.storage_available = 4000.0 + (i as f64 * 50.0);
-            features.network_latency = 50.0 + (i as f64 * 2.0);
+            features.network_latency = 150.0 + (i as f64 * 2.0);
+            features.compute_capability = 300.0 + (i as f64 * 5.0);
             all_features.push(features.clone());
 
             let node_id = create_test_node_id(i);

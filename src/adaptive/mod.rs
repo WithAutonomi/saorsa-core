@@ -198,7 +198,6 @@ pub struct HyperbolicCoordinate {
 /// Node capabilities for resource discovery
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeCapabilities {
-    pub storage: u64,   // GB available
     pub compute: u64,   // Benchmark score
     pub bandwidth: u64, // Mbps available
 }
@@ -313,7 +312,6 @@ pub struct LearningContext {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ContentType {
     DHTLookup,
-    DataRetrieval,
     ComputeRequest,
     RealtimeMessage,
     DiscoveryProbe,

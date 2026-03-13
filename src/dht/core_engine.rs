@@ -76,7 +76,6 @@ impl NodeInfo {
 /// Node capacity metrics
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeCapacity {
-    pub storage_available: u64,
     pub bandwidth_available: u64,
     pub reliability_score: f64,
 }
@@ -84,8 +83,7 @@ pub struct NodeCapacity {
 impl Default for NodeCapacity {
     fn default() -> Self {
         Self {
-            storage_available: 1_000_000_000, // 1GB
-            bandwidth_available: 10_000_000,  // 10MB/s
+            bandwidth_available: 10_000_000, // 10MB/s
             reliability_score: 1.0,
         }
     }

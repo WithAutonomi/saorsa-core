@@ -16,8 +16,8 @@
 //!
 //! ## Age-Based Trust Model
 //!
-//! - **New nodes** (< 1 hour): Very limited trust, cannot participate in replication
-//! - **Young nodes** (1-24 hours): Limited trust, can store data but not for critical ops
+//! - **New nodes** (< 1 hour): Very limited trust, very limited routing participation
+//! - **Young nodes** (1-24 hours): Limited trust, growing routing trust, not yet for critical ops
 //! - **Established nodes** (1-7 days): Normal trust, full participation
 //! - **Veteran nodes** (> 7 days): Highest trust, preferred for critical operations
 //!
@@ -59,8 +59,8 @@ impl NodeAgeCategory {
         }
     }
 
-    /// Check if this category can participate in replication
-    pub fn can_replicate(&self) -> bool {
+    /// Check if this category can participate in full routing operations
+    pub fn can_participate_in_routing(&self) -> bool {
         !matches!(self, NodeAgeCategory::New)
     }
 
@@ -86,8 +86,8 @@ impl NodeAgeCategory {
 /// Configuration for node age verification
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeAgeConfig {
-    /// Minimum age to participate in replication (seconds)
-    pub min_replication_age_secs: u64,
+    /// Minimum age for full routing participation (seconds)
+    pub min_full_routing_age_secs: u64,
     /// Minimum age for critical operations (seconds)
     pub min_critical_ops_age_secs: u64,
     /// Whether to enforce age requirements
@@ -103,7 +103,7 @@ pub struct NodeAgeConfig {
 impl Default for NodeAgeConfig {
     fn default() -> Self {
         Self {
-            min_replication_age_secs: 3600,   // 1 hour
+            min_full_routing_age_secs: 3600,  // 1 hour
             min_critical_ops_age_secs: 86400, // 24 hours
             enforce_age_requirements: true,
             trust_bonus_per_day: 0.05,
@@ -126,7 +126,7 @@ impl NodeAgeConfig {
     #[must_use]
     pub fn testnet() -> Self {
         Self {
-            min_replication_age_secs: 0,     // No minimum age for replication
+            min_full_routing_age_secs: 0,    // No minimum age for full routing
             min_critical_ops_age_secs: 0,    // No minimum age for critical ops
             enforce_age_requirements: false, // Disable age enforcement entirely
             trust_bonus_per_day: 0.0,        // No trust bonus from age
@@ -144,7 +144,7 @@ impl NodeAgeConfig {
     /// Check if this is a testnet or permissive configuration.
     #[must_use]
     pub fn is_relaxed(&self) -> bool {
-        !self.enforce_age_requirements || self.min_replication_age_secs == 0
+        !self.enforce_age_requirements || self.min_full_routing_age_secs == 0
     }
 }
 
@@ -236,8 +236,8 @@ pub struct AgeVerificationResult {
     pub age_secs: u64,
     /// Trust multiplier based on age
     pub trust_multiplier: f64,
-    /// Whether node can participate in replication
-    pub can_replicate: bool,
+    /// Whether node can participate in full routing operations
+    pub can_route: bool,
     /// Whether node can participate in critical operations
     pub can_participate_critical: bool,
     /// Reason if check failed
@@ -320,7 +320,7 @@ impl NodeAgeVerifier {
             let min_age = match operation {
                 OperationType::BasicRead => 0,
                 OperationType::BasicWrite => 0,
-                OperationType::Replication => self.config.min_replication_age_secs,
+                OperationType::FullRouting => self.config.min_full_routing_age_secs,
                 OperationType::CriticalOperation => self.config.min_critical_ops_age_secs,
             };
 
@@ -339,7 +339,7 @@ impl NodeAgeVerifier {
                 category,
                 age_secs,
                 trust_multiplier: self.calculate_trust_multiplier(age_secs),
-                can_replicate: category.can_replicate(),
+                can_route: category.can_participate_in_routing(),
                 can_participate_critical: category.can_participate_in_critical_ops(),
                 failure_reason,
             }
@@ -351,7 +351,7 @@ impl NodeAgeVerifier {
                 category: NodeAgeCategory::New,
                 age_secs: 0,
                 trust_multiplier: NodeAgeCategory::New.trust_multiplier(),
-                can_replicate: false,
+                can_route: false,
                 can_participate_critical: false,
                 failure_reason: Some("Unknown node".to_string()),
             }
@@ -377,13 +377,13 @@ impl NodeAgeVerifier {
         base + bonus
     }
 
-    /// Get nodes eligible for replication
-    pub fn get_replication_eligible_nodes(&self) -> Vec<PeerId> {
+    /// Get nodes eligible for full routing operations
+    pub fn get_routing_eligible_nodes(&self) -> Vec<PeerId> {
         self.records
             .read()
             .iter()
             .filter(|(_, record)| {
-                record.is_active && record.age_secs() >= self.config.min_replication_age_secs
+                record.is_active && record.age_secs() >= self.config.min_full_routing_age_secs
             })
             .map(|(id, _)| *id)
             .collect()
@@ -482,8 +482,8 @@ pub enum OperationType {
     BasicRead,
     /// Basic write operations
     BasicWrite,
-    /// Data replication
-    Replication,
+    /// Full routing operations
+    FullRouting,
     /// Critical operations (consensus, key management, etc.)
     CriticalOperation,
 }
@@ -533,10 +533,10 @@ mod tests {
                 < NodeAgeCategory::Veteran.trust_multiplier()
         );
 
-        assert!(!NodeAgeCategory::New.can_replicate());
-        assert!(NodeAgeCategory::Young.can_replicate());
-        assert!(NodeAgeCategory::Established.can_replicate());
-        assert!(NodeAgeCategory::Veteran.can_replicate());
+        assert!(!NodeAgeCategory::New.can_participate_in_routing());
+        assert!(NodeAgeCategory::Young.can_participate_in_routing());
+        assert!(NodeAgeCategory::Established.can_participate_in_routing());
+        assert!(NodeAgeCategory::Veteran.can_participate_in_routing());
 
         assert!(!NodeAgeCategory::New.can_participate_in_critical_ops());
         assert!(!NodeAgeCategory::Young.can_participate_in_critical_ops());
@@ -598,10 +598,10 @@ mod tests {
         assert!(result.passes);
         assert_eq!(result.category, NodeAgeCategory::New);
 
-        // New node - replication should fail (age requirement)
-        let result = verifier.verify_for_operation(&node_id, OperationType::Replication);
+        // New node - full routing should fail (age requirement)
+        let result = verifier.verify_for_operation(&node_id, OperationType::FullRouting);
         assert!(!result.passes);
-        assert!(!result.can_replicate);
+        assert!(!result.can_route);
     }
 
     #[test]
@@ -634,7 +634,7 @@ mod tests {
     #[test]
     fn test_config_defaults() {
         let config = NodeAgeConfig::default();
-        assert_eq!(config.min_replication_age_secs, 3600);
+        assert_eq!(config.min_full_routing_age_secs, 3600);
         assert_eq!(config.min_critical_ops_age_secs, 86400);
         assert!(config.enforce_age_requirements);
     }
@@ -680,7 +680,7 @@ mod tests {
     #[test]
     fn test_get_eligible_nodes() {
         let verifier = NodeAgeVerifier::with_config(NodeAgeConfig {
-            min_replication_age_secs: 0, // Allow immediate replication for test
+            min_full_routing_age_secs: 0, // Allow immediate routing for test
             min_critical_ops_age_secs: 0,
             enforce_age_requirements: true,
             ..Default::default()
@@ -690,7 +690,7 @@ mod tests {
             verifier.register_node(create_test_node_id(&format!("node_{}", i)));
         }
 
-        let eligible = verifier.get_replication_eligible_nodes();
+        let eligible = verifier.get_routing_eligible_nodes();
         assert_eq!(eligible.len(), 3);
     }
 }

@@ -18,7 +18,7 @@
 
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use saorsa_core::PeerId;
-use saorsa_core::dht::{Key, Record};
+use saorsa_core::dht::Key;
 use std::net::SocketAddr;
 
 /// Benchmark DHT key operations
@@ -58,38 +58,6 @@ fn dht_key_benchmarks(c: &mut Criterion) {
         b.iter(|| {
             let hash = blake3::hash(&key);
             black_box(hash);
-        });
-    });
-
-    group.finish();
-}
-
-/// Benchmark DHT record operations
-fn dht_record_benchmarks(c: &mut Criterion) {
-    let mut group = c.benchmark_group("dht_record_operations");
-
-    // Benchmark record creation
-    group.bench_function("record_creation", |b| {
-        let peer_id = create_test_peer_id([1u8; 32]);
-        let data = vec![42u8; 1024];
-
-        b.iter(|| {
-            let key: Key = [1u8; 32];
-            let record = Record::new(key, black_box(data.clone()), peer_id);
-            black_box(record);
-        });
-    });
-
-    // Benchmark record validation
-    group.bench_function("record_validation", |b| {
-        let peer_id = create_test_peer_id([1u8; 32]);
-        let key: Key = [1u8; 32];
-        let record = Record::new(key, vec![42u8; 1024], peer_id);
-
-        b.iter(|| {
-            // Simulate basic validation
-            let is_valid = !record.value.is_empty() && !record.is_expired();
-            black_box(is_valid);
         });
     });
 
@@ -170,7 +138,6 @@ fn xor_distance(a: &PeerId, b: &PeerId) -> [u8; 32] {
 criterion_group!(
     benches,
     dht_key_benchmarks,
-    dht_record_benchmarks,
     network_address_benchmarks,
     peer_id_benchmarks
 );

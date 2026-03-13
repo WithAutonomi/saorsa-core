@@ -317,7 +317,7 @@ use saorsa_core::{NodeAgeVerifier, NodeAgeConfig, OperationType};
 let verifier = NodeAgeVerifier::new(NodeAgeConfig::default());
 
 // Check if node can perform operation
-let result = verifier.verify_operation(&peer_id, OperationType::Replication)?;
+let result = verifier.verify_operation(&peer_id, OperationType::FullRouting)?;
 
 match result {
     AgeVerificationResult::Allowed => println!("Operation permitted"),

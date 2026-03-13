@@ -167,9 +167,6 @@ pub struct ChurnStats {
     /// Failed recoveries
     pub failed_recoveries: u64,
 
-    /// Proactive replications
-    pub proactive_replications: u64,
-
     /// Average detection time
     pub avg_detection_time_ms: f64,
 }
@@ -238,7 +235,6 @@ impl ChurnHandler {
 
                     if prediction.probability_1h > self.config.prediction_threshold {
                         self.handle_imminent_departure(&node_id).await?;
-                        stats.proactive_replications += 1;
                     }
                 }
                 NodeState::Suspicious => {
@@ -572,7 +568,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_proactive_replication() {
+    async fn test_proactive_departure_handling() {
         let handler = create_test_churn_handler().await;
         let node_id = PeerId::from_bytes([1u8; 32]);
 

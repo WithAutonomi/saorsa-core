@@ -1390,7 +1390,6 @@ mod tests {
             som_position: None,
             trust: 0.5,
             capabilities: NodeCapabilities {
-                storage: 100,
                 compute: 50,
                 bandwidth: 10,
             },

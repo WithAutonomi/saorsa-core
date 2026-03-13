@@ -17,7 +17,7 @@
 //!
 //! This module implements Long Short-Term Memory (LSTM) neural networks for
 //! predicting node churn in the P2P network. It provides predictions for
-//! 1-hour, 6-hour, and 24-hour horizons to enable proactive replication.
+//! 1-hour, 6-hour, and 24-hour horizons to enable proactive routing adjustments.
 
 use crate::Result;
 use crate::adaptive::gossip::ChurnDetector;
@@ -438,44 +438,6 @@ impl LSTMChurnPredictor {
             version: model_data.version,
             learning_rate: 0.001,
         })
-    }
-
-    /// Get proactive replication recommendations
-    pub async fn get_replication_recommendations(
-        &self,
-        nodes: &[NodeIdentity],
-        churn_detector: &ChurnDetector,
-        network_size: usize,
-        threshold: f64,
-    ) -> Vec<(
-        crate::identity::node_identity::PublicNodeIdentity,
-        ChurnPrediction,
-    )> {
-        let mut recommendations = Vec::new();
-
-        for node in nodes {
-            let features = self
-                .extract_features(node, churn_detector, network_size)
-                .await;
-            if let Ok(prediction) = self.predict(&features).await {
-                // Recommend replication if any horizon exceeds threshold
-                if prediction.hour_1 > threshold
-                    || prediction.hour_6 > threshold
-                    || prediction.hour_24 > threshold
-                {
-                    recommendations.push((node.to_public(), prediction));
-                }
-            }
-        }
-
-        // Sort by urgency (1-hour prediction)
-        recommendations.sort_by(|a, b| {
-            b.1.hour_1
-                .partial_cmp(&a.1.hour_1)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-
-        recommendations
     }
 }
 

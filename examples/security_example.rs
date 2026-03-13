@@ -45,7 +45,6 @@ async fn main() -> Result<()> {
         som_position: None,
         trust: 0.5,
         capabilities: NodeCapabilities {
-            storage: 1000,
             compute: 100,
             bandwidth: 100,
         },

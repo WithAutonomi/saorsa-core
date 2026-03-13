@@ -500,7 +500,6 @@ impl MultiArmedBandit {
                         let ct_str = ct_v.as_str().unwrap_or("DHTLookup");
                         let ct = match ct_str {
                             "DHTLookup" => ContentType::DHTLookup,
-                            "DataRetrieval" => ContentType::DataRetrieval,
                             "ComputeRequest" => ContentType::ComputeRequest,
                             "RealtimeMessage" => ContentType::RealtimeMessage,
                             _ => ContentType::DHTLookup,

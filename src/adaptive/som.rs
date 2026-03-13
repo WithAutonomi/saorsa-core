@@ -20,7 +20,7 @@
 //!
 //! This module provides a Self-Organizing Map for intelligent clustering and organization
 //! of nodes in the P2P network based on multi-dimensional features such as content
-//! specialization, compute capability, network latency, and storage availability.
+//! specialization, compute capability, and network latency.
 
 use crate::PeerId;
 use rand::Rng;
@@ -59,8 +59,6 @@ pub struct NodeFeatures {
     pub compute_capability: f64,
     /// Average network latency in milliseconds
     pub network_latency: f64,
-    /// Available storage in GB
-    pub storage_available: f64,
 }
 
 impl NodeFeatures {
@@ -88,7 +86,6 @@ impl NodeFeatures {
             content_vector: normalized_content,
             compute_capability: self.compute_capability / 1000.0, // Max 1000
             network_latency: (self.network_latency / 200.0).min(1.0), // Max 200ms
-            storage_available: (self.storage_available / 5000.0).min(1.0), // Max 5TB
         }
     }
 
@@ -115,7 +112,6 @@ impl NodeFeatures {
         let mut weights = normalized.content_vector.clone();
         weights.push(normalized.compute_capability);
         weights.push(normalized.network_latency);
-        weights.push(normalized.storage_available);
         weights
     }
 }
@@ -182,8 +178,8 @@ impl SelfOrganizingMap {
             GridSize::Dynamic { min, .. } => (*min, *min),
         };
 
-        // Weight dimension = 128 (content) + 3 (other features)
-        let weight_dim = 131;
+        // Weight dimension = 128 (content) + 2 (other features)
+        let weight_dim = 130;
 
         // Initialize grid with random neurons
         let grid = (0..height)

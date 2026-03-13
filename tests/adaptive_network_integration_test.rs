@@ -735,7 +735,6 @@ async fn test_security_monitoring() -> anyhow::Result<()> {
         som_position: None,
         trust: 0.1,
         capabilities: saorsa_core::adaptive::NodeCapabilities {
-            storage: 100,
             compute: 50,
             bandwidth: 10,
         },
@@ -799,7 +798,7 @@ async fn test_full_adaptive_network_simulation() -> anyhow::Result<()> {
 
             let content_type = match i % 4 {
                 0 => ContentType::DHTLookup,
-                1 => ContentType::DataRetrieval,
+                1 => ContentType::DiscoveryProbe,
                 2 => ContentType::ComputeRequest,
                 _ => ContentType::RealtimeMessage,
             };

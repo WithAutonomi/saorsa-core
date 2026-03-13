@@ -356,8 +356,6 @@ pub struct CacheState {
 pub enum CacheAction {
     Cache,
     Evict(EvictionPolicy),
-    IncreaseReplication,
-    DecreaseReplication,
     NoAction,
 }
 
@@ -514,12 +512,10 @@ impl QLearnCacheManager {
 
     /// Get a random action
     fn random_action(&self) -> CacheAction {
-        match rand::random::<u8>() % 5 {
+        match rand::random::<u8>() % 4 {
             0 => CacheAction::Cache,
             1 => CacheAction::Evict(EvictionPolicy::LRU),
             2 => CacheAction::Evict(EvictionPolicy::LFU),
-            3 => CacheAction::IncreaseReplication,
-            4 => CacheAction::DecreaseReplication,
             _ => CacheAction::NoAction,
         }
     }
@@ -641,20 +637,6 @@ impl QLearnCacheManager {
                     0.1 - storage_cost * 0.05 // Small reward for freeing space
                 }
             }
-            CacheAction::IncreaseReplication => {
-                if hit {
-                    hit_rate * 0.5 - bandwidth_cost_normalized * 0.2
-                } else {
-                    -0.2 - bandwidth_cost_normalized * 0.2
-                }
-            }
-            CacheAction::DecreaseReplication => {
-                if hit {
-                    -0.3 // Penalty if content was needed
-                } else {
-                    0.05 + storage_cost * 0.05 // Small reward for saving resources
-                }
-            }
             CacheAction::NoAction => {
                 hit_rate * 0.1 - storage_cost * 0.01 // Neutral reward
             }
@@ -680,14 +662,6 @@ impl QLearnCacheManager {
                     EvictionPolicy::LFU => self.evict_lfu().await,
                     EvictionPolicy::Random => self.evict_random().await,
                 };
-            }
-            CacheAction::IncreaseReplication => {
-                // In a real implementation, this would trigger replication to more nodes
-                // For now, just track the decision
-            }
-            CacheAction::DecreaseReplication => {
-                // In a real implementation, this would reduce replication factor
-                // For now, just track the decision
             }
             CacheAction::NoAction => {
                 // Do nothing
@@ -959,12 +933,6 @@ impl ChurnPredictor {
             max_buffer_size: 10000,
             _update_interval: std::time::Duration::from_secs(3600), // 1 hour
         }
-    }
-
-    /// Check if content should be replicated based on node churn risk
-    pub async fn should_replicate(&self, node_id: &PeerId) -> bool {
-        let prediction = self.predict(node_id).await;
-        prediction.probability_1h > 0.7
     }
 
     /// Update node features for prediction
@@ -1479,7 +1447,7 @@ mod tests {
         // Test selection for different content types
         for content_type in [
             ContentType::DHTLookup,
-            ContentType::DataRetrieval,
+            ContentType::DiscoveryProbe,
             ContentType::ComputeRequest,
             ContentType::RealtimeMessage,
         ] {
@@ -1503,32 +1471,22 @@ mod tests {
     async fn test_thompson_sampling_update() -> Result<()> {
         let ts = ThompsonSampling::new();
 
-        // Heavily reward Hyperbolic strategy for DataRetrieval
+        // Heavily reward Hyperbolic strategy for DHTLookup
         for _ in 0..20 {
-            ts.update(
-                ContentType::DataRetrieval,
-                StrategyChoice::Hyperbolic,
-                true,
-                50,
-            )
-            .await?;
+            ts.update(ContentType::DHTLookup, StrategyChoice::Hyperbolic, true, 50)
+                .await?;
         }
 
-        // Penalize Kademlia for DataRetrieval
+        // Penalize Kademlia for DHTLookup
         for _ in 0..10 {
-            ts.update(
-                ContentType::DataRetrieval,
-                StrategyChoice::Kademlia,
-                false,
-                200,
-            )
-            .await?;
+            ts.update(ContentType::DHTLookup, StrategyChoice::Kademlia, false, 200)
+                .await?;
         }
 
-        // After training, Hyperbolic should be preferred for DataRetrieval
+        // After training, Hyperbolic should be preferred for DHTLookup
         let mut hyperbolic_count = 0;
         for _ in 0..100 {
-            let strategy = ts.select_strategy(ContentType::DataRetrieval).await?;
+            let strategy = ts.select_strategy(ContentType::DHTLookup).await?;
             if matches!(strategy, StrategyChoice::Hyperbolic) {
                 hyperbolic_count += 1;
             }
@@ -1632,7 +1590,7 @@ mod tests {
         let mut ts = ThompsonSampling::new();
 
         let context = LearningContext {
-            content_type: ContentType::DataRetrieval,
+            content_type: ContentType::DHTLookup,
             network_conditions: NetworkConditions {
                 connected_peers: 100,
                 avg_latency_ms: 50.0,
@@ -1678,11 +1636,7 @@ mod tests {
         let action = manager.decide_action(&hash).await;
         assert!(matches!(
             action,
-            CacheAction::Cache
-                | CacheAction::Evict(_)
-                | CacheAction::IncreaseReplication
-                | CacheAction::DecreaseReplication
-                | CacheAction::NoAction
+            CacheAction::Cache | CacheAction::Evict(_) | CacheAction::NoAction
         ));
     }
 
@@ -2012,39 +1966,6 @@ mod tests {
         // High risk is a binary flag based on combined score; with these
         // features it may reasonably be 0.0. Assert that explicitly.
         assert_eq!(patterns.get("high_risk"), Some(&0.0));
-    }
-
-    #[tokio::test]
-    async fn test_churn_predictor_proactive_replication() -> Result<()> {
-        let predictor = ChurnPredictor::new();
-        let node_id = PeerId::from_bytes([1u8; 32]);
-
-        // Create high-risk node history
-        predictor
-            .record_node_event(&node_id, NodeEvent::Connected)
-            .await?;
-
-        let features = NodeFeatures {
-            online_duration: 600.0, // Only 10 minutes online
-            avg_response_time: 500.0,
-            resource_contribution: 0.1,
-            message_frequency: 2.0,
-            time_of_day: 23.0,
-            day_of_week: 5.0,
-            historical_reliability: 0.3,
-            recent_disconnections: 10.0,
-            avg_session_length: 0.5,
-            connection_stability: 0.1,
-        };
-
-        predictor.update_node_behavior(&node_id, features).await?;
-
-        // Should recommend replication for high-risk node
-        let _should_replicate = predictor.should_replicate(&node_id).await;
-        // Without full model training, this might not always be true, but test structure is correct
-        let prediction = predictor.predict(&node_id).await;
-        assert!(prediction.probability_1h > 0.0);
-        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

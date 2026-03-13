@@ -75,8 +75,6 @@ pub struct NodeStatistics {
     pub correct_responses: u64,
     /// Number of failed responses
     pub failed_responses: u64,
-    /// Storage contributed (GB)
-    pub storage_contributed: u64,
     /// Bandwidth contributed (GB)
     pub bandwidth_contributed: u64,
     /// Compute cycles contributed
@@ -100,8 +98,6 @@ pub enum NodeStatisticsUpdate {
     /// Peer violated the expected wire protocol.
     /// Counts as 2 failures due to severity.
     ProtocolViolation,
-    /// Storage contributed (in GB).
-    StorageContributed(u64),
     /// Bandwidth contributed (in GB).
     BandwidthContributed(u64),
     /// Compute cycles contributed.
@@ -179,7 +175,6 @@ impl EigenTrustEngine {
                 // Protocol violations are severe — counts as 2 failures
                 node_stats.failed_responses += 2;
             }
-            NodeStatisticsUpdate::StorageContributed(gb) => node_stats.storage_contributed += gb,
             NodeStatisticsUpdate::BandwidthContributed(gb) => {
                 node_stats.bandwidth_contributed += gb
             }
@@ -399,17 +394,15 @@ impl EigenTrustEngine {
         };
 
         // Normalize contributions (log scale for large values)
-        let storage_factor = (1.0 + stats.storage_contributed as f64).ln() / 10.0;
         let bandwidth_factor = (1.0 + stats.bandwidth_contributed as f64).ln() / 10.0;
         let compute_factor = (1.0 + stats.compute_contributed as f64).ln() / 10.0;
         let uptime_factor = (stats.uptime as f64 / 86400.0).min(1.0); // Max 1 day
 
         // Weighted combination
-        0.4 * response_rate
-            + 0.2 * uptime_factor
-            + 0.15 * storage_factor
+        0.45 * response_rate
+            + 0.25 * uptime_factor
             + 0.15 * bandwidth_factor
-            + 0.1 * compute_factor
+            + 0.15 * compute_factor
     }
 
     /// Add a pre-trusted node
@@ -769,10 +762,6 @@ mod tests {
         engine
             .update_node_stats(&node, NodeStatisticsUpdate::FailedResponse)
             .await;
-        engine
-            .update_node_stats(&node, NodeStatisticsUpdate::StorageContributed(100))
-            .await;
-
         // Add some trust relationships
         let mut hash2 = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut hash2);

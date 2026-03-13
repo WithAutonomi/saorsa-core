@@ -90,7 +90,6 @@ impl QLearningCacheExtensions for QLearningCacheManager {
             Ok(action) => match action {
                 super::q_learning_cache::CacheAction::Cache(_) => CacheDecision::Cache,
                 super::q_learning_cache::CacheAction::Evict(_) => CacheDecision::Evict,
-                super::q_learning_cache::CacheAction::Replicate { .. } => CacheDecision::Cache,
                 super::q_learning_cache::CacheAction::DoNothing => CacheDecision::Skip,
             },
             Err(_) => CacheDecision::Skip,
@@ -98,12 +97,11 @@ impl QLearningCacheExtensions for QLearningCacheManager {
     }
 
     async fn get(&self, hash: &ContentHash) -> Option<Vec<u8>> {
-        // QLearnCacheManager tracks caching decisions but doesn't store actual data
-        // The actual data is stored in ContentStore
-        // This method checks if we have made a caching decision for this hash
+        // QLearnCacheManager tracks caching decisions but doesn't store actual data.
+        // This method checks if we have made a caching decision for this hash.
         if self.is_cached(hash).await {
-            // Content is tracked as cached, but we don't have the actual bytes
-            // The caller should retrieve from ContentStore
+            // Content is tracked as cached, but we don't have the actual bytes.
+            // This always returns None as the cache only tracks routing/lookup decisions.
             None
         } else {
             None

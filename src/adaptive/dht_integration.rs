@@ -391,7 +391,6 @@ impl AdaptiveDHT {
             content_vector: Self::content_vector_from_hash(key),
             compute_capability: 500.0,
             network_latency: 50.0,
-            storage_available: 500.0,
         }
     }
 
@@ -412,7 +411,6 @@ impl AdaptiveDHT {
             content_vector: vector,
             compute_capability: (reliability * 1000.0).clamp(0.0, 1000.0),
             network_latency: avg_latency_ms.max(10.0),
-            storage_available: (200.0 + reliability * 800.0).clamp(50.0, 1000.0),
         }
     }
 
@@ -640,7 +638,6 @@ impl AdaptiveDHT {
                     ]),
                     trust: candidate.scores.trust,
                     capabilities: NodeCapabilities {
-                        storage: (candidate.scores.geo * 1000.0) as u64,
                         compute: (candidate.scores.trust * 1000.0) as u64,
                         bandwidth: (candidate.scores.churn * 1000.0) as u64,
                     },

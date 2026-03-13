@@ -40,7 +40,10 @@ impl NetworkSimulator {
 
         // Kademlia: Good for DHT lookups, poor for real-time
         success_rates.insert((StrategyChoice::Kademlia, ContentType::DHTLookup), 0.95);
-        success_rates.insert((StrategyChoice::Kademlia, ContentType::DataRetrieval), 0.80);
+        success_rates.insert(
+            (StrategyChoice::Kademlia, ContentType::DiscoveryProbe),
+            0.80,
+        );
         success_rates.insert(
             (StrategyChoice::Kademlia, ContentType::RealtimeMessage),
             0.40,
@@ -50,10 +53,10 @@ impl NetworkSimulator {
             0.70,
         );
 
-        // Hyperbolic: Good for data retrieval, excellent for real-time
+        // Hyperbolic: Good for discovery, excellent for real-time
         success_rates.insert((StrategyChoice::Hyperbolic, ContentType::DHTLookup), 0.70);
         success_rates.insert(
-            (StrategyChoice::Hyperbolic, ContentType::DataRetrieval),
+            (StrategyChoice::Hyperbolic, ContentType::DiscoveryProbe),
             0.90,
         );
         success_rates.insert(
@@ -68,7 +71,7 @@ impl NetworkSimulator {
         // TrustPath: Good for compute requests, poor for DHT
         success_rates.insert((StrategyChoice::TrustPath, ContentType::DHTLookup), 0.50);
         success_rates.insert(
-            (StrategyChoice::TrustPath, ContentType::DataRetrieval),
+            (StrategyChoice::TrustPath, ContentType::DiscoveryProbe),
             0.75,
         );
         success_rates.insert(
@@ -83,7 +86,7 @@ impl NetworkSimulator {
         // SOMRegion: Specialized for compute requests
         success_rates.insert((StrategyChoice::SOMRegion, ContentType::DHTLookup), 0.60);
         success_rates.insert(
-            (StrategyChoice::SOMRegion, ContentType::DataRetrieval),
+            (StrategyChoice::SOMRegion, ContentType::DiscoveryProbe),
             0.70,
         );
         success_rates.insert(
@@ -160,7 +163,7 @@ async fn test_mab_learns_optimal_strategies() {
     for _ in 0..TRAINING_ROUNDS {
         for content_type in &[
             ContentType::DHTLookup,
-            ContentType::DataRetrieval,
+            ContentType::DiscoveryProbe,
             ContentType::RealtimeMessage,
             ContentType::ComputeRequest,
         ] {
@@ -183,7 +186,7 @@ async fn test_mab_learns_optimal_strategies() {
     for _ in 0..EVALUATION_ROUNDS {
         for content_type in &[
             ContentType::DHTLookup,
-            ContentType::DataRetrieval,
+            ContentType::DiscoveryProbe,
             ContentType::RealtimeMessage,
             ContentType::ComputeRequest,
         ] {

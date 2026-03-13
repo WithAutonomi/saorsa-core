@@ -33,7 +33,6 @@
 //!
 //! - Weighted scoring combining distance and trust
 //! - Configurable trust emphasis for different operations
-//! - Separate configs for queries vs storage operations
 //! - Graceful fallback when trust engine unavailable
 //! - Never panics - all operations return safe defaults
 
@@ -77,28 +76,6 @@ impl Default for TrustSelectionConfig {
     }
 }
 
-impl TrustSelectionConfig {
-    /// Create a config optimized for storage operations
-    /// Storage uses higher trust requirements since data persistence matters more
-    pub fn for_storage() -> Self {
-        Self {
-            trust_weight: 0.5,
-            min_trust_threshold: 0.2,
-            exclude_untrusted: true,
-        }
-    }
-
-    /// Create a config optimized for query operations
-    /// Queries can be more lenient since bad responses can be detected
-    pub fn for_queries() -> Self {
-        Self {
-            trust_weight: 0.3,
-            min_trust_threshold: 0.1,
-            exclude_untrusted: false,
-        }
-    }
-}
-
 /// Peer selector that combines XOR distance with trust scores
 ///
 /// This selector wraps a trust provider and uses it to score peers
@@ -107,7 +84,6 @@ impl TrustSelectionConfig {
 pub struct TrustAwarePeerSelector<T: TrustProvider> {
     trust_provider: Arc<T>,
     config: TrustSelectionConfig,
-    storage_config: TrustSelectionConfig,
 }
 
 impl<T: TrustProvider> TrustAwarePeerSelector<T> {
@@ -116,24 +92,10 @@ impl<T: TrustProvider> TrustAwarePeerSelector<T> {
         Self {
             trust_provider,
             config,
-            storage_config: TrustSelectionConfig::for_storage(),
         }
     }
 
-    /// Create with custom storage config
-    pub fn with_storage_config(
-        trust_provider: Arc<T>,
-        query_config: TrustSelectionConfig,
-        storage_config: TrustSelectionConfig,
-    ) -> Self {
-        Self {
-            trust_provider,
-            config: query_config,
-            storage_config,
-        }
-    }
-
-    /// Select best peers for a query operation
+    /// Select best peers for a lookup operation
     ///
     /// Returns up to `count` peers, sorted by combined distance/trust score.
     /// Higher scores are better (closer and more trusted).
@@ -144,19 +106,6 @@ impl<T: TrustProvider> TrustAwarePeerSelector<T> {
         count: usize,
     ) -> Vec<NodeInfo> {
         self.select_peers_with_config(key, candidates, count, &self.config)
-    }
-
-    /// Select best peers for a storage operation
-    ///
-    /// Uses stricter trust requirements for storage since data persistence
-    /// depends on node reliability.
-    pub fn select_storage_peers(
-        &self,
-        key: &DhtKey,
-        candidates: &[NodeInfo],
-        count: usize,
-    ) -> Vec<NodeInfo> {
-        self.select_peers_with_config(key, candidates, count, &self.storage_config)
     }
 
     /// Internal peer selection with specified config
@@ -238,11 +187,6 @@ impl<T: TrustProvider> TrustAwarePeerSelector<T> {
     /// Get the current configuration
     pub fn config(&self) -> &TrustSelectionConfig {
         &self.config
-    }
-
-    /// Get the storage configuration
-    pub fn storage_config(&self) -> &TrustSelectionConfig {
-        &self.storage_config
     }
 }
 
@@ -332,30 +276,14 @@ mod tests {
     }
 
     #[test]
-    fn test_storage_config_excludes_untrusted() {
+    fn test_default_config_includes_untrusted() {
         let trust = Arc::new(MockTrustProvider::new());
-        // MockTrustProvider returns 0.0 for unknown nodes
         let selector = TrustAwarePeerSelector::new(trust, TrustSelectionConfig::default());
 
         let key = DhtKey::from_bytes([0u8; 32]);
         let candidates = vec![make_node(1), make_node(2), make_node(3)];
 
-        // Using storage config which excludes untrusted nodes
-        let result = selector.select_storage_peers(&key, &candidates, 3);
-
-        // All nodes have trust=0.0 which is below threshold, so none selected
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn test_query_config_includes_untrusted() {
-        let trust = Arc::new(MockTrustProvider::new());
-        let selector = TrustAwarePeerSelector::new(trust, TrustSelectionConfig::for_queries());
-
-        let key = DhtKey::from_bytes([0u8; 32]);
-        let candidates = vec![make_node(1), make_node(2), make_node(3)];
-
-        // Query config doesn't exclude untrusted
+        // Default config doesn't exclude untrusted
         let result = selector.select_peers(&key, &candidates, 3);
 
         assert_eq!(result.len(), 3);
@@ -367,13 +295,5 @@ mod tests {
         assert!((config.trust_weight - 0.3).abs() < f64::EPSILON);
         assert!((config.min_trust_threshold - 0.1).abs() < f64::EPSILON);
         assert!(!config.exclude_untrusted);
-    }
-
-    #[test]
-    fn test_storage_config_values() {
-        let config = TrustSelectionConfig::for_storage();
-        assert!((config.trust_weight - 0.5).abs() < f64::EPSILON);
-        assert!((config.min_trust_threshold - 0.2).abs() < f64::EPSILON);
-        assert!(config.exclude_untrusted);
     }
 }

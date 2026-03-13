@@ -46,7 +46,6 @@ async fn test_security_manager_validate_join() -> anyhow::Result<()> {
         som_position: None,
         trust: 0.5,
         capabilities: NodeCapabilities {
-            storage: 1,
             compute: 1,
             bandwidth: 1,
         },

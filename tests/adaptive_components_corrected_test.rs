@@ -26,7 +26,7 @@ async fn test_thompson_sampling_real_api() -> anyhow::Result<()> {
     // Test strategy selection for different content types
     let content_types = [
         ContentType::DHTLookup,
-        ContentType::DataRetrieval,
+        ContentType::DiscoveryProbe,
         ContentType::ComputeRequest,
         ContentType::RealtimeMessage,
     ];
@@ -198,7 +198,6 @@ async fn test_security_manager_real_api() -> anyhow::Result<()> {
         som_position: None,
         trust: 0.8,
         capabilities: saorsa_core::adaptive::NodeCapabilities {
-            storage: 1000,
             compute: 500,
             bandwidth: 100,
         },
@@ -378,7 +377,7 @@ async fn test_q_learning_cache_real_api() -> anyhow::Result<()> {
     let new_hash = ContentHash([4u8; 32]);
     let new_data = vec![4u8; 100];
     manager
-        .decide_caching(new_hash, new_data, ContentType::DataRetrieval)
+        .decide_caching(new_hash, new_data, ContentType::DHTLookup)
         .await?;
 
     // Get cache statistics
@@ -466,19 +465,6 @@ async fn test_churn_predictor_real_api() -> anyhow::Result<()> {
         unstable_prediction.probability_6h * 100.0,
         unstable_prediction.probability_24h * 100.0,
         unstable_prediction.confidence * 100.0
-    );
-
-    // Test replication recommendation
-    let should_replicate_stable = predictor.should_replicate(&node_id).await;
-    let should_replicate_unstable = predictor.should_replicate(&unstable_node).await;
-
-    println!(
-        "Should replicate from stable node: {}",
-        should_replicate_stable
-    );
-    println!(
-        "Should replicate from unstable node: {}",
-        should_replicate_unstable
     );
 
     assert!(
@@ -586,7 +572,7 @@ async fn test_integrated_adaptive_system() -> anyhow::Result<()> {
         // Thompson Sampling for strategy selection
         let content_type = match total_operations % 4 {
             0 => ContentType::DHTLookup,
-            1 => ContentType::DataRetrieval,
+            1 => ContentType::DiscoveryProbe,
             2 => ContentType::ComputeRequest,
             _ => ContentType::RealtimeMessage,
         };

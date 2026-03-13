@@ -33,7 +33,6 @@ async fn test_full_system_integration() {
     // Create coordinators
     let config1 = NetworkConfig {
         bootstrap_nodes: vec![],
-        storage_capacity: 10,
         max_connections: 100,
         ml_enabled: true,
         monitoring_interval: Duration::from_secs(5),

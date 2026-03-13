@@ -46,7 +46,6 @@ impl NetworkSimulation {
 
             let config = NetworkConfig {
                 bootstrap_nodes: bootstrap_nodes.clone(),
-                storage_capacity: 10,
                 max_connections: 50,
                 ml_enabled: true,
                 monitoring_interval: Duration::from_secs(10),

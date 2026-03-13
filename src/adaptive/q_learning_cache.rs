@@ -19,7 +19,7 @@
 //!
 //! ## Features
 //! - State discretization for continuous cache metrics
-//! - Action space: cache, evict, replicate, do nothing
+//! - Action space: cache, evict, do nothing
 //! - ε-greedy exploration strategy
 //! - Experience replay for stable learning
 //! - Adaptive to changing access patterns
@@ -27,7 +27,6 @@
 // use super::*; // Removed unused import
 use super::ContentHash;
 use super::eviction::{CacheState, EvictionStrategy, EvictionStrategyType};
-use crate::PeerId;
 use crate::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
@@ -109,11 +108,6 @@ pub enum CacheAction {
     Cache(ContentHash),
     /// Evict content from cache
     Evict(ContentHash),
-    /// Replicate content to another node
-    Replicate {
-        content: ContentHash,
-        target: PeerId,
-    },
     /// Do nothing
     DoNothing,
 }
@@ -124,7 +118,6 @@ impl CacheAction {
         match self {
             CacheAction::Cache(_) => ActionType::Cache,
             CacheAction::Evict(_) => ActionType::Evict,
-            CacheAction::Replicate { .. } => ActionType::Replicate,
             CacheAction::DoNothing => ActionType::DoNothing,
         }
     }
@@ -135,7 +128,6 @@ impl CacheAction {
 pub enum ActionType {
     Cache,
     Evict,
-    Replicate,
     DoNothing,
 }
 
@@ -169,8 +161,6 @@ pub struct CacheStatistics {
     pub access_frequency: HashMap<ContentHash, AccessInfo>,
     /// Total number of evictions
     pub evictions: u64,
-    /// Total number of replications
-    pub replications: u64,
 }
 
 impl CacheStatistics {
@@ -511,10 +501,6 @@ impl QLearnCacheManager {
                     reward -= 0.2; // Penalty for evicting when plenty of space
                 }
             }
-            CacheAction::Replicate { .. } => {
-                // Small reward for replication (helps availability)
-                reward += 0.1;
-            }
             CacheAction::DoNothing => {
                 // Neutral unless it caused a miss
             }
@@ -568,9 +554,6 @@ impl QLearnCacheManager {
                     stats.evictions += 1;
                 }
                 stats.access_frequency.remove(hash);
-            }
-            CacheAction::Replicate { .. } => {
-                stats.replications += 1;
             }
             CacheAction::DoNothing => {}
         }
@@ -653,9 +636,6 @@ impl QLearnCacheManager {
                 }
             }
         }
-
-        // Can always replicate (if we have peers)
-        // In real implementation, would check available peers
 
         Ok(actions)
     }
@@ -778,19 +758,12 @@ mod tests {
     #[test]
     fn test_action_types() {
         let content_hash = ContentHash([1u8; 32]);
-        let peer_id = PeerId([2u8; 32]);
 
         let cache_action = CacheAction::Cache(content_hash);
         assert_eq!(cache_action.action_type(), ActionType::Cache);
 
         let evict_action = CacheAction::Evict(content_hash);
         assert_eq!(evict_action.action_type(), ActionType::Evict);
-
-        let replicate_action = CacheAction::Replicate {
-            content: content_hash,
-            target: peer_id,
-        };
-        assert_eq!(replicate_action.action_type(), ActionType::Replicate);
 
         let do_nothing = CacheAction::DoNothing;
         assert_eq!(do_nothing.action_type(), ActionType::DoNothing);

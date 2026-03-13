@@ -284,9 +284,6 @@ mod eigentrust_tests {
             .update_node_stats(&nodes[0], NodeStatisticsUpdate::CorrectResponse)
             .await;
         engine
-            .update_node_stats(&nodes[0], NodeStatisticsUpdate::StorageContributed(1000))
-            .await;
-        engine
             .update_node_stats(&nodes[0], NodeStatisticsUpdate::BandwidthContributed(500))
             .await;
 

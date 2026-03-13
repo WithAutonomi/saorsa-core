@@ -11,7 +11,7 @@ This repository is a Rust library crate that provides a modular, post‑quantum 
 - Transport & Networking: `transport/`, `network/` (QUIC, NAT traversal, events, dual‑stack listeners, Happy Eyeballs dialing).
 - Routing & Discovery: `dht/`, `dht_network_manager/`, `peer_record/`.
 - Security: `quantum_crypto/`, `security.rs`, `secure_memory.rs`, `key_derivation.rs`, `encrypted_key_storage.rs`.
-- Data & Storage: `persistence/`, `placement/` (orchestrator, strategies, records). Application data storage lives in saorsa-node.
+- Adaptive Intelligence: `adaptive/` (ML routing strategies, EigenTrust, churn prediction, SOM).
 - Application Modules: provided by upper layers (not in this crate).
 - Cross‑cutting: `validation.rs`, `production.rs`, `health/`, `utils/`, `config.rs`, `error.rs`.
 
@@ -26,31 +26,15 @@ This repository is a Rust library crate that provides a modular, post‑quantum 
           |        commands/events
           v
      [network]  <->  [dht_network_manager]  <->  [dht]
-          |
-      [transport (QUIC)]
-          |
-[placement] <-> [persistence]
-          ^
-     [validation|security|secure_memory]
+          |                                        ^
+      [transport (QUIC)]                     [adaptive]
+          ^                               (ML routing, trust,
+     [validation|security|secure_memory]   churn prediction)
 ```
 
-Application storage and data replication are handled in saorsa-node using `send_message`-style APIs.
-saorsa-node is also responsible for replica tracking and re‑replication on churn,
-using core’s routing outputs and `DhtNetworkManager::subscribe_events()`.
-
-Example churn hook:
-```rust
-use saorsa_core::adaptive::ReplicaPlanner;
-use saorsa_core::DhtNetworkEvent;
-
-let planner = ReplicaPlanner::new(adaptive_dht, dht_manager);
-let mut events = planner.subscribe_churn();
-tokio::spawn(async move {
-    while let Ok(DhtNetworkEvent::PeerDisconnected { peer_id }) = events.recv().await {
-        // re-replicate any data that had replicas on peer_id
-    }
-});
-```
+saorsa-core is a peer phonebook with adaptive intelligence: it handles peer discovery,
+trust scoring (EigenTrust), and ML-driven routing. Application data storage and
+replication are handled by saorsa-node via `send_message`-style APIs.
 
 ## Concurrency & Errors
 - Async with `tokio`; prefer `Send + Sync` types and bounded channels where applicable.
