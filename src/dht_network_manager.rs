@@ -2671,3 +2671,25 @@ impl Default for DhtNetworkConfig {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_first_valid_address_skips_non_ip_when_ip_address_exists() {
+        let ble = MultiAddr::new(crate::address::TransportAddr::Ble {
+            mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+            psm: 0x0025,
+        });
+        let quic = MultiAddr::quic("127.0.0.1:9000".parse().unwrap());
+
+        let selected = DhtNetworkManager::first_valid_address(&[ble, quic.clone()]);
+
+        assert_eq!(
+            selected,
+            Some(quic),
+            "address selection should prefer a dialable IP transport over a preceding non-IP entry"
+        );
+    }
+}

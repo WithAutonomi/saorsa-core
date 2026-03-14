@@ -770,4 +770,45 @@ mod tests {
             P2PError::Bootstrap(BootstrapError::RateLimited(_))
         ));
     }
+
+    #[tokio::test]
+    async fn test_add_contact_accepts_ip_address_after_non_ip_primary() {
+        let temp_dir = TempDir::new().unwrap();
+        let config = test_config(&temp_dir);
+        let manager = BootstrapManager::with_config(config).await.unwrap();
+
+        let ble = crate::address::MultiAddr::new(crate::address::TransportAddr::Ble {
+            mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+            psm: 0x0025,
+        });
+        let quic = crate::address::MultiAddr::quic("127.0.0.1:9000".parse().unwrap());
+        let contact = crate::ContactEntry::new(PeerId::random(), vec![ble, quic.clone()]);
+
+        manager
+            .add_contact(contact)
+            .await
+            .expect("contact should be accepted when a later IP address exists");
+
+        assert!(manager.contains(&quic.socket_addr().unwrap()).await);
+    }
+
+    #[tokio::test]
+    async fn test_get_bootstrap_peers_preserves_tcp_transport_kind() {
+        let temp_dir = TempDir::new().unwrap();
+        let config = test_config(&temp_dir);
+        let manager = BootstrapManager::with_config(config).await.unwrap();
+
+        let tcp = crate::address::MultiAddr::tcp("127.0.0.1:9100".parse().unwrap());
+        let contact = crate::ContactEntry::new(PeerId::random(), vec![tcp.clone()]);
+
+        manager.add_contact_trusted(contact).await;
+
+        let peers = manager.get_bootstrap_peers(1).await.unwrap();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(
+            peers[0].addresses,
+            vec![tcp],
+            "bootstrap cache round-trip should preserve the original transport kind"
+        );
+    }
 }

@@ -2370,6 +2370,27 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn test_connect_peer_rejects_tcp_multiaddr() -> Result<()> {
+        let config = create_test_node_config();
+        let node = P2PNode::new(config).await?;
+
+        let result = node.connect_peer("/ip4/127.0.0.1/tcp/1").await;
+
+        assert!(
+            matches!(
+                result,
+                Err(P2PError::Network(
+                    crate::error::NetworkError::InvalidAddress(_)
+                ))
+            ),
+            "TCP multiaddrs should be rejected before a QUIC dial is attempted, got: {:?}",
+            result
+        );
+
+        Ok(())
+    }
+
     // TODO(windows): Investigate QUIC connection issues on Windows CI
     // This test consistently fails on Windows GitHub Actions runners with
     // "All connect attempts failed" even with IPv4-only config, long delays,
