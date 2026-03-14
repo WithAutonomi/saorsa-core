@@ -179,8 +179,6 @@ use std::sync::Arc;
 /// Resource usage health checker
 pub struct ResourceHealthChecker {
     resource_manager: Arc<ResourceManager>,
-    max_memory_percent: f64,
-    max_cpu_percent: f64,
     timeout_duration: Duration,
 }
 
@@ -189,8 +187,6 @@ impl ResourceHealthChecker {
     pub fn new(resource_manager: Arc<ResourceManager>) -> Self {
         Self {
             resource_manager,
-            max_memory_percent: 80.0,
-            max_cpu_percent: 90.0,
             timeout_duration: Duration::from_millis(50),
         }
     }
@@ -199,44 +195,19 @@ impl ResourceHealthChecker {
 #[async_trait]
 impl ComponentChecker for ResourceHealthChecker {
     async fn check(&self) -> Result<HealthStatus> {
-        match timeout(self.timeout_duration, async {
-            self.resource_manager.get_metrics().await
-        })
-        .await
-        {
-            Ok(metrics) => {
-                // Check CPU usage
-                if metrics.cpu_usage > self.max_cpu_percent {
-                    return Ok(HealthStatus::Unhealthy);
-                }
-
-                // Check memory usage (simplified - compare against configured limit)
-                let memory_percent = if self.resource_manager.config.max_memory_bytes > 0 {
-                    (metrics.memory_used as f64
-                        / self.resource_manager.config.max_memory_bytes as f64)
-                        * 100.0
-                } else {
-                    0.0
-                };
-
-                if memory_percent > self.max_memory_percent {
-                    Ok(HealthStatus::Degraded)
-                } else {
-                    Ok(HealthStatus::Healthy)
-                }
-            }
-            _ => Ok(HealthStatus::Unhealthy), // Timeout
+        match timeout(self.timeout_duration, self.resource_manager.health_check()).await {
+            Ok(Ok(())) => Ok(HealthStatus::Healthy),
+            Ok(Err(_)) => Ok(HealthStatus::Degraded),
+            Err(_) => Ok(HealthStatus::Unhealthy), // Timeout
         }
     }
 
     async fn debug_info(&self) -> Option<JsonValue> {
-        let metrics = self.resource_manager.get_metrics().await;
+        let active_connections = self.resource_manager.config.max_connections
+            - self.resource_manager.connection_semaphore_available();
         Some(serde_json::json!({
-            "memory_used": metrics.memory_used,
-            "active_connections": metrics.active_connections,
-            "bandwidth_usage": metrics.bandwidth_usage,
-            "cpu_usage": metrics.cpu_usage,
-            "dht_ops_per_sec": metrics.dht_metrics.ops_per_sec,
+            "active_connections": active_connections,
+            "max_connections": self.resource_manager.config.max_connections,
         }))
     }
 }

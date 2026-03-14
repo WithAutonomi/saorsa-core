@@ -6,7 +6,6 @@
 
 pub mod capacity_signaling;
 pub mod core_engine;
-pub mod telemetry;
 pub mod trust_weighted_dht;
 pub mod trust_weighted_kademlia;
 
@@ -21,9 +20,6 @@ pub use trust_weighted_kademlia::TrustWeightedKademlia;
 
 // Re-export capacity signaling
 pub use capacity_signaling::{CapacityGossip, CapacityHistogram, CapacityManager, CapacityStats};
-
-// Re-export telemetry
-pub use telemetry::{DhtTelemetry, OperationStats, OperationType, TelemetryStats};
 
 // Re-export existing DHT components
 pub use core_engine::{
@@ -82,9 +78,6 @@ pub mod authenticated_sibling_broadcast;
 /// Routing table maintenance and node validation
 pub mod routing_maintenance;
 
-/// Comprehensive metrics for security, DHT health, and trust
-pub mod metrics;
-
 /// Trust-aware peer selection combining XOR distance with EigenTrust scores
 pub mod trust_peer_selector;
 
@@ -119,12 +112,6 @@ pub use authenticated_sibling_broadcast::{
     AuthenticatedSiblingBroadcast, BroadcastValidationFailure, BroadcastValidationResult,
     MembershipProof, MembershipProofType, SiblingBroadcastBuilder, SiblingBroadcastConfig,
     SiblingBroadcastValidator, SignedSiblingEntry,
-};
-
-// Re-export comprehensive metrics types for security, DHT health, and trust
-pub use metrics::{
-    DhtHealthMetrics, DhtMetricsAggregator, DhtMetricsCollector, MetricsSummary, SecurityMetrics,
-    SecurityMetricsCollector, TrustMetrics, TrustMetricsCollector,
 };
 
 #[cfg(test)]

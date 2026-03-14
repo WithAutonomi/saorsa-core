@@ -158,16 +158,13 @@ pub use crate::adaptive::{
 };
 
 // ============================================================================
-// Telemetry & Health
+// Health
 // ============================================================================
-
-/// Metrics and telemetry
-pub use crate::telemetry::{Metrics, StreamClass, record_lookup, record_timeout, telemetry};
 
 /// Health monitoring
 pub use crate::health::{
     ComponentChecker, ComponentHealth, HealthEndpoints, HealthManager, HealthResponse,
-    HealthServer, HealthStatus, PrometheusExporter,
+    HealthServer, HealthStatus,
 };
 
 // ============================================================================

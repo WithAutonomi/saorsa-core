@@ -18,7 +18,6 @@ use parking_lot::RwLock;
 use tokio::sync::broadcast;
 
 use crate::PeerId;
-use crate::dht::metrics::security_metrics::SecurityMetricsCollector;
 use crate::dht::sybil_detector::{SybilDetector, SybilDetectorConfig};
 
 use super::close_group_validator::{
@@ -203,8 +202,6 @@ pub struct SecurityCoordinator {
     eviction_manager: Arc<RwLock<EvictionManager>>,
     /// Close group eviction tracker
     eviction_tracker: Arc<RwLock<CloseGroupEvictionTracker>>,
-    /// Metrics collector
-    metrics: Arc<SecurityMetricsCollector>,
     /// Trust scores (from EigenTrust)
     trust_scores: Arc<RwLock<HashMap<PeerId, f64>>>,
     /// Node geographic regions
@@ -226,7 +223,6 @@ impl SecurityCoordinator {
                 config.maintenance_config.clone(),
             ))),
             eviction_tracker: Arc::new(RwLock::new(CloseGroupEvictionTracker::new())),
-            metrics: Arc::new(SecurityMetricsCollector::new()),
             trust_scores: Arc::new(RwLock::new(HashMap::new())),
             node_regions: Arc::new(RwLock::new(HashMap::new())),
             last_analysis: RwLock::new(Instant::now()),
@@ -238,12 +234,6 @@ impl SecurityCoordinator {
     #[must_use]
     pub fn with_defaults() -> Self {
         Self::new(SecurityCoordinatorConfig::default())
-    }
-
-    /// Get the metrics collector
-    #[must_use]
-    pub fn metrics(&self) -> &Arc<SecurityMetricsCollector> {
-        &self.metrics
     }
 
     /// Get the eviction tracker
@@ -307,9 +297,6 @@ impl SecurityCoordinator {
                 .read()
                 .validate_membership(node_id, responses, trust_score);
 
-        // Update metrics
-        self.metrics.record_close_group_validation(result.is_valid);
-
         // If validation failed, process the failure
         if !result.is_valid {
             self.handle_validation_failure(node_id, &result);
@@ -331,19 +318,6 @@ impl SecurityCoordinator {
 
         // Update eviction manager
         self.eviction_manager.write().record_failure(node_id);
-
-        // Update metrics based on failure reason
-        for reason in &result.failure_reasons {
-            match reason {
-                CloseGroupFailure::SuspectedCollusion => {
-                    self.metrics.record_collusion_detection();
-                }
-                CloseGroupFailure::AttackModeTriggered => {
-                    self.metrics.set_bft_mode(true);
-                }
-                _ => {}
-            }
-        }
     }
 
     /// Run periodic security analysis
@@ -388,14 +362,6 @@ impl SecurityCoordinator {
         self.close_group_validator
             .write()
             .update_attack_indicators(indicators);
-
-        // Update metrics
-        self.metrics.set_sybil_score(sybil_risk);
-
-        // Check for BFT escalation
-        if self.close_group_validator.read().is_attack_mode() {
-            self.metrics.set_bft_mode(true);
-        }
     }
 
     /// Clean up old records from all detectors
@@ -517,15 +483,11 @@ impl SecurityCoordinator {
     /// Manually escalate to BFT mode
     pub fn escalate_to_bft(&self) {
         self.close_group_validator.write().escalate_to_bft();
-        self.metrics.set_bft_mode(true);
     }
 
     /// De-escalate from BFT mode
     pub fn deescalate_from_bft(&self) {
         self.close_group_validator.write().deescalate_from_bft();
-        if !self.close_group_validator.read().is_attack_mode() {
-            self.metrics.set_bft_mode(false);
-        }
     }
 
     // =========================================================================

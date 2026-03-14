@@ -1950,11 +1950,6 @@ impl DhtNetworkManager {
     pub fn trust_engine(&self) -> Option<Arc<EigenTrustEngine>> {
         self.trust_engine.clone()
     }
-
-    /// Get the security metrics collector from the local DHT core.
-    pub async fn security_metrics(&self) -> Arc<crate::dht::metrics::SecurityMetricsCollector> {
-        self.dht.read().await.security_metrics()
-    }
 }
 
 impl Default for DhtNetworkConfig {

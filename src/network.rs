@@ -25,7 +25,7 @@ use crate::error::{NetworkError, P2PError, P2pResult as Result, PeerFailureReaso
 
 use crate::MultiAddr;
 use crate::identity::node_identity::{NodeIdentity, peer_id_from_public_key};
-use crate::production::{ProductionConfig, ResourceManager, ResourceMetrics};
+use crate::production::{ProductionConfig, ResourceManager};
 use crate::quantum_crypto::saorsa_transport_integration::{MlDsaPublicKey, MlDsaSignature};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -546,8 +546,6 @@ impl NodeConfig {
                 connection_timeout: Duration::from_secs(config.network.connection_timeout),
                 keep_alive_interval: Duration::from_secs(config.network.keepalive_interval),
                 health_check_interval: Duration::from_secs(30),
-                metrics_interval: Duration::from_secs(60),
-                enable_performance_tracking: true,
                 enable_auto_cleanup: true,
                 shutdown_timeout: Duration::from_secs(30),
                 rate_limits: crate::production::RateLimitConfig::default(),
@@ -753,9 +751,6 @@ pub struct P2PNode {
     /// Bootstrap cache manager for peer discovery
     bootstrap_manager: Option<Arc<RwLock<BootstrapManager>>>,
 
-    /// Security dashboard for monitoring
-    pub security_dashboard: Option<Arc<crate::dht::metrics::SecurityDashboard>>,
-
     /// Bootstrap state tracking - indicates whether peer discovery has completed
     is_bootstrapped: Arc<AtomicBool>,
 
@@ -867,13 +862,6 @@ impl P2PNode {
                 .await?,
         );
 
-        let security_metrics = dht_manager.security_metrics().await;
-        let security_dashboard = Some(Arc::new(crate::dht::metrics::SecurityDashboard::new(
-            security_metrics,
-            Arc::new(crate::dht::metrics::DhtMetricsCollector::new()),
-            Arc::new(crate::dht::metrics::TrustMetricsCollector::new()),
-        )));
-
         let node = Self {
             config,
             peer_id,
@@ -883,7 +871,6 @@ impl P2PNode {
             dht_manager,
             resource_manager,
             bootstrap_manager,
-            security_dashboard,
             is_bootstrapped: Arc::new(AtomicBool::new(false)),
             is_started: Arc::new(AtomicBool::new(false)),
             trust_engine,
@@ -1568,10 +1555,10 @@ impl P2PNode {
 
     // /// Get MCP server statistics
 
-    /// Get production resource metrics
-    pub async fn resource_metrics(&self) -> Result<ResourceMetrics> {
+    /// Run a production health check
+    pub async fn resource_health_check(&self) -> Result<()> {
         if let Some(ref resource_manager) = self.resource_manager {
-            Ok(resource_manager.get_metrics().await)
+            resource_manager.health_check().await
         } else {
             Err(protocol_error("Production resource manager not enabled"))
         }
@@ -2519,8 +2506,8 @@ mod tests {
         assert!(!node.is_production_mode());
         assert!(node.production_config().is_none());
 
-        // Resource metrics should fail when production mode is disabled
-        let result = node.resource_metrics().await;
+        // Resource health check should fail when production mode is disabled
+        let result = node.resource_health_check().await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("not enabled"));
 

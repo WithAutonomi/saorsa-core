@@ -342,7 +342,7 @@ impl Client {
     /// Initialize network components with optional monitoring
     async fn initialize_components_with_monitoring(
         _config: &ClientConfig,
-        enable_monitoring: bool,
+        _enable_monitoring: bool,
     ) -> Result<NetworkComponents> {
         // Create trust provider
         let trust_provider = Arc::new(crate::adaptive::trust::MockTrustProvider::new());
@@ -382,44 +382,17 @@ impl Client {
             Default::default(),
         ));
 
-        // Always create a unique registry for client instances to avoid metric conflicts
-        // when multiple clients are created in tests or concurrent scenarios
-        #[cfg(feature = "metrics")]
-        let registry = Some(prometheus::Registry::new());
-        #[cfg(not(feature = "metrics"))]
-        let registry = None;
-
-        let monitoring = if enable_monitoring {
-            Arc::new(MonitoringSystem::new_with_registry(
-                crate::adaptive::monitoring::MonitoredComponents {
-                    router: router.clone(),
-                    churn_handler: churn.clone(),
-                    gossip: gossip.clone(),
-                    thompson: Arc::new(crate::adaptive::learning::ThompsonSampling::new()),
-                    cache: cache_manager.clone(),
-                },
-                Default::default(),
-                registry,
-            )?)
-        } else {
-            // Create a minimal monitoring system for testing
-            #[cfg(feature = "metrics")]
-            let test_registry = Some(prometheus::Registry::new());
-            #[cfg(not(feature = "metrics"))]
-            let test_registry = None;
-
-            Arc::new(MonitoringSystem::new_with_registry(
-                crate::adaptive::monitoring::MonitoredComponents {
-                    router: router.clone(),
-                    churn_handler: churn.clone(),
-                    gossip: gossip.clone(),
-                    thompson: Arc::new(crate::adaptive::learning::ThompsonSampling::new()),
-                    cache: cache_manager.clone(),
-                },
-                Default::default(),
-                test_registry,
-            )?)
-        };
+        let monitoring = Arc::new(MonitoringSystem::new_with_registry(
+            crate::adaptive::monitoring::MonitoredComponents {
+                router: router.clone(),
+                churn_handler: churn.clone(),
+                gossip: gossip.clone(),
+                thompson: Arc::new(crate::adaptive::learning::ThompsonSampling::new()),
+                cache: cache_manager.clone(),
+            },
+            Default::default(),
+            None,
+        )?);
 
         Ok(NetworkComponents {
             node_id,
@@ -691,12 +664,6 @@ mod tests {
         // Create Thompson sampling for tests
         let thompson = Arc::new(crate::adaptive::learning::ThompsonSampling::new());
 
-        // Create monitoring system with a test-specific registry to avoid conflicts
-        #[cfg(feature = "metrics")]
-        let test_registry = Some(prometheus::Registry::new());
-        #[cfg(not(feature = "metrics"))]
-        let test_registry = None;
-
         let monitoring = Arc::new(
             MonitoringSystem::new_with_registry(
                 crate::adaptive::monitoring::MonitoredComponents {
@@ -707,7 +674,7 @@ mod tests {
                     cache: cache.clone(),
                 },
                 crate::adaptive::monitoring::MonitoringConfig::default(),
-                test_registry,
+                None,
             )
             .expect("Failed to create monitoring system for tests"),
         );

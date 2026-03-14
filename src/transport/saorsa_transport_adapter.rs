@@ -49,7 +49,6 @@
 //! automatically enables saorsa-transport's prometheus metrics collection.
 
 use crate::error::{GeoEnforcementMode, GeoRejectionError, GeographicConfig};
-use crate::telemetry::StreamClass;
 use anyhow::Result;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -588,20 +587,6 @@ impl<T: LinkTransport + Send + Sync + 'static> P2PNetworkNode<T> {
             .finish()
             .map_err(|e| anyhow::anyhow!("Stream finish failed: {}", e))?;
 
-        Ok(())
-    }
-
-    /// Send data with a StreamClass (basic QoS wiring with telemetry)
-    pub async fn send_with_class(
-        &self,
-        addr: &SocketAddr,
-        data: &[u8],
-        class: StreamClass,
-    ) -> Result<()> {
-        self.send_to_peer_raw(addr, data).await?;
-        crate::telemetry::telemetry()
-            .record_stream_bandwidth(class, data.len() as u64)
-            .await;
         Ok(())
     }
 
@@ -1184,22 +1169,6 @@ impl<T: LinkTransport + Send + Sync + 'static> DualStackNetworkNode<T> {
     /// Send to peer by address.
     pub async fn send_to_peer(&self, addr: &SocketAddr, data: &[u8]) -> Result<()> {
         self.send_to_peer_raw(addr, data).await
-    }
-
-    /// Send to peer with StreamClass
-    pub async fn send_with_class(
-        &self,
-        addr: &SocketAddr,
-        data: &[u8],
-        class: StreamClass,
-    ) -> Result<()> {
-        let res = self.send_to_peer_raw(addr, data).await;
-        if res.is_ok() {
-            crate::telemetry::telemetry()
-                .record_stream_bandwidth(class, data.len() as u64)
-                .await;
-        }
-        res
     }
 
     /// Subscribe to connection lifecycle events from both stacks

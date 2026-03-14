@@ -15,7 +15,6 @@
 //!
 //! This module provides essential production-ready capabilities including:
 //! - Resource management and limits
-//! - Performance monitoring and metrics
 //! - Graceful shutdown handling
 //! - Configuration validation
 //! - Rate limiting and throttling
@@ -26,7 +25,7 @@ use crate::{P2PError, Result};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 use tokio::sync::{RwLock, Semaphore};
 use tokio::time::interval;
 use tracing::{debug, error, info, warn};
@@ -46,10 +45,6 @@ pub struct ProductionConfig {
     pub keep_alive_interval: Duration,
     /// Health check interval
     pub health_check_interval: Duration,
-    /// Metrics collection interval
-    pub metrics_interval: Duration,
-    /// Enable detailed performance tracking
-    pub enable_performance_tracking: bool,
     /// Enable automatic resource cleanup
     pub enable_auto_cleanup: bool,
     /// Graceful shutdown timeout
@@ -73,72 +68,9 @@ pub struct RateLimitConfig {
     pub window_duration: Duration,
 }
 
-/// System resource usage metrics
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ResourceMetrics {
-    /// Current memory usage in bytes
-    pub memory_used: u64,
-    /// Current number of connections
-    pub active_connections: usize,
-    /// Current bandwidth usage in bytes per second
-    pub bandwidth_usage: u64,
-    /// CPU usage percentage (0.0 - 100.0)
-    pub cpu_usage: f64,
-    /// Network latency statistics
-    pub network_latency: LatencyStats,
-    /// DHT performance metrics
-    pub dht_metrics: DHTMetrics,
-    /// MCP performance metrics
-    pub mcp_metrics: MCPMetrics,
-    /// Timestamp of metrics collection
-    pub timestamp: SystemTime,
-}
-
-/// Network latency statistics
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LatencyStats {
-    /// Average latency in milliseconds
-    pub avg_ms: f64,
-    /// Minimum latency in milliseconds
-    pub min_ms: f64,
-    /// Maximum latency in milliseconds
-    pub max_ms: f64,
-    /// 95th percentile latency in milliseconds
-    pub p95_ms: f64,
-    /// Number of samples
-    pub sample_count: u64,
-}
-
-/// DHT performance metrics
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DHTMetrics {
-    /// Operations per second
-    pub ops_per_sec: f64,
-    /// Average operation latency in milliseconds
-    pub avg_latency_ms: f64,
-    /// Success rate (0.0 - 1.0)
-    pub success_rate: f64,
-    /// Cache hit rate (0.0 - 1.0)
-    pub cache_hit_rate: f64,
-}
-
-/// MCP performance metrics
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MCPMetrics {
-    /// Tool calls per second
-    pub calls_per_sec: f64,
-    /// Average call latency in milliseconds
-    pub avg_latency_ms: f64,
-    /// Success rate (0.0 - 1.0)
-    pub success_rate: f64,
-    /// Active service count
-    pub active_services: usize,
-}
-
 /// Production resource manager for enforcing limits and monitoring
 pub struct ResourceManager {
     pub config: ProductionConfig,
-    metrics: Arc<RwLock<ResourceMetrics>>,
     connection_semaphore: Arc<Semaphore>,
     bandwidth_tracker: Arc<BandwidthTracker>,
     rate_limiters: Arc<RwLock<std::collections::HashMap<String, RateLimiter>>>,
@@ -171,8 +103,6 @@ impl Default for ProductionConfig {
             connection_timeout: Duration::from_secs(30),
             keep_alive_interval: Duration::from_secs(30),
             health_check_interval: Duration::from_secs(60),
-            metrics_interval: Duration::from_secs(10),
-            enable_performance_tracking: true,
             enable_auto_cleanup: true,
             shutdown_timeout: Duration::from_secs(30),
             rate_limits: RateLimitConfig::default(),
@@ -198,20 +128,8 @@ impl ResourceManager {
         let connection_semaphore = Arc::new(Semaphore::new(config.max_connections));
         let bandwidth_tracker = Arc::new(BandwidthTracker::new(Duration::from_secs(1)));
 
-        let initial_metrics = ResourceMetrics {
-            memory_used: 0,
-            active_connections: 0,
-            bandwidth_usage: 0,
-            cpu_usage: 0.0,
-            network_latency: LatencyStats::default(),
-            dht_metrics: DHTMetrics::default(),
-            mcp_metrics: MCPMetrics::default(),
-            timestamp: SystemTime::now(),
-        };
-
         Self {
             config,
-            metrics: Arc::new(RwLock::new(initial_metrics)),
             connection_semaphore,
             bandwidth_tracker,
             rate_limiters: Arc::new(RwLock::new(std::collections::HashMap::new())),
@@ -223,11 +141,6 @@ impl ResourceManager {
     /// Start the resource manager background tasks
     pub async fn start(&self) -> Result<()> {
         info!("Starting production resource manager");
-
-        // Start metrics collection task
-        if self.config.enable_performance_tracking {
-            self.spawn_metrics_collector().await;
-        }
 
         // Start health check task
         self.spawn_health_checker().await;
@@ -319,71 +232,39 @@ impl ResourceManager {
         self.bandwidth_tracker.record(bytes_sent, bytes_received);
     }
 
-    /// Get current resource metrics
-    pub async fn get_metrics(&self) -> ResourceMetrics {
-        self.metrics.read().await.clone()
+    /// Get the number of available connection permits
+    pub fn connection_semaphore_available(&self) -> usize {
+        self.connection_semaphore.available_permits()
     }
 
     /// Check if the system is healthy
     pub async fn health_check(&self) -> Result<()> {
-        let metrics = self.get_metrics().await;
-
-        // Check memory usage
-        if self.config.max_memory_bytes > 0 && metrics.memory_used > self.config.max_memory_bytes {
-            warn!(
-                "Memory usage ({} bytes) exceeds limit ({} bytes)",
-                metrics.memory_used, self.config.max_memory_bytes
-            );
-            return Err(P2PError::Network(
-                crate::error::NetworkError::ProtocolError(
-                    "Memory limit exceeded".to_string().into(),
-                ),
-            ));
-        }
+        let active_connections =
+            self.config.max_connections - self.connection_semaphore.available_permits();
+        let bandwidth_usage = self.bandwidth_tracker.current_usage();
 
         // Check bandwidth usage
-        if metrics.bandwidth_usage > self.config.max_bandwidth_bps {
+        if bandwidth_usage > self.config.max_bandwidth_bps {
             warn!(
                 "Bandwidth usage ({} bps) exceeds limit ({} bps)",
-                metrics.bandwidth_usage, self.config.max_bandwidth_bps
+                bandwidth_usage, self.config.max_bandwidth_bps
             );
         }
 
         // Check connection count
-        if metrics.active_connections >= self.config.max_connections {
+        if active_connections >= self.config.max_connections {
             warn!(
                 "Connection count ({}) at maximum ({})",
-                metrics.active_connections, self.config.max_connections
+                active_connections, self.config.max_connections
             );
         }
 
         debug!(
-            "Health check passed: {} connections, {} bytes memory, {} bps bandwidth",
-            metrics.active_connections, metrics.memory_used, metrics.bandwidth_usage
+            "Health check passed: {} connections, {} bps bandwidth",
+            active_connections, bandwidth_usage
         );
 
         Ok(())
-    }
-
-    /// Spawn metrics collection background task
-    async fn spawn_metrics_collector(&self) {
-        let manager = self.clone();
-        tokio::spawn(async move {
-            let mut interval = interval(manager.config.metrics_interval);
-            loop {
-                tokio::select! {
-                    _ = interval.tick() => {
-                        if let Err(e) = manager.collect_metrics().await {
-                            error!("Failed to collect metrics: {}", e);
-                        }
-                    }
-                    _ = manager.shutdown_signal.notified() => {
-                        debug!("Metrics collector shutting down");
-                        break;
-                    }
-                }
-            }
-        });
     }
 
     /// Spawn health check background task
@@ -426,28 +307,6 @@ impl ResourceManager {
         });
     }
 
-    /// Collect current system metrics
-    async fn collect_metrics(&self) -> Result<()> {
-        let mut metrics = self.metrics.write().await;
-
-        // Update bandwidth usage
-        metrics.bandwidth_usage = self.bandwidth_tracker.current_usage();
-
-        // Update connection count
-        metrics.active_connections =
-            self.config.max_connections - self.connection_semaphore.available_permits();
-
-        // Update timestamp
-        metrics.timestamp = SystemTime::now();
-
-        debug!(
-            "Metrics updated: {} connections, {} bps bandwidth",
-            metrics.active_connections, metrics.bandwidth_usage
-        );
-
-        Ok(())
-    }
-
     /// Clean up expired resources
     async fn cleanup_resources(&self) {
         debug!("Starting resource cleanup");
@@ -475,7 +334,6 @@ impl Clone for ResourceManager {
     fn clone(&self) -> Self {
         Self {
             config: self.config.clone(),
-            metrics: self.metrics.clone(),
             connection_semaphore: self.connection_semaphore.clone(),
             bandwidth_tracker: self.bandwidth_tracker.clone(),
             rate_limiters: self.rate_limiters.clone(),
@@ -609,40 +467,6 @@ impl RateLimiter {
     }
 }
 
-impl Default for LatencyStats {
-    fn default() -> Self {
-        Self {
-            avg_ms: 0.0,
-            min_ms: 0.0,
-            max_ms: 0.0,
-            p95_ms: 0.0,
-            sample_count: 0,
-        }
-    }
-}
-
-impl Default for DHTMetrics {
-    fn default() -> Self {
-        Self {
-            ops_per_sec: 0.0,
-            avg_latency_ms: 0.0,
-            success_rate: 1.0,
-            cache_hit_rate: 0.0,
-        }
-    }
-}
-
-impl Default for MCPMetrics {
-    fn default() -> Self {
-        Self {
-            calls_per_sec: 0.0,
-            avg_latency_ms: 0.0,
-            success_rate: 1.0,
-            active_services: 0,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -656,8 +480,6 @@ mod tests {
             connection_timeout: Duration::from_millis(100),
             keep_alive_interval: Duration::from_millis(50),
             health_check_interval: Duration::from_millis(50),
-            metrics_interval: Duration::from_millis(50),
-            enable_performance_tracking: true,
             enable_auto_cleanup: true,
             shutdown_timeout: Duration::from_millis(200),
             rate_limits: RateLimitConfig {
@@ -679,8 +501,6 @@ mod tests {
         assert_eq!(config.connection_timeout, Duration::from_secs(30));
         assert_eq!(config.keep_alive_interval, Duration::from_secs(30));
         assert_eq!(config.health_check_interval, Duration::from_secs(60));
-        assert_eq!(config.metrics_interval, Duration::from_secs(10));
-        assert!(config.enable_performance_tracking);
         assert!(config.enable_auto_cleanup);
         assert_eq!(config.shutdown_timeout, Duration::from_secs(30));
     }
@@ -695,47 +515,13 @@ mod tests {
         assert_eq!(config.window_duration, Duration::from_secs(1));
     }
 
-    #[test]
-    fn test_latency_stats_default() {
-        let stats = LatencyStats::default();
-        assert_eq!(stats.avg_ms, 0.0);
-        assert_eq!(stats.min_ms, 0.0);
-        assert_eq!(stats.max_ms, 0.0);
-        assert_eq!(stats.p95_ms, 0.0);
-        assert_eq!(stats.sample_count, 0);
-    }
-
-    #[test]
-    fn test_dht_metrics_default() {
-        let metrics = DHTMetrics::default();
-        assert_eq!(metrics.ops_per_sec, 0.0);
-        assert_eq!(metrics.avg_latency_ms, 0.0);
-        assert_eq!(metrics.success_rate, 1.0);
-        assert_eq!(metrics.cache_hit_rate, 0.0);
-    }
-
-    #[test]
-    fn test_mcp_metrics_default() {
-        let metrics = MCPMetrics::default();
-        assert_eq!(metrics.calls_per_sec, 0.0);
-        assert_eq!(metrics.avg_latency_ms, 0.0);
-        assert_eq!(metrics.success_rate, 1.0);
-        assert_eq!(metrics.active_services, 0);
-    }
-
     #[tokio::test]
     async fn test_resource_manager_creation() {
         let config = create_test_config();
-        let manager = ResourceManager::new(config.clone());
+        let _manager = ResourceManager::new(config.clone());
 
-        let metrics = manager.get_metrics().await;
-        assert_eq!(metrics.active_connections, 0);
-        assert_eq!(metrics.bandwidth_usage, 0);
-        assert_eq!(metrics.memory_used, 0);
-        assert_eq!(metrics.cpu_usage, 0.0);
-        assert_eq!(metrics.network_latency.sample_count, 0);
-        assert_eq!(metrics.dht_metrics.success_rate, 1.0);
-        assert_eq!(metrics.mcp_metrics.success_rate, 1.0);
+        // Verify the manager was created successfully with the given config
+        assert_eq!(_manager.config.max_connections, 10);
     }
 
     #[tokio::test]
@@ -994,43 +780,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_health_check_memory_limit_exceeded() {
-        let config = ProductionConfig {
-            max_memory_bytes: 100, // Very low limit
-            ..create_test_config()
-        };
-        let manager = ResourceManager::new(config);
-
-        // Manually set high memory usage
-        {
-            let mut metrics = manager.metrics.write().await;
-            metrics.memory_used = 200; // Exceeds limit
-        }
-
-        // Health check should fail
-        let result = manager.health_check().await;
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("Memory limit exceeded")
-        );
-    }
-
-    #[tokio::test]
     async fn test_health_check_bandwidth_warning() {
         let config = ProductionConfig {
-            max_bandwidth_bps: 1000,
+            max_bandwidth_bps: 1, // Very low limit to trigger warning
             ..create_test_config()
         };
         let manager = ResourceManager::new(config);
 
-        // Manually set high bandwidth usage
-        {
-            let mut metrics = manager.metrics.write().await;
-            metrics.bandwidth_usage = 2000; // Exceeds limit but doesn't fail
-        }
+        // Record bandwidth to exceed the limit
+        manager.record_bandwidth(1000, 2000);
 
         // Health check should still pass (bandwidth warning only)
         let result = manager.health_check().await;
@@ -1049,35 +807,9 @@ mod tests {
         let _guard1 = manager.acquire_connection().await?;
         let _guard2 = manager.acquire_connection().await?;
 
-        // Manually update metrics to reflect max connections
-        {
-            let mut metrics = manager.metrics.write().await;
-            metrics.active_connections = 2;
-        }
-
         // Health check should still pass (connection warning only)
         let result = manager.health_check().await;
         assert!(result.is_ok());
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_metrics_collection() -> Result<()> {
-        let config = create_test_config();
-        let manager = ResourceManager::new(config);
-
-        // Record some activity
-        manager.record_bandwidth(500, 1000);
-        let _guard = manager.acquire_connection().await?;
-
-        // Collect metrics
-        manager.collect_metrics().await?;
-
-        let metrics = manager.get_metrics().await;
-        assert_eq!(metrics.active_connections, 1);
-        assert!(metrics.bandwidth_usage > 0);
-        assert!(metrics.timestamp.elapsed().unwrap().as_millis() < 100); // Recent timestamp
-
         Ok(())
     }
 
@@ -1150,7 +882,6 @@ mod tests {
     #[tokio::test]
     async fn test_start_with_disabled_features() {
         let config = ProductionConfig {
-            enable_performance_tracking: false,
             enable_auto_cleanup: false,
             ..create_test_config()
         };
@@ -1263,27 +994,5 @@ mod tests {
         std::thread::sleep(Duration::from_millis(10));
         let usage_after_window = tracker.current_usage();
         assert_eq!(usage_after_window, 0);
-    }
-
-    #[tokio::test]
-    async fn test_resource_metrics_structure() {
-        let config = create_test_config();
-        let manager = ResourceManager::new(config);
-
-        let metrics = manager.get_metrics().await;
-
-        // Verify all fields are properly initialized
-        assert_eq!(metrics.memory_used, 0);
-        assert_eq!(metrics.active_connections, 0);
-        assert_eq!(metrics.bandwidth_usage, 0);
-        assert_eq!(metrics.cpu_usage, 0.0);
-
-        // Verify nested structures
-        assert_eq!(metrics.network_latency.sample_count, 0);
-        assert_eq!(metrics.dht_metrics.ops_per_sec, 0.0);
-        assert_eq!(metrics.mcp_metrics.calls_per_sec, 0.0);
-
-        // Verify timestamp is recent
-        assert!(metrics.timestamp.elapsed().unwrap().as_secs() < 1);
     }
 }

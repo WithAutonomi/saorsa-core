@@ -7,7 +7,6 @@ use crate::PeerId;
 use crate::adaptive::EigenTrustEngine;
 use crate::address::MultiAddr;
 use crate::dht::geographic_routing::GeographicRegion;
-use crate::dht::metrics::SecurityMetricsCollector;
 use crate::dht::network_integration::{DhtMessage, DhtResponse};
 use crate::dht::routing_maintenance::close_group_validator::{
     CloseGroupEnforcementMode, CloseGroupFailure, CloseGroupValidator, CloseGroupValidatorConfig,
@@ -366,7 +365,6 @@ pub struct DhtCoreEngine {
     routing_table: Arc<RwLock<KademliaRoutingTable>>,
 
     // Security Components
-    security_metrics: Arc<SecurityMetricsCollector>,
     bucket_refresh_manager: Arc<RwLock<BucketRefreshManager>>,
     close_group_validator: Arc<RwLock<CloseGroupValidator>>,
     eviction_manager: Arc<RwLock<EvictionManager>>,
@@ -422,7 +420,6 @@ impl DhtCoreEngine {
         allow_loopback: bool,
     ) -> Result<Self> {
         // Initialize security components
-        let security_metrics = Arc::new(SecurityMetricsCollector::new());
         let validator_config =
             CloseGroupValidatorConfig::default().with_enforcement_mode(enforcement_mode);
         let close_group_validator = Arc::new(RwLock::new(CloseGroupValidator::new(
@@ -442,7 +439,6 @@ impl DhtCoreEngine {
         Ok(Self {
             node_id,
             routing_table: Arc::new(RwLock::new(KademliaRoutingTable::new(node_id, K))),
-            security_metrics,
             bucket_refresh_manager,
             close_group_validator,
             eviction_manager,
@@ -509,7 +505,6 @@ impl DhtCoreEngine {
         let refresh_manager = self.bucket_refresh_manager.clone();
         let eviction_manager = self.eviction_manager.clone();
         let close_group_validator = self.close_group_validator.clone();
-        let security_metrics = self.security_metrics.clone();
         let shutdown = self.shutdown.clone();
 
         tokio::spawn(async move {
@@ -612,10 +607,7 @@ impl DhtCoreEngine {
                             }
                         }
 
-                        // Update security metrics
                         if total_validated > 0 || total_evicted > 0 {
-                            security_metrics
-                                .record_validation_during_refresh(total_validated, total_evicted);
                             tracing::info!(
                                 total_validated = total_validated,
                                 total_evicted = total_evicted,
@@ -645,11 +637,6 @@ impl DhtCoreEngine {
                 // metrics.update_churn(...)
             }
         });
-    }
-
-    /// Get the security metrics collector
-    pub fn security_metrics(&self) -> Arc<SecurityMetricsCollector> {
-        self.security_metrics.clone()
     }
 
     /// Handle an incoming DHT request from the network
@@ -759,16 +746,7 @@ impl DhtCoreEngine {
             routing.remove_node(node_id);
         }
 
-        // 2. Update security metrics based on eviction reason
-        let reason_str = match &reason {
-            EvictionReason::ConsecutiveFailures(_) => "consecutive_failures",
-            EvictionReason::LowTrust(_) => "low_trust",
-            EvictionReason::CloseGroupRejection => "close_group_rejection",
-            EvictionReason::Stale => "stale",
-        };
-        self.security_metrics.record_eviction(reason_str).await;
-
-        // 3. Log eviction for data integrity tracking
+        // 2. Log eviction for data integrity tracking
         // Note: Data health tracking handled elsewhere
         // Evicted nodes will be removed from routing table, which affects future lookups
 
@@ -1044,7 +1022,6 @@ impl std::fmt::Debug for DhtCoreEngine {
         f.debug_struct("DhtCoreEngine")
             .field("node_id", &self.node_id)
             .field("routing_table", &"Arc<RwLock<KademliaRoutingTable>>")
-            .field("security_metrics", &"Arc<SecurityMetricsCollector>")
             .field(
                 "bucket_refresh_manager",
                 &"Arc<RwLock<BucketRefreshManager>>",

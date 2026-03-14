@@ -84,9 +84,6 @@ pub mod events;
 /// Shared simple structs
 pub mod types;
 
-/// Telemetry for metrics and health signals
-pub mod telemetry;
-
 // MCP removed; will be redesigned later
 
 /// Security and cryptography
@@ -149,7 +146,7 @@ pub use events::{Subscription, TopologyEvent, device_subscribe, dht_watch, subsc
 pub use fwid::Key as FwKey;
 pub use health::{
     ComponentChecker, ComponentHealth, HealthEndpoints, HealthManager, HealthResponse,
-    HealthServer, HealthStatus, PrometheusExporter,
+    HealthServer, HealthStatus,
 };
 pub use network::{
     ConnectionStatus, NetworkSender, NodeBuilder, NodeConfig, NodeMode, P2PEvent, P2PNode,
@@ -158,12 +155,11 @@ pub use network::{
 pub use transport_handle::TransportHandle;
 // Trust system exports for saorsa-node integration
 pub use adaptive::{EigenTrustEngine, NodeStatistics, NodeStatisticsUpdate, TrustProvider};
-pub use telemetry::{Metrics, StreamClass, record_lookup, record_timeout, telemetry};
 // Back-compat exports for tests
 pub use config::Config;
 pub use network::P2PNode as Node;
 pub use peer_record::NatType;
-pub use production::{ProductionConfig, ResourceManager, ResourceMetrics};
+pub use production::{ProductionConfig, ResourceManager};
 pub use validation::{
     RateLimitConfig, RateLimiter, Sanitize, Validate, ValidationContext, ValidationError,
     sanitize_string, validate_dht_key, validate_dht_value, validate_file_path,

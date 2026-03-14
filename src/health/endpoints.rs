@@ -14,7 +14,6 @@
 //! HTTP endpoints for health checks
 
 use super::HealthManager;
-use crate::health::metrics::PrometheusExporter;
 use crate::{P2PError, Result};
 use axum::{
     Json, Router,
@@ -31,16 +30,12 @@ use tracing::{error, info};
 /// Health check HTTP endpoints
 pub struct HealthEndpoints {
     health_manager: Arc<HealthManager>,
-    prometheus_exporter: Arc<PrometheusExporter>,
 }
 
 impl HealthEndpoints {
     /// Create new health endpoints
     pub fn new(health_manager: Arc<HealthManager>) -> Self {
-        Self {
-            health_manager: health_manager.clone(),
-            prometheus_exporter: Arc::new(PrometheusExporter::new(health_manager)),
-        }
+        Self { health_manager }
     }
 
     /// Build the router with all health endpoints
@@ -48,7 +43,6 @@ impl HealthEndpoints {
         Router::new()
             .route("/health", get(health_handler))
             .route("/ready", get(ready_handler))
-            .route("/metrics", get(metrics_handler))
             .route("/debug/vars", get(debug_handler))
             .with_state(Arc::new(self))
     }
@@ -193,36 +187,6 @@ async fn ready_handler(
     }
 }
 
-/// Handler for /metrics endpoint (Prometheus format)
-async fn metrics_handler(
-    State(endpoints): State<Arc<HealthEndpoints>>,
-) -> std::result::Result<impl IntoResponse, HealthError> {
-    let start = Instant::now();
-
-    let metrics = endpoints
-        .prometheus_exporter
-        .export()
-        .await
-        .map_err(|e| HealthError::Internal(e.to_string()))?;
-
-    let latency = start.elapsed();
-    if latency.as_millis() > 100 {
-        error!(
-            "Metrics export took {}ms (> 100ms threshold)",
-            latency.as_millis()
-        );
-    }
-
-    Ok((
-        StatusCode::OK,
-        [(
-            axum::http::header::CONTENT_TYPE,
-            "text/plain; version=0.0.4",
-        )],
-        metrics,
-    ))
-}
-
 /// Handler for /debug/vars endpoint
 async fn debug_handler(
     State(endpoints): State<Arc<HealthEndpoints>>,
@@ -329,36 +293,6 @@ mod tests {
 
         assert_eq!(health.status, "healthy");
         assert!(!health.version.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_metrics_endpoint() {
-        let app = create_test_app().await;
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/metrics")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            response.headers().get("content-type").unwrap(),
-            "text/plain; version=0.0.4"
-        );
-
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let metrics = String::from_utf8(body.to_vec()).unwrap();
-
-        // Check for standard Prometheus format
-        assert!(metrics.contains("# HELP"));
-        assert!(metrics.contains("# TYPE"));
     }
 
     #[tokio::test]
