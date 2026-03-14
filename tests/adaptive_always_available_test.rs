@@ -22,9 +22,6 @@ use saorsa_core::adaptive::{
     TrustProvider,
 };
 
-// Geographic module
-use saorsa_core::geographic_enhanced_network::GeographicNetworkConfig;
-
 // DHT trust integration
 use saorsa_core::dht::trust_peer_selector::TrustAwarePeerSelector;
 
@@ -54,12 +51,6 @@ fn adaptive_module_types_constructible() {
 
     // HyperbolicCoordinate (public fields)
     let _coord = HyperbolicCoordinate { r: 0.5, theta: 1.0 };
-}
-
-#[test]
-fn geographic_module_accessible() {
-    let type_name = std::any::type_name::<GeographicNetworkConfig>();
-    assert!(!type_name.is_empty());
 }
 
 #[test]

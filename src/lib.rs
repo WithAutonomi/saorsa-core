@@ -79,13 +79,8 @@ pub mod transport_handle;
 /// Transport layer (QUIC, TCP)
 pub mod transport;
 
-/// Authentication system for multi-writer records
-pub mod auth;
-
 /// Async event bus for watches and state changes
 pub mod events;
-/// MLS verifier adapter and proof format
-pub mod mls;
 /// Shared simple structs
 pub mod types;
 
@@ -130,30 +125,13 @@ pub mod error;
 /// Peer record system for DHT-based peer discovery
 pub mod peer_record;
 
-/// Monotonic counter system for replay attack prevention
-pub mod monotonic_counter;
-
-/// Secure memory management for cryptographic operations
-pub mod secure_memory;
-
-/// Hierarchical key derivation system
-pub mod key_derivation;
-
-/// Encrypted key storage with Argon2id and ChaCha20-Poly1305
-pub mod encrypted_key_storage;
-
 /// Adaptive P2P network implementation
 pub mod adaptive;
 
 /// Configuration management system
 pub mod config;
-pub mod control;
-
 /// Health check system for monitoring and metrics
 pub mod health;
-
-/// Geographic-aware networking enhancements for P2P routing optimization
-pub mod geographic_enhanced_network;
 
 /// Auto-upgrade system for cross-platform binary updates
 pub mod upgrade;
@@ -161,18 +139,10 @@ pub mod upgrade;
 // Re-export main types
 pub use address::{AddressBook, MultiAddr};
 
-// New spec-compliant API exports
-pub use auth::{
-    DelegatedWriteAuth, MlsWriteAuth, PubKey, Sig, SingleWriteAuth, ThresholdWriteAuth, WriteAuth,
-};
 pub use bootstrap::{BootstrapConfig, BootstrapManager, BootstrapStats};
 pub use dht::Key;
 pub use dht_network_manager::{
     DhtNetworkConfig, DhtNetworkEvent, DhtNetworkManager, DhtNetworkOperation, DhtNetworkResult,
-};
-pub use encrypted_key_storage::{
-    Argon2Config, DerivationPriority as KeyDerivationPriority, EncryptedKeyStorageManager,
-    KeyMetadata, PasswordValidation, SecurityLevel, StorageStats,
 };
 pub use error::{P2PError, P2pResult as Result, PeerFailureReason};
 pub use events::{Subscription, TopologyEvent, device_subscribe, dht_watch, subscribe_topology};
@@ -180,14 +150,6 @@ pub use fwid::Key as FwKey;
 pub use health::{
     ComponentChecker, ComponentHealth, HealthEndpoints, HealthManager, HealthResponse,
     HealthServer, HealthStatus, PrometheusExporter,
-};
-pub use key_derivation::{
-    BatchDerivationRequest, BatchDerivationResult, DerivationPath, DerivationPriority,
-    DerivationStats, DerivedKey, HierarchicalKeyDerivation, MasterSeed,
-};
-pub use monotonic_counter::{
-    BatchUpdateRequest, BatchUpdateResult, CounterStats, MonotonicCounterSystem, PeerCounter,
-    SequenceValidationResult,
 };
 pub use network::{
     ConnectionStatus, NetworkSender, NodeBuilder, NodeConfig, NodeMode, P2PEvent, P2PNode,
@@ -200,12 +162,8 @@ pub use telemetry::{Metrics, StreamClass, record_lookup, record_timeout, telemet
 // Back-compat exports for tests
 pub use config::Config;
 pub use network::P2PNode as Node;
-pub use peer_record::{EndpointId, NatType, PeerDHTRecord, PeerEndpoint, SignatureCache};
+pub use peer_record::NatType;
 pub use production::{ProductionConfig, ResourceManager, ResourceMetrics};
-pub use secure_memory::{
-    PoolStats, SecureMemory, SecureMemoryPool, SecureString, SecureVec, allocate_secure,
-    secure_string_with_capacity, secure_vec_with_capacity,
-};
 pub use validation::{
     RateLimitConfig, RateLimiter, Sanitize, Validate, ValidationContext, ValidationError,
     sanitize_string, validate_dht_key, validate_dht_value, validate_file_path,

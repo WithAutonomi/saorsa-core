@@ -48,16 +48,11 @@ pub use crate::bootstrap::{BootstrapConfig, BootstrapManager, BootstrapStats};
 pub use crate::dht::Key;
 
 // ============================================================================
-// Identity & Authentication
+// Identity & Peer Records
 // ============================================================================
 
-/// Write authorization types
-pub use crate::auth::{
-    DelegatedWriteAuth, MlsWriteAuth, PubKey, Sig, SingleWriteAuth, ThresholdWriteAuth, WriteAuth,
-};
-
 /// Peer record types
-pub use crate::peer_record::{EndpointId, NatType, PeerDHTRecord, PeerEndpoint, SignatureCache};
+pub use crate::peer_record::NatType;
 
 // ============================================================================
 // Post-Quantum Cryptography
@@ -114,16 +109,6 @@ pub use crate::security::{
 pub use crate::dht::node_age_verifier::{
     AgeVerificationResult, NodeAgeCategory, NodeAgeConfig, NodeAgeRecord, NodeAgeStats,
     NodeAgeVerifier, OperationType,
-};
-
-// ============================================================================
-// State Management
-// ============================================================================
-
-/// Secure memory management
-pub use crate::secure_memory::{
-    PoolStats, SecureMemory, SecureMemoryPool, SecureString, SecureVec, allocate_secure,
-    secure_string_with_capacity, secure_vec_with_capacity,
 };
 
 // ============================================================================
