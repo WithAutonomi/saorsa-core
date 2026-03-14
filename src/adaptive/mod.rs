@@ -38,7 +38,6 @@ pub mod eviction;
 pub mod gossip;
 pub mod hyperbolic;
 pub mod learning;
-pub mod monitoring;
 pub mod multi_armed_bandit;
 pub mod q_learning_cache;
 pub mod routing;
@@ -59,9 +58,6 @@ pub use eviction::{
 pub use gossip::AdaptiveGossipSub;
 pub use hyperbolic::{HyperbolicRoutingStrategy, HyperbolicSpace};
 pub use learning::{ChurnPredictor, QLearnCacheManager, ThompsonSampling};
-pub use monitoring::{
-    Alert, AlertManager, DashboardData, MonitoringConfig, MonitoringSystem, NetworkHealth,
-};
 pub use multi_armed_bandit::{
     MABConfig, MABRoutingStrategy, MultiArmedBandit, RouteDecision, RouteId,
 };

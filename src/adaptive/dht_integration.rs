@@ -173,16 +173,6 @@ pub struct AdaptiveDHT {
     churn_predictor: Arc<ChurnPredictor>,
     geo_integration: Arc<GeographicNetworkIntegration>,
     identity: Arc<NodeIdentity>,
-    metrics: Arc<RwLock<DHTMetrics>>,
-}
-
-/// DHT performance metrics
-#[derive(Debug, Default, Clone)]
-pub struct DHTMetrics {
-    pub lookups_total: u64,
-    pub lookups_successful: u64,
-    pub average_lookup_hops: f64,
-    pub trust_rejections: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -242,7 +232,6 @@ impl AdaptiveDHT {
             churn_predictor: dependencies.churn_predictor,
             geo_integration,
             identity: dependencies.identity,
-            metrics: Arc::new(RwLock::new(DHTMetrics::default())),
         })
     }
 
@@ -280,7 +269,6 @@ impl AdaptiveDHT {
             churn_predictor: dependencies.churn_predictor,
             geo_integration,
             identity: dependencies.identity,
-            metrics: Arc::new(RwLock::new(DHTMetrics::default())),
         })
     }
 
@@ -370,16 +358,12 @@ impl AdaptiveDHT {
         let weights = self.config.enforced_weights();
 
         let mut scored = Vec::with_capacity(candidates.len());
-        let mut trust_rejections = 0u64;
 
         for candidate in candidates {
             let node_id = &candidate.peer_id;
             let address = Some(candidate.address.clone());
             let region = self.detect_region(&address).await;
             let trust = self.trust_provider.get_trust(node_id).clamp(0.0, 1.0);
-            if trust < self.config.min_trust_threshold {
-                trust_rejections += 1;
-            }
 
             let prediction = self.churn_predictor.predict(node_id).await;
             let churn_risk = (prediction.probability_1h * 0.6
@@ -426,11 +410,6 @@ impl AdaptiveDHT {
                 scores,
                 composite,
             });
-        }
-
-        if trust_rejections > 0 {
-            let mut metrics = self.metrics.write().await;
-            metrics.trust_rejections = metrics.trust_rejections.saturating_add(trust_rejections);
         }
 
         Ok(scored)
@@ -568,11 +547,6 @@ impl AdaptiveDHT {
 
         Ok(())
     }
-
-    /// Get current DHT metrics
-    pub async fn get_metrics(&self) -> DHTMetrics {
-        self.metrics.read().await.clone()
-    }
 }
 
 /// Implement Kademlia routing strategy for adaptive router
@@ -598,7 +572,7 @@ impl RoutingStrategy for KademliaRoutingStrategy {
     }
 
     fn update_metrics(&self, _path: &[PeerId], _success: bool) {
-        // Metrics updated in AdaptiveDHT
+        // No-op: metrics removed
     }
 }
 
@@ -624,10 +598,7 @@ mod tests {
         let identity = Arc::new(NodeIdentity::generate().unwrap());
         let trust_provider = Arc::new(MockTrustProvider);
 
-        let dht = AdaptiveDHT::new(identity, trust_provider).await.unwrap();
-        let metrics = dht.get_metrics().await;
-
-        assert_eq!(metrics.lookups_total, 0);
+        let _dht = AdaptiveDHT::new(identity, trust_provider).await.unwrap();
     }
 
     #[tokio::test]

@@ -57,11 +57,6 @@ async fn test_thompson_sampling_real_api() -> anyhow::Result<()> {
         }
     }
 
-    // Check metrics
-    let metrics = ts.get_metrics().await;
-    println!("Thompson Sampling metrics: {:?}", metrics);
-    assert!(metrics.total_decisions > 0, "Should have made decisions");
-
     // Check confidence intervals
     for content_type in &content_types {
         let (lower, upper) = ts
@@ -168,12 +163,9 @@ async fn test_multi_armed_bandit_real_api() -> anyhow::Result<()> {
         );
     }
 
-    let metrics = mab.get_metrics().await;
-    println!("MAB metrics: {:?}", metrics);
-    assert!(
-        metrics.total_decisions > 0,
-        "Should have made routing decisions"
-    );
+    // Verify statistics were recorded
+    let stats = mab.get_all_statistics().await;
+    assert!(!stats.is_empty(), "Should have route statistics");
 
     // Test persistence
     mab.persist().await?;
@@ -239,14 +231,6 @@ async fn test_security_manager_real_api() -> anyhow::Result<()> {
         Ok(()) => println!("WARNING: Blacklisted node was allowed to join!"),
         Err(e) => println!("Other error: {:?}", e),
     }
-
-    // Check security metrics
-    let metrics = security.get_metrics().await;
-    println!("Security metrics: {:?}", metrics);
-    assert!(
-        metrics.blacklisted_nodes > 0,
-        "Should have blacklisted nodes"
-    );
 
     Ok(())
 }
@@ -643,33 +627,19 @@ async fn test_integrated_adaptive_system() -> anyhow::Result<()> {
     );
 
     // Check final states
-    let ts_metrics = thompson.get_metrics().await;
-    let mab_metrics = mab.get_metrics().await;
+    let mab_stats = mab.get_all_statistics().await;
     let cache_stats = cache_manager.get_stats_async().await;
-    let security_metrics = security.get_metrics().await;
 
-    println!("Final metrics:");
-    println!(
-        "  Thompson Sampling decisions: {}",
-        ts_metrics.total_decisions
-    );
-    println!("  MAB decisions: {}", mab_metrics.total_decisions);
+    println!("Final state:");
+    println!("  MAB routes tracked: {}", mab_stats.len());
     println!(
         "  Cache hits: {}, misses: {}",
         cache_stats.hits, cache_stats.misses
     );
-    println!(
-        "  Security audit entries: {}",
-        security_metrics.audit_entries
-    );
 
     // Verify all systems are functioning
     assert!(total_operations > 10, "Should complete multiple operations");
-    assert!(
-        ts_metrics.total_decisions > 0,
-        "Thompson Sampling should make decisions"
-    );
-    assert!(mab_metrics.total_decisions > 0, "MAB should make decisions");
+    assert!(!mab_stats.is_empty(), "MAB should have tracked routes");
 
     println!("\n=== Integrated System Test Passed ===\n");
 

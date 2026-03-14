@@ -69,28 +69,6 @@ pub trait MessageValidator: Send + Sync {
     async fn validate(&self, message: &GossipMessage) -> Result<bool>;
 }
 
-/// Gossip statistics
-#[derive(Debug, Clone, Default)]
-pub struct GossipStats {
-    /// Total messages sent
-    pub messages_sent: u64,
-
-    /// Total messages received
-    pub messages_received: u64,
-
-    /// Current mesh size
-    pub mesh_size: usize,
-
-    /// Number of active topics
-    pub topic_count: usize,
-
-    /// Total peers
-    pub peer_count: usize,
-
-    /// Messages by topic
-    pub messages_by_topic: HashMap<Topic, u64>,
-}
-
 /// Adaptive GossipSub implementation
 pub struct AdaptiveGossipSub {
     /// Local node ID
@@ -134,9 +112,6 @@ pub struct AdaptiveGossipSub {
 
     /// Churn detector
     churn_detector: Arc<RwLock<ChurnDetector>>,
-
-    /// Statistics
-    stats: Arc<RwLock<GossipStats>>,
 }
 
 /// Gossip message
@@ -390,7 +365,6 @@ impl AdaptiveGossipSub {
             _message_rx: Arc::new(RwLock::new(None)),
             control_tx: Arc::new(RwLock::new(None)),
             churn_detector: Arc::new(RwLock::new(ChurnDetector::new())),
-            stats: Arc::new(RwLock::new(GossipStats::default())),
         }
     }
 
@@ -778,21 +752,6 @@ impl AdaptiveGossipSub {
         // In a real implementation, would reduce mesh degree based on factor
         // This would involve updating the target degree for mesh maintenance
         let _ = factor; // Suppress unused warning
-    }
-
-    /// Get gossip statistics
-    pub async fn get_stats(&self) -> GossipStats {
-        let mut stats = self.stats.read().await.clone();
-
-        // Update current values
-        let mesh = self.mesh.read().await;
-        stats.mesh_size = mesh.values().map(|peers| peers.len()).sum();
-        stats.topic_count = mesh.len();
-
-        let peer_scores = self.peer_scores.read().await;
-        stats.peer_count = peer_scores.len();
-
-        stats
     }
 }
 

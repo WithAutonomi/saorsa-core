@@ -29,12 +29,9 @@ use crate::PeerId;
 use crate::adaptive::StrategyChoice;
 use crate::adaptive::coordinator_extensions::{
     AdaptiveDHTExtensions, AdaptiveGossipSubExtensions, AdaptiveRouterExtensions,
-    EigenTrustEngineExtensions, MonitoringSystemExtensions, MultiArmedBanditExtensions,
-    SecurityManagerExtensions,
+    EigenTrustEngineExtensions, MultiArmedBanditExtensions, SecurityManagerExtensions,
 };
 use crate::adaptive::gossip::GossipMessage;
-use crate::adaptive::learning::{QLearnCacheManager, ThompsonSampling};
-use crate::adaptive::monitoring::{LogLevel, MonitoredComponents};
 use crate::adaptive::multi_armed_bandit::RouteId;
 use crate::adaptive::q_learning_cache::{
     QLearnCacheManager as QLearningCacheManager, QLearningConfig,
@@ -87,13 +84,11 @@ pub struct LearningComponents {
     pub churn_predictor: Arc<ChurnPredictor>,
 }
 
-/// Operations and monitoring components
+/// Operations and security components
 #[derive(Clone)]
 pub struct OperationsComponents {
     /// Churn handler
     pub churn_handler: Arc<ChurnHandler>,
-    /// Monitoring system
-    pub monitoring: Arc<MonitoringSystem>,
     /// Security manager
     pub security: Arc<SecurityManager>,
 }
@@ -192,20 +187,8 @@ struct CoordinatorState {
     /// Active connections
     connections: usize,
 
-    /// Current network health
-    health: NetworkHealthStatus,
-
     /// Graceful shutdown flag
     shutting_down: bool,
-}
-
-/// Network health status
-#[derive(Debug, Clone, Copy)]
-#[allow(dead_code)]
-enum NetworkHealthStatus {
-    Healthy,
-    Degraded,
-    Critical,
 }
 
 /// Message types for routing
@@ -303,37 +286,6 @@ impl NetworkCoordinator {
             churn_config,
         ));
 
-        // Create ThompsonSampling for monitoring
-        let thompson = Arc::new(ThompsonSampling::new());
-
-        // Create cache for monitoring (from learning module)
-        let retrieval_cache = Arc::new(QLearnCacheManager::new(
-            DEFAULT_ML_CACHE_CAPACITY_BYTES as usize,
-        ));
-
-        // Initialize monitoring
-        let monitoring_config = MonitoringConfig {
-            collection_interval: config.monitoring_interval,
-            anomaly_window_size: 100,
-            alert_cooldown: Duration::from_secs(300), // 5 minutes
-            profiling_sample_rate: 0.1,
-            log_level: LogLevel::Info,
-            dashboard_interval: Duration::from_secs(10),
-        };
-
-        let monitored_components = MonitoredComponents {
-            router: router.clone(),
-            churn_handler: churn_handler.clone(),
-            gossip: gossip.clone(),
-            thompson: thompson.clone(),
-            cache: retrieval_cache.clone(),
-        };
-
-        let monitoring = Arc::new(
-            MonitoringSystem::new(monitored_components, monitoring_config)
-                .map_err(|_| P2PError::Network(crate::error::NetworkError::Timeout))?,
-        );
-
         // Initialize security
         let security_config = SecurityConfig {
             rate_limit: RateLimitConfig {
@@ -381,7 +333,6 @@ impl NetworkCoordinator {
 
         let operations_components = OperationsComponents {
             churn_handler,
-            monitoring,
             security,
         };
 
@@ -395,7 +346,6 @@ impl NetworkCoordinator {
             state: Arc::new(RwLock::new(CoordinatorState {
                 joined: false,
                 connections: 0,
-                health: NetworkHealthStatus::Healthy,
                 shutting_down: false,
             })),
             metrics: Arc::new(RwLock::new(SystemMetrics::default())),
@@ -426,9 +376,6 @@ impl NetworkCoordinator {
 
         // Join gossip mesh
         self.network.gossip.start().await?;
-
-        // Start monitoring
-        self.operations.monitoring.start_collection().await?;
 
         // Update state
         let mut state = self.state.write().await;
@@ -501,7 +448,6 @@ impl NetworkCoordinator {
         self.operations.churn_handler.start_monitoring().await;
 
         // Start metrics collection
-        let _monitoring = self.operations.monitoring.clone();
         let _metrics = self.metrics.clone();
         tokio::spawn(async move {
             loop {
@@ -546,17 +492,8 @@ impl NetworkCoordinator {
                     .security
                     .enable_strict_rate_limiting()
                     .await?;
-                // Reduce monitoring frequency
-                self.operations
-                    .monitoring
-                    .reduce_collection_frequency(0.5)
-                    .await;
             }
         }
-
-        // Update state
-        let mut state = self.state.write().await;
-        state.health = NetworkHealthStatus::Degraded;
 
         Ok(())
     }
@@ -696,13 +633,6 @@ impl NetworkCoordinator {
             .map(|(_, path)| path)
             .ok_or_else(|| AdaptiveNetworkError::Routing("No path selected".into()).into())
     }
-
-    /// Collect metrics from all components
-    pub async fn collect_metrics(&self) -> Result<SystemMetrics> {
-        // For now, return default metrics since the coordinator doesn't have a metrics field
-        // This can be enhanced later when proper metrics collection is implemented
-        Ok(SystemMetrics::default())
-    }
 }
 
 #[cfg(test)]
@@ -841,10 +771,7 @@ mod tests {
                 .await;
 
                 match degradation_result {
-                    Ok(Ok(_)) => {
-                        let state = coordinator.state.read().await;
-                        assert!(matches!(state.health, NetworkHealthStatus::Degraded));
-                    }
+                    Ok(Ok(_)) => {} // Degradation handled successfully
                     Ok(Err(e)) => {
                         println!(
                             "Degradation handling failed (expected in test environment): {}",
@@ -853,49 +780,6 @@ mod tests {
                     }
                     Err(_) => {
                         println!("Degradation handling timed out (expected in test environment)");
-                    }
-                }
-            }
-            Ok(Err(e)) => {
-                // If creation fails due to missing implementation, that's expected
-                println!("Coordinator creation failed (expected): {}", e);
-            }
-            Err(_) => {
-                // Timeout occurred - this is also acceptable for now
-                println!("Coordinator creation timed out (expected in test environment)");
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn test_metrics_collection() {
-        let identity = NodeIdentity::generate().unwrap();
-        let config = NetworkConfig::default();
-
-        // Use a timeout to prevent hanging
-        let result = tokio::time::timeout(
-            Duration::from_secs(10),
-            NetworkCoordinator::new(identity, config),
-        )
-        .await;
-
-        match result {
-            Ok(Ok(coordinator)) => {
-                // Metrics collection should work
-                let metrics_result =
-                    tokio::time::timeout(Duration::from_secs(5), coordinator.collect_metrics())
-                        .await;
-
-                match metrics_result {
-                    Ok(Ok(_)) => {} // Success
-                    Ok(Err(e)) => {
-                        println!(
-                            "Metrics collection failed (expected in test environment): {}",
-                            e
-                        );
-                    }
-                    Err(_) => {
-                        println!("Metrics collection timed out (expected in test environment)");
                     }
                 }
             }

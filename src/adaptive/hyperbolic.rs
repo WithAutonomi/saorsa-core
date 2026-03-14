@@ -32,20 +32,6 @@ pub struct HyperbolicSpace {
 
     /// Coordinate adjustment rate
     adjustment_rate: f64,
-
-    /// Routing statistics
-    routing_stats: Arc<RwLock<RoutingStats>>,
-}
-
-/// Statistics for hyperbolic routing performance
-#[derive(Debug, Default, Clone)]
-pub struct RoutingStats {
-    pub attempts: u64,
-    pub successes: u64,
-    pub failures: u64,
-    pub fallback_used: u64,
-    pub average_hop_count: f64,
-    pub success_rate: f64,
 }
 
 impl Default for HyperbolicSpace {
@@ -64,7 +50,6 @@ impl HyperbolicSpace {
             }),
             neighbor_coordinates: Arc::new(RwLock::new(HashMap::new())),
             adjustment_rate: 0.01,
-            routing_stats: Arc::new(RwLock::new(RoutingStats::default())),
         }
     }
 
@@ -173,53 +158,6 @@ impl HyperbolicSpace {
     pub async fn remove_neighbor(&self, node_id: &PeerId) {
         let mut neighbors = self.neighbor_coordinates.write().await;
         neighbors.remove(node_id);
-    }
-
-    /// Get routing statistics
-    pub async fn get_stats(&self) -> RoutingStats {
-        self.routing_stats.read().await.clone()
-    }
-
-    /// Get routing success rate
-    pub async fn get_success_rate(&self) -> f64 {
-        let stats = self.routing_stats.read().await;
-        if stats.attempts == 0 {
-            0.0
-        } else {
-            let correction = 0.5 / stats.attempts as f64;
-            ((stats.success_rate + correction).min(1.0) * 100.0).round() / 100.0
-        }
-    }
-
-    /// Record routing attempt result
-    pub async fn record_routing_result(
-        &self,
-        success: bool,
-        hop_count: usize,
-        used_fallback: bool,
-    ) {
-        let mut stats = self.routing_stats.write().await;
-        stats.attempts += 1;
-
-        if success {
-            stats.successes += 1;
-        } else {
-            stats.failures += 1;
-        }
-
-        if used_fallback {
-            stats.fallback_used += 1;
-        }
-
-        // Update average hop count (exponential moving average)
-        let alpha = 0.1;
-        stats.average_hop_count =
-            (1.0 - alpha) * stats.average_hop_count + alpha * hop_count as f64;
-
-        // Update success rate using smoothing to dampen small-sample noise
-        if stats.attempts > 0 {
-            stats.success_rate = stats.successes as f64 / stats.attempts as f64;
-        }
     }
 }
 
@@ -336,20 +274,7 @@ impl HyperbolicRoutingStrategy {
 #[async_trait]
 impl RoutingStrategy for HyperbolicRoutingStrategy {
     async fn find_path(&self, target: &PeerId) -> Result<Vec<PeerId>> {
-        // Try hyperbolic routing
-        let result = self.find_hyperbolic_path(target).await;
-
-        // Record the result
-        let (success, hop_count, used_fallback) = match &result {
-            Ok(path) => (true, path.len(), false),
-            Err(_) => (false, 0, true), // Will use fallback
-        };
-
-        self.space
-            .record_routing_result(success, hop_count, used_fallback)
-            .await;
-
-        result
+        self.find_hyperbolic_path(target).await
     }
 
     fn route_score(&self, _neighbor: &PeerId, _target: &PeerId) -> f64 {
@@ -359,7 +284,7 @@ impl RoutingStrategy for HyperbolicRoutingStrategy {
     }
 
     fn update_metrics(&self, _path: &[PeerId], _success: bool) {
-        // Metrics are updated in find_path via record_routing_result
+        // No-op: metrics removed
     }
 }
 
@@ -433,25 +358,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_routing_stats() {
-        let space = HyperbolicSpace::new();
-
-        // Record some routing results
-        space.record_routing_result(true, 3, false).await;
-        space.record_routing_result(true, 4, false).await;
-        space.record_routing_result(false, 0, true).await;
-
-        let stats = space.get_stats().await;
-        assert_eq!(stats.attempts, 3);
-        assert_eq!(stats.successes, 2);
-        assert_eq!(stats.failures, 1);
-        assert_eq!(stats.fallback_used, 1);
-
-        let success_rate = space.get_success_rate().await;
-        assert!((success_rate - 0.83).abs() < 0.01);
-    }
-
-    #[tokio::test]
     async fn test_hyperbolic_routing_strategy() {
         use rand::RngCore;
 
@@ -490,10 +396,6 @@ mod tests {
 
         // Try routing to target
         let _result = strategy.find_path(&target).await;
-
-        // Without proper network setup, routing will fail, but we can check stats
-        let stats = space.get_stats().await;
-        assert_eq!(stats.attempts, 1);
     }
 
     #[tokio::test]

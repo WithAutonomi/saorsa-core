@@ -96,20 +96,8 @@ async fn main() -> Result<()> {
         Err(e) => println!("Eclipse attack warning: {}", e),
     }
 
-    // Example: Get security metrics
-    let metrics = security_manager.get_metrics().await;
-    println!("\nSecurity Metrics:");
-    println!("  Rate limit violations: {}", metrics.rate_limit_violations);
-    println!("  Blacklisted nodes: {}", metrics.blacklisted_nodes);
-    println!("  Verification failures: {}", metrics.verification_failures);
-    println!("  Eclipse detections: {}", metrics.eclipse_detections);
-    println!("  Audit entries: {}", metrics.audit_entries);
-
-    // Example: Export audit report
-    let report = security_manager.get_metrics().await; // Simplified example
-    println!("\nAudit Report:");
-    println!("  Rate limit violations: {}", report.rate_limit_violations);
-    println!("  Blacklisted nodes: {}", report.blacklisted_nodes);
+    // Security metrics have been removed; security enforcement logic remains active
+    println!("\nSecurity enforcement active (metrics removed)");
 
     Ok(())
 }

@@ -31,7 +31,6 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-type LegacyStatsFormat = (HashMap<(RouteId, ContentType), RouteStatistics>, MABMetrics);
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -144,23 +143,6 @@ pub struct MultiArmedBandit {
     statistics: Arc<RwLock<HashMap<(RouteId, ContentType), RouteStatistics>>>,
     /// Last persistence time
     last_persist: Arc<RwLock<Instant>>,
-    /// Performance metrics
-    metrics: Arc<RwLock<MABMetrics>>,
-}
-
-/// Performance metrics for the MAB system
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
-pub struct MABMetrics {
-    /// Total routing decisions made
-    pub total_decisions: u64,
-    /// Decisions that were exploration
-    pub exploration_decisions: u64,
-    /// Average success rate across all routes
-    pub overall_success_rate: f64,
-    /// Number of unique routes tracked
-    pub unique_routes: usize,
-    /// Last cleanup timestamp
-    pub last_cleanup: u64,
 }
 
 impl MultiArmedBandit {
@@ -175,7 +157,6 @@ impl MultiArmedBandit {
             config,
             statistics: Arc::new(RwLock::new(HashMap::new())),
             last_persist: Arc::new(RwLock::new(initial_persist)),
-            metrics: Arc::new(RwLock::new(MABMetrics::default())),
         };
 
         // Load persisted statistics if available
@@ -196,15 +177,11 @@ impl MultiArmedBandit {
         available_strategies: &[StrategyChoice],
     ) -> Result<RouteDecision> {
         let mut statistics = self.statistics.write().await;
-        let mut metrics = self.metrics.write().await;
-
-        metrics.total_decisions += 1;
 
         // Check if we should explore
         let should_explore = rand::random::<f64>() < self.config.epsilon;
 
         if should_explore {
-            metrics.exploration_decisions += 1;
             // Random exploration
             let strategy =
                 available_strategies[rand::random::<usize>() % available_strategies.len()];
@@ -282,9 +259,6 @@ impl MultiArmedBandit {
                 ))
             })?;
 
-        // Update metrics
-        metrics.unique_routes = statistics.len();
-
         Ok(RouteDecision {
             route_id,
             probability: best_sample.min(1.0), // Clamp to valid probability range
@@ -302,7 +276,6 @@ impl MultiArmedBandit {
         outcome: &Outcome,
     ) -> Result<()> {
         let mut statistics = self.statistics.write().await;
-        let mut metrics = self.metrics.write().await;
 
         let key = (route_id.clone(), content_type);
         let stats = statistics.entry(key).or_default();
@@ -327,33 +300,21 @@ impl MultiArmedBandit {
             .unwrap_or_default()
             .as_secs();
 
-        // Update overall metrics
-        let total_successes: u64 = statistics.values().map(|s| s.successes).sum();
-        let total_attempts: u64 = statistics.values().map(|s| s.attempts).sum();
-        metrics.overall_success_rate = if total_attempts > 0 {
-            total_successes as f64 / total_attempts as f64
-        } else {
-            0.0
-        };
-
         // Check if we should persist
         let last_persist = *self.last_persist.read().await;
         if last_persist.elapsed() > self.config.persist_interval
             && let Some(ref path) = self.config.storage_path
         {
             let statistics_clone = statistics.clone();
-            let metrics_clone = metrics.clone();
             let path_clone = path.clone();
             let stats_arc = Arc::clone(&self.statistics);
-            let metrics_arc = Arc::clone(&self.metrics);
             let path_deferred = path.clone();
             let interval = self.config.persist_interval;
 
             // Persist asynchronously
             tokio::spawn(async move {
                 if let Err(e) =
-                    Self::persist_statistics_static(&path_clone, &statistics_clone, &metrics_clone)
-                        .await
+                    Self::persist_statistics_static(&path_clone, &statistics_clone).await
                 {
                     tracing::error!("Failed to persist MAB statistics: {}", e);
                 }
@@ -363,10 +324,7 @@ impl MultiArmedBandit {
             tokio::spawn(async move {
                 tokio::time::sleep(interval).await;
                 let statistics = stats_arc.read().await.clone();
-                let metrics = metrics_arc.read().await.clone();
-                if let Err(e) =
-                    Self::persist_statistics_static(&path_deferred, &statistics, &metrics).await
-                {
+                if let Err(e) = Self::persist_statistics_static(&path_deferred, &statistics).await {
                     tracing::error!("Failed to persist deferred MAB statistics: {}", e);
                 }
             });
@@ -403,11 +361,6 @@ impl MultiArmedBandit {
         self.statistics.read().await.clone()
     }
 
-    /// Get current metrics
-    pub async fn get_metrics(&self) -> MABMetrics {
-        self.metrics.read().await.clone()
-    }
-
     /// Reset statistics for a specific route
     pub async fn reset_route(&self, route_id: &RouteId, content_type: ContentType) {
         let mut statistics = self.statistics.write().await;
@@ -440,80 +393,64 @@ impl MultiArmedBandit {
             .await
             .map_err(P2PError::Io)?;
 
-        // Try legacy tuple format first
-        let parsed_legacy: Result<LegacyStatsFormat> = serde_json::from_str(&data).map_err(|e| {
+        // Parse statistics from JSON format
+        let v: serde_json::Value = serde_json::from_str(&data).map_err(|e| {
             P2PError::State(crate::error::StateError::Database(
-                format!("Failed to deserialize legacy statistics: {}", e).into(),
+                format!("Failed to parse statistics JSON: {}", e).into(),
             ))
-        });
+        })?;
 
-        let (statistics, metrics) = if let Ok((stats, metrics)) = parsed_legacy {
-            (stats, metrics)
-        } else {
-            // New format: {"statistics":[{route_id:{node_id, strategy}, content_type, stats}], "metrics":{...}}
-            let v: serde_json::Value = serde_json::from_str(&data).map_err(|e| {
-                P2PError::State(crate::error::StateError::Database(
-                    format!("Failed to parse statistics JSON: {}", e).into(),
-                ))
-            })?;
+        let mut statistics: HashMap<(RouteId, ContentType), RouteStatistics> = HashMap::new();
+        if let Some(arr) = v.get("statistics").and_then(|s| s.as_array()) {
+            for item in arr {
+                if let (Some(route_id_v), Some(ct_v), Some(stats_v)) = (
+                    item.get("route_id"),
+                    item.get("content_type"),
+                    item.get("stats"),
+                ) {
+                    // Parse route id
+                    let node_hex = route_id_v
+                        .get("node_id")
+                        .and_then(|n| n.as_str())
+                        .unwrap_or("");
+                    let mut node_bytes = [0u8; 32];
+                    if let Ok(b) = hex::decode(node_hex) {
+                        let len = b.len().min(32);
+                        node_bytes[..len].copy_from_slice(&b[..len]);
+                    }
+                    let node = crate::peer_record::PeerId::from_bytes(node_bytes);
+                    let strategy_str = route_id_v
+                        .get("strategy")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("Kademlia");
+                    let strategy = match strategy_str {
+                        "Kademlia" => StrategyChoice::Kademlia,
+                        "Hyperbolic" => StrategyChoice::Hyperbolic,
+                        "TrustPath" => StrategyChoice::TrustPath,
+                        "SOMRegion" => StrategyChoice::SOMRegion,
+                        _ => StrategyChoice::Kademlia,
+                    };
+                    let route_id = RouteId {
+                        node_id: node,
+                        strategy,
+                    };
 
-            let metrics: MABMetrics =
-                serde_json::from_value(v.get("metrics").cloned().unwrap_or_default())
-                    .unwrap_or_default();
+                    // Parse content type
+                    let ct_str = ct_v.as_str().unwrap_or("DHTLookup");
+                    let ct = match ct_str {
+                        "DHTLookup" => ContentType::DHTLookup,
+                        "ComputeRequest" => ContentType::ComputeRequest,
+                        "RealtimeMessage" => ContentType::RealtimeMessage,
+                        _ => ContentType::DHTLookup,
+                    };
 
-            let mut map: HashMap<(RouteId, ContentType), RouteStatistics> = HashMap::new();
-            if let Some(arr) = v.get("statistics").and_then(|s| s.as_array()) {
-                for item in arr {
-                    if let (Some(route_id_v), Some(ct_v), Some(stats_v)) = (
-                        item.get("route_id"),
-                        item.get("content_type"),
-                        item.get("stats"),
-                    ) {
-                        // Parse route id
-                        let node_hex = route_id_v
-                            .get("node_id")
-                            .and_then(|n| n.as_str())
-                            .unwrap_or("");
-                        let mut node_bytes = [0u8; 32];
-                        if let Ok(b) = hex::decode(node_hex) {
-                            let len = b.len().min(32);
-                            node_bytes[..len].copy_from_slice(&b[..len]);
-                        }
-                        let node = crate::peer_record::PeerId::from_bytes(node_bytes);
-                        let strategy_str = route_id_v
-                            .get("strategy")
-                            .and_then(|s| s.as_str())
-                            .unwrap_or("Kademlia");
-                        let strategy = match strategy_str {
-                            "Kademlia" => StrategyChoice::Kademlia,
-                            "Hyperbolic" => StrategyChoice::Hyperbolic,
-                            "TrustPath" => StrategyChoice::TrustPath,
-                            "SOMRegion" => StrategyChoice::SOMRegion,
-                            _ => StrategyChoice::Kademlia,
-                        };
-                        let route_id = RouteId {
-                            node_id: node,
-                            strategy,
-                        };
-
-                        // Parse content type
-                        let ct_str = ct_v.as_str().unwrap_or("DHTLookup");
-                        let ct = match ct_str {
-                            "DHTLookup" => ContentType::DHTLookup,
-                            "ComputeRequest" => ContentType::ComputeRequest,
-                            "RealtimeMessage" => ContentType::RealtimeMessage,
-                            _ => ContentType::DHTLookup,
-                        };
-
-                        // Parse stats
-                        if let Ok(st) = serde_json::from_value::<RouteStatistics>(stats_v.clone()) {
-                            map.insert((route_id, ct), st);
-                        }
+                    // Parse stats
+                    if let Ok(st) = serde_json::from_value::<RouteStatistics>(stats_v.clone()) {
+                        statistics.insert((route_id, ct), st);
                     }
                 }
             }
-            (map, metrics)
-        };
+        }
 
         // Clean up old statistics
         let now = std::time::SystemTime::now()
@@ -528,7 +465,6 @@ impl MultiArmedBandit {
             .collect();
 
         *self.statistics.write().await = cleaned_stats;
-        *self.metrics.write().await = metrics;
 
         tracing::info!(
             "Loaded {} route statistics from disk",
@@ -541,7 +477,6 @@ impl MultiArmedBandit {
     async fn persist_statistics_static(
         path: &Path,
         statistics: &HashMap<(RouteId, ContentType), RouteStatistics>,
-        metrics: &MABMetrics,
     ) -> Result<()> {
         let stats_path = path.join("mab_statistics.json");
 
@@ -550,7 +485,7 @@ impl MultiArmedBandit {
             fs::create_dir_all(parent).await.map_err(P2PError::Io)?;
         }
 
-        // New format: serialize with string keys for portability
+        // Serialize with string keys for portability
         let export_stats: Vec<serde_json::Value> = statistics
             .iter()
             .map(|((rid, ct), st)| {
@@ -565,7 +500,6 @@ impl MultiArmedBandit {
 
         let export = serde_json::json!({
             "statistics": export_stats,
-            "metrics": metrics,
         });
 
         let data = serde_json::to_string_pretty(&export).map_err(|e| {
@@ -583,8 +517,7 @@ impl MultiArmedBandit {
     pub async fn persist(&self) -> Result<()> {
         if let Some(ref path) = self.config.storage_path {
             let statistics = self.statistics.read().await.clone();
-            let metrics = self.metrics.read().await.clone();
-            Self::persist_statistics_static(path, &statistics, &metrics).await?;
+            Self::persist_statistics_static(path, &statistics).await?;
             *self.last_persist.write().await = Instant::now();
         }
         Ok(())
@@ -630,9 +563,8 @@ mod tests {
     #[tokio::test]
     async fn test_mab_creation() {
         let mab = create_test_mab().await;
-        let metrics = mab.get_metrics().await;
-        assert_eq!(metrics.total_decisions, 0);
-        assert_eq!(metrics.exploration_decisions, 0);
+        let stats = mab.get_all_statistics().await;
+        assert!(stats.is_empty());
     }
 
     #[tokio::test]

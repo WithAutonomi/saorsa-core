@@ -149,23 +149,6 @@ impl ChurnPredictorExtensions for ChurnPredictor {
     }
 }
 
-// Extension trait for MonitoringSystem
-pub trait MonitoringSystemExtensions {
-    async fn start_collection(&self) -> Result<()>;
-    async fn reduce_collection_frequency(&self, factor: f64);
-}
-
-impl MonitoringSystemExtensions for MonitoringSystem {
-    async fn start_collection(&self) -> Result<()> {
-        // TODO: Implement collection start
-        Ok(())
-    }
-
-    async fn reduce_collection_frequency(&self, _factor: f64) {
-        // TODO: Implement frequency reduction
-    }
-}
-
 // Extension trait for SecurityManager
 pub trait SecurityManagerExtensions {
     async fn check_rate_limit(&self, node_id: &PeerId) -> Result<()>;

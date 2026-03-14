@@ -30,36 +30,6 @@ use std::sync::Arc;
 // Re-export types that other modules need
 pub use super::{ContentType, StrategyChoice};
 
-/// Routing statistics
-#[derive(Debug, Clone, Default)]
-pub struct RoutingStats {
-    /// Total routing requests
-    pub total_requests: u64,
-
-    /// Successful routing requests
-    pub successful_requests: u64,
-
-    /// Failed routing requests
-    pub failed_requests: u64,
-
-    /// Average latency in milliseconds
-    pub avg_latency_ms: f64,
-
-    /// Success rate by strategy
-    pub strategy_success: HashMap<String, f64>,
-}
-
-impl RoutingStats {
-    /// Calculate overall success rate
-    pub fn success_rate(&self) -> f64 {
-        if self.total_requests == 0 {
-            1.0
-        } else {
-            self.successful_requests as f64 / self.total_requests as f64
-        }
-    }
-}
-
 /// Adaptive router that combines multiple routing strategies
 pub struct AdaptiveRouter {
     /// Local node ID
@@ -70,12 +40,6 @@ pub struct AdaptiveRouter {
 
     /// Multi-armed bandit for strategy selection
     bandit: Arc<RwLock<ThompsonSampling>>,
-
-    /// Metrics collector
-    metrics: Arc<RwLock<HashMap<String, f64>>>,
-
-    /// Routing statistics
-    stats: Arc<RwLock<RoutingStats>>,
 }
 
 impl AdaptiveRouter {
@@ -90,8 +54,6 @@ impl AdaptiveRouter {
             _local_id: node_id,
             strategies: Arc::new(RwLock::new(HashMap::new())),
             bandit: Arc::new(RwLock::new(ThompsonSampling::new())),
-            metrics: Arc::new(RwLock::new(HashMap::new())),
-            stats: Arc::new(RwLock::new(RoutingStats::default())),
         }
     }
 
@@ -119,14 +81,6 @@ impl AdaptiveRouter {
             .select_strategy(content_type)
             .await
             .unwrap_or(StrategyChoice::Kademlia);
-
-        // Record strategy selection
-        {
-            let mut metrics = self.metrics.write().await;
-            let key = format!("route_attempts_{strategy_choice:?}");
-            let count = metrics.get(&key).copied().unwrap_or(0.0) + 1.0;
-            metrics.insert(key, count);
-        }
 
         // Execute routing with selected strategy
         let start = std::time::Instant::now();
@@ -167,21 +121,7 @@ impl AdaptiveRouter {
             .await
             .unwrap_or(());
 
-        // Update metrics
-        if success {
-            let mut metrics = self.metrics.write().await;
-            let success_key = format!("route_success_{strategy_choice:?}");
-            let count = metrics.get(&success_key).copied().unwrap_or(0.0) + 1.0;
-            metrics.insert(success_key, count);
-            metrics.insert(format!("route_latency_{strategy_choice:?}"), latency);
-        }
-
         result
-    }
-
-    /// Get routing metrics
-    pub async fn get_metrics(&self) -> std::collections::HashMap<String, f64> {
-        self.metrics.read().await.clone()
     }
 
     /// Get all routing strategies
@@ -195,79 +135,42 @@ impl AdaptiveRouter {
 
     /// Mark a node as unreliable
     pub async fn mark_node_unreliable(&self, _node_id: &PeerId) {
-        // Update routing metrics to reflect unreliability
-        let strategies = self.strategies.read().await;
-        for (_choice, _strategy) in strategies.iter() {
-            // Would update metrics in real implementation
-        }
+        // In a real implementation, would notify strategies about unreliable node
     }
 
     /// Remove a node from all routing tables
     pub async fn remove_node(&self, _node_id: &PeerId) {
         // In a real implementation, would remove from K-buckets, etc.
-        // log::info!("Removing node {:?} from routing tables", node_id);
     }
 
     /// Remove node's hyperbolic coordinates
     pub async fn remove_hyperbolic_coordinate(&self, _node_id: &PeerId) {
-        // log::info!("Removing hyperbolic coordinates for {:?}", node_id);
+        // In a real implementation, would remove coordinates
     }
 
     /// Remove node from SOM
     pub async fn remove_from_som(&self, _node_id: &PeerId) {
-        // log::info!("Removing {:?} from SOM", node_id);
+        // In a real implementation, would remove from SOM
     }
 
     /// Enable aggressive caching during high churn
     pub async fn enable_aggressive_caching(&self) {
-        // log::info!("Enabling aggressive caching due to high churn");
+        // In a real implementation, would enable aggressive caching
     }
 
     /// Rebalance hyperbolic space after failures
     pub async fn rebalance_hyperbolic_space(&self) {
-        // log::info!("Rebalancing hyperbolic space");
+        // In a real implementation, would rebalance space
     }
 
     /// Update SOM grid after topology changes
     pub async fn update_som_grid(&self) {
-        // log::info!("Updating SOM grid");
+        // In a real implementation, would update SOM grid
     }
 
     /// Trigger trust score recomputation
     pub async fn trigger_trust_recomputation(&self) {
-        // log::info!("Triggering trust score recomputation");
-    }
-
-    /// Update routing statistics
-    pub async fn update_statistics(&self, node_id: &PeerId, success: bool, latency_ms: u64) {
-        let mut metrics = self.metrics.write().await;
-        let key = format!("node_{node_id:?}_success_rate");
-        let current = metrics.get(&key).copied().unwrap_or(0.0);
-        let new_value = if success {
-            current * 0.9 + 0.1
-        } else {
-            current * 0.9
-        };
-        metrics.insert(key, new_value);
-
-        // Update routing stats
-        let mut stats = self.stats.write().await;
-        stats.total_requests += 1;
-        if success {
-            stats.successful_requests += 1;
-        } else {
-            stats.failed_requests += 1;
-        }
-
-        // Update average latency
-        let current_avg = stats.avg_latency_ms;
-        let count = stats.total_requests as f64;
-        stats.avg_latency_ms = (current_avg * (count - 1.0) + latency_ms as f64) / count;
-    }
-
-    /// Get routing statistics
-    pub async fn get_stats(&self) -> RoutingStats {
-        self.stats.read().await.clone()
+        // In a real implementation, would trigger recomputation
     }
 }
 
@@ -535,11 +438,7 @@ mod tests {
         rand::thread_rng().fill_bytes(&mut hash);
         let node_id = PeerId::from_bytes(hash); // Create proper PeerId
         let trust_provider = Arc::new(MockTrustProvider);
-        let router = AdaptiveRouter::new_with_id(node_id, trust_provider);
-
-        let metrics = router.get_metrics().await;
-        // Metrics is a HashMap<String, f64>, check it's not empty or contains expected keys
-        assert!(!metrics.is_empty() || metrics.is_empty()); // Basic validity check
+        let _router = AdaptiveRouter::new_with_id(node_id, trust_provider);
     }
 
     #[allow(clippy::unwrap_used)]

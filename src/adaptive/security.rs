@@ -669,17 +669,6 @@ impl SecurityManager {
             .await;
     }
 
-    /// Get security metrics
-    pub async fn get_metrics(&self) -> SecurityMetrics {
-        SecurityMetrics {
-            rate_limit_violations: self.rate_limiter.get_violation_count().await,
-            blacklisted_nodes: self.blacklist.get_blacklist_size().await,
-            verification_failures: self.integrity_verifier.get_failure_count().await,
-            eclipse_detections: self.eclipse_detector.get_detection_count().await,
-            audit_entries: self.auditor.get_entry_count().await,
-        }
-    }
-
     /// Verify node identity by binding PeerId to the advertised ML-DSA public key
     async fn verify_identity(&self, node: &NodeDescriptor) -> bool {
         // PeerId is defined as BLAKE3(pubkey)
@@ -1149,16 +1138,6 @@ impl SecurityAuditor {
     }
 }
 
-/// Security metrics
-#[derive(Debug, Clone, Default)]
-pub struct SecurityMetrics {
-    pub rate_limit_violations: u64,
-    pub blacklisted_nodes: usize,
-    pub verification_failures: u64,
-    pub eclipse_detections: u64,
-    pub audit_entries: u64,
-}
-
 /// Audit report
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditReport {
@@ -1409,9 +1388,7 @@ mod tests {
             Err(SecurityError::Blacklisted)
         ));
 
-        // Check metrics
-        let metrics = manager.get_metrics().await;
-        assert_eq!(metrics.blacklisted_nodes, 1);
-        assert!(metrics.audit_entries > 0);
+        // Verify blacklist state directly
+        assert!(manager.blacklist.is_blacklisted(&node.id).await);
     }
 }

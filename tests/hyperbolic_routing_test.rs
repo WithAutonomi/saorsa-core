@@ -213,12 +213,6 @@ async fn test_routing_fallback_conditions() {
         }
         _ => panic!("Expected routing error for unknown target"),
     }
-
-    // Check that fallback was recorded in stats
-    let stats = space.get_stats().await;
-    assert_eq!(stats.attempts, 1);
-    assert_eq!(stats.failures, 1);
-    assert_eq!(stats.fallback_used, 1);
 }
 
 #[tokio::test]
@@ -272,31 +266,7 @@ async fn test_routing_loop_detection() {
     }
 }
 
-#[tokio::test]
-async fn test_success_rate_tracking() {
-    let space = HyperbolicSpace::new();
-
-    // Record various routing outcomes
-    for i in 0..100 {
-        let success = i % 3 != 0; // 66.67% success rate
-        let hop_count = if success { 3 + (i % 5) } else { 0 };
-        let used_fallback = !success;
-
-        space
-            .record_routing_result(success, hop_count, used_fallback)
-            .await;
-    }
-
-    let stats = space.get_stats().await;
-    assert_eq!(stats.attempts, 100);
-
-    let success_rate = space.get_success_rate().await;
-    assert_relative_eq!(success_rate, 0.67, epsilon = 0.01);
-
-    // Check average hop count (should be around 5 for successful routes)
-    assert!(stats.average_hop_count > 3.0);
-    assert!(stats.average_hop_count < 6.0);
-}
+// test_success_rate_tracking removed: RoutingStats and record_routing_result were removed
 
 // Helper functions
 

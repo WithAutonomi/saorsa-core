@@ -276,18 +276,6 @@ mod gossipsub_tests {
     }
 
     #[tokio::test]
-    async fn test_stats_initialization() {
-        let stats = GossipStats::default();
-
-        assert_eq!(stats.messages_sent, 0);
-        assert_eq!(stats.messages_received, 0);
-        assert_eq!(stats.mesh_size, 0);
-        assert_eq!(stats.topic_count, 0);
-        assert_eq!(stats.peer_count, 0);
-        assert!(stats.messages_by_topic.is_empty());
-    }
-
-    #[tokio::test]
     async fn test_peer_score_calculation() {
         let score = PeerScore {
             time_in_mesh: Duration::from_secs(300),

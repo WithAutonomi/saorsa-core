@@ -38,9 +38,6 @@ pub struct ThompsonSampling {
 
     /// Decay factor for old observations (0.0-1.0)
     decay_factor: f64,
-
-    /// Performance metrics
-    metrics: Arc<RwLock<RoutingMetrics>>,
 }
 
 /// Beta distribution parameters with proper distribution
@@ -68,19 +65,6 @@ impl Default for BetaParams {
     }
 }
 
-/// Routing performance metrics
-#[derive(Debug, Default, Clone)]
-pub struct RoutingMetrics {
-    /// Total routing decisions made
-    pub total_decisions: u64,
-    /// Decisions per content type
-    pub decisions_by_type: HashMap<ContentType, u64>,
-    /// Success rate per strategy
-    pub strategy_success_rates: HashMap<StrategyChoice, f64>,
-    /// Average latency per strategy (ms)
-    pub strategy_latencies: HashMap<StrategyChoice, f64>,
-}
-
 impl Default for ThompsonSampling {
     fn default() -> Self {
         Self::new()
@@ -94,17 +78,12 @@ impl ThompsonSampling {
             arms: Arc::new(RwLock::new(HashMap::new())),
             min_samples: 10,
             decay_factor: 0.99,
-            metrics: Arc::new(RwLock::new(RoutingMetrics::default())),
         }
     }
 
     /// Select optimal routing strategy for given content type
     pub async fn select_strategy(&self, content_type: ContentType) -> Result<StrategyChoice> {
         let mut arms = self.arms.write().await;
-        let mut metrics = self.metrics.write().await;
-
-        metrics.total_decisions += 1;
-        *metrics.decisions_by_type.entry(content_type).or_insert(0) += 1;
 
         let strategies = vec![
             StrategyChoice::Kademlia,
@@ -164,10 +143,9 @@ impl ThompsonSampling {
         _content_type: ContentType,
         strategy: StrategyChoice,
         success: bool,
-        latency_ms: u64,
+        _latency_ms: u64,
     ) -> anyhow::Result<()> {
         let mut arms = self.arms.write().await;
-        let mut metrics = self.metrics.write().await;
 
         let key = (_content_type, strategy);
         let params = arms.entry(key).or_default();
@@ -177,27 +155,7 @@ impl ThompsonSampling {
         params.trials += 1;
         params.last_update = std::time::Instant::now();
 
-        // Update success rate (exponential moving average)
-        let success_rate = params.distribution.mean();
-        let current_rate = metrics
-            .strategy_success_rates
-            .entry(strategy)
-            .or_insert(0.5);
-        *current_rate = 0.9 * (*current_rate) + 0.1 * success_rate;
-
-        // Update latency (exponential moving average)
-        let current_latency = metrics
-            .strategy_latencies
-            .entry(strategy)
-            .or_insert(latency_ms as f64);
-        *current_latency = 0.9 * (*current_latency) + 0.1 * (latency_ms as f64);
-
         Ok(())
-    }
-
-    /// Get current performance metrics
-    pub async fn get_metrics(&self) -> RoutingMetrics {
-        self.metrics.read().await.clone()
     }
 
     /// Get confidence interval for a strategy's success rate
@@ -253,15 +211,28 @@ impl LearningSystem for ThompsonSampling {
     }
 
     async fn metrics(&self) -> LearningMetrics {
-        let metrics = self.get_metrics().await;
+        // Compute metrics from arm distributions on the fly
+        let arms = self.arms.read().await;
+        let mut strategy_performance: HashMap<StrategyChoice, f64> = HashMap::new();
+        let mut total_decisions: u64 = 0;
+
+        for ((_, strategy), params) in arms.iter() {
+            total_decisions += params.trials as u64;
+            let entry = strategy_performance.entry(*strategy).or_insert(0.0);
+            *entry = params.distribution.mean();
+        }
+
+        let success_rate = if strategy_performance.is_empty() {
+            0.0
+        } else {
+            strategy_performance.values().sum::<f64>() / strategy_performance.len() as f64
+        };
 
         LearningMetrics {
-            total_decisions: metrics.total_decisions,
-            success_rate: metrics.strategy_success_rates.values().sum::<f64>()
-                / metrics.strategy_success_rates.len().max(1) as f64,
-            avg_latency_ms: metrics.strategy_latencies.values().sum::<f64>()
-                / metrics.strategy_latencies.len().max(1) as f64,
-            strategy_performance: metrics.strategy_success_rates.clone(),
+            total_decisions,
+            success_rate,
+            avg_latency_ms: 0.0,
+            strategy_performance,
         }
     }
 }
@@ -1433,11 +1404,8 @@ mod tests {
     #[tokio::test]
     async fn test_thompson_sampling_initialization() {
         let ts = ThompsonSampling::new();
-        let metrics = ts.get_metrics().await;
-
-        assert_eq!(metrics.total_decisions, 0);
-        assert!(metrics.decisions_by_type.is_empty());
-        assert!(metrics.strategy_success_rates.is_empty());
+        let arms = ts.arms.read().await;
+        assert!(arms.is_empty());
     }
 
     #[tokio::test]
@@ -1461,9 +1429,9 @@ mod tests {
             ));
         }
 
-        let metrics = ts.get_metrics().await;
-        assert_eq!(metrics.total_decisions, 4);
-        assert_eq!(metrics.decisions_by_type.len(), 4);
+        // Should have arm entries for 4 content types
+        let arms = ts.arms.read().await;
+        assert!(!arms.is_empty());
         Ok(())
     }
 
