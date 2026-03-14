@@ -15,6 +15,7 @@ use saorsa_transport::NatConfig;
 
 /// Configuration for network port binding
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct NetworkConfig {
     /// Port configuration for networking
     pub port: PortConfig,
@@ -31,6 +32,7 @@ pub struct NetworkConfig {
 
 /// Port configuration options
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub enum PortConfig {
     /// Let OS assign random available port (port 0)
     ///
@@ -61,6 +63,7 @@ pub enum PortConfig {
 
 /// IP stack mode configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub enum IpMode {
     /// Both IPv4 and IPv6 on same port (if platform supports it)
     ///
@@ -89,6 +92,7 @@ pub enum IpMode {
 
 /// Retry behavior on port conflicts
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub enum RetryBehavior {
     /// Fail immediately if port unavailable
     ///
@@ -108,6 +112,7 @@ pub enum RetryBehavior {
 
 /// NAT traversal mode for this node
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub enum NatTraversalMode {
     /// Act as client only (no incoming path validations)
     ClientOnly,
@@ -160,6 +165,7 @@ impl Default for NetworkConfig {
     }
 }
 
+#[allow(dead_code)]
 impl NetworkConfig {
     /// Create configuration with explicit port
     pub fn with_port(port: u16) -> Self {
@@ -275,6 +281,7 @@ impl NetworkConfig {
 
 /// Error types for network configuration
 #[derive(Debug, thiserror::Error)]
+#[allow(dead_code)]
 pub enum NetworkConfigError {
     #[error("Port {0} is already in use. Try using PortConfig::OsAssigned to let the OS choose.")]
     PortInUse(u16),

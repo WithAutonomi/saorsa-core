@@ -48,7 +48,7 @@
 //! When saorsa-core is compiled with the `metrics` feature, this adapter
 //! automatically enables saorsa-transport's prometheus metrics collection.
 
-use crate::error::{GeoEnforcementMode, GeoRejectionError, GeographicConfig};
+use crate::error::{GeoRejectionError, GeographicConfig};
 use anyhow::Result;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -77,6 +77,7 @@ pub const SAORSA_DHT_PROTOCOL: ProtocolId = ProtocolId::from_static(b"saorsa-dht
 
 /// Connection lifecycle events from saorsa-transport
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum ConnectionEvent {
     /// Connection successfully established
     Established {
@@ -101,6 +102,7 @@ pub enum ConnectionEvent {
 /// with advanced NAT traversal and post-quantum cryptography.
 ///
 /// Generic over the transport type to allow testing with MockTransport.
+#[allow(dead_code)]
 pub struct P2PNetworkNode<T: LinkTransport = P2pLinkTransport> {
     /// The underlying transport (generic for testing)
     transport: Arc<T>,
@@ -128,12 +130,7 @@ pub struct P2PNetworkNode<T: LinkTransport = P2pLinkTransport> {
 /// explicitly configured.
 pub const DEFAULT_MAX_CONNECTIONS: usize = 100;
 
-/// Maximum application-layer message size (1 MiB).
-///
-/// This tunes both the QUIC stream receive window and the per-stream
-/// read buffer inside `saorsa-transport`.
-pub const MAX_MESSAGE_SIZE: usize = P2pConfig::DEFAULT_MAX_MESSAGE_SIZE;
-
+#[allow(dead_code)]
 impl P2PNetworkNode<P2pLinkTransport> {
     /// Create a new P2P network node with default P2pLinkTransport
     pub async fn new(bind_addr: SocketAddr) -> Result<Self> {
@@ -338,6 +335,7 @@ impl P2PNetworkNode<P2pLinkTransport> {
     }
 }
 
+#[allow(dead_code)]
 impl<T: LinkTransport + Send + Sync + 'static> P2PNetworkNode<T> {
     /// Create with any LinkTransport implementation (for testing)
     pub async fn with_transport(transport: Arc<T>, bind_addr: SocketAddr) -> Result<Self> {
@@ -663,19 +661,10 @@ impl<T: LinkTransport + Send + Sync + 'static> P2PNetworkNode<T> {
         if let Some(ref config) = self.geo_config {
             match self.validate_geographic_diversity(&addr, config).await {
                 Ok(()) => {}
-                Err(err) => match config.enforcement_mode {
-                    GeoEnforcementMode::Strict => {
-                        tracing::warn!("REJECTED peer {} - {}", addr, err);
-                        return;
-                    }
-                    GeoEnforcementMode::LogOnly => {
-                        tracing::info!(
-                            "GEO_AUDIT: Would reject peer {} - {} (log-only mode)",
-                            addr,
-                            err
-                        );
-                    }
-                },
+                Err(err) => {
+                    tracing::warn!("REJECTED peer {} - {}", addr, err);
+                    return;
+                }
             }
         }
 
@@ -888,11 +877,13 @@ impl<T: LinkTransport + Send + Sync + 'static> P2PNetworkNode<T> {
 }
 
 /// Dual-stack wrapper managing IPv4 and IPv6 transports
+#[allow(dead_code)]
 pub struct DualStackNetworkNode<T: LinkTransport = P2pLinkTransport> {
     pub v6: Option<P2PNetworkNode<T>>,
     pub v4: Option<P2PNetworkNode<T>>,
 }
 
+#[allow(dead_code)]
 impl DualStackNetworkNode<P2pLinkTransport> {
     /// Shut down the underlying QUIC endpoints on both stacks.
     ///
@@ -1014,6 +1005,7 @@ impl DualStackNetworkNode<P2pLinkTransport> {
     }
 }
 
+#[allow(dead_code)]
 impl<T: LinkTransport + Send + Sync + 'static> DualStackNetworkNode<T> {
     /// Create with custom transports (for testing)
     pub fn with_transports(v6: Option<P2PNetworkNode<T>>, v4: Option<P2PNetworkNode<T>>) -> Self {

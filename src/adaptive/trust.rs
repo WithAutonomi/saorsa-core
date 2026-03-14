@@ -18,7 +18,6 @@
 
 use super::*;
 use crate::PeerId;
-use async_trait::async_trait;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -493,124 +492,8 @@ impl TrustProvider for EigenTrustEngine {
     }
 }
 
-/// Configuration for trust-based routing
-#[derive(Debug, Clone)]
-pub struct TrustRoutingConfig {
-    /// Minimum trust threshold for routing (nodes below this are excluded)
-    /// Default: 0.15 (15%) - provides Sybil resistance while allowing network growth
-    pub min_trust_threshold: f64,
-    /// Maximum intermediate hops in a path
-    /// Default: 3
-    pub max_intermediate_hops: usize,
-}
-
-impl Default for TrustRoutingConfig {
-    fn default() -> Self {
-        Self {
-            min_trust_threshold: 0.15, // Raised from 0.01 for better Sybil protection
-            max_intermediate_hops: 3,
-        }
-    }
-}
-
-impl TrustRoutingConfig {
-    /// Create config with custom minimum trust threshold
-    pub fn with_min_trust(min_trust_threshold: f64) -> Self {
-        Self {
-            min_trust_threshold,
-            ..Default::default()
-        }
-    }
-}
-
-/// Trust-based routing strategy
-pub struct TrustBasedRoutingStrategy {
-    /// Reference to the trust engine
-    trust_engine: Arc<EigenTrustEngine>,
-
-    /// Local node ID
-    local_id: PeerId,
-
-    /// Routing configuration
-    config: TrustRoutingConfig,
-}
-
-impl TrustBasedRoutingStrategy {
-    /// Create a new trust-based routing strategy with default config
-    pub fn new(trust_engine: Arc<EigenTrustEngine>, local_id: PeerId) -> Self {
-        Self::with_config(trust_engine, local_id, TrustRoutingConfig::default())
-    }
-
-    /// Create a new trust-based routing strategy with custom config
-    pub fn with_config(
-        trust_engine: Arc<EigenTrustEngine>,
-        local_id: PeerId,
-        config: TrustRoutingConfig,
-    ) -> Self {
-        Self {
-            trust_engine,
-            local_id,
-            config,
-        }
-    }
-
-    /// Get the current minimum trust threshold
-    pub fn min_trust_threshold(&self) -> f64 {
-        self.config.min_trust_threshold
-    }
-}
-
-#[async_trait]
-impl RoutingStrategy for TrustBasedRoutingStrategy {
-    async fn find_path(&self, target: &PeerId) -> Result<Vec<PeerId>> {
-        // Get global trust scores
-        let trust_scores = self.trust_engine.get_global_trust();
-
-        // Filter nodes by minimum trust
-        let mut trusted_nodes: Vec<(PeerId, f64)> = trust_scores
-            .into_iter()
-            .filter(|(id, trust)| {
-                id != &self.local_id && id != target && *trust >= self.config.min_trust_threshold
-            })
-            .collect();
-
-        // Sort by trust descending
-        trusted_nodes.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-        // Create path through highest trust nodes
-        let path: Vec<PeerId> = trusted_nodes
-            .into_iter()
-            .take(self.config.max_intermediate_hops)
-            .map(|(id, _)| id)
-            .chain(std::iter::once(*target))
-            .collect();
-
-        if path.len() == 1 {
-            // Only target, no trusted intermediaries
-            Err(AdaptiveNetworkError::Routing(
-                "No trusted path found".to_string(),
-            ))
-        } else {
-            Ok(path)
-        }
-    }
-
-    fn route_score(&self, neighbor: &PeerId, _target: &PeerId) -> f64 {
-        self.trust_engine.get_trust(neighbor)
-    }
-
-    fn update_metrics(&self, path: &[PeerId], success: bool) {
-        // Update trust based on routing outcome
-        if path.len() >= 2 {
-            for window in path.windows(2) {
-                self.trust_engine
-                    .update_trust(&window[0], &window[1], success);
-            }
-        }
-    }
-}
-
 /// Mock trust provider for testing
+#[allow(dead_code)]
 pub struct MockTrustProvider {
     trust_scores: Arc<RwLock<HashMap<PeerId, f64>>>,
 }
@@ -621,6 +504,7 @@ impl Default for MockTrustProvider {
     }
 }
 
+#[allow(dead_code)]
 impl MockTrustProvider {
     pub fn new() -> Self {
         Self {
@@ -833,50 +717,5 @@ mod tests {
         if initial_trust > 0.0 && decayed_trust > 0.0 {
             assert!(decayed_trust <= initial_trust);
         }
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_trust_based_routing() {
-        use rand::RngCore;
-
-        // Create pre-trusted nodes
-        let mut hash_pre = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut hash_pre);
-        let pre_trusted_id = PeerId::from_bytes(hash_pre);
-
-        let engine = Arc::new(EigenTrustEngine::new(HashSet::from([pre_trusted_id])));
-
-        // Create some nodes
-        let mut hash_local = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut hash_local);
-        let local_id = PeerId::from_bytes(hash_local);
-
-        let mut hash_target = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut hash_target);
-        let target_id = PeerId::from_bytes(hash_target);
-
-        // Build trust relationships
-        engine
-            .update_local_trust(&pre_trusted_id, &local_id, true)
-            .await;
-        engine.update_local_trust(&local_id, &target_id, true).await;
-
-        let _ = engine.get_global_trust();
-
-        // Create routing strategy
-        let strategy = TrustBasedRoutingStrategy::new(engine.clone(), local_id);
-
-        // Try to find path with timeout to catch hangs
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            strategy.find_path(&target_id),
-        )
-        .await
-        .expect("find_path timed out");
-
-        // Should find a path through trusted nodes
-        assert!(result.is_ok());
-        let path = result.unwrap();
-        assert!(path.contains(&target_id));
     }
 }

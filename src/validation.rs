@@ -72,6 +72,7 @@ const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024; // 16MB
 const MAX_PATH_LENGTH: usize = 4096;
 const MAX_KEY_SIZE: usize = 1024 * 1024; // 1MB for DHT keys
 const MAX_VALUE_SIZE: usize = 10 * 1024 * 1024; // 10MB for DHT values
+#[allow(dead_code)]
 const MAX_FILE_NAME_LENGTH: usize = 255;
 
 // Rate limiting constants
@@ -126,6 +127,7 @@ impl From<ValidationError> for P2PError {
 
 /// Context for validation operations
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct ValidationContext {
     pub max_message_size: usize,
     pub max_key_size: usize,
@@ -150,6 +152,7 @@ impl Default for ValidationContext {
     }
 }
 
+#[allow(dead_code)]
 impl ValidationContext {
     /// Create a new validation context with custom settings
     pub fn new() -> Self {
@@ -176,12 +179,14 @@ impl ValidationContext {
 }
 
 /// Core validation trait
+#[allow(dead_code)]
 pub trait Validate {
     /// Validate the object with the given context
     fn validate(&self, ctx: &ValidationContext) -> P2pResult<()>;
 }
 
 /// Trait for sanitizing input
+#[allow(dead_code)]
 pub trait Sanitize {
     /// Sanitize the input, returning a cleaned version
     fn sanitize(&self) -> Self;
@@ -230,6 +235,7 @@ fn is_private_ip(ip: &IpAddr) -> bool {
 ///
 /// PeerId is a strongly-typed 32-byte identifier that is always valid by
 /// construction, so this is a no-op. Kept for API compatibility.
+#[allow(dead_code)]
 pub fn validate_peer_id(_peer_id: &PeerId) -> P2pResult<()> {
     Ok(())
 }
@@ -237,6 +243,7 @@ pub fn validate_peer_id(_peer_id: &PeerId) -> P2pResult<()> {
 // ===== Message Size Validation =====
 
 /// Validate message size
+#[allow(dead_code)]
 pub fn validate_message_size(size: usize, max_size: usize) -> P2pResult<()> {
     if size > max_size {
         return Err(ValidationError::MessageTooLarge {
@@ -251,6 +258,7 @@ pub fn validate_message_size(size: usize, max_size: usize) -> P2pResult<()> {
 // ===== File Path Validation =====
 
 /// Validate a file path for security
+#[allow(dead_code)]
 pub fn validate_file_path(path: &Path) -> P2pResult<()> {
     let path_str = path.to_string_lossy();
 
@@ -319,6 +327,7 @@ pub fn validate_file_path(path: &Path) -> P2pResult<()> {
 // ===== Cryptographic Parameter Validation =====
 
 /// Validate key size for cryptographic operations
+#[allow(dead_code)]
 pub fn validate_key_size(size: usize, expected: usize) -> P2pResult<()> {
     if size != expected {
         return Err(ValidationError::InvalidCryptoParam(format!(
@@ -331,6 +340,7 @@ pub fn validate_key_size(size: usize, expected: usize) -> P2pResult<()> {
 }
 
 /// Validate nonce size
+#[allow(dead_code)]
 pub fn validate_nonce_size(size: usize, expected: usize) -> P2pResult<()> {
     if size != expected {
         return Err(ValidationError::InvalidCryptoParam(format!(
@@ -345,6 +355,7 @@ pub fn validate_nonce_size(size: usize, expected: usize) -> P2pResult<()> {
 // ===== DHT Key/Value Validation =====
 
 /// Validate DHT key
+#[allow(dead_code)]
 pub fn validate_dht_key(key: &[u8], ctx: &ValidationContext) -> P2pResult<()> {
     if key.is_empty() {
         return Err(ValidationError::InvalidFormat("DHT key cannot be empty".to_string()).into());
@@ -362,6 +373,7 @@ pub fn validate_dht_key(key: &[u8], ctx: &ValidationContext) -> P2pResult<()> {
 }
 
 /// Validate DHT value
+#[allow(dead_code)]
 pub fn validate_dht_value(value: &[u8], ctx: &ValidationContext) -> P2pResult<()> {
     if value.len() > ctx.max_value_size {
         return Err(ValidationError::InvalidValueSize {
@@ -388,6 +400,7 @@ pub struct RateLimiter {
 
 /// Rate limit configuration
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct RateLimitConfig {
     /// Time window for rate limiting
     pub window: Duration,
@@ -451,6 +464,7 @@ impl RateLimiter {
     }
 
     /// Clean up expired entries
+    #[allow(dead_code)]
     pub fn cleanup(&self) {
         // Not required with the unified engine (buckets age out via window). No-op.
     }
@@ -460,6 +474,7 @@ impl RateLimiter {
 
 /// Network message validation
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct NetworkMessage {
     pub peer_id: PeerId,
     pub payload: Vec<u8>,
@@ -493,6 +508,7 @@ impl Validate for NetworkMessage {
 
 /// API request validation
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct ApiRequest {
     pub method: String,
     pub path: String,
@@ -595,6 +611,7 @@ where
 }
 
 /// Sanitize a string for safe usage
+#[allow(dead_code)]
 pub fn sanitize_string(input: &str, max_length: usize) -> String {
     // First remove any HTML tags and dangerous patterns
     let mut cleaned = input

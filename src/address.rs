@@ -158,101 +158,6 @@ impl From<&MultiAddr> for SocketAddr {
     }
 }
 
-/// Collection of network addresses for a peer
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AddressBook {
-    /// Primary addresses for this peer
-    pub addresses: Vec<MultiAddr>,
-    /// Last known good address
-    pub last_known_good: Option<MultiAddr>,
-}
-
-impl AddressBook {
-    /// Create a new empty address book
-    pub fn new() -> Self {
-        Self {
-            addresses: Vec::new(),
-            last_known_good: None,
-        }
-    }
-
-    /// Create an address book with a single address
-    pub fn with_address(address: MultiAddr) -> Self {
-        Self {
-            addresses: vec![address.clone()],
-            last_known_good: Some(address),
-        }
-    }
-
-    /// Add an address to the book
-    pub fn add_address(&mut self, address: MultiAddr) {
-        if !self.addresses.contains(&address) {
-            self.addresses.push(address);
-        }
-    }
-
-    /// Remove an address from the book
-    pub fn remove_address(&mut self, address: &MultiAddr) {
-        self.addresses.retain(|a| a != address);
-        if self.last_known_good.as_ref() == Some(address) {
-            self.last_known_good = self.addresses.first().cloned();
-        }
-    }
-
-    /// Update the last known good address
-    pub fn update_last_known_good(&mut self, address: MultiAddr) {
-        if self.addresses.contains(&address) {
-            self.last_known_good = Some(address);
-        }
-    }
-
-    /// Get the best address to try first
-    pub fn best_address(&self) -> Option<&MultiAddr> {
-        self.last_known_good
-            .as_ref()
-            .or_else(|| self.addresses.first())
-    }
-
-    /// Get all addresses
-    pub fn addresses(&self) -> &[MultiAddr] {
-        &self.addresses
-    }
-
-    /// Check if the address book is empty
-    pub fn is_empty(&self) -> bool {
-        self.addresses.is_empty()
-    }
-
-    /// Get the number of addresses
-    pub fn len(&self) -> usize {
-        self.addresses.len()
-    }
-}
-
-impl Default for AddressBook {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Display for AddressBook {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.addresses.is_empty() {
-            write!(f, "Empty address book")
-        } else {
-            write!(
-                f,
-                "Addresses: [{}]",
-                self.addresses
-                    .iter()
-                    .map(|a| a.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        }
-    }
-}
-
 /// Serde helpers for serializing `MultiAddr` as a plain string.
 ///
 /// Use with `#[serde(with = "crate::address::serde_as_string")]` on fields
@@ -298,22 +203,6 @@ mod tests {
         let addr = MultiAddr::from_ipv4(Ipv4Addr::new(192, 168, 1, 1), 9000);
         let display = addr.to_string();
         assert!(display.contains("192.168.1.1:9000"));
-    }
-
-    #[test]
-    fn test_address_book() {
-        let mut book = AddressBook::new();
-        let addr1 = MultiAddr::from_ipv4(Ipv4Addr::new(192, 168, 1, 1), 9000);
-        let addr2 = MultiAddr::from_ipv4(Ipv4Addr::new(192, 168, 1, 2), 9001);
-
-        book.add_address(addr1.clone());
-        book.add_address(addr2.clone());
-
-        assert_eq!(book.len(), 2);
-        assert_eq!(book.best_address(), Some(&addr1));
-
-        book.update_last_known_good(addr2.clone());
-        assert_eq!(book.best_address(), Some(&addr2));
     }
 
     #[test]

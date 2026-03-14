@@ -87,9 +87,7 @@
 //! ```
 
 use serde::{Deserialize, Serialize};
-use smallvec::SmallVec;
 use std::borrow::Cow;
-use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -517,69 +515,37 @@ pub enum GeoRejectionError {
 
     #[error("Geographic diversity violation in region {region} (ratio: {current_ratio:.1}%)")]
     DiversityViolation { region: String, current_ratio: f64 },
-
-    #[error("Region lookup failed: {0}")]
-    LookupFailed(String),
 }
 
 /// Geographic enforcement mode
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum GeoEnforcementMode {
-    /// Audit mode - log violations but allow connections
-    LogOnly,
     /// Strict mode - reject connections that violate rules
     #[default]
     Strict,
+    /// Log-only mode - log violations but allow connections
+    #[allow(dead_code)]
+    LogOnly,
 }
 
 /// Configuration for geographic diversity enforcement
 #[derive(Debug, Clone)]
 pub struct GeographicConfig {
-    /// Minimum number of regions required (default: 3)
-    pub min_regions: usize,
     /// Maximum ratio of peers from a single region (default: 0.4 = 40%)
     pub max_single_region_ratio: f64,
     /// Regions to outright block
     pub blocked_regions: Vec<String>,
-    /// Enforcement mode (LogOnly or Strict)
+    /// Enforcement mode
     pub enforcement_mode: GeoEnforcementMode,
 }
 
 impl Default for GeographicConfig {
     fn default() -> Self {
         Self {
-            min_regions: 3,
             max_single_region_ratio: 0.4,
             blocked_regions: Vec::new(),
             enforcement_mode: GeoEnforcementMode::Strict,
         }
-    }
-}
-
-impl GeographicConfig {
-    /// Create a new config with strict enforcement (default)
-    pub fn strict() -> Self {
-        Self::default()
-    }
-
-    /// Create a config for logging only (no rejection)
-    pub fn log_only() -> Self {
-        Self {
-            enforcement_mode: GeoEnforcementMode::LogOnly,
-            ..Default::default()
-        }
-    }
-
-    /// Add a blocked region
-    pub fn with_blocked_region(mut self, region: impl Into<String>) -> Self {
-        self.blocked_regions.push(region.into());
-        self
-    }
-
-    /// Set maximum single region ratio
-    pub fn with_max_ratio(mut self, ratio: f64) -> Self {
-        self.max_single_region_ratio = ratio;
-        self
     }
 }
 
@@ -659,93 +625,6 @@ impl std::fmt::Display for PeerFailureReason {
 
 /// Result type alias for P2P operations
 pub type P2pResult<T> = Result<T, P2PError>;
-
-// ===== Recovery patterns =====
-
-/// Trait for errors that can be recovered from with retry
-pub trait Recoverable {
-    /// Check if this error is transient and can be retried
-    fn is_transient(&self) -> bool;
-
-    /// Suggested delay before retry
-    fn suggested_retry_after(&self) -> Option<Duration>;
-
-    /// Maximum number of retries recommended
-    fn max_retries(&self) -> usize;
-}
-
-impl Recoverable for P2PError {
-    fn is_transient(&self) -> bool {
-        match self {
-            P2PError::Network(NetworkError::ConnectionFailed { .. }) => true,
-            P2PError::Network(NetworkError::Timeout) => true,
-            P2PError::Transport(TransportError::ConnectionFailed { .. }) => true,
-            P2PError::Dht(DhtError::QueryTimeout) => true,
-            P2PError::Timeout(_) => true,
-            P2PError::ResourceExhausted(_) => true,
-            P2PError::Io(err) => matches!(
-                err.kind(),
-                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::Interrupted
-            ),
-            _ => false,
-        }
-    }
-
-    fn suggested_retry_after(&self) -> Option<Duration> {
-        match self {
-            P2PError::Network(NetworkError::Timeout) => Some(Duration::from_secs(5)),
-            P2PError::Timeout(duration) => Some(*duration * 2),
-            P2PError::ResourceExhausted(_) => Some(Duration::from_secs(30)),
-            P2PError::Transport(TransportError::ConnectionFailed { .. }) => {
-                Some(Duration::from_secs(1))
-            }
-            _ => None,
-        }
-    }
-
-    fn max_retries(&self) -> usize {
-        match self {
-            P2PError::Network(NetworkError::ConnectionFailed { .. }) => 3,
-            P2PError::Transport(TransportError::ConnectionFailed { .. }) => 3,
-            P2PError::Timeout(_) => 2,
-            P2PError::ResourceExhausted(_) => 1,
-            _ => 0,
-        }
-    }
-}
-
-/// Extension trait for adding context to errors
-pub trait ErrorContext<T> {
-    /// Add context to an error
-    fn context(self, msg: &str) -> Result<T, P2PError>;
-
-    /// Add context with a closure
-    fn with_context<F>(self, f: F) -> Result<T, P2PError>
-    where
-        F: FnOnce() -> String;
-}
-
-impl<T, E> ErrorContext<T> for Result<T, E>
-where
-    E: Into<P2PError>,
-{
-    fn context(self, msg: &str) -> Result<T, P2PError> {
-        self.map_err(|e| {
-            let base_error = e.into();
-            P2PError::Internal(format!("{}: {}", msg, base_error).into())
-        })
-    }
-
-    fn with_context<F>(self, f: F) -> Result<T, P2PError>
-    where
-        F: FnOnce() -> String,
-    {
-        self.map_err(|e| {
-            let base_error = e.into();
-            P2PError::Internal(format!("{}: {}", f(), base_error).into())
-        })
-    }
-}
 
 /// Helper functions for error creation
 impl P2PError {
@@ -846,150 +725,6 @@ impl From<crate::adaptive::AdaptiveNetworkError> for P2PError {
     }
 }
 
-// ===== Structured logging =====
-
-/// Value types for error context
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum ErrorValue {
-    String(Cow<'static, str>),
-    Number(i64),
-    Bool(bool),
-    Duration(Duration),
-    Address(SocketAddr),
-}
-
-/// Structured error log entry optimized for performance
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ErrorLog {
-    pub timestamp: i64, // Unix timestamp for efficiency
-    pub error_type: &'static str,
-    pub message: Cow<'static, str>,
-    pub context: SmallVec<[(&'static str, ErrorValue); 4]>, // Stack-allocated for common cases
-    pub stack_trace: Option<Cow<'static, str>>,
-}
-
-impl ErrorLog {
-    /// Creates an error log entry from a P2PError
-    pub fn from_error(error: &P2PError) -> Self {
-        let mut context = SmallVec::new();
-
-        // Add error-specific context
-        match error {
-            P2PError::Network(NetworkError::ConnectionFailed { addr, reason }) => {
-                context.push(("address", ErrorValue::Address(*addr)));
-                context.push(("reason", ErrorValue::String(reason.clone())));
-            }
-            P2PError::Timeout(duration) => {
-                context.push(("timeout", ErrorValue::Duration(*duration)));
-            }
-            P2PError::Crypto(CryptoError::InvalidKeyLength { expected, actual }) => {
-                context.push(("expected_length", ErrorValue::Number(*expected as i64)));
-                context.push(("actual_length", ErrorValue::Number(*actual as i64)));
-            }
-            _ => {}
-        }
-
-        ErrorLog {
-            timestamp: chrono::Utc::now().timestamp(),
-            error_type: error_type_name(error),
-            message: error.to_string().into(),
-            context,
-            stack_trace: None,
-        }
-    }
-
-    pub fn with_context(mut self, key: &'static str, value: ErrorValue) -> Self {
-        self.context.push((key, value));
-        self
-    }
-
-    pub fn log(&self) {
-        use log::{error, warn};
-
-        let json = serde_json::to_string(self).unwrap_or_else(|_| self.message.to_string());
-
-        match self.error_type {
-            "Validation" | "Config" => warn!("{}", json),
-            _ => error!("{}", json),
-        }
-    }
-}
-
-fn error_type_name(error: &P2PError) -> &'static str {
-    match error {
-        P2PError::Network(_) => "Network",
-        P2PError::Dht(_) => "DHT",
-        P2PError::Identity(_) => "Identity",
-        P2PError::Crypto(_) => "Crypto",
-        P2PError::State(_) => "State",
-        P2PError::Transport(_) => "Transport",
-        P2PError::Config(_) => "Config",
-        P2PError::Io(_) => "IO",
-        P2PError::Serialization(_) => "Serialization",
-        P2PError::Validation(_) => "Validation",
-        P2PError::Timeout(_) => "Timeout",
-        P2PError::ResourceExhausted(_) => "ResourceExhausted",
-        P2PError::Internal(_) => "Internal",
-        P2PError::Security(_) => "Security",
-        P2PError::Bootstrap(_) => "Bootstrap",
-        P2PError::Encoding(_) => "Encoding",
-        P2PError::RecordTooLarge(_) => "RecordTooLarge",
-        P2PError::TimeError => "TimeError",
-        P2PError::InvalidInput(_) => "InvalidInput",
-        P2PError::WebRtcError(_) => "WebRTC",
-        P2PError::Trust(_) => "Trust",
-    }
-}
-
-/// Error reporting trait for structured logging
-pub trait ErrorReporting {
-    fn report(&self) -> ErrorLog;
-    fn report_with_context(&self, context: HashMap<String, serde_json::Value>) -> ErrorLog;
-}
-
-impl ErrorReporting for P2PError {
-    fn report(&self) -> ErrorLog {
-        ErrorLog::from_error(self)
-    }
-
-    fn report_with_context(&self, context: HashMap<String, serde_json::Value>) -> ErrorLog {
-        let log = ErrorLog::from_error(self);
-        // Convert HashMap entries to ErrorValue entries
-        for (_key, _value) in context {
-            // We need to leak the key to get a &'static str, or use a different approach
-            // For now, we'll skip this functionality as it requires a redesign
-            // log.context.push((key.leak(), ErrorValue::String(value.to_string().into())));
-        }
-        log
-    }
-}
-
-// ===== Anyhow integration =====
-
-/// Conversion helpers for anyhow integration
-pub trait IntoAnyhow<T> {
-    fn into_anyhow(self) -> anyhow::Result<T>;
-}
-
-impl<T> IntoAnyhow<T> for P2pResult<T> {
-    fn into_anyhow(self) -> anyhow::Result<T> {
-        self.map_err(|e| anyhow::anyhow!(e))
-    }
-}
-
-pub trait FromAnyhowExt<T> {
-    fn into_p2p_result(self) -> P2pResult<T>;
-}
-
-impl<T> FromAnyhowExt<T> for anyhow::Result<T> {
-    fn into_p2p_result(self) -> P2pResult<T> {
-        self.map_err(|e| P2PError::Internal(e.to_string().into()))
-    }
-}
-
-/// Re-export for convenience
-pub use anyhow::{Context as AnyhowContext, Result as AnyhowResult};
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1001,21 +736,6 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "Network error: Connection failed to 127.0.0.1:8080: Connection refused"
-        );
-    }
-
-    #[test]
-    fn test_error_context() {
-        let result: Result<(), io::Error> =
-            Err(io::Error::new(io::ErrorKind::NotFound, "file not found"));
-
-        let with_context = crate::error::ErrorContext::context(result, "Failed to load config");
-        assert!(with_context.is_err());
-        assert!(
-            with_context
-                .unwrap_err()
-                .to_string()
-                .contains("Failed to load config")
         );
     }
 
@@ -1037,39 +757,5 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_error_log_serialization() {
-        let error = P2PError::Network(NetworkError::ConnectionFailed {
-            addr: "127.0.0.1:8080".parse().unwrap(),
-            reason: "Connection refused".into(),
-        });
-
-        let log = error
-            .report()
-            .with_context("peer_id", ErrorValue::String("peer123".into()))
-            .with_context("retry_count", ErrorValue::Number(3));
-
-        let json = serde_json::to_string_pretty(&log).unwrap();
-        assert!(json.contains("Network"));
-        assert!(json.contains("127.0.0.1:8080"));
-        assert!(json.contains("peer123"));
-    }
-
     // PeerFailureReason transient/severity tests are in tests/request_response_trust_test.rs
-
-    #[test]
-    fn test_anyhow_conversion() {
-        let p2p_result: P2pResult<()> = Err(P2PError::validation("Invalid input"));
-        let anyhow_result = p2p_result.into_anyhow();
-        assert!(anyhow_result.is_err());
-
-        let anyhow_err = anyhow::anyhow!("Test error");
-        let anyhow_result: anyhow::Result<()> = Err(anyhow_err);
-        let p2p_result = crate::error::FromAnyhowExt::into_p2p_result(anyhow_result);
-        assert!(p2p_result.is_err());
-        match p2p_result.unwrap_err() {
-            P2PError::Internal(msg) => assert!(msg.contains("Test error")),
-            _ => panic!("Expected Internal error"),
-        }
-    }
 }

@@ -26,7 +26,7 @@ pub mod dht_handler;
 // Network binding and NAT traversal configuration (moved from messaging)
 pub mod network_config;
 
-pub use network_config::{IpMode, NatTraversalMode, NetworkConfig, PortConfig, RetryBehavior};
+pub use network_config::NetworkConfig;
 
 use crate::validation::{Validate, ValidationContext, validate_message_size};
 use crate::{P2PError, Result};
@@ -37,6 +37,7 @@ use std::time::{Duration, Instant};
 
 /// Transport protocol types
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub enum TransportType {
     /// QUIC transport protocol with NAT traversal
     QUIC,
@@ -44,6 +45,7 @@ pub enum TransportType {
 
 /// Transport selection strategy (simplified for QUIC-only)
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[allow(dead_code)]
 pub enum TransportSelection {
     /// Use QUIC transport (default and only option)
     #[default]
@@ -52,6 +54,7 @@ pub enum TransportSelection {
 
 /// Connection quality metrics
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct ConnectionQuality {
     /// Round-trip latency
     pub latency: Duration,
@@ -67,6 +70,7 @@ pub struct ConnectionQuality {
 
 /// Connection information
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct ConnectionInfo {
     /// Transport type being used
     pub transport_type: TransportType,
@@ -88,6 +92,7 @@ pub struct ConnectionInfo {
 
 /// Connection pool information
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct ConnectionPoolInfo {
     /// Number of active connections
     pub active_connections: usize,
@@ -101,6 +106,7 @@ pub struct ConnectionPoolInfo {
 
 /// Connection pool statistics
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct ConnectionPoolStats {
     /// Messages sent per connection
     pub messages_per_connection: HashMap<String, usize>,
@@ -112,6 +118,7 @@ pub struct ConnectionPoolStats {
 
 /// Message received from transport
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct TransportMessage {
     /// Sender peer ID
     pub sender: crate::PeerId,
@@ -139,6 +146,7 @@ impl Validate for TransportMessage {
 
 /// Transport configuration options
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct TransportOptions {
     /// Enable 0-RTT for QUIC
     pub enable_0rtt: bool,

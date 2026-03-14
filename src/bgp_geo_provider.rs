@@ -85,6 +85,7 @@ pub struct AsnInfo {
 
 /// Configuration for BgpGeoProvider
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct BgpGeoConfig {
     /// Path to IPv4 prefix file (optional, uses embedded data if not set)
     pub ipv4_prefix_file: Option<String>,
@@ -127,6 +128,7 @@ impl BgpGeoProvider {
     }
 
     /// Create with custom configuration
+    #[allow(dead_code)]
     pub fn with_config(_config: BgpGeoConfig) -> Self {
         // For now, just use default embedded data
         // Future: load from specified files
@@ -374,6 +376,7 @@ impl BgpGeoProvider {
     }
 
     /// Add a custom IPv4 prefix
+    #[allow(dead_code)]
     pub fn add_ipv4_prefix(&self, network: [u8; 4], prefix_len: u8, asn: u32) {
         let mut prefixes = self.ipv4_prefixes.write();
         prefixes.push(Ipv4Prefix::new(network, prefix_len, asn));
@@ -381,16 +384,19 @@ impl BgpGeoProvider {
     }
 
     /// Add a custom hosting ASN
+    #[allow(dead_code)]
     pub fn add_hosting_asn(&self, asn: u32) {
         self.hosting_asns.write().insert(asn);
     }
 
     /// Add a custom VPN ASN
+    #[allow(dead_code)]
     pub fn add_vpn_asn(&self, asn: u32) {
         self.vpn_asns.write().insert(asn);
     }
 
     /// Add ASN info
+    #[allow(dead_code)]
     pub fn add_asn_info(&self, asn: u32, org_name: &str, country: &str, rir: &str) {
         self.asn_info.write().insert(
             asn,
@@ -404,6 +410,7 @@ impl BgpGeoProvider {
     }
 
     /// Get statistics about loaded data
+    #[allow(dead_code)]
     pub fn stats(&self) -> BgpGeoStats {
         BgpGeoStats {
             ipv4_prefix_count: self.ipv4_prefixes.read().len(),
@@ -484,6 +491,7 @@ impl Ipv6Prefix {
 
 /// Statistics about loaded BGP data
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct BgpGeoStats {
     pub ipv4_prefix_count: usize,
     pub ipv6_prefix_count: usize,

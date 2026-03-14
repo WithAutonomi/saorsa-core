@@ -41,6 +41,7 @@ const MAX_SUBNET_TRACKING: usize = 50_000;
 // ============================================================================
 
 /// Trait for IP addresses that can be used in node ID generation
+#[allow(dead_code)]
 pub trait NodeIpAddress: Debug + Clone + Send + Sync + 'static {
     /// Get the octets of this IP address for hashing
     fn octets_vec(&self) -> Vec<u8>;
@@ -67,6 +68,7 @@ impl NodeIpAddress for Ipv4Addr {
 /// This struct provides a unified implementation for both IPv4 and IPv6
 /// node identities, reducing code duplication while maintaining type safety.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct GenericIpNodeID<A: NodeIpAddress> {
     /// Derived node ID (BLAKE3 of ip_addr + public_key + salt + timestamp)
     pub node_id: Vec<u8>,
@@ -82,6 +84,7 @@ pub struct GenericIpNodeID<A: NodeIpAddress> {
     pub salt: Vec<u8>,
 }
 
+#[allow(dead_code)]
 impl<A: NodeIpAddress> GenericIpNodeID<A> {
     /// ML-DSA-65 signature length
     const SIGNATURE_LENGTH: usize = 3309;
@@ -209,6 +212,7 @@ impl<A: NodeIpAddress> GenericIpNodeID<A> {
 
 /// IPv6-based node identity that binds node ID to actual network location
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct IPv6NodeID {
     /// Derived node ID (BLAKE3 of ipv6_addr + public_key + salt)
     pub node_id: Vec<u8>,
@@ -292,6 +296,7 @@ pub struct IPAnalysis {
 
 /// Analysis of an IPv4 address for diversity enforcement
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[allow(dead_code)]
 pub struct IPv4Analysis {
     /// The exact IPv4 address
     pub ip_addr: Ipv4Addr,
@@ -315,6 +320,7 @@ pub struct IPv4Analysis {
 
 /// Unified IP analysis that handles both IPv4 and IPv6 addresses
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[allow(dead_code)]
 pub enum UnifiedIPAnalysis {
     /// IPv4 address analysis
     IPv4(IPv4Analysis),
@@ -324,6 +330,7 @@ pub enum UnifiedIPAnalysis {
 
 /// Node reputation tracking for security-aware routing
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct NodeReputation {
     /// Peer ID
     pub peer_id: PeerId,
@@ -429,6 +436,7 @@ impl IPDiversityConfig {
     }
 }
 
+#[allow(dead_code)]
 impl IPv6NodeID {
     /// Generate a new IPv6-based node ID
     ///
@@ -499,6 +507,7 @@ impl IPv6NodeID {
 /// IPv4-based node identity that binds node ID to actual network location
 /// Mirrors IPv6NodeID for security parity on IPv4 networks
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct IPv4NodeID {
     /// Derived node ID (BLAKE3 of ipv4_addr + public_key + salt + timestamp)
     pub node_id: Vec<u8>,
@@ -514,6 +523,7 @@ pub struct IPv4NodeID {
     pub salt: Vec<u8>,
 }
 
+#[allow(dead_code)]
 impl IPv4NodeID {
     /// Generate a new IPv4-based node ID
     ///
@@ -600,17 +610,22 @@ pub struct IPDiversityEnforcer {
     subnet_48_counts: LruCache<Ipv6Addr, usize>,
     subnet_32_counts: LruCache<Ipv6Addr, usize>,
     // IPv4 tracking (LRU caches with max 50k entries to prevent memory DoS)
+    #[allow(dead_code)]
     ipv4_32_counts: LruCache<Ipv4Addr, usize>, // Per exact IP
+    #[allow(dead_code)]
     ipv4_24_counts: LruCache<Ipv4Addr, usize>, // Per /24 subnet
+    #[allow(dead_code)]
     ipv4_16_counts: LruCache<Ipv4Addr, usize>, // Per /16 subnet
     // Shared tracking (LRU caches with max 50k entries to prevent memory DoS)
     asn_counts: LruCache<u32, usize>,
     country_counts: LruCache<String, usize>,
     geo_provider: Option<Arc<dyn GeoProvider + Send + Sync>>,
     // Network size for dynamic limits
+    #[allow(dead_code)]
     network_size: usize,
 }
 
+#[allow(dead_code)]
 impl IPDiversityEnforcer {
     /// Create a new IP diversity enforcer with loopback disabled.
     pub fn new(config: IPDiversityConfig) -> Self {
@@ -1205,11 +1220,13 @@ pub struct GeoInfo {
 
 /// A simple in-memory caching wrapper for a GeoProvider
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct CachedGeoProvider<P: GeoProvider> {
     inner: P,
     cache: parking_lot::RwLock<HashMap<Ipv6Addr, GeoInfo>>,
 }
 
+#[allow(dead_code)]
 impl<P: GeoProvider> CachedGeoProvider<P> {
     pub fn new(inner: P) -> Self {
         Self {
@@ -1232,6 +1249,7 @@ impl<P: GeoProvider> GeoProvider for CachedGeoProvider<P> {
 
 /// Stub provider returning no ASN/GeoIP info
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct StubGeoProvider;
 impl GeoProvider for StubGeoProvider {
     fn lookup(&self, _ip: Ipv6Addr) -> GeoInfo {
@@ -1246,6 +1264,7 @@ impl GeoProvider for StubGeoProvider {
 
 /// Diversity statistics for monitoring
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct DiversityStats {
     // === IPv6 stats ===
     /// Number of unique /64 subnets represented
@@ -1284,12 +1303,14 @@ pub struct DiversityStats {
 
 /// Reputation manager for tracking node behavior
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct ReputationManager {
     reputations: HashMap<PeerId, NodeReputation>,
     reputation_decay: f64,
     min_reputation: f64,
 }
 
+#[allow(dead_code)]
 impl ReputationManager {
     /// Create a new reputation manager
     pub fn new(reputation_decay: f64, min_reputation: f64) -> Self {

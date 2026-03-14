@@ -16,7 +16,6 @@
 //! Provides a 32-byte BLAKE3 key type used for content-addressed lookups.
 
 use anyhow::{Context, Result};
-use blake3::Hasher;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -70,15 +69,6 @@ impl fmt::Display for Key {
     }
 }
 
-/// Compute key from a context string and content
-pub fn compute_key(context: &str, content: &[u8]) -> Key {
-    let mut hasher = Hasher::new();
-    hasher.update(context.as_bytes());
-    hasher.update(content);
-    let hash = hasher.finalize();
-    Key(*hash.as_bytes())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -90,19 +80,5 @@ mod tests {
         let hex = key.to_hex();
         let recovered = Key::from_hex(&hex).unwrap();
         assert_eq!(key, recovered);
-    }
-
-    #[test]
-    fn test_compute_key_deterministic() {
-        let key1 = compute_key("ctx", b"data");
-        let key2 = compute_key("ctx", b"data");
-        assert_eq!(key1, key2);
-    }
-
-    #[test]
-    fn test_compute_key_different_inputs() {
-        let key1 = compute_key("ctx1", b"data");
-        let key2 = compute_key("ctx2", b"data");
-        assert_ne!(key1, key2);
     }
 }

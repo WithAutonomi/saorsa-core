@@ -1743,6 +1743,7 @@ impl P2PNode {
 
 /// Network sender trait for sending messages
 #[async_trait::async_trait]
+#[allow(dead_code)]
 pub trait NetworkSender: Send + Sync {
     /// Send a message to an authenticated peer.
     async fn send_message(&self, peer_id: &PeerId, protocol: &str, data: Vec<u8>) -> Result<()>;

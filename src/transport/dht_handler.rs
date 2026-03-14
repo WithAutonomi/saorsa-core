@@ -30,6 +30,7 @@ use tracing::{debug, error, trace, warn};
 use crate::dht::core_engine::DhtCoreEngine;
 use crate::dht::network_integration::{DhtMessage, DhtResponse, ErrorCode};
 
+#[allow(dead_code)]
 /// DHT stream types handled by this handler.
 ///
 /// Only DhtQuery remains — store and replication are handled by the
@@ -40,6 +41,7 @@ const DHT_STREAM_TYPES: &[StreamType] = &[StreamType::DhtQuery];
 ///
 /// Routes incoming DHT streams to the appropriate handlers based on stream type:
 /// - DhtQuery: Handles FIND_NODE, Ping requests (peer phonebook)
+#[allow(dead_code)]
 pub struct DhtStreamHandler {
     /// Reference to the DHT engine for processing requests.
     dht_engine: Arc<RwLock<DhtCoreEngine>>,
@@ -47,6 +49,7 @@ pub struct DhtStreamHandler {
     name: String,
 }
 
+#[allow(dead_code)]
 impl DhtStreamHandler {
     /// Create a new DHT stream handler.
     ///
@@ -190,6 +193,7 @@ impl ProtocolHandler for DhtStreamHandler {
 
 /// Message wrapper for typed DHT stream transmission.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct TypedDhtMessage {
     /// The stream type to use for this message.
     pub stream_type: DhtStreamType,

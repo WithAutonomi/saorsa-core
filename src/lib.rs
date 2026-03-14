@@ -28,213 +28,59 @@
 //! - IPv4-first with simple addressing
 //! - Kademlia DHT for distributed routing
 //! - Post-quantum cryptography (ML-DSA-65, ML-KEM-768)
-//!
-//! ## Example
-//!
-//! ```rust,ignore
-//! use saorsa_core::{P2PNode, NodeConfig, MultiAddr};
-//! use std::str::FromStr;
-//!
-//! #[tokio::main]
-//! async fn main() -> anyhow::Result<()> {
-//!     let addr = "127.0.0.1:9000".parse::<MultiAddr>()?;
-//!     let node = P2PNode::builder()
-//!         .listen_on(addr)
-//!         .with_mcp_server()
-//!         .build()
-//!         .await?;
-//!
-//!     node.run().await?;
-//!     Ok(())
-//! }
-//! ```
 
 #![allow(missing_docs)]
 #![allow(missing_debug_implementations)]
 #![warn(rust_2018_idioms)]
 
-/// Key derivation and hashing utilities
-pub mod fwid;
+// Internal modules — used by the crate but not exposed publicly.
+pub(crate) mod adaptive;
+pub(crate) mod address;
+pub(crate) mod bgp_geo_provider;
+pub(crate) mod bootstrap;
+pub(crate) mod config;
+pub(crate) mod dht;
+pub(crate) mod dht_network_manager;
+pub(crate) mod error;
+pub(crate) mod events;
+pub(crate) mod fwid;
+pub(crate) mod network;
+pub(crate) mod peer_record;
+pub(crate) mod quantum_crypto;
+pub(crate) mod rate_limit;
+pub(crate) mod security;
+pub(crate) mod transport;
+pub(crate) mod transport_handle;
+pub(crate) mod types;
+pub(crate) mod validation;
 
-/// Prelude module for convenient imports
-///
-/// Use `use saorsa_core::prelude::*;` to import commonly used types.
-pub mod prelude;
-
-/// Network address types
-pub mod address;
-
-/// Network core functionality
-pub mod network;
-
-/// Distributed Hash Table implementation
-pub mod dht;
-
-/// DHT Network Integration Manager
-pub mod dht_network_manager;
-
-/// Transport handle: shared QUIC + peer + event state
-pub mod transport_handle;
-
-/// Transport layer (QUIC, TCP)
-pub mod transport;
-
-/// Async event bus for watches and state changes
-pub mod events;
-/// Shared simple structs
-pub mod types;
-
-// MCP removed; will be redesigned later
-
-/// Security and cryptography
-pub mod security;
-
-/// BGP-based GeoIP provider using open-source routing data
-pub mod bgp_geo_provider;
-
-/// User identity and privacy system
+/// User identity and privacy system (public — accessed via path by saorsa-node).
 pub mod identity;
 
-/// Quantum-resistant cryptography
-pub mod quantum_crypto;
+// ---------------------------------------------------------------------------
+// Public re-exports — only items that saorsa-node consumes.
+// ---------------------------------------------------------------------------
 
-/// Validation framework for input sanitization and rate limiting
-pub mod validation;
+// Networking
+pub use address::MultiAddr;
+pub use network::{NodeConfig, NodeMode, P2PEvent, P2PNode};
 
-/// Unified rate limiting engine
-pub mod rate_limit;
-
-/// Bootstrap cache for decentralized peer discovery
-pub mod bootstrap;
-
-/// Error types
-pub mod error;
-
-/// Peer record system for DHT-based peer discovery
-pub mod peer_record;
-
-/// Adaptive P2P network implementation
-pub mod adaptive;
-
-/// Configuration management system
-pub mod config;
-
-// Re-export main types
-pub use address::{AddressBook, MultiAddr};
-
+// Bootstrap
 pub use bootstrap::{BootstrapConfig, BootstrapManager, BootstrapStats};
-pub use dht::Key;
-pub use dht_network_manager::{
-    DhtNetworkConfig, DhtNetworkEvent, DhtNetworkManager, DhtNetworkOperation, DhtNetworkResult,
-};
-pub use error::{P2PError, P2pResult as Result, PeerFailureReason};
-pub use events::{Subscription, TopologyEvent, device_subscribe, dht_watch, subscribe_topology};
-pub use fwid::Key as FwKey;
-pub use network::{
-    ConnectionStatus, NetworkSender, NodeBuilder, NodeConfig, NodeMode, P2PEvent, P2PNode,
-    PeerInfo, PeerResponse, is_dht_participant, user_agent_for_mode,
-};
-pub use transport_handle::TransportHandle;
-// Trust system exports for saorsa-node integration
-pub use adaptive::{EigenTrustEngine, NodeStatistics, NodeStatisticsUpdate, TrustProvider};
-// Back-compat exports for tests
-pub use config::Config;
-pub use network::P2PNode as Node;
-pub use peer_record::NatType;
-pub use validation::{
-    RateLimitConfig, RateLimiter, Sanitize, Validate, ValidationContext, ValidationError,
-    sanitize_string, validate_dht_key, validate_dht_value, validate_file_path,
-    validate_message_size, validate_network_address, validate_peer_id,
-};
 
-// Join rate limiting for Sybil protection
-pub use rate_limit::{
-    JoinRateLimitError, JoinRateLimiter, JoinRateLimiterConfig, extract_ipv4_subnet_8,
-    extract_ipv4_subnet_16, extract_ipv4_subnet_24, extract_ipv6_subnet_32, extract_ipv6_subnet_48,
-    extract_ipv6_subnet_64,
-};
+// Security
+pub use security::IPDiversityConfig;
 
-// Security and anti-Sybil exports (includes testnet configurations)
-pub use dht::node_age_verifier::{
-    AgeVerificationResult, NodeAgeCategory, NodeAgeConfig, NodeAgeRecord, NodeAgeStats,
-    NodeAgeVerifier, OperationType,
-};
-pub use security::{
-    DiversityStats, GeoInfo, GeoProvider, IPAnalysis, IPDiversityConfig, IPDiversityEnforcer,
-    IPv4NodeID, IPv6NodeID, NodeReputation, ReputationManager, StubGeoProvider,
-};
+// Post-quantum cryptography
+pub use quantum_crypto::MlDsa65;
 
-// Post-quantum cryptography exports (using saorsa-transport types exclusively)
-pub use quantum_crypto::{
-    CryptoCapabilities,
-    KemAlgorithm,
-    NegotiatedAlgorithms,
-    ProtocolVersion,
-    // Core types and errors (compatibility layer only)
-    QuantumCryptoError,
-    SignatureAlgorithm,
-    // Functions (compatibility layer only)
-    negotiate_algorithms,
-};
+// Canonical peer identity (also accessible via identity::peer_id::PeerId)
+pub use identity::peer_id::PeerId;
 
-// Saorsa-PQC exports (primary post-quantum crypto types)
-pub use quantum_crypto::{
-    // Symmetric encryption (quantum-resistant)
-    ChaCha20Poly1305Cipher,
-    // Encrypted message types
-    EncryptedMessage,
-    // Algorithm implementations
-    MlDsa65,
-    MlDsaOperations,
-    // Use saorsa-transport types for better trait implementations
-    MlDsaPublicKey as AntMlDsaPublicKey,
-    MlDsaSecretKey as AntMlDsaSecretKey,
-    MlDsaSignature as AntMlDsaSignature,
-    MlKem768,
-    MlKemCiphertext,
-    // Core traits for operations
-    MlKemOperations,
-    // Key types
-    MlKemPublicKey,
-    MlKemSecretKey,
-    // Errors and results
-    PqcError,
-    SaorsaPqcResult,
-    SharedSecret,
-    SymmetricEncryptedMessage,
-    SymmetricError,
-    SymmetricKey,
-    // Configuration functions
-    create_default_pqc_config,
-    create_pqc_only_config,
-    // Library initialization
-    saorsa_pqc_init,
-};
-
-// Session and identity types
-pub use quantum_crypto::types::{
-    // FROST threshold signatures
-    FrostCommitment,
-    FrostGroupPublicKey,
-    FrostKeyShare,
-    FrostPublicKey,
-    FrostSignature,
-    // Session and group management types
-    GroupId,
-    HandshakeParameters,
-    ParticipantId,
-    PeerId as QuantumPeerId,
-    QuantumPeerIdentity,
-    SecureSession,
-    SessionId,
-    SessionState,
-};
-
-// Canonical peer identity type — 32-byte BLAKE3 hash of ML-DSA-65 public key.
-pub use identity::peer_id::{PEER_ID_BYTE_LEN, PeerId, PeerIdParseError};
-
-/// Saorsa Core version
-pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+// ---------------------------------------------------------------------------
+// Crate-internal re-exports — used by sibling modules via `crate::Result` etc.
+// ---------------------------------------------------------------------------
+pub(crate) use error::{P2PError, P2pResult as Result};
 
 /// Default capacity for broadcast and mpsc event channels throughout the system.
-pub const DEFAULT_EVENT_CHANNEL_CAPACITY: usize = 1000;
+pub(crate) const DEFAULT_EVENT_CHANNEL_CAPACITY: usize = 1000;

@@ -4,17 +4,14 @@
 //! trust-weighted peer selection, and security-hardened maintenance tasks.
 
 use crate::PeerId;
-use crate::adaptive::EigenTrustEngine;
 use crate::address::MultiAddr;
 use crate::dht::geographic_routing::GeographicRegion;
-use crate::dht::network_integration::{DhtMessage, DhtResponse};
 use crate::dht::routing_maintenance::close_group_validator::{
-    CloseGroupEnforcementMode, CloseGroupFailure, CloseGroupValidator, CloseGroupValidatorConfig,
+    CloseGroupEnforcementMode, CloseGroupValidator, CloseGroupValidatorConfig,
 };
 use crate::dht::routing_maintenance::{
     BucketRefreshManager, EvictionManager, EvictionReason, MaintenanceConfig,
 };
-use crate::dht::trust_peer_selector::{TrustAwarePeerSelector, TrustSelectionConfig};
 use crate::security::IPDiversityConfig;
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
@@ -326,10 +323,6 @@ const GEO_DEFAULT_MAX_PER_REGION: usize = 50;
 /// K parameter - number of closest nodes per bucket
 const K: usize = 8;
 
-/// Maximum node count for FindNode requests
-/// Prevents amplification attacks by limiting response size
-const MAX_FIND_NODE_COUNT: usize = 20;
-
 /// Number of K-buckets in Kademlia routing table (one per bit in 256-bit key space)
 const KADEMLIA_BUCKET_COUNT: usize = 256;
 
@@ -340,24 +333,6 @@ const CANDIDATE_EXPANSION_FACTOR: usize = 2;
 /// DHT routing table maintenance interval in seconds
 /// Periodic refresh of buckets and eviction of stale nodes
 const MAINTENANCE_INTERVAL_SECS: u64 = 60;
-
-/// DHT request wrapper with request ID for correlation
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DhtRequestWrapper {
-    /// Unique request ID for response correlation
-    pub id: String,
-    /// The underlying DHT message
-    pub message: DhtMessage,
-}
-
-/// DHT response wrapper with request ID for correlation
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DhtResponseWrapper {
-    /// Request ID this response corresponds to
-    pub id: String,
-    /// The underlying DHT response
-    pub response: DhtResponse,
-}
 
 /// Main DHT Core Engine
 pub struct DhtCoreEngine {
@@ -381,20 +356,11 @@ pub struct DhtCoreEngine {
     /// Maximum nodes per geographic region.
     geo_max_per_region: usize,
 
-    // Trust-weighted peer selection
-    /// Optional trust-aware peer selector for combining distance with trust scores
-    trust_peer_selector: Option<TrustAwarePeerSelector<EigenTrustEngine>>,
-
     /// Shutdown token for background maintenance tasks
     shutdown: CancellationToken,
 }
 
 impl DhtCoreEngine {
-    /// Create new DHT engine with specified node ID
-    pub fn new(node_id: PeerId) -> Result<Self> {
-        Self::new_with_validation_mode(node_id, CloseGroupEnforcementMode::Strict, false)
-    }
-
     /// Create new DHT engine for testing (permissive validation)
     #[cfg(test)]
     pub fn new_for_tests(node_id: PeerId) -> Result<Self> {
@@ -445,53 +411,13 @@ impl DhtCoreEngine {
             ip_diversity_config: IPDiversityConfig::default(),
             allow_loopback,
             geo_max_per_region: GEO_DEFAULT_MAX_PER_REGION,
-            trust_peer_selector: None,
             shutdown: CancellationToken::new(),
         })
-    }
-
-    /// Get this node's ID
-    #[must_use]
-    pub fn node_id(&self) -> &PeerId {
-        &self.node_id
     }
 
     /// Number of peers currently in the routing table.
     pub async fn routing_table_size(&self) -> usize {
         self.routing_table.read().await.node_count()
-    }
-
-    // ===== Trust-weighted peer selection methods =====
-
-    /// Enable trust-weighted peer selection
-    ///
-    /// When enabled, peer selection for DHT operations will combine XOR distance
-    /// with EigenTrust scores to prefer higher-trust nodes.
-    ///
-    /// # Arguments
-    /// * `trust_engine` - The EigenTrust engine providing trust scores
-    /// * `config` - Configuration for trust selection behavior
-    pub fn enable_trust_selection(
-        &mut self,
-        trust_engine: Arc<EigenTrustEngine>,
-        config: TrustSelectionConfig,
-    ) {
-        self.trust_peer_selector = Some(TrustAwarePeerSelector::new(trust_engine, config));
-        tracing::info!("DHT trust-weighted peer selection enabled");
-    }
-
-    /// Disable trust-weighted peer selection
-    ///
-    /// Falls back to pure distance-based selection.
-    pub fn disable_trust_selection(&mut self) {
-        self.trust_peer_selector = None;
-        tracing::info!("DHT trust-weighted peer selection disabled");
-    }
-
-    /// Check if trust-weighted peer selection is enabled
-    #[must_use]
-    pub fn has_trust_selection(&self) -> bool {
-        self.trust_peer_selector.is_some()
     }
 
     /// Signal background maintenance tasks to stop
@@ -639,71 +565,10 @@ impl DhtCoreEngine {
         });
     }
 
-    /// Handle an incoming DHT request from the network
-    ///
-    /// Processes the request and returns a response wrapper ready to be sent back.
-    pub async fn handle_request(&self, request_wrapper: DhtRequestWrapper) -> DhtResponseWrapper {
-        let response = match request_wrapper.message {
-            DhtMessage::FindNode { ref target, count } => {
-                // Security: Cap count to prevent amplification attacks
-                let capped_count = count.min(MAX_FIND_NODE_COUNT);
-                let routing = self.routing_table.read().await;
-                let nodes = routing.find_closest_nodes(target, capped_count);
-                DhtResponse::FindNodeReply {
-                    nodes,
-                    distances: Vec::new(),
-                }
-            }
-            DhtMessage::Ping { timestamp } => DhtResponse::Pong { timestamp },
-            _ => DhtResponse::Error {
-                code: crate::dht::network_integration::ErrorCode::InvalidMessage,
-                message: "Unsupported message type".to_string(),
-                retry_after: None,
-            },
-        };
-
-        DhtResponseWrapper {
-            id: request_wrapper.id,
-            response,
-        }
-    }
-
     /// Find nodes closest to a key
     pub async fn find_nodes(&self, key: &DhtKey, count: usize) -> Result<Vec<NodeInfo>> {
         let routing = self.routing_table.read().await;
         Ok(routing.find_closest_nodes(key, count))
-    }
-
-    /// Join the DHT network.
-    ///
-    /// Bootstrap nodes go through the same close-group validation and
-    /// IP/geographic diversity checks as every other `add_node` call, so a
-    /// compromised bootstrap list cannot bypass security invariants.
-    ///
-    /// Returns an error if the list is non-empty but *every* node fails
-    /// validation (the caller would be left with an empty routing table).
-    pub async fn join_network(&mut self, bootstrap_nodes: Vec<NodeInfo>) -> Result<()> {
-        let total = bootstrap_nodes.len();
-        let mut added: usize = 0;
-        for node in bootstrap_nodes {
-            match self.add_node(node).await {
-                Ok(()) => added += 1,
-                Err(e) => tracing::warn!("Skipping bootstrap node that failed validation: {e}"),
-            }
-        }
-
-        if total > 0 && added == 0 {
-            return Err(anyhow!(
-                "All {total} bootstrap nodes failed validation — cannot join network"
-            ));
-        }
-
-        Ok(())
-    }
-
-    /// Leave the DHT network gracefully
-    pub async fn leave_network(&mut self) -> Result<()> {
-        Ok(())
     }
 
     /// Look up a node's address from the routing table by peer ID.
@@ -726,97 +591,6 @@ impl DhtCoreEngine {
     pub async fn touch_node(&self, node_id: &PeerId, address: Option<&str>) -> bool {
         let mut routing = self.routing_table.write().await;
         routing.touch_node(node_id, address)
-    }
-
-    /// Handle node failure by removing it from the routing table.
-    pub async fn handle_node_failure(&mut self, failed_node: PeerId) -> Result<()> {
-        let mut routing = self.routing_table.write().await;
-        routing.remove_node(&failed_node);
-        Ok(())
-    }
-
-    /// Evict a node from the routing table with a specific reason.
-    ///
-    /// This is called when a node fails security validation or is detected
-    /// as malicious through Sybil/collusion detection.
-    pub async fn evict_node(&self, node_id: &PeerId, reason: EvictionReason) -> Result<()> {
-        // 1. Remove from routing table
-        {
-            let mut routing = self.routing_table.write().await;
-            routing.remove_node(node_id);
-        }
-
-        // 2. Log eviction for data integrity tracking
-        // Note: Data health tracking handled elsewhere
-        // Evicted nodes will be removed from routing table, which affects future lookups
-
-        tracing::info!(
-            node_id = %node_id,
-            reason = ?reason,
-            "Node evicted from DHT"
-        );
-
-        Ok(())
-    }
-
-    /// Evict a node due to close group validation failure.
-    ///
-    /// This is a specialized eviction for security-related failures.
-    pub async fn evict_node_for_security(
-        &self,
-        node_id: &PeerId,
-        failure_reason: CloseGroupFailure,
-    ) -> Result<()> {
-        let eviction_reason = match failure_reason {
-            CloseGroupFailure::NotInCloseGroup => EvictionReason::CloseGroupRejection,
-            CloseGroupFailure::EvictedFromCloseGroup => EvictionReason::CloseGroupRejection,
-            CloseGroupFailure::InsufficientConfirmation => EvictionReason::CloseGroupRejection,
-            CloseGroupFailure::LowTrustScore => {
-                EvictionReason::LowTrust("Security validation failed".to_string())
-            }
-            CloseGroupFailure::InsufficientGeographicDiversity => {
-                EvictionReason::LowTrust("Geographic diversity violation".to_string())
-            }
-            CloseGroupFailure::SuspectedCollusion => {
-                EvictionReason::LowTrust("Suspected collusion".to_string())
-            }
-            CloseGroupFailure::AttackModeTriggered => {
-                EvictionReason::LowTrust("Attack mode triggered".to_string())
-            }
-        };
-
-        self.evict_node(node_id, eviction_reason).await
-    }
-
-    /// Get eviction candidates from the refresh manager.
-    ///
-    /// Returns nodes that should be evicted based on validation failures.
-    pub async fn get_eviction_candidates(&self) -> Vec<(PeerId, CloseGroupFailure)> {
-        self.bucket_refresh_manager
-            .read()
-            .await
-            .get_nodes_for_eviction()
-            .await
-    }
-
-    /// Check if the system is currently in attack mode.
-    #[must_use]
-    pub async fn is_attack_mode(&self) -> bool {
-        self.bucket_refresh_manager
-            .read()
-            .await
-            .is_attack_mode()
-            .await
-    }
-
-    /// Get the bucket refresh manager for external access
-    pub fn bucket_refresh_manager(&self) -> Arc<RwLock<BucketRefreshManager>> {
-        self.bucket_refresh_manager.clone()
-    }
-
-    /// Get the close group validator for external access
-    pub fn close_group_validator(&self) -> Arc<RwLock<CloseGroupValidator>> {
-        self.close_group_validator.clone()
     }
 
     /// Add a node to the DHT with security checks.

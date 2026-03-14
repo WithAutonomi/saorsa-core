@@ -96,23 +96,10 @@ impl ScheduledTask {
         self.last_run = Instant::now();
         self.failure_count += 1;
     }
-
-    /// Time until next run
-    #[must_use]
-    pub fn time_until_due(&self) -> Duration {
-        let elapsed = self.last_run.elapsed();
-        if elapsed >= self.interval {
-            Duration::ZERO
-        } else {
-            self.interval - elapsed
-        }
-    }
 }
 
 /// Manages scheduling of maintenance tasks
 pub struct MaintenanceScheduler {
-    /// Configuration
-    config: MaintenanceConfig,
     /// Scheduled tasks
     tasks: Vec<ScheduledTask>,
     /// Whether the scheduler is active
@@ -131,7 +118,6 @@ impl MaintenanceScheduler {
         }
 
         Self {
-            config,
             tasks,
             is_active: false,
         }
@@ -140,17 +126,6 @@ impl MaintenanceScheduler {
     /// Start the scheduler
     pub fn start(&mut self) {
         self.is_active = true;
-    }
-
-    /// Stop the scheduler
-    pub fn stop(&mut self) {
-        self.is_active = false;
-    }
-
-    /// Check if scheduler is active
-    #[must_use]
-    pub fn is_active(&self) -> bool {
-        self.is_active
     }
 
     /// Get the next tasks that are due to run
@@ -187,59 +162,6 @@ impl MaintenanceScheduler {
             scheduled.fail();
         }
     }
-
-    /// Get time until next scheduled task
-    #[must_use]
-    pub fn time_until_next_task(&self) -> Option<Duration> {
-        self.tasks
-            .iter()
-            .filter(|t| !t.is_running)
-            .map(|t| t.time_until_due())
-            .min()
-    }
-
-    /// Get statistics for all tasks
-    #[must_use]
-    pub fn get_stats(&self) -> Vec<TaskStats> {
-        self.tasks
-            .iter()
-            .map(|t| TaskStats {
-                task: t.task,
-                run_count: t.run_count,
-                failure_count: t.failure_count,
-                is_running: t.is_running,
-                time_until_due: t.time_until_due(),
-            })
-            .collect()
-    }
-
-    /// Update interval for a specific task
-    pub fn set_interval(&mut self, task: MaintenanceTask, interval: Duration) {
-        if let Some(scheduled) = self.tasks.iter_mut().find(|t| t.task == task) {
-            scheduled.interval = interval;
-        }
-    }
-
-    /// Get the configuration
-    #[must_use]
-    pub fn config(&self) -> &MaintenanceConfig {
-        &self.config
-    }
-}
-
-/// Statistics for a task
-#[derive(Debug, Clone)]
-pub struct TaskStats {
-    /// The task type
-    pub task: MaintenanceTask,
-    /// Number of times run
-    pub run_count: u64,
-    /// Number of failures
-    pub failure_count: u64,
-    /// Whether currently running
-    pub is_running: bool,
-    /// Time until next scheduled run
-    pub time_until_due: Duration,
 }
 
 #[cfg(test)]
@@ -264,10 +186,8 @@ mod tests {
     fn test_scheduled_task_is_due() {
         let mut task = ScheduledTask::new(MaintenanceTask::BucketRefresh, Duration::from_nanos(0));
 
-        // With zero interval, should be due immediately
         assert!(task.is_due());
 
-        // While running, should not be due
         task.start();
         assert!(!task.is_due());
 
@@ -309,19 +229,16 @@ mod tests {
         let scheduler = MaintenanceScheduler::new(config);
 
         assert_eq!(scheduler.tasks.len(), 2);
-        assert!(!scheduler.is_active());
+        assert!(!scheduler.is_active);
     }
 
     #[test]
-    fn test_scheduler_start_stop() {
+    fn test_scheduler_start() {
         let config = MaintenanceConfig::default();
         let mut scheduler = MaintenanceScheduler::new(config);
 
         scheduler.start();
-        assert!(scheduler.is_active());
-
-        scheduler.stop();
-        assert!(!scheduler.is_active());
+        assert!(scheduler.is_active);
     }
 
     #[test]
@@ -332,9 +249,7 @@ mod tests {
         // Not active - no tasks due
         assert!(scheduler.get_due_tasks().is_empty());
 
-        // Active but no tasks due yet (all have intervals > 0)
         scheduler.start();
-        // Tasks won't be immediately due unless we manipulate their state
 
         // Set all tasks to have zero interval (for testing)
         for task in &mut scheduler.tasks {
@@ -371,50 +286,9 @@ mod tests {
     }
 
     #[test]
-    fn test_scheduler_get_stats() {
-        let config = MaintenanceConfig::default();
-        let scheduler = MaintenanceScheduler::new(config);
-
-        let stats = scheduler.get_stats();
-        assert_eq!(stats.len(), 2);
-
-        for stat in stats {
-            assert_eq!(stat.run_count, 0);
-            assert_eq!(stat.failure_count, 0);
-            assert!(!stat.is_running);
-        }
-    }
-
-    #[test]
-    fn test_scheduler_set_interval() {
-        let config = MaintenanceConfig::default();
-        let mut scheduler = MaintenanceScheduler::new(config);
-
-        let new_interval = Duration::from_secs(120);
-        scheduler.set_interval(MaintenanceTask::BucketRefresh, new_interval);
-
-        let task = scheduler
-            .tasks
-            .iter()
-            .find(|t| t.task == MaintenanceTask::BucketRefresh)
-            .unwrap();
-        assert_eq!(task.interval, new_interval);
-    }
-
-    #[test]
-    fn test_scheduler_time_until_next_task() {
-        let config = MaintenanceConfig::default();
-        let scheduler = MaintenanceScheduler::new(config);
-
-        let time = scheduler.time_until_next_task();
-        assert!(time.is_some());
-    }
-
-    #[test]
     fn test_task_default_intervals() {
         let config = MaintenanceConfig::default();
 
-        // Bucket refresh should use config interval
         let bucket_interval = MaintenanceTask::BucketRefresh.default_interval(&config);
         assert_eq!(bucket_interval, config.bucket_refresh_interval);
     }

@@ -23,14 +23,8 @@ pub mod manager;
 pub use manager::BootstrapManager;
 pub use manager::{BootstrapConfig, BootstrapStats};
 
-use crate::error::BootstrapError;
-use crate::{P2PError, Result};
 use std::net::IpAddr;
 use std::net::Ipv6Addr;
-use std::path::PathBuf;
-
-/// Default directory for storing bootstrap cache files
-pub const DEFAULT_CACHE_DIR: &str = ".cache/saorsa";
 
 /// Convert an IP address to IPv6
 ///
@@ -41,28 +35,6 @@ pub fn ip_to_ipv6(ip: &IpAddr) -> Ipv6Addr {
         IpAddr::V4(ipv4) => ipv4.to_ipv6_mapped(),
         IpAddr::V6(ipv6) => *ipv6,
     }
-}
-
-/// Get the home cache directory
-pub fn home_cache_dir() -> Result<PathBuf> {
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .map_err(|_| {
-            P2PError::Bootstrap(BootstrapError::CacheError(
-                "Unable to determine home directory".to_string().into(),
-            ))
-        })?;
-
-    let cache_dir = PathBuf::from(home).join(DEFAULT_CACHE_DIR);
-
-    // Ensure cache directory exists
-    std::fs::create_dir_all(&cache_dir).map_err(|e| {
-        P2PError::Bootstrap(BootstrapError::CacheError(
-            format!("Failed to create cache directory: {e}").into(),
-        ))
-    })?;
-
-    Ok(cache_dir)
 }
 
 #[cfg(test)]
@@ -83,15 +55,5 @@ mod tests {
 
         let manager = BootstrapManager::with_node_config(config, &node_config).await;
         assert!(manager.is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_home_cache_dir() {
-        let result = home_cache_dir();
-        assert!(result.is_ok());
-
-        let path = result.unwrap();
-        assert!(path.exists());
-        assert!(path.is_dir());
     }
 }

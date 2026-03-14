@@ -4,30 +4,20 @@
 //! peer discovery, liveness, and trust-weighted selection. Data storage
 //! and replication are handled by the application layer (saorsa-node).
 
-pub mod capacity_signaling;
 pub mod core_engine;
-pub mod trust_weighted_dht;
-pub mod trust_weighted_kademlia;
+pub mod geographic_routing;
+pub mod network_integration;
+pub mod routing_maintenance;
+pub mod trust_peer_selector;
 
-// Re-export the main DHT trait and types
-pub use trust_weighted_dht::{Contact, Dht, Key, Outcome, eigen_trust_epoch, record_interaction};
-
-// Re-export PeerId from trust_weighted_dht
-pub use trust_weighted_dht::PeerId;
-
-// Re-export the trust-weighted implementation
-pub use trust_weighted_kademlia::TrustWeightedKademlia;
-
-// Re-export capacity signaling
-pub use capacity_signaling::{CapacityGossip, CapacityHistogram, CapacityManager, CapacityStats};
-
-// Re-export existing DHT components
-pub use core_engine::{
-    DhtCoreEngine, DhtKey, DhtRequestWrapper, DhtResponseWrapper, NodeCapacity, NodeInfo,
-};
+// Re-export core engine types
+pub use core_engine::{DhtCoreEngine, DhtKey};
 
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
+
+/// DHT key type (256-bit)
+pub type Key = [u8; 32];
 
 /// DHT configuration parameters (peer phonebook only — no data storage)
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,67 +42,6 @@ impl Default for DHTConfig {
         }
     }
 }
-
-pub mod geographic_network_integration;
-pub mod geographic_routing;
-pub mod geographic_routing_table;
-pub mod latency_aware_selection;
-pub mod network_integration;
-pub mod skademlia;
-
-/// IPv6-based DHT identity for security parity
-pub mod ipv6_identity;
-
-/// IPv4-based DHT identity for security parity
-pub mod ipv4_identity;
-
-/// Node age verification for anti-Sybil protection
-pub mod node_age_verifier;
-
-/// Sybil attack detection for DHT protection
-pub mod sybil_detector;
-
-/// Authenticated sibling broadcast for eclipse attack prevention
-pub mod authenticated_sibling_broadcast;
-
-/// Routing table maintenance and node validation
-pub mod routing_maintenance;
-
-/// Trust-aware peer selection combining XOR distance with EigenTrust scores
-pub mod trust_peer_selector;
-
-// Re-export trust peer selector types
-pub use trust_peer_selector::{TrustAwarePeerSelector, TrustSelectionConfig};
-
-// Re-export routing maintenance types for convenience
-pub use routing_maintenance::{
-    BucketRefreshManager, EvictionManager, EvictionReason, MaintenanceConfig, MaintenanceScheduler,
-    MaintenanceTask, NodeLivenessState, NodeValidationResult, RefreshTier, ValidationFailure,
-};
-
-// Re-export security coordinator types
-pub use routing_maintenance::{
-    CloseGroupEviction, CloseGroupEvictionTracker, EvictionRecord, SecurityCoordinator,
-    SecurityCoordinatorConfig,
-};
-
-// Re-export close group validator types
-pub use routing_maintenance::close_group_validator::{
-    AttackIndicators, CloseGroupFailure, CloseGroupHistory, CloseGroupResponse,
-    CloseGroupValidationResult, CloseGroupValidator, CloseGroupValidatorConfig,
-};
-
-// Re-export sybil detector types for DHT protection
-pub use sybil_detector::{
-    BehaviorProfile, JoinRecord, SybilDetector, SybilDetectorConfig, SybilEvidence, SybilGroup,
-};
-
-// Re-export authenticated sibling broadcast types
-pub use authenticated_sibling_broadcast::{
-    AuthenticatedSiblingBroadcast, BroadcastValidationFailure, BroadcastValidationResult,
-    MembershipProof, MembershipProofType, SiblingBroadcastBuilder, SiblingBroadcastConfig,
-    SiblingBroadcastValidator, SignedSiblingEntry,
-};
 
 #[cfg(test)]
 mod security_tests;
