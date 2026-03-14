@@ -31,8 +31,6 @@ default-target = "x86_64-unknown-linux-gnu"
 default = []
 # Compile-time gate for test/dummy helpers. Off by default.
 mocks = []
-## Optional: enable hyperbolic greedy routing helpers in API
-h2_greedy = []
 # Test utilities including mock DHT for integration tests
 test-utils = []
 
@@ -58,10 +56,6 @@ statrs = "0.18"
 
 # Cryptography - Primary source of truth: saorsa-pqc
 saorsa-pqc = "0.5"
-# Classical crypto for backward compatibility only
-# Classical crypto removed from production; PQC-only via saorsa-pqc and saorsa-transport
-# Password hashing
-argon2 = "0.5"
 # Random number generation
 rand = "0.8"
 rand_core = "0.6"
@@ -92,21 +86,11 @@ log = "0.4"
 tokio-stream = "0.1"
 tokio-util = { version = "0.7", features = ["rt"] }
 
-# Health check dependencies
-axum = "0.8"
-tower = { version = "0.5", features = ["util"] }
-
-# HTTP client for upgrade system
-reqwest = { version = "0.12", features = ["stream", "rustls-tls"], default-features = false }
-num_cpus = "1.16"
-
-
 # Fix wyz 0.5.0 compatibility issue with tap 1.0 (CI build failure)
 # wyz 0.5.0 has incorrect import path for tap::Pipe, fixed in 0.5.1
 # Exact pin required: >=0.5.1 doesn't override transitive resolution under -Z minimal-versions
 wyz = "=0.5.1"
 
-clap = { version = "4.5", features = ["derive"] }
 
 [build-dependencies]
 # No build dependencies currently required

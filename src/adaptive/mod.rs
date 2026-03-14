@@ -31,34 +31,23 @@ use serde::{Deserialize, Serialize};
 pub mod beta_distribution;
 pub mod churn;
 pub mod churn_prediction;
-pub mod client;
-pub mod component_builders;
 pub mod coordinator;
 pub mod coordinator_extensions;
 pub mod dht_integration;
 pub mod eviction;
 pub mod gossip;
 pub mod hyperbolic;
-pub mod hyperbolic_enhanced;
-pub mod hyperbolic_greedy;
-// Use crate-level PQC identity instead of local Ed25519 variant
 pub mod learning;
 pub mod monitoring;
 pub mod multi_armed_bandit;
-pub mod performance;
 pub mod q_learning_cache;
 pub mod routing;
 pub mod security;
-pub mod som;
-pub mod transport;
 pub mod trust;
 
 // Re-export commonly used types
 pub use crate::identity::NodeIdentity;
 pub use churn::{ChurnConfig, ChurnHandler, NodeMonitor, NodeState};
-pub use client::{
-    AdaptiveP2PClient, Client, ClientConfig, ClientProfile, NetworkStats as ClientNetworkStats,
-};
 pub use coordinator::{NetworkConfig, NetworkCoordinator};
 pub use dht_integration::{
     AdaptiveDHT, AdaptiveDhtConfig, AdaptiveDhtDependencies, KademliaRoutingStrategy,
@@ -69,22 +58,12 @@ pub use eviction::{
 };
 pub use gossip::AdaptiveGossipSub;
 pub use hyperbolic::{HyperbolicRoutingStrategy, HyperbolicSpace};
-pub use hyperbolic_enhanced::{
-    EnhancedHyperbolicCoordinate, EnhancedHyperbolicRoutingStrategy, EnhancedHyperbolicSpace,
-};
-pub use hyperbolic_greedy::{
-    Embedding, EmbeddingConfig, HyperbolicGreedyRouter, embed_snapshot, greedy_next,
-};
 pub use learning::{ChurnPredictor, QLearnCacheManager, ThompsonSampling};
 pub use monitoring::{
     Alert, AlertManager, DashboardData, MonitoringConfig, MonitoringSystem, NetworkHealth,
 };
 pub use multi_armed_bandit::{
     MABConfig, MABRoutingStrategy, MultiArmedBandit, RouteDecision, RouteId,
-};
-pub use performance::{
-    BatchProcessor, ConcurrencyLimiter, ConnectionPool, OptimizedSerializer, PerformanceCache,
-    PerformanceConfig,
 };
 pub use q_learning_cache::{
     AccessInfo, CacheAction, CacheStatistics, QLearnCacheManager as QLearningCacheManager,
@@ -95,8 +74,6 @@ pub use security::{
     BlacklistManager, EclipseDetector, RateLimiter, SecurityAuditor, SecurityConfig,
     SecurityManager,
 };
-pub use som::{FeatureExtractor, GridSize, SOMRoutingStrategy, SelfOrganizingMap, SomConfig};
-pub use transport::{ConnectionInfo, Transport, TransportManager, TransportProtocol};
 pub use trust::{
     EigenTrustEngine, MockTrustProvider, NodeStatistics, NodeStatisticsUpdate,
     TrustBasedRoutingStrategy, TrustRoutingConfig,

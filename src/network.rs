@@ -25,7 +25,6 @@ use crate::error::{NetworkError, P2PError, P2pResult as Result, PeerFailureReaso
 
 use crate::MultiAddr;
 use crate::identity::node_identity::{NodeIdentity, peer_id_from_public_key};
-use crate::production::{ProductionConfig, ResourceManager};
 use crate::quantum_crypto::saorsa_transport_integration::{MlDsaPublicKey, MlDsaSignature};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -153,9 +152,6 @@ pub struct NodeConfig {
 
     /// Security configuration
     pub security_config: SecurityConfig,
-
-    /// Production hardening configuration
-    pub production_config: Option<ProductionConfig>,
 
     /// Bootstrap cache configuration
     pub bootstrap_cache_config: Option<BootstrapConfig>,
@@ -307,7 +303,6 @@ impl NodeConfig {
             max_incoming_connections: config.security.connection_limit as usize,
             dht_config: DHTConfig::default(),
             security_config: SecurityConfig::default(),
-            production_config: None,
             bootstrap_cache_config: None,
             diversity_config: None,
             max_message_size: config.transport.max_message_size,
@@ -339,7 +334,6 @@ pub struct NodeConfigBuilder {
     keep_alive_interval: Option<Duration>,
     dht_config: Option<DHTConfig>,
     security_config: Option<SecurityConfig>,
-    production_config: Option<ProductionConfig>,
     max_message_size: Option<usize>,
     mode: NodeMode,
     custom_user_agent: Option<String>,
@@ -392,12 +386,6 @@ impl NodeConfigBuilder {
     /// Set security configuration
     pub fn security_config(mut self, config: SecurityConfig) -> Self {
         self.security_config = Some(config);
-        self
-    }
-
-    /// Set production configuration
-    pub fn production_config(mut self, config: ProductionConfig) -> Self {
-        self.production_config = Some(config);
         self
     }
 
@@ -464,7 +452,6 @@ impl NodeConfigBuilder {
             max_incoming_connections: base_config.security.connection_limit as usize,
             dht_config: self.dht_config.unwrap_or_default(),
             security_config: self.security_config.unwrap_or_default(),
-            production_config: self.production_config,
             bootstrap_cache_config: None,
             diversity_config: None,
             max_message_size: self
@@ -501,7 +488,6 @@ impl Default for NodeConfig {
             max_incoming_connections: config.security.connection_limit as usize,
             dht_config: DHTConfig::default(),
             security_config: SecurityConfig::default(),
-            production_config: None,
             bootstrap_cache_config: None,
             diversity_config: None,
             max_message_size: config.transport.max_message_size,
@@ -539,17 +525,6 @@ impl NodeConfig {
                 enable_tls: true,
                 trust_level: TrustLevel::Basic,
             },
-            production_config: Some(ProductionConfig {
-                max_connections: config.network.max_connections,
-                max_memory_bytes: 0,  // unlimited
-                max_bandwidth_bps: 0, // unlimited
-                connection_timeout: Duration::from_secs(config.network.connection_timeout),
-                keep_alive_interval: Duration::from_secs(config.network.keepalive_interval),
-                health_check_interval: Duration::from_secs(30),
-                enable_auto_cleanup: true,
-                shutdown_timeout: Duration::from_secs(30),
-                rate_limits: crate::production::RateLimitConfig::default(),
-            }),
             bootstrap_cache_config: None,
             diversity_config: None,
             max_message_size: config.transport.max_message_size,
@@ -745,9 +720,6 @@ pub struct P2PNode {
     /// DHT manager for distributed hash table operations (peer discovery and routing)
     dht_manager: Arc<DhtNetworkManager>,
 
-    /// Production resource manager (optional)
-    resource_manager: Option<Arc<ResourceManager>>,
-
     /// Bootstrap cache manager for peer discovery
     bootstrap_manager: Option<Arc<RwLock<BootstrapManager>>>,
 
@@ -808,12 +780,6 @@ impl P2PNode {
         // Derive the canonical peer ID from the cryptographic identity.
         let peer_id = *node_identity.peer_id();
 
-        // Initialize production resource manager if configured
-        let resource_manager = config
-            .production_config
-            .clone()
-            .map(|prod_config| Arc::new(ResourceManager::new(prod_config)));
-
         // Initialize bootstrap cache manager
         let bootstrap_config = config.bootstrap_cache_config.clone().unwrap_or_default();
         let bootstrap_manager =
@@ -869,7 +835,6 @@ impl P2PNode {
             start_time: Instant::now(),
             shutdown: CancellationToken::new(),
             dht_manager,
-            resource_manager,
             bootstrap_manager,
             is_bootstrapped: Arc::new(AtomicBool::new(false)),
             is_started: Arc::new(AtomicBool::new(false)),
@@ -1178,15 +1143,6 @@ impl P2PNode {
     pub async fn start(&self) -> Result<()> {
         info!("Starting P2P node...");
 
-        // Start production resource manager if configured
-        if let Some(ref resource_manager) = self.resource_manager {
-            resource_manager
-                .start()
-                .await
-                .map_err(|e| protocol_error(format!("Failed to start resource manager: {e}")))?;
-            info!("Production resource manager started");
-        }
-
         // Start bootstrap manager background tasks
         if let Some(ref bootstrap_manager) = self.bootstrap_manager {
             let mut manager = bootstrap_manager.write().await;
@@ -1250,15 +1206,6 @@ impl P2PNode {
 
         // Stop the transport layer (shutdown endpoints, join tasks, disconnect peers)
         self.transport.stop().await?;
-
-        // Shutdown production resource manager if configured
-        if let Some(ref resource_manager) = self.resource_manager {
-            resource_manager
-                .shutdown()
-                .await
-                .map_err(|e| protocol_error(format!("Failed to shutdown resource manager: {e}")))?;
-            info!("Production resource manager stopped");
-        }
 
         self.is_started
             .store(false, std::sync::atomic::Ordering::Release);
@@ -1555,43 +1502,19 @@ impl P2PNode {
 
     // /// Get MCP server statistics
 
-    /// Run a production health check
-    pub async fn resource_health_check(&self) -> Result<()> {
-        if let Some(ref resource_manager) = self.resource_manager {
-            resource_manager.health_check().await
-        } else {
-            Err(protocol_error("Production resource manager not enabled"))
-        }
-    }
-
     // Background tasks (connection_lifecycle_monitor, keepalive, periodic_maintenance)
     // are now implemented in TransportHandle.
 
     /// Check system health
     pub async fn health_check(&self) -> Result<()> {
-        if let Some(ref resource_manager) = self.resource_manager {
-            resource_manager.health_check().await
+        let peer_count = self.peer_count().await;
+        if peer_count > self.config.max_connections {
+            Err(protocol_error(format!(
+                "Too many connections: {peer_count}"
+            )))
         } else {
-            // Basic health check without resource manager
-            let peer_count = self.peer_count().await;
-            if peer_count > self.config.max_connections {
-                Err(protocol_error(format!(
-                    "Too many connections: {peer_count}"
-                )))
-            } else {
-                Ok(())
-            }
+            Ok(())
         }
-    }
-
-    /// Get production configuration (if enabled)
-    pub fn production_config(&self) -> Option<&ProductionConfig> {
-        self.config.production_config.as_ref()
-    }
-
-    /// Check if production hardening is enabled
-    pub fn is_production_mode(&self) -> bool {
-        self.resource_manager.is_some()
     }
 
     /// Get the attached DHT manager.
@@ -1905,18 +1828,6 @@ impl NodeBuilder {
         self
     }
 
-    /// Enable production mode with default configuration
-    pub fn with_production_mode(mut self) -> Self {
-        self.config.production_config = Some(ProductionConfig::default());
-        self
-    }
-
-    /// Configure production settings
-    pub fn with_production_config(mut self, production_config: ProductionConfig) -> Self {
-        self.config.production_config = Some(production_config);
-        self
-    }
-
     /// Allow loopback addresses in the transport layer.
     ///
     /// Enable for devnet/testnet modes where multiple nodes run on the same
@@ -2036,7 +1947,6 @@ mod tests {
             max_incoming_connections: 50,
             dht_config: DHTConfig::default(),
             security_config: SecurityConfig::default(),
-            production_config: None,
             bootstrap_cache_config: None,
             diversity_config: None,
             max_message_size: None,
@@ -2495,22 +2405,6 @@ mod tests {
         let _peer_count = node.peer_count().await;
 
         node.stop().await?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_production_mode_disabled() -> Result<()> {
-        let config = create_test_node_config();
-        let node = P2PNode::new(config).await?;
-
-        assert!(!node.is_production_mode());
-        assert!(node.production_config().is_none());
-
-        // Resource health check should fail when production mode is disabled
-        let result = node.resource_health_check().await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("not enabled"));
-
         Ok(())
     }
 

@@ -95,23 +95,14 @@ pub mod bgp_geo_provider;
 /// User identity and privacy system
 pub mod identity;
 
-/// Threshold cryptography for group operations
-pub mod threshold;
-
 /// Quantum-resistant cryptography
 pub mod quantum_crypto;
-
-/// Utility functions and types
-pub mod utils;
 
 /// Validation framework for input sanitization and rate limiting
 pub mod validation;
 
 /// Unified rate limiting engine
 pub mod rate_limit;
-
-/// Production hardening features
-pub mod production;
 
 /// Bootstrap cache for decentralized peer discovery
 pub mod bootstrap;
@@ -127,11 +118,6 @@ pub mod adaptive;
 
 /// Configuration management system
 pub mod config;
-/// Health check system for monitoring and metrics
-pub mod health;
-
-/// Auto-upgrade system for cross-platform binary updates
-pub mod upgrade;
 
 // Re-export main types
 pub use address::{AddressBook, MultiAddr};
@@ -144,10 +130,6 @@ pub use dht_network_manager::{
 pub use error::{P2PError, P2pResult as Result, PeerFailureReason};
 pub use events::{Subscription, TopologyEvent, device_subscribe, dht_watch, subscribe_topology};
 pub use fwid::Key as FwKey;
-pub use health::{
-    ComponentChecker, ComponentHealth, HealthEndpoints, HealthManager, HealthResponse,
-    HealthServer, HealthStatus,
-};
 pub use network::{
     ConnectionStatus, NetworkSender, NodeBuilder, NodeConfig, NodeMode, P2PEvent, P2PNode,
     PeerInfo, PeerResponse, is_dht_participant, user_agent_for_mode,
@@ -159,7 +141,6 @@ pub use adaptive::{EigenTrustEngine, NodeStatistics, NodeStatisticsUpdate, Trust
 pub use config::Config;
 pub use network::P2PNode as Node;
 pub use peer_record::NatType;
-pub use production::{ProductionConfig, ResourceManager};
 pub use validation::{
     RateLimitConfig, RateLimiter, Sanitize, Validate, ValidationContext, ValidationError,
     sanitize_string, validate_dht_key, validate_dht_value, validate_file_path,
@@ -181,13 +162,6 @@ pub use dht::node_age_verifier::{
 pub use security::{
     DiversityStats, GeoInfo, GeoProvider, IPAnalysis, IPDiversityConfig, IPDiversityEnforcer,
     IPv4NodeID, IPv6NodeID, NodeReputation, ReputationManager, StubGeoProvider,
-};
-
-// Enhanced identity removed
-
-// Threshold exports
-pub use threshold::{
-    GroupMetadata, ParticipantInfo, ThresholdGroup, ThresholdGroupManager, ThresholdSignature,
 };
 
 // Post-quantum cryptography exports (using saorsa-transport types exclusively)
@@ -264,12 +238,3 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Default capacity for broadcast and mpsc event channels throughout the system.
 pub const DEFAULT_EVENT_CHANNEL_CAPACITY: usize = 1000;
-
-// Upgrade system exports
-pub use upgrade::{
-    ApplierConfig, ApplyResult, BackupMetadata, DownloadProgress, Downloader, DownloaderConfig,
-    PinnedKey, Platform as UpgradePlatform, PlatformBinary, Release, ReleaseChannel,
-    RollbackManager, SignatureVerifier, StagedUpdate, StagedUpdateManager, UpdateConfig,
-    UpdateConfigBuilder, UpdateInfo, UpdateManager, UpdateManifest, UpdatePolicy, UpgradeError,
-    UpgradeEvent, create_applier,
-};

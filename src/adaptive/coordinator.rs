@@ -19,7 +19,7 @@
 //! P2P components into a cohesive system. It coordinates between:
 //! - Identity management
 //! - DHT operations
-//! - Adaptive routing (Kademlia, Hyperbolic, SOM, Trust-based)
+//! - Adaptive routing (Kademlia, Hyperbolic, Trust-based)
 //! - Gossip protocol
 //! - Machine learning systems (MAB, Q-Learning, LSTM)
 //! - Monitoring and security
@@ -30,13 +30,12 @@ use crate::adaptive::StrategyChoice;
 use crate::adaptive::coordinator_extensions::{
     AdaptiveDHTExtensions, AdaptiveGossipSubExtensions, AdaptiveRouterExtensions,
     EigenTrustEngineExtensions, MonitoringSystemExtensions, MultiArmedBanditExtensions,
-    SecurityManagerExtensions, TransportExtensions,
+    SecurityManagerExtensions,
 };
 use crate::adaptive::gossip::GossipMessage;
 use crate::adaptive::learning::{QLearnCacheManager, ThompsonSampling};
 use crate::adaptive::monitoring::{LogLevel, MonitoredComponents};
 use crate::adaptive::multi_armed_bandit::RouteId;
-use crate::adaptive::performance::CacheConfig;
 use crate::adaptive::q_learning_cache::{
     QLearnCacheManager as QLearningCacheManager, QLearningConfig,
 };
@@ -60,8 +59,6 @@ use tokio::sync::RwLock;
 pub struct NetworkComponents {
     /// Node identity
     pub identity: Arc<NodeIdentity>,
-    /// Transport layer
-    pub transport: Arc<TransportManager>,
     /// DHT integration
     pub dht: Arc<AdaptiveDHT>,
     /// Adaptive router combining all strategies
@@ -75,8 +72,6 @@ pub struct NetworkComponents {
 pub struct RoutingComponents {
     /// Hyperbolic space for routing
     pub hyperbolic_space: Arc<HyperbolicSpace>,
-    /// Self-organizing map for content clustering
-    pub som: Arc<SelfOrganizingMap>,
     /// Trust engine
     pub trust_engine: Arc<EigenTrustEngine>,
 }
@@ -101,8 +96,6 @@ pub struct OperationsComponents {
     pub monitoring: Arc<MonitoringSystem>,
     /// Security manager
     pub security: Arc<SecurityManager>,
-    /// Performance optimizer
-    pub performance: Arc<PerformanceCache<ContentHash, Vec<u8>>>,
 }
 
 // ============================================================================
@@ -112,7 +105,7 @@ pub struct OperationsComponents {
 /// Network Coordinator - Central integration point for all components
 ///
 /// Components are organized into logical groups for maintainability:
-/// - `network`: Transport, DHT, routing, gossip
+/// - `network`: DHT, routing, gossip
 /// - `routing`: Spatial algorithms and trust
 /// - `learning`: ML-based optimization systems
 /// - `operations`: Monitoring, security, churn handling
@@ -138,7 +131,8 @@ pub struct NetworkCoordinator {
     /// Metrics collector
     metrics: Arc<RwLock<SystemMetrics>>,
 
-    /// Configuration
+    /// Configuration (retained for future method access)
+    #[allow(dead_code)]
     config: NetworkConfig,
 }
 
@@ -259,7 +253,6 @@ impl NetworkCoordinator {
     pub async fn new(identity: NodeIdentity, config: NetworkConfig) -> Result<Self> {
         // Initialize all components
         let identity = Arc::new(identity);
-        let transport = Arc::new(TransportManager::new());
 
         // Create trust provider for components that need it
         let mut pre_trusted = HashSet::new();
@@ -268,34 +261,15 @@ impl NetworkCoordinator {
 
         // Initialize routing components
         let hyperbolic_space = Arc::new(HyperbolicSpace::new());
-        let som = Arc::new(SelfOrganizingMap::new(crate::adaptive::som::SomConfig {
-            initial_learning_rate: 0.3,
-            initial_radius: 5.0,
-            iterations: 1000,
-            grid_size: crate::adaptive::som::GridSize::Fixed(10, 10),
-        }));
 
         // Create adaptive router
         let router = Arc::new(AdaptiveRouter::new(trust_engine.clone()));
-        // Store references for potential future use
-        let _hyperbolic_space = hyperbolic_space.clone();
-        let _som = som.clone();
 
         // Initialize ML components early so AdaptiveDHT can use the same predictors
         let churn_predictor = Arc::new(ChurnPredictor::new());
 
         // Initialize DHT with shared adaptive layers
-        let dht_dependencies = AdaptiveDhtDependencies::new(
-            identity.clone(),
-            trust_engine.clone(),
-            hyperbolic_space.clone(),
-            som.clone(),
-            churn_predictor.clone(),
-        );
-        let dht = Arc::new(
-            AdaptiveDHT::new_with_dependencies(AdaptiveDhtConfig::default(), dht_dependencies)
-                .await?,
-        );
+        let dht = Arc::new(AdaptiveDHT::new(identity.clone(), trust_engine.clone()).await?);
 
         // Initialize gossip
         let gossip = Arc::new(AdaptiveGossipSub::new(
@@ -386,18 +360,9 @@ impl NetworkCoordinator {
         };
         let security = Arc::new(SecurityManager::new(security_config, &identity));
 
-        // Initialize performance cache
-        let cache_config = CacheConfig {
-            max_entries: 1000,
-            ttl: Duration::from_secs(3600), // 1 hour
-            compression: false,
-        };
-        let performance = Arc::new(PerformanceCache::new(cache_config));
-
         // Create component groups
         let network_components = NetworkComponents {
             identity: identity.clone(),
-            transport,
             dht,
             router,
             gossip,
@@ -405,7 +370,6 @@ impl NetworkCoordinator {
 
         let routing_components = RoutingComponents {
             hyperbolic_space,
-            som,
             trust_engine,
         };
 
@@ -419,7 +383,6 @@ impl NetworkCoordinator {
             churn_handler,
             monitoring,
             security,
-            performance,
         };
 
         // Create coordinator with organized component groups
@@ -454,19 +417,6 @@ impl NetworkCoordinator {
             "Joining P2P network with identity: {:?}",
             self.network.identity.peer_id()
         );
-
-        // Connect to bootstrap nodes
-        for bootstrap in &self.config.bootstrap_nodes {
-            match <TransportManager as TransportExtensions>::connect(
-                &self.network.transport,
-                bootstrap,
-            )
-            .await
-            {
-                Ok(_) => info!("Connected to bootstrap node: {}", bootstrap),
-                Err(e) => error!("Failed to connect to {}: {:?}", bootstrap, e),
-            }
-        }
 
         // Initialize DHT routing table
         self.network.dht.bootstrap().await?;
@@ -620,9 +570,6 @@ impl NetworkCoordinator {
             let mut state = self.state.write().await;
             state.shutting_down = true;
         }
-
-        // Stop accepting new requests
-        self.network.transport.stop_accepting().await?;
 
         // Save ML models
         // TODO: Add model paths or use extension traits

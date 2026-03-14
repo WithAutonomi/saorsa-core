@@ -17,7 +17,6 @@
 //! network, providing trust-weighted routing and integration with other adaptive
 //! components.
 
-use super::som::NodeFeatures;
 use super::*;
 use crate::P2PNode;
 use crate::PeerId;
@@ -40,7 +39,6 @@ pub struct AdaptiveDhtWeights {
     pub geo: f64,
     pub churn: f64,
     pub hyperbolic: f64,
-    pub som: f64,
     pub proximity: f64,
 }
 
@@ -53,21 +51,15 @@ impl AdaptiveDhtWeights {
             geo: self.geo.max(Self::MIN_WEIGHT),
             churn: self.churn.max(Self::MIN_WEIGHT),
             hyperbolic: self.hyperbolic.max(Self::MIN_WEIGHT),
-            som: self.som.max(Self::MIN_WEIGHT),
             proximity: self.proximity.max(Self::MIN_WEIGHT),
         };
-        let total = weights.trust
-            + weights.geo
-            + weights.churn
-            + weights.hyperbolic
-            + weights.som
-            + weights.proximity;
+        let total =
+            weights.trust + weights.geo + weights.churn + weights.hyperbolic + weights.proximity;
         if total > 0.0 {
             weights.trust /= total;
             weights.geo /= total;
             weights.churn /= total;
             weights.hyperbolic /= total;
-            weights.som /= total;
             weights.proximity /= total;
         }
         weights
@@ -77,12 +69,11 @@ impl AdaptiveDhtWeights {
 impl Default for AdaptiveDhtWeights {
     fn default() -> Self {
         Self {
-            trust: 0.2,
-            geo: 0.15,
+            trust: 0.25,
+            geo: 0.2,
             churn: 0.15,
             hyperbolic: 0.2,
-            som: 0.15,
-            proximity: 0.15,
+            proximity: 0.2,
         }
     }
 }
@@ -135,7 +126,6 @@ pub struct AdaptiveDhtDependencies {
     pub identity: Arc<NodeIdentity>,
     pub trust_provider: Arc<dyn TrustProvider>,
     pub hyperbolic_space: Arc<HyperbolicSpace>,
-    pub som: Arc<SelfOrganizingMap>,
     pub churn_predictor: Arc<ChurnPredictor>,
 }
 
@@ -144,14 +134,12 @@ impl AdaptiveDhtDependencies {
         identity: Arc<NodeIdentity>,
         trust_provider: Arc<dyn TrustProvider>,
         hyperbolic_space: Arc<HyperbolicSpace>,
-        som: Arc<SelfOrganizingMap>,
         churn_predictor: Arc<ChurnPredictor>,
     ) -> Self {
         Self {
             identity,
             trust_provider,
             hyperbolic_space,
-            som,
             churn_predictor,
         }
     }
@@ -161,18 +149,11 @@ impl AdaptiveDhtDependencies {
         trust_provider: Arc<dyn TrustProvider>,
     ) -> Self {
         let hyperbolic_space = Arc::new(HyperbolicSpace::new());
-        let som = Arc::new(SelfOrganizingMap::new(super::som::SomConfig {
-            initial_learning_rate: 0.3,
-            initial_radius: 5.0,
-            iterations: 1000,
-            grid_size: super::som::GridSize::Fixed(10, 10),
-        }));
         let churn_predictor = Arc::new(ChurnPredictor::new());
         Self {
             identity,
             trust_provider,
             hyperbolic_space,
-            som,
             churn_predictor,
         }
     }
@@ -189,7 +170,6 @@ pub struct AdaptiveDHT {
     config: AdaptiveDhtConfig,
     trust_provider: Arc<dyn TrustProvider>,
     hyperbolic_space: Arc<HyperbolicSpace>,
-    som: Arc<SelfOrganizingMap>,
     churn_predictor: Arc<ChurnPredictor>,
     geo_integration: Arc<GeographicNetworkIntegration>,
     identity: Arc<NodeIdentity>,
@@ -211,7 +191,6 @@ struct LayerScores {
     geo: f64,
     churn: f64,
     hyperbolic: f64,
-    som: f64,
     proximity: f64,
 }
 
@@ -228,7 +207,6 @@ struct ScoredCandidate {
 struct CandidateNode {
     peer_id: PeerId,
     address: MultiAddr,
-    reliability: f64,
 }
 
 impl AdaptiveDHT {
@@ -261,7 +239,6 @@ impl AdaptiveDHT {
             config,
             trust_provider: dependencies.trust_provider,
             hyperbolic_space: dependencies.hyperbolic_space,
-            som: dependencies.som,
             churn_predictor: dependencies.churn_predictor,
             geo_integration,
             identity: dependencies.identity,
@@ -300,7 +277,6 @@ impl AdaptiveDHT {
             config,
             trust_provider: dependencies.trust_provider,
             hyperbolic_space: dependencies.hyperbolic_space,
-            som: dependencies.som,
             churn_predictor: dependencies.churn_predictor,
             geo_integration,
             identity: dependencies.identity,
@@ -377,43 +353,6 @@ impl AdaptiveDHT {
         }
     }
 
-    fn content_vector_from_hash(hash: &[u8; 32]) -> Vec<f64> {
-        let mut vector = Vec::with_capacity(128);
-        for i in 0..128 {
-            let value = hash[i % 32] as f64 / 255.0;
-            vector.push(value);
-        }
-        vector
-    }
-
-    fn content_features_from_key(key: &DhtKeyBytes) -> NodeFeatures {
-        NodeFeatures {
-            content_vector: Self::content_vector_from_hash(key),
-            compute_capability: 500.0,
-            network_latency: 50.0,
-        }
-    }
-
-    fn node_features_from_candidate(
-        node_id: &PeerId,
-        reliability: f64,
-        region: GeographicRegion,
-    ) -> NodeFeatures {
-        let mut vector = Self::content_vector_from_hash(node_id.to_bytes());
-        for (idx, value) in vector.iter_mut().enumerate() {
-            let modifier = ((idx as f64 * 0.01) + reliability).sin().abs();
-            *value = (*value * 0.7 + modifier * 0.3).clamp(0.0, 1.0);
-        }
-        let (min_latency, max_latency) = region.expected_latency_range();
-        let avg_latency = (min_latency + max_latency) / 2;
-        let avg_latency_ms = avg_latency.as_millis() as f64;
-        NodeFeatures {
-            content_vector: vector,
-            compute_capability: (reliability * 1000.0).clamp(0.0, 1000.0),
-            network_latency: avg_latency_ms.max(10.0),
-        }
-    }
-
     async fn detect_region(&self, address: &Option<MultiAddr>) -> GeographicRegion {
         if let Some(addr) = address {
             self.geo_integration.detect_region(addr).await
@@ -429,16 +368,6 @@ impl AdaptiveDHT {
     ) -> Result<Vec<ScoredCandidate>> {
         let target_id = Self::key_to_node_id(key);
         let weights = self.config.enforced_weights();
-        let target_features = Self::content_features_from_key(key);
-        let target_bmu = self.som.find_best_matching_unit(&target_features);
-        let (grid_w, grid_h) = self.som.get_grid_dimensions();
-        let max_grid_distance = if grid_w > 1 || grid_h > 1 {
-            let dx = (grid_w.saturating_sub(1)) as f64;
-            let dy = (grid_h.saturating_sub(1)) as f64;
-            (dx * dx + dy * dy).sqrt()
-        } else {
-            1.0
-        };
 
         let mut scored = Vec::with_capacity(candidates.len());
         let mut trust_rejections = 0u64;
@@ -462,16 +391,6 @@ impl AdaptiveDHT {
 
             let hyperbolic_score = self.hyperbolic_score(node_id, &target_id).await;
 
-            let node_features =
-                Self::node_features_from_candidate(node_id, candidate.reliability, region);
-            let node_bmu = self.som.find_best_matching_unit(&node_features);
-            let som_distance = {
-                let dx = node_bmu.0 as f64 - target_bmu.0 as f64;
-                let dy = node_bmu.1 as f64 - target_bmu.1 as f64;
-                (dx * dx + dy * dy).sqrt()
-            };
-            let som_score = (1.0 - (som_distance / max_grid_distance).min(1.0)).clamp(0.0, 1.0);
-
             let proximity_score = Self::xor_distance_score(node_id, &target_id);
             let geo_score = self
                 .config
@@ -484,7 +403,6 @@ impl AdaptiveDHT {
                 geo: geo_score,
                 churn: churn_score.clamp(0.0, 1.0),
                 hyperbolic: hyperbolic_score.clamp(0.0, 1.0),
-                som: som_score,
                 proximity: proximity_score.clamp(0.0, 1.0),
             };
 
@@ -492,7 +410,6 @@ impl AdaptiveDHT {
                 + scores.geo * weights.geo
                 + scores.churn * weights.churn
                 + scores.hyperbolic * weights.hyperbolic
-                + scores.som * weights.som
                 + scores.proximity * weights.proximity;
 
             if trust < self.config.min_trust_threshold {
@@ -575,7 +492,6 @@ impl AdaptiveDHT {
                     .map(|node| CandidateNode {
                         peer_id: node.id,
                         address: node.address,
-                        reliability: node.capacity.reliability_score,
                     })
                     .collect())
             }
@@ -588,7 +504,6 @@ impl AdaptiveDHT {
                         .map(|node| CandidateNode {
                             peer_id: node.peer_id,
                             address: node.address,
-                            reliability: node.reliability,
                         })
                         .collect()
                 })
@@ -630,12 +545,7 @@ impl AdaptiveDHT {
                     public_key: public_key.clone(),
                     addresses: candidate.address.into_iter().collect(),
                     hyperbolic: Some(Self::derive_hyperbolic_coordinate(&node_id)),
-                    som_position: Some([
-                        candidate.scores.som,
-                        candidate.scores.trust,
-                        candidate.scores.geo,
-                        candidate.scores.churn,
-                    ]),
+                    som_position: None,
                     trust: candidate.scores.trust,
                     capabilities: NodeCapabilities {
                         compute: (candidate.scores.trust * 1000.0) as u64,

@@ -31,24 +31,6 @@ use crate::PeerId;
 use crate::{P2PError, Result};
 use std::time::Duration;
 
-// Extension trait for TransportManager - only add methods that don't exist
-pub trait TransportExtensions {
-    async fn connect(&self, address: &str) -> Result<()>;
-    async fn stop_accepting(&self) -> Result<()>;
-}
-
-impl TransportExtensions for TransportManager {
-    async fn connect(&self, _address: &str) -> Result<()> {
-        // TODO: Implement actual connection logic
-        Ok(())
-    }
-
-    async fn stop_accepting(&self) -> Result<()> {
-        // TODO: Implement
-        Ok(())
-    }
-}
-
 // Cache decision type
 #[derive(Debug)]
 pub enum CacheDecision {

@@ -158,16 +158,6 @@ pub use crate::adaptive::{
 };
 
 // ============================================================================
-// Health
-// ============================================================================
-
-/// Health monitoring
-pub use crate::health::{
-    ComponentChecker, ComponentHealth, HealthEndpoints, HealthManager, HealthResponse,
-    HealthServer, HealthStatus,
-};
-
-// ============================================================================
 // Events & Subscriptions
 // ============================================================================
 

@@ -28,7 +28,6 @@ use crate::network::{
     RequestResponseEnvelope, WireMessage, broadcast_event, normalize_wildcard_to_loopback,
     parse_protocol_message, register_new_channel,
 };
-use crate::production::{ProductionConfig, ResourceManager};
 use crate::security::GeoProvider;
 use crate::transport::saorsa_transport_adapter::{ConnectionEvent, DualStackNetworkNode};
 use crate::validation::{RateLimitConfig, RateLimiter};
@@ -64,8 +63,6 @@ pub struct TransportConfig {
     pub connection_timeout: Duration,
     /// Maximum concurrent connections.
     pub max_connections: usize,
-    /// Optional production hardening config.
-    pub production_config: Option<ProductionConfig>,
     /// Broadcast channel capacity for P2P events.
     pub event_channel_capacity: usize,
     /// Optional override for the maximum application-layer message size.
@@ -95,7 +92,6 @@ impl TransportConfig {
             enable_ipv6: config.enable_ipv6,
             connection_timeout: config.connection_timeout,
             max_connections: config.max_connections,
-            production_config: config.production_config.clone(),
             event_channel_capacity,
             max_message_size: config.max_message_size,
             node_identity,
@@ -123,7 +119,6 @@ pub struct TransportHandle {
     #[allow(dead_code)]
     geo_provider: Arc<BgpGeoProvider>,
     shutdown: CancellationToken,
-    resource_manager: Option<Arc<ResourceManager>>,
     connection_timeout: Duration,
     connection_monitor_handle: Arc<RwLock<Option<JoinHandle<()>>>>,
     recv_handles: Arc<RwLock<Vec<JoinHandle<()>>>>,
@@ -208,11 +203,6 @@ impl TransportHandle {
         let geo_provider = Arc::new(BgpGeoProvider::new());
         let peers = Arc::new(RwLock::new(HashMap::new()));
 
-        // Initialize production resource manager if configured
-        let resource_manager = config
-            .production_config
-            .map(|prod_config| Arc::new(ResourceManager::new(prod_config)));
-
         let shutdown = CancellationToken::new();
 
         // Subscribe to connection events BEFORE spawning the monitor task
@@ -266,7 +256,6 @@ impl TransportHandle {
             active_requests: Arc::new(RwLock::new(HashMap::new())),
             geo_provider,
             shutdown,
-            resource_manager,
             connection_timeout: config.connection_timeout,
             connection_monitor_handle,
             recv_handles: Arc::new(RwLock::new(Vec::new())),
@@ -328,7 +317,6 @@ impl TransportHandle {
             active_requests: Arc::new(RwLock::new(HashMap::new())),
             geo_provider: Arc::new(BgpGeoProvider::new()),
             shutdown: CancellationToken::new(),
-            resource_manager: None,
             connection_timeout: Duration::from_secs(TEST_CONNECTION_TIMEOUT_SECS),
             connection_monitor_handle: Arc::new(RwLock::new(None)),
             recv_handles: Arc::new(RwLock::new(Vec::new())),
@@ -381,11 +369,6 @@ impl TransportHandle {
     /// Get the connection timeout duration.
     pub fn connection_timeout(&self) -> Duration {
         self.connection_timeout
-    }
-
-    /// Get a reference to the resource manager, if configured.
-    pub fn resource_manager(&self) -> Option<&Arc<ResourceManager>> {
-        self.resource_manager.as_ref()
     }
 }
 
@@ -564,13 +547,6 @@ impl TransportHandle {
     /// Accepts both `"ip:port"` and MultiAddr formats (e.g.
     /// `/ip4/1.2.3.4/udp/9000`).
     pub async fn connect_peer(&self, address: &str) -> Result<String> {
-        // Check production limits if resource manager is enabled
-        let _connection_guard = if let Some(ref resource_manager) = self.resource_manager {
-            Some(resource_manager.acquire_connection().await?)
-        } else {
-            None
-        };
-
         // Parse via MultiAddr for consistent MultiAddr support
         let socket_addr: SocketAddr = address
             .parse::<MultiAddr>()
@@ -646,10 +622,6 @@ impl TransportHandle {
             .write()
             .await
             .insert(peer_id.clone());
-
-        if let Some(ref resource_manager) = self.resource_manager {
-            resource_manager.record_bandwidth(0, 0);
-        }
 
         // PeerConnected is emitted later when the peer's identity is
         // authenticated via a signed message — not at transport level.
@@ -802,17 +774,6 @@ impl TransportHandle {
             channel_id, protocol
         );
 
-        // Check rate limits if resource manager is enabled
-        if let Some(ref resource_manager) = self.resource_manager
-            && !resource_manager
-                .check_rate_limit(channel_id, "message")
-                .await?
-        {
-            return Err(P2PError::ResourceExhausted(
-                format!("Rate limit exceeded for channel {}", channel_id).into(),
-            ));
-        }
-
         if !self.peers.read().await.contains_key(channel_id) {
             return Err(P2PError::Network(NetworkError::PeerNotFound(
                 channel_id.to_string().into(),
@@ -824,10 +785,6 @@ impl TransportHandle {
             return Err(P2PError::Network(NetworkError::ConnectionClosed {
                 peer_id: channel_id.to_string().into(),
             }));
-        }
-
-        if let Some(ref resource_manager) = self.resource_manager {
-            resource_manager.record_bandwidth(data.len() as u64, 0);
         }
 
         let raw_data_len = data.len();
