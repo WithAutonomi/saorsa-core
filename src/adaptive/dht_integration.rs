@@ -333,6 +333,37 @@ impl AdaptiveDHT {
         })
     }
 
+    /// Create an AdaptiveDHT that reuses an existing node's DHT network manager.
+    ///
+    /// Unlike `attach_to_node`, this does not create a second `DhtNetworkManager`.
+    /// The node's existing manager is shared, so all DHT operations benefit from
+    /// the adaptive scoring layer without duplicating network state.
+    pub fn with_existing_manager(
+        manager: Arc<DhtNetworkManager>,
+        dht_config: DHTConfig,
+        config: AdaptiveDhtConfig,
+        dependencies: AdaptiveDhtDependencies,
+    ) -> Result<Self> {
+        let geo_integration = Arc::new(
+            GeographicNetworkIntegration::new(config.local_region)
+                .map_err(|e| AdaptiveNetworkError::Other(e.to_string()))?,
+        );
+
+        Ok(Self {
+            backend: AdaptiveDhtBackend::Network { manager },
+            dht_config,
+            config,
+            trust_provider: dependencies.trust_provider,
+            router: dependencies.router,
+            hyperbolic_space: dependencies.hyperbolic_space,
+            som: dependencies.som,
+            churn_predictor: dependencies.churn_predictor,
+            geo_integration,
+            identity: dependencies.identity,
+            metrics: Arc::new(RwLock::new(DHTMetrics::default())),
+        })
+    }
+
     /// Convert adaptive PeerId to DHT key
     fn node_id_to_key(node_id: &PeerId) -> DhtKeyBytes {
         node_id.0

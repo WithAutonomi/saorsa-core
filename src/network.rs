@@ -17,7 +17,10 @@
 //! It handles peer connections, network events, and node lifecycle management.
 
 use crate::PeerId;
-use crate::adaptive::{EigenTrustEngine, NodeStatisticsUpdate, TrustProvider};
+use crate::adaptive::{
+    AdaptiveDHT, AdaptiveDhtConfig, AdaptiveDhtDependencies, AdaptiveRouter, EigenTrustEngine,
+    NodeStatisticsUpdate, TrustProvider,
+};
 use crate::bootstrap::{BootstrapManager, ContactEntry, QualityMetrics};
 use crate::config::Config;
 use crate::dht_network_manager::{DhtNetworkConfig, DhtNetworkManager};
@@ -839,6 +842,12 @@ pub struct P2PNode {
     /// Consumers (like saorsa-node) should report successes and failures
     /// via `report_peer_success()` and `report_peer_failure()` methods.
     trust_engine: Option<Arc<EigenTrustEngine>>,
+
+    /// Adaptive DHT layer providing trust-weighted, geographic-aware,
+    /// and ML-optimized peer selection on top of the base Kademlia DHT.
+    ///
+    /// Automatically activated when a trust engine is available.
+    adaptive_dht: Option<Arc<AdaptiveDHT>>,
 }
 
 /// Normalize wildcard bind addresses to localhost loopback addresses
@@ -933,6 +942,7 @@ impl P2PNode {
             republish_interval: config.dht_config.refresh_interval,
             max_distance: DHT_MAX_DISTANCE,
         };
+        let adaptive_dht_config = manager_dht_config.clone();
         let dht_manager_config = DhtNetworkConfig {
             peer_id,
             dht_config: manager_dht_config,
@@ -955,6 +965,43 @@ impl P2PNode {
             Arc::new(crate::dht::metrics::PlacementMetricsCollector::new()),
         )));
 
+        // Initialize the adaptive DHT layer when a trust engine is available.
+        // This wires Thompson Sampling, geographic routing, churn prediction,
+        // and hyperbolic embedding into the production DHT path.
+        let adaptive_dht = match &trust_engine {
+            Some(engine) => {
+                let trust_provider: Arc<dyn TrustProvider> =
+                    Arc::clone(engine) as Arc<dyn TrustProvider>;
+                let router = Arc::new(AdaptiveRouter::new_with_id(
+                    peer_id,
+                    Arc::clone(&trust_provider),
+                ));
+                let deps = AdaptiveDhtDependencies::with_defaults(
+                    node_identity.clone(),
+                    trust_provider,
+                    router,
+                );
+                match AdaptiveDHT::with_existing_manager(
+                    Arc::clone(&dht_manager),
+                    adaptive_dht_config.clone(),
+                    AdaptiveDhtConfig::default(),
+                    deps,
+                ) {
+                    Ok(adht) => {
+                        info!("Adaptive DHT layer activated (trust + geographic + ML routing)");
+                        Some(Arc::new(adht))
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to initialize adaptive DHT layer: {e}, continuing with base Kademlia"
+                        );
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
+
         let node = Self {
             config,
             peer_id,
@@ -968,6 +1015,7 @@ impl P2PNode {
             is_bootstrapped: Arc::new(AtomicBool::new(false)),
             is_started: Arc::new(AtomicBool::new(false)),
             trust_engine,
+            adaptive_dht,
         };
         info!(
             "Created P2P node with peer ID: {} (call start() to begin networking)",
@@ -1043,6 +1091,15 @@ impl P2PNode {
     /// ```
     pub fn trust_engine(&self) -> Option<Arc<EigenTrustEngine>> {
         self.trust_engine.clone()
+    }
+
+    /// Get the adaptive DHT layer, if active.
+    ///
+    /// The adaptive DHT provides trust-weighted, geographic-aware, and ML-optimized
+    /// peer selection on top of the base Kademlia DHT. It is automatically activated
+    /// when a trust engine is available.
+    pub fn adaptive_dht(&self) -> Option<&Arc<AdaptiveDHT>> {
+        self.adaptive_dht.as_ref()
     }
 
     /// Report a successful interaction with a peer

@@ -24,7 +24,7 @@ use crate::{
     address::MultiAddr,
     dht::core_engine::{NodeCapacity, NodeInfo},
     dht::routing_maintenance::{MaintenanceConfig, MaintenanceScheduler, MaintenanceTask},
-    dht::{DHTConfig, DhtCoreEngine, DhtKey, Key},
+    dht::{DHTConfig, DhtCoreEngine, DhtKey, Key, TrustSelectionConfig},
     error::{DhtError, IdentityError, NetworkError},
     network::NodeConfig,
 };
@@ -399,6 +399,17 @@ impl DhtNetworkManager {
         // insertion, not just bootstrap discovery.
         if let Some(diversity) = &config.node_config.diversity_config {
             dht_instance.set_ip_diversity_config(diversity.clone());
+        }
+
+        // Enable trust-weighted peer selection when an EigenTrust engine is available.
+        // Storage operations use stricter trust requirements since data persistence
+        // depends on node reliability; queries can be more lenient.
+        if let Some(ref engine) = trust_engine {
+            dht_instance.enable_trust_selection_with_storage_config(
+                Arc::clone(engine),
+                TrustSelectionConfig::for_queries(),
+                TrustSelectionConfig::for_storage(),
+            );
         }
 
         let dht = Arc::new(RwLock::new(dht_instance));
