@@ -383,10 +383,13 @@ impl IPDiversityConfig {
             max_nodes_per_64: 100,  // Allow many nodes per /64 subnet
             max_nodes_per_48: 500,  // Allow many nodes per /48 allocation
             max_nodes_per_32: 1000, // Allow many nodes per /32 region
-            // IPv4 — no static caps for testnet (dynamic limits suffice)
-            max_nodes_per_ipv4_32: None,
-            max_nodes_per_ipv4_24: None,
-            max_nodes_per_ipv4_16: None,
+            // IPv4 — explicit caps prevent bootstrap deadlock when many
+            // nodes share few public IPs (e.g. 10 nodes per VM).  Without
+            // these, the dynamic per-IP formula starts at 1 for small
+            // networks and never grows past the number of unique IPs.
+            max_nodes_per_ipv4_32: Some(100),
+            max_nodes_per_ipv4_24: Some(500),
+            max_nodes_per_ipv4_16: Some(1000),
             // Network-relative limits (relaxed for testnet)
             max_per_ip_cap: 100,       // Higher cap for testing
             max_network_fraction: 0.1, // Allow 10% of network from one IP (relaxed from 0.5%)
