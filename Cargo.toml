@@ -27,17 +27,9 @@ documentation = "https://docs.rs/saorsa-core"
 no-default-features = false
 default-target = "x86_64-unknown-linux-gnu"
 
-[features]
-default = []
-# Compile-time gate for test/dummy helpers. Off by default.
-mocks = []
-# Test utilities including mock DHT for integration tests
-test-utils = []
-
 [dependencies]
 # Core async and serialization
 tokio = { version = "1.49", features = ["full"] }
-
 futures = "0.3"
 async-trait = "0.1"
 serde = { version = "1.0", features = ["derive"] }
@@ -45,26 +37,17 @@ serde_json = "1.0"
 anyhow = "1.0"
 thiserror = "2.0"
 tracing = "0.1"
-smallvec = { version = "1.15", features = ["serde"] }
 uuid = { version = "1.14", features = ["v4", "serde"] }
 bytes = "1.10"
 hex = "0.4"
-chrono = { version = "0.4.43", features = ["serde"] }
-base64 = "0.22"
-array-init = "2.1"
-statrs = "0.18"
 
 # Cryptography - Primary source of truth: saorsa-pqc
 saorsa-pqc = "0.5"
-# Random number generation
 rand = "0.8"
-rand_core = "0.6"
-# TODO: Remove once fully migrated to saorsa-pqc - keeping temporarily for compatibility
 blake3 = "1.6"
 
 # Performance optimization
 parking_lot = "0.12"
-flate2 = "1.1"
 once_cell = "1.21"
 
 # Networking
@@ -72,76 +55,16 @@ saorsa-transport = "0.25"
 
 # Core-specific dependencies
 dirs = "6.0"
-fastrand = "2.3"
-
-# Git content addressing
 postcard = { version = "1.1.3", features = ["use-std"] }
 lru = "0.16"
-
-
-# Configuration
 toml = "0.8"
-log = "0.4"
-
-tokio-stream = "0.1"
 tokio-util = { version = "0.7", features = ["rt"] }
 
 # Fix wyz 0.5.0 compatibility issue with tap 1.0 (CI build failure)
-# wyz 0.5.0 has incorrect import path for tap::Pipe, fixed in 0.5.1
-# Exact pin required: >=0.5.1 doesn't override transitive resolution under -Z minimal-versions
 wyz = "=0.5.1"
 
 
-[build-dependencies]
-# No build dependencies currently required
-
 [dev-dependencies]
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tempfile = "3.17"
-pretty_assertions = "1.4"
 serial_test = "3.3"
-criterion = { version = "0.5", features = ["html_reports"] }
-clap = { version = "4.5", features = ["derive"] }
-proptest = "1.6"
-quickcheck = "1.0"
-quickcheck_macros = "1.0"
-approx = "0.5"
-tokio-test = "0.4"
-semver = "1.0"
 
-# All features are now enabled by default - no feature flags needed
-
-[[bench]]
-name = "adaptive_benchmarks"
-harness = false
-
-[[bench]]
-name = "validation_bench"
-harness = false
-
-[[test]]
-name = "eigentrust_integration_test"
-path = "tests/eigentrust_integration_test.rs"
-
-[[test]]
-name = "gossipsub_integration_test"
-path = "tests/gossipsub_integration_test.rs"
-
-[[example]]
-name = "security_example"
-
-[[example]]
-name = "adaptive_network_monitor"
-
-
-# [[bench]]
-# name = "comprehensive_performance_test"
-# harness = false
-
-# [[bench]]
-# name = "load_testing_scenarios"
-# harness = false
-
-# [[bench]]
-# name = "performance_monitor"
-# harness = false

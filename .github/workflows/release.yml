@@ -108,7 +108,7 @@ jobs:
           key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Run tests
-        run: cargo test --lib --features "default,mocks,test-utils"
+        run: cargo test --lib
 
       - name: Check formatting
         run: cargo fmt --all -- --check

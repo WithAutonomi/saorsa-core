@@ -42,7 +42,7 @@ jobs:
       # Note: Using specific features instead of --all-features to avoid sp1-sdk
       # build issues (linker OOM on Linux, C++20 on Windows).
       - name: Run clippy (strict)
-        run: cargo clippy --features "default,mocks,h2_greedy,test-utils" -- -D clippy::panic -D clippy::unwrap_used -D clippy::expect_used
+        run: cargo clippy -- -D clippy::panic -D clippy::unwrap_used -D clippy::expect_used
 
       - name: Check for backup files
         run: |

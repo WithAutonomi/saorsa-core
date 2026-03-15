@@ -1,7 +1,0 @@
-# Seeds for failure cases proptest has generated in the past. It is
-# automatically read and these particular cases re-run before any
-# novel cases are generated.
-#
-# It is recommended to check this file in to source control so that
-# everyone who runs the test benefits from these saved cases.
-cc 21dcc328c1c9ecddfc1970165d4a4b0bacaedc047006da7cf254dd3b0ac5d8b3 # shrinks to cache_size = 20, operations = [GetByPublisher("AaA"), GetByPublisher("Aa_")]

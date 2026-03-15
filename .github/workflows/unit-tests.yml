@@ -56,10 +56,10 @@ jobs:
       # build issues. The zkvm-prover feature requires SP1 toolchain and causes
       # linker OOM on Linux and C++20 errors on Windows.
       - name: Run unit tests
-        run: cargo nextest run --lib --features "default,mocks,h2_greedy,test-utils" --profile default
+        run: cargo nextest run --lib --profile default
 
       - name: Run doctests
-        run: cargo test --doc --features "default,mocks,h2_greedy,test-utils" || echo "Doctests completed"
+        run: cargo test --doc || echo "Doctests completed"
 
   unit-tests-macos:
     name: Unit Tests (macOS)
@@ -91,7 +91,7 @@ jobs:
       # Note: Using specific features instead of --all-features to avoid sp1-sdk
       # build issues. The zkvm-prover feature requires SP1 toolchain.
       - name: Run unit tests
-        run: cargo nextest run --lib --features "default,mocks,h2_greedy,test-utils" --profile default
+        run: cargo nextest run --lib --profile default
 
   unit-tests-windows:
     name: Unit Tests (Windows)
@@ -123,4 +123,4 @@ jobs:
       # Note: Using specific features instead of --all-features to avoid sp1-sdk
       # build issues. The zkvm-prover feature requires C++20 on Windows.
       - name: Run unit tests
-        run: cargo nextest run --lib --features "default,mocks,h2_greedy,test-utils" --profile default
+        run: cargo nextest run --lib --profile default

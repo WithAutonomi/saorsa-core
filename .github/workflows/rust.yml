@@ -12,9 +12,6 @@ env:
 # Note: Main test suites are in separate workflows:
 # - lint.yml: Format and clippy checks
 # - unit-tests.yml: Library unit tests (all platforms)
-# - integration-core.yml: DHT peer discovery, adaptive tests
-# - integration-identity.yml: Identity and security tests
-# - integration-network.yml: Network and protocol tests
 
 jobs:
   # Build verification on all platforms
@@ -63,10 +60,8 @@ jobs:
         if: matrix.os == 'macos-latest'
         run: brew install protobuf
 
-      # Note: Using specific features instead of --all-features to avoid sp1-sdk
-      # build issues (linker OOM on Linux, C++20 on Windows).
       - name: Build
-        run: cargo build --features "default,mocks,h2_greedy,test-utils"
+        run: cargo build
 
   security_audit:
     name: Security Audit
@@ -82,41 +77,6 @@ jobs:
           key: ${{ runner.os }}-cargo-audit
       - run: cargo install cargo-audit
       - run: cargo audit
-
-  benchmarks:
-    name: Benchmarks
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    steps:
-      - name: Free disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /usr/local/share/boost
-          df -h
-
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y pkg-config libssl-dev build-essential protobuf-compiler
-
-      - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-bench-${{ hashFiles('**/Cargo.lock') }}
-
-      # Note: Using specific features instead of --all-features to avoid sp1-sdk
-      # build issues (linker OOM on Linux, C++20 on Windows).
-      - name: Run benchmarks
-        run: cargo bench --features "default,mocks,h2_greedy,test-utils"
 
   minimal-versions:
     name: Minimal versions
@@ -135,4 +95,4 @@ jobs:
       - run: cargo update -Z minimal-versions
       # Note: Using specific features instead of --all-features to avoid sp1-sdk
       # build issues (linker OOM on Linux, C++20 on Windows).
-      - run: cargo check --features "default,mocks,h2_greedy,test-utils"
+      - run: cargo check

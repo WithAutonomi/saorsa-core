@@ -42,16 +42,12 @@ pub(crate) mod config;
 pub(crate) mod dht;
 pub(crate) mod dht_network_manager;
 pub(crate) mod error;
-pub(crate) mod events;
-pub(crate) mod fwid;
 pub(crate) mod network;
-pub(crate) mod peer_record;
 pub(crate) mod quantum_crypto;
 pub(crate) mod rate_limit;
 pub(crate) mod security;
 pub(crate) mod transport;
 pub(crate) mod transport_handle;
-pub(crate) mod types;
 pub(crate) mod validation;
 
 /// User identity and privacy system (public — accessed via path by saorsa-node).
