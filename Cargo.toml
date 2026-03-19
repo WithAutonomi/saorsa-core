@@ -14,7 +14,8 @@ name = "saorsa-core"
 # 0.17.0: remove configuration system, streamline network setup
 # 0.17.1: keep logging macros crate-internal, strip from public API
 # 0.17.2: bump saorsa-transport to 0.27
-version = "0.17.2"
+# 0.18.0: harden send_message reconnect logic
+version = "0.18.0"
 edition = "2024"
 authors = ["Saorsa Labs Limited <david@saorsalabs.com>"]
 license = "AGPL-3.0"
