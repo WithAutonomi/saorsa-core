@@ -325,8 +325,8 @@ fn clamp_limit(limit: usize, floor: Option<usize>, ceiling: Option<usize>) -> us
     result
 }
 
-/// Default maximum nodes per geographic region. Matches
-/// `GeographicRoutingConfig::max_nodes_per_region` default.
+/// Default maximum nodes from any single geographic region allowed per
+/// k-bucket and within the K closest nodes to self.
 const GEO_DEFAULT_MAX_PER_REGION: usize = 3;
 
 /// K parameter - number of closest nodes per bucket
@@ -733,9 +733,23 @@ impl DhtCoreEngine {
         let mut close_swap: Option<PeerId> = None;
         let close_group = routing.find_closest_nodes(&self.node_id, K);
 
-        let candidate_in_close = close_group.len() < K
+        // The candidate qualifies for close-group validation when it would
+        // land in the K closest peers.  If a bucket_swap is planned, the
+        // swapped-out peer may be in the current close group, opening a
+        // slot for the candidate even when the raw list looks full.
+        let effective_close_len = if bucket_swap.is_some() {
+            close_group
+                .iter()
+                .filter(|n| bucket_swap != Some(n.id))
+                .count()
+        } else {
+            close_group.len()
+        };
+
+        let candidate_in_close = effective_close_len < K
             || close_group
-                .last()
+                .iter()
+                .rfind(|n| bucket_swap != Some(n.id))
                 .map(|n| {
                     candidate_distance
                         < xor_distance_bytes(self.node_id.to_bytes(), n.id.to_bytes())
@@ -807,7 +821,11 @@ impl DhtCoreEngine {
             let bucket = &routing.buckets[bucket_idx];
             let already_exists = bucket.nodes.iter().any(|n| n.id == node.id);
             let has_room = bucket.nodes.len() < bucket.max_size;
-            if !already_exists && !has_room && bucket_swap.is_none() {
+            let swap_frees_slot = bucket_swap.is_some()
+                || close_swap
+                    .map(|id| routing.get_bucket_index(&id) == bucket_idx)
+                    .unwrap_or(false);
+            if !already_exists && !has_room && !swap_frees_slot {
                 return Err(anyhow!(
                     "K-bucket at capacity ({}/{})",
                     bucket.nodes.len(),
