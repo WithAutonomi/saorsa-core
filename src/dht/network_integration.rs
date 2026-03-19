@@ -4,7 +4,7 @@
 //! efficient protocol handling, connection management, and network optimization.
 
 use crate::PeerId;
-use crate::dht::core_engine::{DhtKey, NodeInfo};
+use crate::dht::core_engine::{DhtKey, NodeCapacity, NodeInfo};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -12,12 +12,22 @@ use std::time::Duration;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum DhtMessage {
     // Node Discovery
-    FindNode { target: DhtKey, count: usize },
+    FindNode {
+        target: DhtKey,
+        count: usize,
+    },
 
     // Network Management
-    Ping { timestamp: u64 },
-    Join { node_info: NodeInfo },
-    Leave { node_id: PeerId },
+    Ping {
+        timestamp: u64,
+    },
+    Join {
+        node_info: NodeInfo,
+        capacity: NodeCapacity,
+    },
+    Leave {
+        node_id: PeerId,
+    },
 }
 
 /// DHT protocol responses

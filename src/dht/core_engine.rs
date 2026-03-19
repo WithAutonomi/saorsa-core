@@ -32,47 +32,46 @@ fn xor_distance_bytes(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
     out
 }
 
-/// Maximum addresses stored per node to prevent memory exhaustion.
-/// A peer can legitimately have several addresses (multi-homed, NAT traversal),
-/// but unbounded lists would be an abuse vector.
-const MAX_ADDRESSES_PER_NODE: usize = 8;
-
 /// Node information for routing.
 ///
-/// The `addresses` field stores one or more typed [`MultiAddr`] values that are
-/// always valid. Serializes each as a canonical `/`-delimited string.
+/// The `address` field stores a typed [`MultiAddr`] that is always valid.
+/// Serializes as a canonical `/`-delimited string via `serde_as_string`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeInfo {
     pub id: PeerId,
-    pub addresses: Vec<MultiAddr>,
+    #[serde(with = "crate::address::serde_as_string")]
+    pub address: MultiAddr,
     pub last_seen: SystemTime,
+    pub capacity: NodeCapacity,
 }
 
 impl NodeInfo {
-    /// Get the socket address from the first address. Returns `None` for
-    /// non-IP transports or when no addresses are stored.
+    /// Get the socket address. Returns `None` for non-IP transports.
     #[must_use]
     pub fn socket_addr(&self) -> Option<SocketAddr> {
-        self.addresses.first().and_then(MultiAddr::socket_addr)
+        self.address.socket_addr()
     }
 
-    /// Get the IP address from the first address. Returns `None` for
-    /// non-IP transports or when no addresses are stored.
+    /// Get the IP address. Returns `None` for non-IP transports.
     #[must_use]
     pub fn ip(&self) -> Option<IpAddr> {
-        self.addresses.first().and_then(MultiAddr::ip)
+        self.address.ip()
     }
+}
 
-    /// Merge a new address into this node's address list.
-    ///
-    /// If the address is already present it is moved to the front (most
-    /// recently seen). New addresses are prepended. The list is capped at
-    /// [`MAX_ADDRESSES_PER_NODE`].
-    pub fn merge_address(&mut self, addr: MultiAddr) {
-        // Remove existing duplicate so the re-insert moves it to the front.
-        self.addresses.retain(|a| a != &addr);
-        self.addresses.insert(0, addr);
-        self.addresses.truncate(MAX_ADDRESSES_PER_NODE);
+/// Node capacity metrics
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeCapacity {
+    pub bandwidth_available: u64,
+    pub reliability_score: f64,
+}
+
+impl Default for NodeCapacity {
+    fn default() -> Self {
+        Self {
+            bandwidth_available: 10_000_000, // 10MB/s
+            reliability_score: 1.0,
+        }
     }
 }
 
@@ -90,17 +89,7 @@ impl KBucket {
         }
     }
 
-    fn add_node(&mut self, mut node: NodeInfo) -> Result<()> {
-        // Reject nodes with no addresses — a node without reachable
-        // addresses is useless in the routing table and would waste a slot.
-        if node.addresses.is_empty() {
-            return Err(anyhow!("NodeInfo has no addresses"));
-        }
-
-        // Cap addresses to prevent memory exhaustion from oversized lists
-        // arriving via deserialization or direct construction.
-        node.addresses.truncate(MAX_ADDRESSES_PER_NODE);
-
+    fn add_node(&mut self, node: NodeInfo) -> Result<()> {
         // If the node is already in this bucket, replace it fully and move to
         // tail (most-recently-seen) per standard Kademlia protocol.
         if let Some(pos) = self.nodes.iter().position(|n| n.id == node.id) {
@@ -125,14 +114,13 @@ impl KBucket {
         self.nodes.retain(|n| &n.id != node_id);
     }
 
-    /// Update `last_seen` (and optionally merge an address) for a node, then
-    /// move it to the tail of the bucket (most recently seen) per Kademlia
-    /// protocol.
+    /// Update `last_seen` (and optionally the address) for a node, then move
+    /// it to the tail of the bucket (most recently seen) per Kademlia protocol.
     fn touch_node(&mut self, node_id: &PeerId, address: Option<&MultiAddr>) -> bool {
         if let Some(pos) = self.nodes.iter().position(|n| &n.id == node_id) {
             self.nodes[pos].last_seen = SystemTime::now();
             if let Some(addr) = address {
-                self.nodes[pos].merge_address(addr.clone());
+                self.nodes[pos].address = addr.clone();
             }
             let node = self.nodes.remove(pos);
             self.nodes.push(node);
@@ -148,6 +136,42 @@ impl KBucket {
 
     fn find_node(&self, node_id: &PeerId) -> Option<&NodeInfo> {
         self.nodes.iter().find(|n| &n.id == node_id)
+    }
+
+    /// Count nodes in this bucket that belong to `region`, excluding a specific
+    /// peer (to avoid a reconnecting node blocking itself) and loopback nodes.
+    fn count_region(&self, region: GeographicRegion, exclude_id: &PeerId) -> usize {
+        self.nodes
+            .iter()
+            .filter(|n| n.id != *exclude_id)
+            .filter(|n| {
+                n.ip()
+                    .is_some_and(|ip| !ip.is_loopback() && GeographicRegion::from_ip(ip) == region)
+            })
+            .count()
+    }
+
+    /// Find the same-region node in this bucket that is farthest from `our_node_id`
+    /// by XOR distance. Used by swap logic to identify the eviction candidate.
+    /// Excludes `exclude_id` (the candidate itself, for reconnection) and loopback nodes.
+    fn farthest_same_region_node(
+        &self,
+        region: GeographicRegion,
+        our_node_id: &PeerId,
+        exclude_id: &PeerId,
+    ) -> Option<(PeerId, [u8; 32])> {
+        self.nodes
+            .iter()
+            .filter(|n| n.id != *exclude_id)
+            .filter(|n| {
+                n.ip()
+                    .is_some_and(|ip| !ip.is_loopback() && GeographicRegion::from_ip(ip) == region)
+            })
+            .map(|n| {
+                let dist = xor_distance_bytes(n.id.to_bytes(), our_node_id.to_bytes());
+                (n.id, dist)
+            })
+            .max_by(|a, b| a.1.cmp(&b.1))
     }
 }
 
@@ -182,8 +206,8 @@ impl KademliaRoutingTable {
         self.buckets[bucket_index].remove_node(node_id);
     }
 
-    /// Update `last_seen` (and optionally merge an address) for a node and
-    /// move it to the tail of its k-bucket. Returns `true` if the node was found.
+    /// Update `last_seen` (and optionally address) for a node and move it to
+    /// the tail of its k-bucket. Returns `true` if the node was found.
     fn touch_node(&mut self, node_id: &PeerId, address: Option<&MultiAddr>) -> bool {
         let bucket_index = self.get_bucket_index(node_id);
         self.buckets[bucket_index].touch_node(node_id, address)
@@ -267,6 +291,21 @@ impl KademliaRoutingTable {
     fn get_bucket_index(&self, node_id: &PeerId) -> usize {
         self.get_bucket_index_for_key(&DhtKey::from_bytes(*node_id.to_bytes()))
     }
+
+    /// Return the K nodes closest to `self.node_id` by XOR distance, sorted
+    /// nearest-first. May span multiple buckets. Used for closest-K geo check.
+    fn closest_k_nodes_to_self(&self) -> Vec<(PeerId, [u8; 32])> {
+        let mut all: Vec<(PeerId, [u8; 32])> = self
+            .iter_nodes()
+            .map(|n| {
+                let dist = xor_distance_bytes(n.id.to_bytes(), self.node_id.to_bytes());
+                (n.id, dist)
+            })
+            .collect();
+        all.sort_by(|a, b| a.1.cmp(&b.1));
+        all.truncate(K);
+        all
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -325,9 +364,8 @@ fn clamp_limit(limit: usize, floor: Option<usize>, ceiling: Option<usize>) -> us
     result
 }
 
-/// Default maximum nodes per geographic region. Matches
-/// `GeographicRoutingConfig::max_nodes_per_region` default.
-const GEO_DEFAULT_MAX_PER_REGION: usize = 50;
+/// Default maximum nodes per geographic region (per-bucket and closest-K).
+const GEO_DEFAULT_MAX_PER_REGION: usize = 3;
 
 /// K parameter - number of closest nodes per bucket
 const K: usize = 8;
@@ -347,6 +385,16 @@ const SUBNET_MEDIUM_MULTIPLIER: usize = 10;
 
 /// Subnet diversity multiplier for IPv6 /32 (widest prefix tier).
 const SUBNET_WIDE_MULTIPLIER: usize = 30;
+
+/// Result of a per-bucket or closest-K geographic diversity check.
+enum GeoCheckResult {
+    /// Candidate is allowed (under the limit).
+    Allowed,
+    /// Candidate is closer than an existing same-region peer; evict that peer.
+    SwapNeeded { evict_peer_id: PeerId },
+    /// Candidate is rejected (at limit and not closer than any incumbent).
+    Rejected { reason: String },
+}
 
 /// Main DHT Core Engine
 pub struct DhtCoreEngine {
@@ -399,6 +447,12 @@ impl DhtCoreEngine {
         self.allow_loopback = allow;
     }
 
+    /// Override the per-bucket / closest-K geographic region limit.
+    #[cfg(test)]
+    pub fn set_geo_max_per_region(&mut self, max: usize) {
+        self.geo_max_per_region = max;
+    }
+
     /// Number of peers currently in the routing table.
     pub async fn routing_table_size(&self) -> usize {
         self.routing_table.read().await.node_count()
@@ -420,22 +474,13 @@ impl DhtCoreEngine {
         Ok(routing.find_closest_nodes(key, count))
     }
 
-    /// Look up a node's addresses from the routing table by peer ID.
+    /// Look up a node's address from the routing table by peer ID.
     ///
-    /// Returns the stored addresses if the peer is in the routing table,
-    /// an empty vec otherwise. O(K) scan of the target k-bucket.
-    pub async fn get_node_addresses(&self, peer_id: &PeerId) -> Vec<MultiAddr> {
+    /// Returns the stored address if the peer is in the routing table,
+    /// `None` otherwise. O(K) scan of the target k-bucket.
+    pub async fn get_node_address(&self, peer_id: &PeerId) -> Option<MultiAddr> {
         let routing = self.routing_table.read().await;
-        routing
-            .find_node_by_id(peer_id)
-            .map(|n| n.addresses.clone())
-            .unwrap_or_default()
-    }
-
-    /// Check whether a peer is present in the routing table.
-    pub async fn has_node(&self, peer_id: &PeerId) -> bool {
-        let routing = self.routing_table.read().await;
-        routing.find_node_by_id(peer_id).is_some()
+        routing.find_node_by_id(peer_id).map(|n| n.address.clone())
     }
 
     /// Record a successful interaction with a peer by updating its `last_seen`
@@ -456,6 +501,10 @@ impl DhtCoreEngine {
     /// Diversity limits (IP subnet and geographic region) are derived from the
     /// live routing table contents on every call, so counts are always accurate
     /// regardless of evictions, reconnections, or address changes.
+    ///
+    /// Geographic diversity is enforced per-bucket and across the K closest
+    /// nodes to self. When a region is at its per-scope limit, a closer
+    /// candidate can swap out the farthest same-region incumbent (1-for-1).
     pub async fn add_node(&mut self, node: NodeInfo) -> Result<()> {
         // IP-based transports always have an IP; non-IP transports skip diversity.
         let candidate_ip = match node.ip() {
@@ -468,31 +517,64 @@ impl DhtCoreEngine {
             }
         };
 
-        // 2. Security Check: IP + Geographic Diversity
-        //
-        // Counts are derived from the routing table in a single pass.
-        // Nodes already present (reconnecting with the same ID) are
-        // excluded from the count so they can update their address
-        // without inflating limits.
-        // 3. Add to routing table — single write lock for both the diversity
-        //    check and the insertion to avoid a TOCTOU race where touch_node
-        //    could change an address between a read-lock check and the write.
+        // Single write lock for diversity check + insertion (avoids TOCTOU).
         let mut routing = self.routing_table.write().await;
-        self.check_diversity(&routing, &node.id, candidate_ip)?;
-        routing.add_node(node)?;
 
+        // IP subnet diversity (loopback gating handled inside).
+        self.check_diversity(&routing, &node.id, candidate_ip)?;
+
+        // Geographic diversity — skipped for loopback nodes.
+        if !(self.allow_loopback && candidate_ip.is_loopback()) {
+            let candidate_region = GeographicRegion::from_ip(candidate_ip);
+
+            // Per-bucket check (cheaper: scans at most K=8 nodes).
+            let bucket_result =
+                self.check_geo_diversity_per_bucket(&routing, &node, candidate_region);
+
+            if let GeoCheckResult::Rejected { reason } = &bucket_result {
+                return Err(anyhow!("{reason}"));
+            }
+
+            // Closest-K check (scans all nodes, but only when bucket passed).
+            let closest_k_result =
+                self.check_geo_diversity_closest_k(&routing, &node, candidate_region);
+
+            if let GeoCheckResult::Rejected { reason } = &closest_k_result {
+                return Err(anyhow!("{reason}"));
+            }
+
+            // Collect eviction set (dedup if both target the same peer).
+            let mut evictions: Vec<PeerId> = Vec::new();
+            if let GeoCheckResult::SwapNeeded { evict_peer_id } = bucket_result {
+                evictions.push(evict_peer_id);
+            }
+            if let GeoCheckResult::SwapNeeded { evict_peer_id } = closest_k_result
+                && !evictions.contains(&evict_peer_id)
+            {
+                evictions.push(evict_peer_id);
+            }
+
+            for peer_id in &evictions {
+                routing.remove_node(peer_id);
+            }
+        }
+
+        routing.add_node(node)?;
         Ok(())
     }
 
-    /// Check IP subnet and geographic diversity against the live routing table.
+    /// Check IP subnet diversity against the live routing table.
     ///
     /// Single pass over all nodes — each node's address is parsed once.
     /// `candidate_id` is excluded from counting so that a reconnecting node
     /// doesn't block itself.  Loopback candidates are only accepted when
     /// `self.allow_loopback` is `true`; otherwise they are
     /// rejected outright.  Existing loopback nodes in the table are always
-    /// excluded from `network_size` and subnet/region counts so they don't
+    /// excluded from `network_size` and subnet counts so they don't
     /// inflate the dynamic per-IP limit in devnet environments.
+    ///
+    /// Geographic diversity is handled separately by per-bucket and closest-K
+    /// checks in `add_node`.
     fn check_diversity(
         &self,
         routing: &KademliaRoutingTable,
@@ -514,8 +596,6 @@ impl DhtCoreEngine {
             ));
         }
 
-        let candidate_region = GeographicRegion::from_ip(candidate_ip);
-        let mut region_count: usize = 0;
         let mut network_size: usize = 0;
 
         // Protocol-specific subnet accumulators
@@ -545,9 +625,6 @@ impl DhtCoreEngine {
                 continue;
             }
             network_size += 1;
-            if GeographicRegion::from_ip(existing_ip) == candidate_region {
-                region_count += 1;
-            }
             // Count subnet matches for the candidate's address family
             match (existing_ip, v4_masks, v6_masks) {
                 (IpAddr::V4(existing_v4), Some((v4, cand_24, cand_16)), _) => {
@@ -652,13 +729,6 @@ impl DhtCoreEngine {
             }
         }
 
-        if region_count >= self.geo_max_per_region {
-            return Err(anyhow!(
-                "Geographic diversity: region {candidate_region:?} limit ({}) exceeded",
-                self.geo_max_per_region
-            ));
-        }
-
         Ok(())
     }
 
@@ -672,6 +742,125 @@ impl DhtCoreEngine {
             self.ip_diversity_config.max_per_ip_cap,
             std::cmp::max(1, fraction),
         )
+    }
+
+    /// Per-bucket geographic diversity check.
+    ///
+    /// If the candidate's bucket already has `geo_max_per_region` nodes from
+    /// the same region, the candidate can only enter if it is strictly closer
+    /// to self than the farthest same-region incumbent (swap logic).
+    fn check_geo_diversity_per_bucket(
+        &self,
+        routing: &KademliaRoutingTable,
+        candidate: &NodeInfo,
+        candidate_region: GeographicRegion,
+    ) -> GeoCheckResult {
+        let bucket_index = routing.get_bucket_index(&candidate.id);
+        let bucket = &routing.buckets[bucket_index];
+        let count = bucket.count_region(candidate_region, &candidate.id);
+
+        if count < self.geo_max_per_region {
+            return GeoCheckResult::Allowed;
+        }
+
+        // At limit — swap if candidate is closer than the farthest incumbent.
+        let candidate_dist = xor_distance_bytes(candidate.id.to_bytes(), self.node_id.to_bytes());
+        if let Some((farthest_id, farthest_dist)) =
+            bucket.farthest_same_region_node(candidate_region, &self.node_id, &candidate.id)
+            && candidate_dist < farthest_dist
+        {
+            return GeoCheckResult::SwapNeeded {
+                evict_peer_id: farthest_id,
+            };
+        }
+
+        GeoCheckResult::Rejected {
+            reason: format!(
+                "Geographic diversity: region {candidate_region:?} per-bucket limit ({}) exceeded in bucket {bucket_index}",
+                self.geo_max_per_region
+            ),
+        }
+    }
+
+    /// Closest-K geographic diversity check.
+    ///
+    /// Considers only the K nodes closest to self by XOR distance. If the
+    /// candidate would be part of that group and would push a region over the
+    /// limit, it can swap out the farthest same-region node in the group.
+    /// Candidates that would NOT be in the closest-K group bypass this check.
+    fn check_geo_diversity_closest_k(
+        &self,
+        routing: &KademliaRoutingTable,
+        candidate: &NodeInfo,
+        candidate_region: GeographicRegion,
+    ) -> GeoCheckResult {
+        let closest_k = routing.closest_k_nodes_to_self();
+        let candidate_dist = xor_distance_bytes(candidate.id.to_bytes(), self.node_id.to_bytes());
+
+        // Would candidate be in the closest-K group?
+        let would_be_in_k = if closest_k.len() < K {
+            true
+        } else {
+            // Must be strictly closer than the current K-th node.
+            closest_k
+                .last()
+                .is_none_or(|&(_, kth_dist)| candidate_dist < kth_dist)
+        };
+
+        if !would_be_in_k {
+            return GeoCheckResult::Allowed;
+        }
+
+        // Build hypothetical closest-K including the candidate.
+        let mut hypothetical = closest_k;
+        hypothetical.push((candidate.id, candidate_dist));
+        hypothetical.sort_by(|a, b| a.1.cmp(&b.1));
+        hypothetical.truncate(K);
+
+        // Count same-region nodes in the hypothetical group (excluding candidate).
+        let region_count = hypothetical
+            .iter()
+            .filter(|(id, _)| *id != candidate.id)
+            .filter(|&&(id, _)| {
+                routing
+                    .find_node_by_id(&id)
+                    .and_then(|n| n.ip())
+                    .is_some_and(|ip| {
+                        !ip.is_loopback() && GeographicRegion::from_ip(ip) == candidate_region
+                    })
+            })
+            .count();
+
+        if region_count < self.geo_max_per_region {
+            return GeoCheckResult::Allowed;
+        }
+
+        // Find farthest same-region node in the hypothetical group (excl. candidate).
+        if let Some(&(farthest_id, farthest_dist)) = hypothetical
+            .iter()
+            .filter(|(id, _)| *id != candidate.id)
+            .filter(|&&(id, _)| {
+                routing
+                    .find_node_by_id(&id)
+                    .and_then(|n| n.ip())
+                    .is_some_and(|ip| {
+                        !ip.is_loopback() && GeographicRegion::from_ip(ip) == candidate_region
+                    })
+            })
+            .max_by(|a, b| a.1.cmp(&b.1))
+            && candidate_dist < farthest_dist
+        {
+            return GeoCheckResult::SwapNeeded {
+                evict_peer_id: farthest_id,
+            };
+        }
+
+        GeoCheckResult::Rejected {
+            reason: format!(
+                "Geographic diversity: region {candidate_region:?} closest-K limit ({}) exceeded",
+                self.geo_max_per_region
+            ),
+        }
     }
 }
 
@@ -712,8 +901,9 @@ mod tests {
     fn make_node(byte: u8, address: &str) -> NodeInfo {
         NodeInfo {
             id: PeerId::from_bytes([byte; 32]),
-            addresses: vec![address.parse::<MultiAddr>().unwrap()],
+            address: address.parse::<MultiAddr>().unwrap(),
             last_seen: SystemTime::now(),
+            capacity: NodeCapacity::default(),
         }
     }
 
@@ -722,24 +912,21 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_touch_node_merges_address() {
+    fn test_touch_node_updates_address() {
         let k = 8;
         let mut bucket = KBucket::new(k);
         let node = make_node(1, "/ip4/1.2.3.4/udp/9000/quic");
         bucket.add_node(node).unwrap();
 
-        // Touch with a new address — should be prepended, old kept
+        // Touch with a new address
         let new_addr: MultiAddr = "/ip4/5.6.7.8/udp/9000/quic".parse().unwrap();
-        let old_addr: MultiAddr = "/ip4/1.2.3.4/udp/9000/quic".parse().unwrap();
         let found = bucket.touch_node(&PeerId::from_bytes([1u8; 32]), Some(&new_addr));
         assert!(found);
-        let addrs = &bucket.get_nodes().last().unwrap().addresses;
-        assert_eq!(addrs[0], new_addr);
-        assert_eq!(addrs[1], old_addr);
+        assert_eq!(bucket.get_nodes().last().unwrap().address, new_addr);
     }
 
     #[test]
-    fn test_touch_node_none_preserves_addresses() {
+    fn test_touch_node_none_preserves_address() {
         let k = 8;
         let mut bucket = KBucket::new(k);
         let node = make_node(1, "/ip4/1.2.3.4/udp/9000/quic");
@@ -748,7 +935,7 @@ mod tests {
         let found = bucket.touch_node(&PeerId::from_bytes([1u8; 32]), None);
         assert!(found);
         let expected: MultiAddr = "/ip4/1.2.3.4/udp/9000/quic".parse().unwrap();
-        assert_eq!(bucket.get_nodes().last().unwrap().addresses, vec![expected]);
+        assert_eq!(bucket.get_nodes().last().unwrap().address, expected);
     }
 
     #[test]
@@ -805,8 +992,9 @@ mod tests {
         table
             .add_node(NodeInfo {
                 id: PeerId::from_bytes(id_bytes),
-                addresses: vec!["/ip4/10.0.0.1/udp/9000/quic".parse().unwrap()],
+                address: "/ip4/10.0.0.1/udp/9000/quic".parse().unwrap(),
                 last_seen: SystemTime::now(),
+                capacity: NodeCapacity::default(),
             })
             .unwrap();
 
@@ -815,8 +1003,9 @@ mod tests {
         table
             .add_node(NodeInfo {
                 id: PeerId::from_bytes(id_bytes),
-                addresses: vec!["/ip4/10.0.0.2/udp/9000/quic".parse().unwrap()],
+                address: "/ip4/10.0.0.2/udp/9000/quic".parse().unwrap(),
                 last_seen: SystemTime::now(),
+                capacity: NodeCapacity::default(),
             })
             .unwrap();
 
@@ -847,8 +1036,9 @@ mod tests {
         table
             .add_node(NodeInfo {
                 id: PeerId::from_bytes(id_bytes),
-                addresses: vec!["/ip4/10.0.0.1/udp/9000/quic".parse().unwrap()],
+                address: "/ip4/10.0.0.1/udp/9000/quic".parse().unwrap(),
                 last_seen: SystemTime::now(),
+                capacity: NodeCapacity::default(),
             })
             .unwrap();
 
@@ -857,8 +1047,9 @@ mod tests {
         table
             .add_node(NodeInfo {
                 id: PeerId::from_bytes(id_bytes),
-                addresses: vec!["/ip4/10.0.0.2/udp/9000/quic".parse().unwrap()],
+                address: "/ip4/10.0.0.2/udp/9000/quic".parse().unwrap(),
                 last_seen: SystemTime::now(),
+                capacity: NodeCapacity::default(),
             })
             .unwrap();
 
@@ -886,12 +1077,11 @@ mod tests {
             table
                 .add_node(NodeInfo {
                     id: PeerId::from_bytes(id_bytes),
-                    addresses: vec![
-                        format!("/ip4/10.0.0.{}/udp/9000/quic", i + 1)
-                            .parse()
-                            .unwrap(),
-                    ],
+                    address: format!("/ip4/10.0.0.{}/udp/9000/quic", i + 1)
+                        .parse()
+                        .unwrap(),
                     last_seen: SystemTime::now(),
+                    capacity: NodeCapacity::default(),
                 })
                 .unwrap();
         }
@@ -994,6 +1184,8 @@ mod tests {
         let mut config = IPDiversityConfig::testnet();
         config.ipv4_limit_floor = Some(100);
         dht.set_ip_diversity_config(config);
+        // Raise geo limit so this IP-diversity test isn't affected by per-bucket geo.
+        dht.set_geo_max_per_region(100);
 
         // Add multiple nodes from the same IP — the dynamic formula alone
         // would cap at 1, but the floor of 100 must allow these.
@@ -1009,63 +1201,372 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // KBucket::add_node address validation tests
+    // Per-bucket geographic diversity tests
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_add_node_rejects_empty_addresses() {
-        let mut bucket = KBucket::new(8);
-        let node = NodeInfo {
-            id: PeerId::from_bytes([1u8; 32]),
-            addresses: vec![],
+    /// Helper: create a NodeInfo with specific id bytes and address string.
+    fn make_node_with_id(id_bytes: [u8; 32], address: &str) -> NodeInfo {
+        NodeInfo {
+            id: PeerId::from_bytes(id_bytes),
+            address: address.parse::<MultiAddr>().unwrap(),
             last_seen: SystemTime::now(),
-        };
-        assert!(bucket.add_node(node).is_err());
+            capacity: NodeCapacity::default(),
+        }
     }
 
-    #[test]
-    fn test_add_node_truncates_excess_addresses() {
-        let mut bucket = KBucket::new(8);
-
-        // Build a NodeInfo with more addresses than the cap.
-        let addresses: Vec<MultiAddr> = (1..=MAX_ADDRESSES_PER_NODE + 4)
-            .map(|i| format!("/ip4/10.0.0.{}/udp/9000/quic", i).parse().unwrap())
-            .collect();
-        assert!(addresses.len() > MAX_ADDRESSES_PER_NODE);
-
-        let node = NodeInfo {
-            id: PeerId::from_bytes([1u8; 32]),
-            addresses,
-            last_seen: SystemTime::now(),
-        };
-        bucket.add_node(node).unwrap();
-
-        let stored = &bucket.get_nodes()[0].addresses;
-        assert_eq!(stored.len(), MAX_ADDRESSES_PER_NODE);
+    /// Build a PeerId that lands in bucket 0 when node_id is [0;32].
+    /// `variant` is OR'd into byte[0] alongside the 0x80 bucket-0 marker.
+    fn bucket0_id(variant: u8) -> [u8; 32] {
+        let mut id = [0u8; 32];
+        id[0] = 0x80 | variant;
+        id
     }
 
-    #[test]
-    fn test_add_node_replace_also_truncates() {
-        let mut bucket = KBucket::new(8);
+    /// 3 same-region nodes in one bucket OK, 4th rejected (farther than all).
+    #[tokio::test]
+    async fn test_per_bucket_geo_limit_blocks_excess() {
+        let mut dht = DhtCoreEngine::new_for_tests(PeerId::from_bytes([0u8; 32])).unwrap();
+        dht.set_ip_diversity_config(IPDiversityConfig {
+            ipv4_limit_floor: Some(100),
+            ..IPDiversityConfig::default()
+        });
 
-        // Insert once with a single address.
-        bucket
-            .add_node(make_node(1, "/ip4/1.1.1.1/udp/9000/quic"))
+        // 3 Europe nodes in bucket 0 (distinct /16 subnets)
+        for i in 1..=3u8 {
+            let addr = format!("/ip4/{}.1.1.1/udp/9000/quic", 129 + i);
+            dht.add_node(make_node_with_id(bucket0_id(i), &addr))
+                .await
+                .unwrap();
+        }
+
+        // 4th Europe node in bucket 0 — farther than all (0x84 > 0x83) → rejected
+        let node = make_node_with_id(bucket0_id(4), "/ip4/134.1.1.1/udp/9000/quic");
+        let result = dht.add_node(node).await;
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("per-bucket limit"),
+            "should be rejected by per-bucket geo check"
+        );
+    }
+
+    /// 3 same-region in bucket A, 1 same-region in bucket B succeeds.
+    #[tokio::test]
+    async fn test_per_bucket_geo_allows_across_buckets() {
+        let mut dht = DhtCoreEngine::new_for_tests(PeerId::from_bytes([0u8; 32])).unwrap();
+        dht.set_ip_diversity_config(IPDiversityConfig {
+            ipv4_limit_floor: Some(100),
+            ..IPDiversityConfig::default()
+        });
+
+        // 3 Europe nodes in bucket 0
+        for i in 1..=3u8 {
+            let addr = format!("/ip4/{}.1.1.1/udp/9000/quic", 129 + i);
+            dht.add_node(make_node_with_id(bucket0_id(i), &addr))
+                .await
+                .unwrap();
+        }
+
+        // 1 Europe node in bucket 1 (byte[0]=0x40) — different bucket → per-bucket OK
+        let mut id = [0u8; 32];
+        id[0] = 0x40;
+        let result = dht
+            .add_node(make_node_with_id(id, "/ip4/133.1.1.1/udp/9000/quic"))
+            .await;
+        assert!(
+            result.is_ok(),
+            "Europe node in different bucket should succeed: {:?}",
+            result
+        );
+    }
+
+    /// 4th same-region node closer to self swaps out farthest in bucket.
+    #[tokio::test]
+    async fn test_per_bucket_swap_closer_replaces_farther() {
+        let mut dht = DhtCoreEngine::new_for_tests(PeerId::from_bytes([0u8; 32])).unwrap();
+        dht.set_ip_diversity_config(IPDiversityConfig {
+            ipv4_limit_floor: Some(100),
+            ..IPDiversityConfig::default()
+        });
+
+        let eviction_target = PeerId::from_bytes(bucket0_id(3));
+
+        // 3 Europe nodes in bucket 0: IDs 0x81, 0x82, 0x83 (farthest = 0x83)
+        for i in 1..=3u8 {
+            let addr = format!("/ip4/{}.1.1.1/udp/9000/quic", 129 + i);
+            dht.add_node(make_node_with_id(bucket0_id(i), &addr))
+                .await
+                .unwrap();
+        }
+
+        // 4th: id 0x80 — closest to self in bucket 0 → swaps out 0x83
+        let closer_id = bucket0_id(0);
+        let result = dht
+            .add_node(make_node_with_id(closer_id, "/ip4/133.1.1.1/udp/9000/quic"))
+            .await;
+        assert!(result.is_ok(), "closer node should swap in: {:?}", result);
+
+        assert!(
+            dht.get_node_address(&eviction_target).await.is_none(),
+            "farthest Europe node should have been evicted"
+        );
+        assert!(
+            dht.get_node_address(&PeerId::from_bytes(closer_id))
+                .await
+                .is_some(),
+            "closer Europe node should be in table"
+        );
+    }
+
+    /// 4th same-region node farther than all → rejected (no swap possible).
+    #[tokio::test]
+    async fn test_per_bucket_swap_rejected_when_farther() {
+        let mut dht = DhtCoreEngine::new_for_tests(PeerId::from_bytes([0u8; 32])).unwrap();
+        dht.set_ip_diversity_config(IPDiversityConfig {
+            ipv4_limit_floor: Some(100),
+            ..IPDiversityConfig::default()
+        });
+
+        // 3 Europe nodes in bucket 0: IDs 0x81, 0x82, 0x83
+        for i in 1..=3u8 {
+            let addr = format!("/ip4/{}.1.1.1/udp/9000/quic", 129 + i);
+            dht.add_node(make_node_with_id(bucket0_id(i), &addr))
+                .await
+                .unwrap();
+        }
+
+        // 4th: id 0x84 — farther than all → rejected
+        let node = make_node_with_id(bucket0_id(4), "/ip4/134.1.1.1/udp/9000/quic");
+        let result = dht.add_node(node).await;
+        assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Closest-K geographic diversity tests
+    // -----------------------------------------------------------------------
+
+    /// K closest nodes have 3 same-region, 4th same-region (farther) rejected.
+    #[tokio::test]
+    async fn test_closest_k_geo_limit() {
+        let mut dht = DhtCoreEngine::new_for_tests(PeerId::from_bytes([0u8; 32])).unwrap();
+
+        // 3 Europe nodes in different close buckets (each bucket has 1 → per-bucket OK)
+        for (byte, addr) in [
+            (0x01u8, "/ip4/130.1.1.1/udp/9000/quic"), // bucket 255
+            (0x02, "/ip4/131.1.1.1/udp/9000/quic"),   // bucket 254
+            (0x04, "/ip4/132.1.1.1/udp/9000/quic"),   // bucket 253
+        ] {
+            let mut id = [0u8; 32];
+            id[31] = byte;
+            dht.add_node(make_node_with_id(id, addr)).await.unwrap();
+        }
+
+        // 4th Europe node farther from self (0x08 > 0x04) → closest-K rejects
+        let mut id = [0u8; 32];
+        id[31] = 0x08;
+        let result = dht
+            .add_node(make_node_with_id(id, "/ip4/133.1.1.1/udp/9000/quic"))
+            .await;
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("closest-K limit"),
+            "should be rejected by closest-K geo check"
+        );
+    }
+
+    /// Candidate closer than farthest same-region in K → swap.
+    #[tokio::test]
+    async fn test_closest_k_swap_closer_replaces_farther() {
+        let mut dht = DhtCoreEngine::new_for_tests(PeerId::from_bytes([0u8; 32])).unwrap();
+
+        let eviction_target = PeerId::from_bytes({
+            let mut id = [0u8; 32];
+            id[31] = 0x08;
+            id
+        });
+
+        // 3 Europe nodes: distances 0x02, 0x04, 0x08 (all different buckets)
+        for (byte, addr) in [
+            (0x02u8, "/ip4/130.1.1.1/udp/9000/quic"),
+            (0x04, "/ip4/131.1.1.1/udp/9000/quic"),
+            (0x08, "/ip4/132.1.1.1/udp/9000/quic"),
+        ] {
+            let mut id = [0u8; 32];
+            id[31] = byte;
+            dht.add_node(make_node_with_id(id, addr)).await.unwrap();
+        }
+
+        // 4th Europe node closer (0x01 < 0x08) → swap out farthest
+        let mut id = [0u8; 32];
+        id[31] = 0x01;
+        let result = dht
+            .add_node(make_node_with_id(id, "/ip4/133.1.1.1/udp/9000/quic"))
+            .await;
+        assert!(result.is_ok(), "closer node should swap in: {:?}", result);
+        assert!(
+            dht.get_node_address(&eviction_target).await.is_none(),
+            "farthest same-region node should have been evicted"
+        );
+    }
+
+    /// Candidate far from self, not in closest-K → geo check irrelevant.
+    #[tokio::test]
+    async fn test_closest_k_not_in_group_bypasses_check() {
+        let mut dht = DhtCoreEngine::new_for_tests(PeerId::from_bytes([0u8; 32])).unwrap();
+
+        // 8 mixed-region nodes close to self (fill K=8). Interleave regions
+        // so no single region exceeds the per-bucket or closest-K limit (3).
+        for (byte, addr) in [
+            (0x01u8, "/ip4/1.1.1.1/udp/9000/quic"), // NA, bucket 255
+            (0x02, "/ip4/161.1.1.1/udp/9000/quic"), // AP, bucket 254
+            (0x03, "/ip4/225.1.1.1/udp/9000/quic"), // SA, bucket 254
+            (0x04, "/ip4/2.1.1.1/udp/9000/quic"),   // NA, bucket 253
+            (0x05, "/ip4/162.1.1.1/udp/9000/quic"), // AP, bucket 253
+            (0x06, "/ip4/226.1.1.1/udp/9000/quic"), // SA, bucket 253
+            (0x07, "/ip4/3.1.1.1/udp/9000/quic"),   // NA, bucket 253
+            (0x08, "/ip4/163.1.1.1/udp/9000/quic"), // AP, bucket 252
+        ] {
+            let mut id = [0u8; 32];
+            id[31] = byte;
+            dht.add_node(make_node_with_id(id, addr)).await.unwrap();
+        }
+
+        // 4 Europe nodes far from self (buckets 0-3) — not in closest-K
+        for (i, &byte) in [0x80u8, 0x40, 0x20, 0x10].iter().enumerate() {
+            let mut id = [0u8; 32];
+            id[0] = byte;
+            let addr = format!("/ip4/{}.1.1.1/udp/9000/quic", 130 + i as u8);
+            let result = dht.add_node(make_node_with_id(id, &addr)).await;
+            assert!(
+                result.is_ok(),
+                "far Europe node {i} should bypass closest-K: {:?}",
+                result
+            );
+        }
+    }
+
+    /// Both per-bucket and closest-K trigger swap (same target, dedup).
+    ///
+    /// When all same-region nodes in K are in one bucket, both checks
+    /// identify the same farthest peer. The dedup ensures single eviction.
+    #[tokio::test]
+    async fn test_both_checks_trigger_simultaneously() {
+        let mut dht = DhtCoreEngine::new_for_tests(PeerId::from_bytes([0u8; 32])).unwrap();
+
+        // 4 non-EU close nodes (distances 0x01-0x05, mixed regions)
+        for (byte, addr) in [
+            (0x01u8, "/ip4/1.1.1.1/udp/9000/quic"), // NA, bucket 255
+            (0x02, "/ip4/161.1.1.1/udp/9000/quic"), // AP, bucket 254
+            (0x04, "/ip4/225.1.1.1/udp/9000/quic"), // SA, bucket 253
+            (0x05, "/ip4/2.1.1.1/udp/9000/quic"),   // NA, bucket 253
+        ] {
+            let mut id = [0u8; 32];
+            id[31] = byte;
+            dht.add_node(make_node_with_id(id, addr)).await.unwrap();
+        }
+
+        // 3 EU in bucket 252: distances 0x09, 0x0A, 0x0B
+        for (byte, addr) in [
+            (0x09u8, "/ip4/130.1.1.1/udp/9000/quic"),
+            (0x0A, "/ip4/131.1.1.1/udp/9000/quic"),
+            (0x0B, "/ip4/132.1.1.1/udp/9000/quic"),
+        ] {
+            let mut id = [0u8; 32];
+            id[31] = byte;
+            dht.add_node(make_node_with_id(id, addr)).await.unwrap();
+        }
+
+        // 1 non-EU at 0x0C (SA, bucket 252) — will be K-th, displaced by candidate
+        // so that the hypothetical K still has 3 EU from bucket 252.
+        {
+            let mut id = [0u8; 32];
+            id[31] = 0x0C;
+            dht.add_node(make_node_with_id(id, "/ip4/226.1.1.1/udp/9000/quic"))
+                .await
+                .unwrap();
+        }
+
+        // Candidate: 0x08 EU, bucket 252 — closer than farthest EU (0x0B).
+        // Per-bucket: 3 EU → swap(0x0B). Closest-K: candidate displaces 0x0C
+        // (non-EU) keeping 3 EU in K → swap(0x0B). Both target 0x0B (dedup).
+        let evict_target = PeerId::from_bytes({
+            let mut id = [0u8; 32];
+            id[31] = 0x0B;
+            id
+        });
+        let mut id = [0u8; 32];
+        id[31] = 0x08;
+        let result = dht
+            .add_node(make_node_with_id(id, "/ip4/133.1.1.1/udp/9000/quic"))
+            .await;
+        assert!(result.is_ok(), "candidate should swap in: {:?}", result);
+        assert!(
+            dht.get_node_address(&evict_target).await.is_none(),
+            "both checks should evict same peer (0x0B)"
+        );
+    }
+
+    /// Same ID re-added passes without geo rejection (reconnecting node).
+    #[tokio::test]
+    async fn test_reconnecting_node_bypasses_geo() {
+        let mut dht = DhtCoreEngine::new_for_tests(PeerId::from_bytes([0u8; 32])).unwrap();
+        dht.set_ip_diversity_config(IPDiversityConfig {
+            ipv4_limit_floor: Some(100),
+            ..IPDiversityConfig::default()
+        });
+
+        let reconnect_id = bucket0_id(2);
+
+        // Fill bucket 0 with 3 Europe nodes at geo limit
+        for i in 1..=3u8 {
+            let addr = format!("/ip4/{}.1.1.1/udp/9000/quic", 129 + i);
+            dht.add_node(make_node_with_id(bucket0_id(i), &addr))
+                .await
+                .unwrap();
+        }
+
+        // Re-add with same ID (reconnection) — count_region excludes own ID
+        let result = dht
+            .add_node(make_node_with_id(
+                reconnect_id,
+                "/ip4/131.2.2.2/udp/9000/quic",
+            ))
+            .await;
+        assert!(
+            result.is_ok(),
+            "reconnecting node should bypass geo: {:?}",
+            result
+        );
+    }
+
+    /// Loopback nodes don't inflate geo counts.
+    #[tokio::test]
+    async fn test_loopback_excluded_from_geo_counting() {
+        let mut dht = DhtCoreEngine::new_for_tests(PeerId::from_bytes([0u8; 32])).unwrap();
+        dht.set_allow_loopback(true);
+        dht.set_ip_diversity_config(IPDiversityConfig {
+            ipv4_limit_floor: Some(100),
+            ..IPDiversityConfig::default()
+        });
+
+        // Add 5 loopback nodes in bucket 0 (127.0.0.1 → Europe by IP mapping)
+        for i in 1..=5u8 {
+            dht.add_node(make_node_with_id(
+                bucket0_id(i),
+                "/ip4/127.0.0.1/udp/9000/quic",
+            ))
+            .await
             .unwrap();
-        assert_eq!(bucket.get_nodes()[0].addresses.len(), 1);
+        }
 
-        // Replace with an oversized address list.
-        let addresses: Vec<MultiAddr> = (1..=MAX_ADDRESSES_PER_NODE + 4)
-            .map(|i| format!("/ip4/10.0.0.{}/udp/9000/quic", i).parse().unwrap())
-            .collect();
-        let replacement = NodeInfo {
-            id: PeerId::from_bytes([1u8; 32]),
-            addresses,
-            last_seen: SystemTime::now(),
-        };
-        bucket.add_node(replacement).unwrap();
-
-        let stored = &bucket.get_nodes().last().unwrap().addresses;
-        assert_eq!(stored.len(), MAX_ADDRESSES_PER_NODE);
+        // 3 non-loopback Europe nodes in bucket 0 — loopback excluded from count
+        for i in 6..=8u8 {
+            let addr = format!("/ip4/{}.1.1.1/udp/9000/quic", 123 + i); // 129-131: Europe
+            let result = dht.add_node(make_node_with_id(bucket0_id(i), &addr)).await;
+            assert!(
+                result.is_ok(),
+                "non-loopback Europe node {i} should succeed: {:?}",
+                result
+            );
+        }
     }
 }

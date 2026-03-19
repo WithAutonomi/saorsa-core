@@ -109,7 +109,7 @@ async fn send_message_between_connected_nodes() {
     let payload = b"hello from node_a".to_vec();
     let result = timeout(
         Duration::from_millis(500),
-        node_a.send_message(&peer_b, "test/echo", payload, &[]),
+        node_a.send_message(&peer_b, "test/echo", payload),
     )
     .await
     .expect("send should not timeout");
@@ -133,7 +133,7 @@ async fn send_message_to_unknown_peer_fails() {
 
     let fake_peer = PeerId::random();
     let result = node
-        .send_message(&fake_peer, "test/echo", vec![1, 2, 3], &[])
+        .send_message(&fake_peer, "test/echo", vec![1, 2, 3])
         .await;
     assert!(result.is_err(), "Sending to unknown peer should fail");
 

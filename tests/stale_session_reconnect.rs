@@ -122,7 +122,7 @@ async fn send_recovers_when_target_drops_connection() {
     // Sanity: a normal send works before the disconnect.
     let pre_result = timeout(
         Duration::from_millis(500),
-        node_a.send_message(&peer_b, "test/echo", b"before disconnect".to_vec(), &[]),
+        node_a.send_message(&peer_b, "test/echo", b"before disconnect".to_vec()),
     )
     .await
     .expect("pre-disconnect send should not timeout");
@@ -145,7 +145,7 @@ async fn send_recovers_when_target_drops_connection() {
     // connection.
     let post_result = timeout(
         Duration::from_secs(10),
-        node_a.send_message(&peer_b, "test/echo", b"after disconnect".to_vec(), &[]),
+        node_a.send_message(&peer_b, "test/echo", b"after disconnect".to_vec()),
     )
     .await
     .expect("post-disconnect send should not timeout");
@@ -173,7 +173,7 @@ async fn send_recovers_after_idle_timeout_expiry() {
     // Sanity: a normal send works before going idle.
     let pre_result = timeout(
         Duration::from_millis(500),
-        node_a.send_message(&peer_b, "test/echo", b"before idle".to_vec(), &[]),
+        node_a.send_message(&peer_b, "test/echo", b"before idle".to_vec()),
     )
     .await
     .expect("pre-idle send should not timeout");
@@ -190,7 +190,7 @@ async fn send_recovers_after_idle_timeout_expiry() {
     // cleaned up.  The next send should trigger a reconnect.
     let post_result = timeout(
         Duration::from_secs(10),
-        node_a.send_message(&peer_b, "test/echo", b"after idle".to_vec(), &[]),
+        node_a.send_message(&peer_b, "test/echo", b"after idle".to_vec()),
     )
     .await
     .expect("post-idle send should not timeout");

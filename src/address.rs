@@ -284,6 +284,24 @@ impl<'de> Deserialize<'de> for MultiAddr {
 // AddressBook
 // ---------------------------------------------------------------------------
 
+/// Serde helpers for serializing `MultiAddr` as a plain string.
+///
+/// Use with `#[serde(with = "crate::address::serde_as_string")]` on fields
+/// of type `MultiAddr` to maintain wire-protocol compatibility.
+pub mod serde_as_string {
+    use super::MultiAddr;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(addr: &MultiAddr, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&addr.to_string())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<MultiAddr, D::Error> {
+        let s = String::deserialize(d)?;
+        s.parse::<MultiAddr>().map_err(serde::de::Error::custom)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -448,6 +466,26 @@ mod tests {
         assert!(!addr.is_private());
         assert!(!addr.is_ipv4());
         assert!(!addr.is_ipv6());
+    }
+
+    #[test]
+    fn test_serde_as_string_roundtrip() {
+        #[derive(Serialize, Deserialize)]
+        struct Wrapper {
+            #[serde(with = "super::serde_as_string")]
+            addr: MultiAddr,
+        }
+
+        let original = Wrapper {
+            addr: MultiAddr::from_ipv4(Ipv4Addr::new(192, 168, 1, 1), 9000),
+        };
+
+        let json = serde_json::to_string(&original).unwrap();
+        assert!(json.contains("/ip4/192.168.1.1/udp/9000/quic"));
+
+        let recovered: Wrapper = serde_json::from_str(&json).unwrap();
+        assert_eq!(recovered.addr.ip(), original.addr.ip());
+        assert_eq!(recovered.addr.port(), original.addr.port());
     }
 
     #[test]
