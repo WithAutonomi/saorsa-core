@@ -226,60 +226,74 @@ pub struct IPv6NodeID {
     pub salt: Vec<u8>,
 }
 
-/// Configuration for IP diversity enforcement at multiple subnet levels
+/// Configuration for IP diversity enforcement at multiple subnet levels.
+///
+/// Limits are applied **per-bucket** and **per-close-group** (the K closest
+/// nodes to self), matching how geographic diversity is enforced.  When a
+/// candidate would exceed a limit, it may still be admitted via swap-closer
+/// logic: if the candidate is closer (XOR distance) to self than the
+/// farthest same-subnet peer in the scope, that farther peer is evicted.
+///
+/// The dynamic per-IP formula uses the *global* network size for stability,
+/// but counting happens within each scope independently.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IPDiversityConfig {
-    // === IPv6 subnet limits (existing) ===
-    /// Maximum nodes per /64 subnet (default: 1)
+    // === IPv6 subnet limits ===
+    /// Maximum nodes per /64 subnet within a single k-bucket or
+    /// close group (default: 1).
     pub max_nodes_per_ipv6_64: usize,
-    /// Maximum nodes per /48 allocation (default: 3)
+    /// Maximum nodes per /48 allocation within a single k-bucket or
+    /// close group (default: 3).
     pub max_nodes_per_ipv6_48: usize,
-    /// Maximum nodes per /32 region (default: 10)
+    /// Maximum nodes per /32 region within a single k-bucket or
+    /// close group (default: 10).
     pub max_nodes_per_ipv6_32: usize,
 
     // === IPv4 subnet limits ===
-    /// Optional guaranteed minimum for nodes per single IPv4 address (/32).
-    /// When `None` (default), the dynamic per-IP limit is used alone.
-    /// When `Some(n)`, the effective limit is `max(n, dynamic_per_ip)`,
-    /// ensuring at least `n` nodes are allowed even when the dynamic
-    /// formula yields a lower value (e.g. during bootstrap).
+    /// Optional cap for nodes per single IPv4 address (/32) within a
+    /// single k-bucket or close group.  When `None` (default), the
+    /// dynamic per-IP limit is used alone.  When `Some(n)`, the
+    /// effective limit is `min(n, dynamic_per_ip)`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_nodes_per_ipv4_32: Option<usize>,
-    /// Optional guaranteed minimum for nodes per /24 subnet (Class C).
-    /// When `None` (default), `dynamic_per_ip * 3` is used alone.
-    /// When `Some(n)`, the effective limit is `max(n, dynamic_per_ip * 3)`.
+    /// Optional cap for nodes per /24 subnet (Class C) within a single
+    /// k-bucket or close group.  When `None` (default),
+    /// `dynamic_per_ip * 3` is used alone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_nodes_per_ipv4_24: Option<usize>,
-    /// Optional guaranteed minimum for nodes per /16 subnet (Class B).
-    /// When `None` (default), `dynamic_per_ip * 10` is used alone.
-    /// When `Some(n)`, the effective limit is `max(n, dynamic_per_ip * 10)`.
+    /// Optional cap for nodes per /16 subnet (Class B) within a single
+    /// k-bucket or close group.  When `None` (default),
+    /// `dynamic_per_ip * 10` is used alone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_nodes_per_ipv4_16: Option<usize>,
 
     // === Per-protocol limit overrides ===
-    /// Optional floor for all IPv4 subnet limits. When set, the effective
-    /// limit at every IPv4 prefix level (/32, /24, /16) will be at least
-    /// this value, overriding the dynamic calculation and existing hard caps.
+    /// Optional floor for all IPv4 subnet limits (per-bucket / per-close-group).
+    /// When set, the effective limit at every IPv4 prefix level (/32, /24, /16)
+    /// will be at least this value, overriding the dynamic calculation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ipv4_limit_floor: Option<usize>,
-    /// Optional ceiling for all IPv4 subnet limits. When set, the effective
-    /// limit at every IPv4 prefix level will be at most this value.
+    /// Optional ceiling for all IPv4 subnet limits (per-bucket / per-close-group).
+    /// When set, the effective limit at every IPv4 prefix level will be at most
+    /// this value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ipv4_limit_ceiling: Option<usize>,
-    /// Optional floor for all IPv6 subnet limits.
+    /// Optional floor for all IPv6 subnet limits (per-bucket / per-close-group).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ipv6_limit_floor: Option<usize>,
-    /// Optional ceiling for all IPv6 subnet limits.
+    /// Optional ceiling for all IPv6 subnet limits (per-bucket / per-close-group).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ipv6_limit_ceiling: Option<usize>,
 
     // === Network-relative limits ===
-    /// Absolute maximum nodes allowed per single IP (default: 50)
+    /// Absolute maximum nodes allowed per single IP (default: 50).
+    /// Used in the global dynamic per-IP formula.
     pub max_per_ip_cap: usize,
-    /// Maximum fraction of network any single IP can represent (default: 0.005 = 0.5%)
+    /// Maximum fraction of global network any single IP can represent
+    /// (default: 0.005 = 0.5%).  Used in the dynamic per-IP formula.
     pub max_network_fraction: f64,
 
-    // === ASN and GeoIP (existing) ===
+    // === ASN and GeoIP ===
     /// Maximum nodes per AS number (default: 20)
     pub max_nodes_per_asn: usize,
     /// Enable GeoIP-based diversity checks
