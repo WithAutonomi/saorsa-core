@@ -22,7 +22,7 @@
 
 use crate::error::BootstrapError;
 use crate::rate_limit::{JoinRateLimiter, JoinRateLimiterConfig};
-use crate::security::{IPDiversityConfig, IPDiversityEnforcer};
+use crate::security::{BootstrapIpLimiter, IPDiversityConfig};
 use crate::{P2PError, Result};
 use parking_lot::Mutex;
 use saorsa_transport::bootstrap_cache::{
@@ -68,7 +68,7 @@ impl Default for BootstrapConfig {
 pub struct BootstrapManager {
     cache: Arc<AntBootstrapCache>,
     rate_limiter: JoinRateLimiter,
-    diversity_enforcer: Mutex<IPDiversityEnforcer>,
+    ip_limiter: Mutex<BootstrapIpLimiter>,
     diversity_config: IPDiversityConfig,
     maintenance_handle: Option<JoinHandle<()>>,
 }
@@ -93,7 +93,7 @@ impl BootstrapManager {
         Ok(Self {
             cache: Arc::new(cache),
             rate_limiter: JoinRateLimiter::new(config.rate_limit),
-            diversity_enforcer: Mutex::new(IPDiversityEnforcer::with_loopback(
+            ip_limiter: Mutex::new(BootstrapIpLimiter::with_loopback(
                 config.diversity.clone(),
                 allow_loopback,
             )),
@@ -160,17 +160,9 @@ impl BootstrapManager {
         })?;
 
         // IP diversity check (scoped to avoid holding lock across await)
-        let ipv6 = super::ip_to_ipv6(&ip);
         {
-            let mut diversity = self.diversity_enforcer.lock();
-            let analysis = diversity.analyze_ip(ipv6).map_err(|e| {
-                warn!("IP analysis failed for {}: {}", ip, e);
-                P2PError::Bootstrap(BootstrapError::InvalidData(
-                    format!("IP analysis failed: {e}").into(),
-                ))
-            })?;
-
-            if !diversity.can_accept_node(&analysis) {
+            let mut diversity = self.ip_limiter.lock();
+            if !diversity.can_accept(ip) {
                 warn!("IP diversity limit exceeded for {}", ip);
                 return Err(P2PError::Bootstrap(BootstrapError::RateLimited(
                     "IP diversity limits exceeded".to_string().into(),
@@ -178,7 +170,7 @@ impl BootstrapManager {
             }
 
             // Track in diversity enforcer
-            if let Err(e) = diversity.add_node(&analysis) {
+            if let Err(e) = diversity.track(ip) {
                 warn!("Failed to track IP diversity for {}: {}", ip, e);
             }
         } // Lock released here before await
@@ -536,9 +528,6 @@ mod tests {
         let diversity_config = IPDiversityConfig {
             max_per_ip: Some(usize::MAX),
             max_per_subnet: Some(usize::MAX),
-            max_nodes_per_asn: 1000,
-            enable_geolocation_check: false,
-            min_geographic_diversity: 0,
         };
 
         let config = BootstrapConfig {

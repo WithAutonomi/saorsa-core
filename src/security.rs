@@ -14,7 +14,7 @@
 //! Security module
 //!
 //! This module provides cryptographic functionality and Sybil protection for the P2P network.
-//! It implements IPv6-based node ID generation and IP diversity enforcement to prevent
+//! It implements IP-based node ID generation and IP diversity enforcement to prevent
 //! large-scale Sybil attacks while maintaining network openness.
 
 use crate::quantum_crypto::saorsa_transport_integration::{
@@ -25,22 +25,20 @@ use lru::LruCache;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::Debug;
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::num::NonZeroUsize;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use std::sync::Arc;
-
 /// Maximum subnet tracking entries before evicting oldest (prevents memory DoS)
-const MAX_SUBNET_TRACKING: usize = 50_000;
+const BOOTSTRAP_MAX_TRACKED_SUBNETS: usize = 50_000;
 
-/// Default subnet limit for the global `IPDiversityEnforcer` (/64 IPv6, /24 IPv4).
+/// Default subnet limit for `BootstrapIpLimiter` (/64 IPv6, /24 IPv4).
 /// Used when `IPDiversityConfig::max_per_subnet` is `None`.
-const ENFORCER_DEFAULT_SUBNET_LIMIT: usize = 2;
+const BOOTSTRAP_DEFAULT_SUBNET_LIMIT: usize = 2;
 
-/// Default exact-IP limit for the global `IPDiversityEnforcer`.
+/// Default exact-IP limit for `BootstrapIpLimiter`.
 /// Used when `IPDiversityConfig::max_per_ip` is `None`.
-const ENFORCER_DEFAULT_IP_LIMIT: usize = 2;
+const BOOTSTRAP_DEFAULT_IP_LIMIT: usize = 2;
 
 // ============================================================================
 // Generic IP Address Trait
@@ -245,7 +243,7 @@ pub struct IPv6NodeID {
 /// By default every limit is `None`, meaning the K-based defaults from
 /// `DhtCoreEngine` apply (fractions of the bucket size K).  Setting an
 /// explicit `Some(n)` overrides the K-based default for that tier.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct IPDiversityConfig {
     /// Override for max nodes sharing an exact IP address per bucket/close-group.
     /// When `None`, uses the default of 2.
@@ -256,87 +254,6 @@ pub struct IPDiversityConfig {
     /// When `None`, uses the K-based default (~25% of bucket size).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_per_subnet: Option<usize>,
-
-    // === ASN and GeoIP ===
-    /// Maximum nodes per AS number (default: 20)
-    pub max_nodes_per_asn: usize,
-    /// Enable GeoIP-based diversity checks
-    pub enable_geolocation_check: bool,
-    /// Minimum number of different countries required
-    pub min_geographic_diversity: usize,
-}
-
-/// Analysis of an IPv6 address for diversity enforcement
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct IPAnalysis {
-    /// Whether the original address is a loopback address (::1 or
-    /// an IPv4-mapped loopback like ::ffff:127.0.0.1).
-    #[serde(default)]
-    pub is_loopback: bool,
-    /// /64 subnet (host allocation)
-    pub subnet_64: Ipv6Addr,
-    /// /48 subnet (site allocation)
-    pub subnet_48: Ipv6Addr,
-    /// /32 subnet (ISP allocation)
-    pub subnet_32: Ipv6Addr,
-    /// Autonomous System Number (if available)
-    pub asn: Option<u32>,
-    /// Country code from GeoIP lookup
-    pub country: Option<String>,
-    /// Whether this is a known hosting/VPS provider
-    pub is_hosting_provider: bool,
-    /// Whether this is a known VPN provider
-    pub is_vpn_provider: bool,
-    /// Historical reputation score for this IP range
-    pub reputation_score: f64,
-}
-
-/// Analysis of an IPv4 address for diversity enforcement
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[allow(dead_code)]
-pub struct IPv4Analysis {
-    /// The exact IPv4 address
-    pub ip_addr: Ipv4Addr,
-    /// /24 subnet (Class C equivalent)
-    pub subnet_24: Ipv4Addr,
-    /// /16 subnet (Class B equivalent)
-    pub subnet_16: Ipv4Addr,
-    /// /8 subnet (Class A equivalent)
-    pub subnet_8: Ipv4Addr,
-    /// Autonomous System Number (if available)
-    pub asn: Option<u32>,
-    /// Country code from GeoIP lookup
-    pub country: Option<String>,
-    /// Whether this is a known hosting/VPS provider
-    pub is_hosting_provider: bool,
-    /// Whether this is a known VPN provider
-    pub is_vpn_provider: bool,
-    /// Historical reputation score for this IP range
-    pub reputation_score: f64,
-}
-
-/// Unified IP analysis that handles both IPv4 and IPv6 addresses
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[allow(dead_code)]
-pub enum UnifiedIPAnalysis {
-    /// IPv4 address analysis
-    IPv4(IPv4Analysis),
-    /// IPv6 address analysis
-    IPv6(IPAnalysis),
-}
-
-impl Default for IPDiversityConfig {
-    fn default() -> Self {
-        Self {
-            // All IP limits default to None — K-based defaults apply.
-            max_per_ip: None,
-            max_per_subnet: None,
-            // ASN and GeoIP
-            max_nodes_per_asn: 20,
-            enable_geolocation_check: true,
-            min_geographic_diversity: 3,
-        }
-    }
 }
 
 impl IPDiversityConfig {
@@ -353,13 +270,8 @@ impl IPDiversityConfig {
     #[must_use]
     pub fn testnet() -> Self {
         Self {
-            // Effectively disable all IP diversity limits for testing.
             max_per_ip: Some(usize::MAX),
             max_per_subnet: Some(usize::MAX),
-            // ASN and GeoIP
-            max_nodes_per_asn: 5000, // Allow many nodes from same ASN (e.g., Digital Ocean)
-            enable_geolocation_check: false, // Disable geo checks for testing
-            min_geographic_diversity: 1, // Single region is acceptable for testing
         }
     }
 
@@ -372,16 +284,7 @@ impl IPDiversityConfig {
         Self {
             max_per_ip: Some(usize::MAX),
             max_per_subnet: Some(usize::MAX),
-            max_nodes_per_asn: usize::MAX,
-            enable_geolocation_check: false,
-            min_geographic_diversity: 0,
         }
-    }
-
-    /// Check if this is a testnet or permissive configuration.
-    #[must_use]
-    pub fn is_relaxed(&self) -> bool {
-        self.max_nodes_per_asn > 100 || !self.enable_geolocation_check
     }
 }
 
@@ -545,8 +448,11 @@ impl IPv4NodeID {
 }
 
 /// IP diversity enforcement system
+///
+/// Tracks per-IP and per-subnet counts to prevent Sybil attacks.
+/// Uses simple 2-tier limits: exact IP and subnet (/24 IPv4, /64 IPv6).
 #[derive(Debug)]
-pub struct IPDiversityEnforcer {
+pub struct BootstrapIpLimiter {
     config: IPDiversityConfig,
     /// Allow loopback addresses (127.0.0.1, ::1) to bypass diversity checks.
     ///
@@ -554,22 +460,15 @@ pub struct IPDiversityEnforcer {
     /// has a single source of truth in the owning component (`NodeConfig`,
     /// `BootstrapManager`, etc.) rather than being copied into every config.
     allow_loopback: bool,
-    // IPv6 tracking (LRU caches with max 50k entries to prevent memory DoS)
-    subnet_64_counts: LruCache<Ipv6Addr, usize>,
-    // IPv4 tracking (LRU caches with max 50k entries to prevent memory DoS)
-    #[allow(dead_code)]
-    ipv4_32_counts: LruCache<Ipv4Addr, usize>, // Per exact IP
-    #[allow(dead_code)]
-    ipv4_24_counts: LruCache<Ipv4Addr, usize>, // Per /24 subnet
-    // Shared tracking (LRU caches with max 50k entries to prevent memory DoS)
-    asn_counts: LruCache<u32, usize>,
-    country_counts: LruCache<String, usize>,
-    geo_provider: Option<Arc<dyn GeoProvider + Send + Sync>>,
+    /// Count of nodes per exact IP address
+    ip_counts: LruCache<IpAddr, usize>,
+    /// Count of nodes per subnet (/24 IPv4, /64 IPv6)
+    subnet_counts: LruCache<IpAddr, usize>,
 }
 
-#[allow(dead_code)]
-impl IPDiversityEnforcer {
+impl BootstrapIpLimiter {
     /// Create a new IP diversity enforcer with loopback disabled.
+    #[allow(dead_code)]
     pub fn new(config: IPDiversityConfig) -> Self {
         Self::with_loopback(config, false)
     }
@@ -579,110 +478,57 @@ impl IPDiversityEnforcer {
     /// `allow_loopback` should come from the single source of truth
     /// (e.g. `NodeConfig.allow_loopback`), not from the diversity config.
     pub fn with_loopback(config: IPDiversityConfig, allow_loopback: bool) -> Self {
-        let cache_size = NonZeroUsize::new(MAX_SUBNET_TRACKING).unwrap_or(NonZeroUsize::MIN);
+        let cache_size =
+            NonZeroUsize::new(BOOTSTRAP_MAX_TRACKED_SUBNETS).unwrap_or(NonZeroUsize::MIN);
         Self {
             config,
             allow_loopback,
-            // IPv6 (LRU caches with bounded size)
-            subnet_64_counts: LruCache::new(cache_size),
-            // IPv4 (LRU caches with bounded size)
-            ipv4_32_counts: LruCache::new(cache_size),
-            ipv4_24_counts: LruCache::new(cache_size),
-            // Shared (LRU caches with bounded size)
-            asn_counts: LruCache::new(cache_size),
-            country_counts: LruCache::new(cache_size),
-            geo_provider: None,
+            ip_counts: LruCache::new(cache_size),
+            subnet_counts: LruCache::new(cache_size),
         }
     }
 
-    /// Create a new IP diversity enforcer with a GeoIP/ASN provider
-    pub fn with_geo_provider(
-        config: IPDiversityConfig,
-        provider: Arc<dyn GeoProvider + Send + Sync>,
-    ) -> Self {
-        let mut s = Self::new(config);
-        s.geo_provider = Some(provider);
-        s
+    /// Mask an IP to its subnet prefix (/24 for IPv4, /64 for IPv6).
+    fn subnet_key(ip: IpAddr) -> IpAddr {
+        match ip {
+            IpAddr::V4(v4) => {
+                let o = v4.octets();
+                IpAddr::V4(Ipv4Addr::new(o[0], o[1], o[2], 0))
+            }
+            IpAddr::V6(v6) => {
+                let mut o = v6.octets();
+                // Zero out bytes 8-15 (host portion of /64)
+                for b in &mut o[8..] {
+                    *b = 0;
+                }
+                IpAddr::V6(Ipv6Addr::from(o))
+            }
+        }
     }
 
-    /// Analyze an IPv6 address for diversity enforcement
-    pub fn analyze_ip(&self, ipv6_addr: Ipv6Addr) -> Result<IPAnalysis> {
-        let subnet_64 = Self::extract_subnet_prefix(ipv6_addr, 64);
-        let subnet_48 = Self::extract_subnet_prefix(ipv6_addr, 48);
-        let subnet_32 = Self::extract_subnet_prefix(ipv6_addr, 32);
-
-        // GeoIP/ASN lookup via provider if available
-        let (asn, country, is_hosting_provider, is_vpn_provider) =
-            if let Some(p) = &self.geo_provider {
-                let info = p.lookup(ipv6_addr);
-                (
-                    info.asn,
-                    info.country,
-                    info.is_hosting_provider,
-                    info.is_vpn_provider,
-                )
-            } else {
-                (None, None, false, false)
-            };
-
-        // Default reputation for new IPs
-        let reputation_score = 0.5;
-
-        // Detect loopback: native ::1 or IPv4-mapped 127.0.0.0/8.
-        let is_loopback = ipv6_addr.is_loopback()
-            || ipv6_addr
-                .to_ipv4_mapped()
-                .is_some_and(|v4| v4.is_loopback());
-
-        Ok(IPAnalysis {
-            is_loopback,
-            subnet_64,
-            subnet_48,
-            subnet_32,
-            asn,
-            country,
-            is_hosting_provider,
-            is_vpn_provider,
-            reputation_score,
-        })
-    }
-
-    /// Check if a new node can be accepted based on IP diversity constraints
-    pub fn can_accept_node(&self, ip_analysis: &IPAnalysis) -> bool {
-        // Loopback addresses bypass diversity checks only when explicitly allowed.
-        if ip_analysis.is_loopback && self.allow_loopback {
+    /// Check if a new node with the given IP can be accepted under diversity limits.
+    pub fn can_accept(&self, ip: IpAddr) -> bool {
+        if ip.is_loopback() && self.allow_loopback {
             return true;
         }
 
-        // Resolve limits from config overrides or defaults
-        let base_64 = self
+        let ip_limit = self.config.max_per_ip.unwrap_or(BOOTSTRAP_DEFAULT_IP_LIMIT);
+        let subnet_limit = self
             .config
             .max_per_subnet
-            .unwrap_or(ENFORCER_DEFAULT_SUBNET_LIMIT);
+            .unwrap_or(BOOTSTRAP_DEFAULT_SUBNET_LIMIT);
 
-        // Determine limits based on hosting provider status
-        let (limit_64, limit_asn) =
-            if ip_analysis.is_hosting_provider || ip_analysis.is_vpn_provider {
-                // Stricter limits for hosting providers (halved)
-                (
-                    std::cmp::max(1, base_64 / 2),
-                    std::cmp::max(1, self.config.max_nodes_per_asn / 2),
-                )
-            } else {
-                (base_64, self.config.max_nodes_per_asn)
-            };
-
-        // Check /64 subnet limit (use peek() for read-only access)
-        if let Some(&count) = self.subnet_64_counts.peek(&ip_analysis.subnet_64)
-            && count >= limit_64
+        // Check exact IP limit
+        if let Some(&count) = self.ip_counts.peek(&ip)
+            && count >= ip_limit
         {
             return false;
         }
 
-        // Check ASN limit (use peek() for read-only access)
-        if let Some(asn) = ip_analysis.asn
-            && let Some(&count) = self.asn_counts.peek(&asn)
-            && count >= limit_asn
+        // Check subnet limit
+        let subnet = Self::subnet_key(ip);
+        if let Some(&count) = self.subnet_counts.peek(&subnet)
+            && count >= subnet_limit
         {
             return false;
         }
@@ -690,328 +536,46 @@ impl IPDiversityEnforcer {
         true
     }
 
-    /// Add a node to the diversity tracking
-    pub fn add_node(&mut self, ip_analysis: &IPAnalysis) -> Result<()> {
-        if !self.can_accept_node(ip_analysis) {
+    /// Track a new node's IP address in the diversity enforcer.
+    ///
+    /// Returns an error if the IP would exceed diversity limits.
+    pub fn track(&mut self, ip: IpAddr) -> Result<()> {
+        if !self.can_accept(ip) {
             return Err(anyhow!("IP diversity limits exceeded"));
         }
 
-        // Update counts (optimized: single hash lookup per cache)
-        let count_64 = self
-            .subnet_64_counts
-            .get(&ip_analysis.subnet_64)
-            .copied()
-            .unwrap_or(0)
-            + 1;
-        self.subnet_64_counts.put(ip_analysis.subnet_64, count_64);
+        let count = self.ip_counts.get(&ip).copied().unwrap_or(0) + 1;
+        self.ip_counts.put(ip, count);
 
-        if let Some(asn) = ip_analysis.asn {
-            let count = self.asn_counts.get(&asn).copied().unwrap_or(0) + 1;
-            self.asn_counts.put(asn, count);
-        }
-
-        if let Some(ref country) = ip_analysis.country {
-            let count = self.country_counts.get(country).copied().unwrap_or(0) + 1;
-            self.country_counts.put(country.clone(), count);
-        }
+        let subnet = Self::subnet_key(ip);
+        let count = self.subnet_counts.get(&subnet).copied().unwrap_or(0) + 1;
+        self.subnet_counts.put(subnet, count);
 
         Ok(())
     }
 
-    /// Remove a node from diversity tracking
-    pub fn remove_node(&mut self, ip_analysis: &IPAnalysis) {
-        // Optimized: pop removes and returns value in single hash operation
-        if let Some(count) = self.subnet_64_counts.pop(&ip_analysis.subnet_64) {
-            let new_count = count.saturating_sub(1);
-            if new_count > 0 {
-                self.subnet_64_counts.put(ip_analysis.subnet_64, new_count);
+    /// Remove a tracked IP address from the diversity enforcer.
+    #[allow(dead_code)]
+    pub fn untrack(&mut self, ip: IpAddr) {
+        if let Some(count) = self.ip_counts.pop(&ip) {
+            let new = count.saturating_sub(1);
+            if new > 0 {
+                self.ip_counts.put(ip, new);
             }
         }
 
-        if let Some(asn) = ip_analysis.asn
-            && let Some(count) = self.asn_counts.pop(&asn)
-        {
-            let new_count = count.saturating_sub(1);
-            if new_count > 0 {
-                self.asn_counts.put(asn, new_count);
-            }
-        }
-
-        if let Some(ref country) = ip_analysis.country
-            && let Some(count) = self.country_counts.pop(country)
-        {
-            let new_count = count.saturating_sub(1);
-            if new_count > 0 {
-                self.country_counts.put(country.clone(), new_count);
-            }
-        }
-    }
-
-    /// Extract network prefix of specified length from IPv6 address
-    pub fn extract_subnet_prefix(addr: Ipv6Addr, prefix_len: u8) -> Ipv6Addr {
-        let octets = addr.octets();
-        let mut subnet = [0u8; 16];
-
-        let bytes_to_copy = (prefix_len / 8) as usize;
-        let remaining_bits = prefix_len % 8;
-
-        // Copy full bytes
-        if bytes_to_copy < 16 {
-            subnet[..bytes_to_copy].copy_from_slice(&octets[..bytes_to_copy]);
-        } else {
-            subnet.copy_from_slice(&octets);
-        }
-
-        // Handle partial byte
-        if remaining_bits > 0 && bytes_to_copy < 16 {
-            let mask = 0xFF << (8 - remaining_bits);
-            subnet[bytes_to_copy] = octets[bytes_to_copy] & mask;
-        }
-
-        Ipv6Addr::from(subnet)
-    }
-
-    /// Get diversity statistics
-    pub fn get_diversity_stats(&self) -> DiversityStats {
-        // LRU cache API: use iter() instead of values()
-        let max_nodes_per_ipv6_64 = self
-            .subnet_64_counts
-            .iter()
-            .map(|(_, &v)| v)
-            .max()
-            .unwrap_or(0);
-        let max_nodes_per_ipv4_32 = self
-            .ipv4_32_counts
-            .iter()
-            .map(|(_, &v)| v)
-            .max()
-            .unwrap_or(0);
-        let max_nodes_per_ipv4_24 = self
-            .ipv4_24_counts
-            .iter()
-            .map(|(_, &v)| v)
-            .max()
-            .unwrap_or(0);
-
-        DiversityStats {
-            total_64_subnets: self.subnet_64_counts.len(),
-            total_asns: self.asn_counts.len(),
-            total_countries: self.country_counts.len(),
-            max_nodes_per_ipv6_64,
-            // IPv4 stats
-            total_ipv4_32: self.ipv4_32_counts.len(),
-            total_ipv4_24_subnets: self.ipv4_24_counts.len(),
-            max_nodes_per_ipv4_32,
-            max_nodes_per_ipv4_24,
-        }
-    }
-
-    // === IPv4 Methods ===
-
-    /// Extract /24 subnet from IPv4 address
-    fn extract_ipv4_subnet_24(addr: Ipv4Addr) -> Ipv4Addr {
-        let octets = addr.octets();
-        Ipv4Addr::new(octets[0], octets[1], octets[2], 0)
-    }
-
-    /// Extract /16 subnet from IPv4 address
-    fn extract_ipv4_subnet_16(addr: Ipv4Addr) -> Ipv4Addr {
-        let octets = addr.octets();
-        Ipv4Addr::new(octets[0], octets[1], 0, 0)
-    }
-
-    /// Extract /8 subnet from IPv4 address
-    fn extract_ipv4_subnet_8(addr: Ipv4Addr) -> Ipv4Addr {
-        let octets = addr.octets();
-        Ipv4Addr::new(octets[0], 0, 0, 0)
-    }
-
-    /// Analyze an IPv4 address for diversity enforcement
-    pub fn analyze_ipv4(&self, ipv4_addr: Ipv4Addr) -> Result<IPv4Analysis> {
-        let subnet_24 = Self::extract_ipv4_subnet_24(ipv4_addr);
-        let subnet_16 = Self::extract_ipv4_subnet_16(ipv4_addr);
-        let subnet_8 = Self::extract_ipv4_subnet_8(ipv4_addr);
-
-        // For IPv4, we don't have GeoIP lookup yet (would need IPv4 support in GeoProvider)
-        // Using defaults for now
-        let asn = None;
-        let country = None;
-        let is_hosting_provider = false;
-        let is_vpn_provider = false;
-        let reputation_score = 0.5;
-
-        Ok(IPv4Analysis {
-            ip_addr: ipv4_addr,
-            subnet_24,
-            subnet_16,
-            subnet_8,
-            asn,
-            country,
-            is_hosting_provider,
-            is_vpn_provider,
-            reputation_score,
-        })
-    }
-
-    /// Analyze any IP address (IPv4 or IPv6) for diversity enforcement
-    pub fn analyze_unified(&self, addr: std::net::IpAddr) -> Result<UnifiedIPAnalysis> {
-        match addr {
-            std::net::IpAddr::V4(ipv4) => {
-                let analysis = self.analyze_ipv4(ipv4)?;
-                Ok(UnifiedIPAnalysis::IPv4(analysis))
-            }
-            std::net::IpAddr::V6(ipv6) => {
-                let analysis = self.analyze_ip(ipv6)?;
-                Ok(UnifiedIPAnalysis::IPv6(analysis))
-            }
-        }
-    }
-
-    /// Check if a node can be accepted based on unified IP diversity constraints
-    pub fn can_accept_unified(&self, analysis: &UnifiedIPAnalysis) -> bool {
-        match analysis {
-            UnifiedIPAnalysis::IPv4(ipv4_analysis) => self.can_accept_ipv4(ipv4_analysis),
-            UnifiedIPAnalysis::IPv6(ipv6_analysis) => self.can_accept_node(ipv6_analysis),
-        }
-    }
-
-    /// Check if an IPv4 node can be accepted based on diversity constraints
-    fn can_accept_ipv4(&self, analysis: &IPv4Analysis) -> bool {
-        // Loopback addresses bypass diversity checks only when explicitly allowed.
-        if analysis.ip_addr.is_loopback() && self.allow_loopback {
-            return true;
-        }
-
-        // Resolve limits from config overrides or defaults
-        let base_32 = self.config.max_per_ip.unwrap_or(ENFORCER_DEFAULT_IP_LIMIT);
-        let base_24 = self
-            .config
-            .max_per_subnet
-            .unwrap_or(ENFORCER_DEFAULT_SUBNET_LIMIT);
-
-        // Apply stricter limits for hosting/VPN providers
-        let (limit_32, limit_24) = if analysis.is_hosting_provider || analysis.is_vpn_provider {
-            (std::cmp::max(1, base_32 / 2), std::cmp::max(1, base_24 / 2))
-        } else {
-            (base_32, base_24)
-        };
-
-        // Check /32 (exact IP) limit (use peek() for read-only access)
-        if let Some(&count) = self.ipv4_32_counts.peek(&analysis.ip_addr)
-            && count >= limit_32
-        {
-            return false;
-        }
-
-        // Check /24 subnet limit (use peek() for read-only access)
-        if let Some(&count) = self.ipv4_24_counts.peek(&analysis.subnet_24)
-            && count >= limit_24
-        {
-            return false;
-        }
-
-        // Check ASN limit (shared with IPv6, use peek() for read-only access)
-        if let Some(asn) = analysis.asn
-            && let Some(&count) = self.asn_counts.peek(&asn)
-            && count >= self.config.max_nodes_per_asn
-        {
-            return false;
-        }
-
-        true
-    }
-
-    /// Add a unified node to the diversity tracking
-    pub fn add_unified(&mut self, analysis: &UnifiedIPAnalysis) -> Result<()> {
-        match analysis {
-            UnifiedIPAnalysis::IPv4(ipv4_analysis) => self.add_ipv4(ipv4_analysis),
-            UnifiedIPAnalysis::IPv6(ipv6_analysis) => self.add_node(ipv6_analysis),
-        }
-    }
-
-    /// Add an IPv4 node to diversity tracking
-    fn add_ipv4(&mut self, analysis: &IPv4Analysis) -> Result<()> {
-        if !self.can_accept_ipv4(analysis) {
-            return Err(anyhow!("IPv4 diversity limits exceeded"));
-        }
-
-        // Update counts (optimized: single hash lookup per cache)
-        let count_32 = self
-            .ipv4_32_counts
-            .get(&analysis.ip_addr)
-            .copied()
-            .unwrap_or(0)
-            + 1;
-        self.ipv4_32_counts.put(analysis.ip_addr, count_32);
-
-        let count_24 = self
-            .ipv4_24_counts
-            .get(&analysis.subnet_24)
-            .copied()
-            .unwrap_or(0)
-            + 1;
-        self.ipv4_24_counts.put(analysis.subnet_24, count_24);
-
-        if let Some(asn) = analysis.asn {
-            let count = self.asn_counts.get(&asn).copied().unwrap_or(0) + 1;
-            self.asn_counts.put(asn, count);
-        }
-
-        if let Some(ref country) = analysis.country {
-            let count = self.country_counts.get(country).copied().unwrap_or(0) + 1;
-            self.country_counts.put(country.clone(), count);
-        }
-
-        Ok(())
-    }
-
-    /// Remove a unified node from diversity tracking
-    pub fn remove_unified(&mut self, analysis: &UnifiedIPAnalysis) {
-        match analysis {
-            UnifiedIPAnalysis::IPv4(ipv4_analysis) => self.remove_ipv4(ipv4_analysis),
-            UnifiedIPAnalysis::IPv6(ipv6_analysis) => self.remove_node(ipv6_analysis),
-        }
-    }
-
-    /// Remove an IPv4 node from diversity tracking
-    fn remove_ipv4(&mut self, analysis: &IPv4Analysis) {
-        // Optimized: pop removes and returns value in single hash operation
-        if let Some(count) = self.ipv4_32_counts.pop(&analysis.ip_addr) {
-            let new_count = count.saturating_sub(1);
-            if new_count > 0 {
-                self.ipv4_32_counts.put(analysis.ip_addr, new_count);
-            }
-        }
-
-        if let Some(count) = self.ipv4_24_counts.pop(&analysis.subnet_24) {
-            let new_count = count.saturating_sub(1);
-            if new_count > 0 {
-                self.ipv4_24_counts.put(analysis.subnet_24, new_count);
-            }
-        }
-
-        if let Some(asn) = analysis.asn
-            && let Some(count) = self.asn_counts.pop(&asn)
-        {
-            let new_count = count.saturating_sub(1);
-            if new_count > 0 {
-                self.asn_counts.put(asn, new_count);
-            }
-        }
-
-        if let Some(ref country) = analysis.country
-            && let Some(count) = self.country_counts.pop(country)
-        {
-            let new_count = count.saturating_sub(1);
-            if new_count > 0 {
-                self.country_counts.put(country.clone(), new_count);
+        let subnet = Self::subnet_key(ip);
+        if let Some(count) = self.subnet_counts.pop(&subnet) {
+            let new = count.saturating_sub(1);
+            if new > 0 {
+                self.subnet_counts.put(subnet, new);
             }
         }
     }
 }
 
 #[cfg(test)]
-impl IPDiversityEnforcer {
+impl BootstrapIpLimiter {
     #[allow(dead_code)]
     pub fn config(&self) -> &IPDiversityConfig {
         &self.config
@@ -1019,12 +583,14 @@ impl IPDiversityEnforcer {
 }
 
 /// GeoIP/ASN provider trait
+#[allow(dead_code)]
 pub trait GeoProvider: std::fmt::Debug {
     fn lookup(&self, ip: Ipv6Addr) -> GeoInfo;
 }
 
 /// Geo information
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct GeoInfo {
     pub asn: Option<u32>,
     pub country: Option<String>,
@@ -1061,48 +627,6 @@ impl<P: GeoProvider> GeoProvider for CachedGeoProvider<P> {
     }
 }
 
-/// Stub provider returning no ASN/GeoIP info
-#[derive(Debug)]
-#[allow(dead_code)]
-pub struct StubGeoProvider;
-impl GeoProvider for StubGeoProvider {
-    fn lookup(&self, _ip: Ipv6Addr) -> GeoInfo {
-        GeoInfo {
-            asn: None,
-            country: None,
-            is_hosting_provider: false,
-            is_vpn_provider: false,
-        }
-    }
-}
-
-/// Diversity statistics for monitoring
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[allow(dead_code)]
-pub struct DiversityStats {
-    // === IPv6 stats ===
-    /// Number of unique /64 subnets represented
-    pub total_64_subnets: usize,
-    /// Maximum nodes in any single /64 subnet
-    pub max_nodes_per_ipv6_64: usize,
-
-    // === IPv4 stats ===
-    /// Number of unique IPv4 addresses (/32)
-    pub total_ipv4_32: usize,
-    /// Number of unique /24 subnets represented
-    pub total_ipv4_24_subnets: usize,
-    /// Maximum nodes from any single IPv4 address
-    pub max_nodes_per_ipv4_32: usize,
-    /// Maximum nodes in any single /24 subnet
-    pub max_nodes_per_ipv4_24: usize,
-
-    // === Shared stats ===
-    /// Number of unique ASNs represented
-    pub total_asns: usize,
-    /// Number of unique countries represented
-    pub total_countries: usize,
-}
-
 // Ed25519 compatibility removed
 
 #[cfg(test)]
@@ -1118,18 +642,6 @@ mod tests {
         Ipv6Addr::new(
             0x2001, 0xdb8, 0x85a3, 0x0000, 0x0000, 0x8a2e, 0x0370, 0x7334,
         )
-    }
-
-    fn create_test_diversity_config() -> IPDiversityConfig {
-        IPDiversityConfig {
-            // IPv6 /64 limit = 1 for the enforcer tests
-            max_per_ip: None,
-            max_per_subnet: Some(1),
-            // ASN and GeoIP
-            max_nodes_per_asn: 20,
-            enable_geolocation_check: true,
-            min_geographic_diversity: 3,
-        }
     }
 
     #[test]
@@ -1351,216 +863,167 @@ mod tests {
 
         assert!(config.max_per_ip.is_none());
         assert!(config.max_per_subnet.is_none());
-        assert_eq!(config.max_nodes_per_asn, 20);
-        assert!(config.enable_geolocation_check);
-        assert_eq!(config.min_geographic_diversity, 3);
     }
 
     #[test]
-    fn test_ip_diversity_enforcer_creation() {
-        let config = create_test_diversity_config();
-        let enforcer = IPDiversityEnforcer::with_loopback(config.clone(), true);
+    fn test_bootstrap_ip_limiter_creation() {
+        let config = IPDiversityConfig {
+            max_per_ip: None,
+            max_per_subnet: Some(1),
+        };
+        let enforcer = BootstrapIpLimiter::with_loopback(config.clone(), true);
 
         assert_eq!(enforcer.config.max_per_subnet, config.max_per_subnet);
-        assert_eq!(enforcer.subnet_64_counts.len(), 0);
     }
 
     #[test]
-    fn test_ip_analysis() -> Result<()> {
-        let config = create_test_diversity_config();
-        let enforcer = IPDiversityEnforcer::new(config);
+    fn test_can_accept_basic() {
+        let config = IPDiversityConfig::default();
+        let enforcer = BootstrapIpLimiter::new(config);
 
-        let ipv6_addr = create_test_ipv6();
-        let analysis = enforcer.analyze_ip(ipv6_addr)?;
-
-        assert_eq!(
-            analysis.subnet_64,
-            IPDiversityEnforcer::extract_subnet_prefix(ipv6_addr, 64)
-        );
-        assert_eq!(
-            analysis.subnet_48,
-            IPDiversityEnforcer::extract_subnet_prefix(ipv6_addr, 48)
-        );
-        assert_eq!(
-            analysis.subnet_32,
-            IPDiversityEnforcer::extract_subnet_prefix(ipv6_addr, 32)
-        );
-        assert!(analysis.asn.is_none()); // Not implemented in test
-        assert!(analysis.country.is_none()); // Not implemented in test
-        assert!(!analysis.is_hosting_provider);
-        assert!(!analysis.is_vpn_provider);
-        assert_eq!(analysis.reputation_score, 0.5);
-
-        Ok(())
+        let ip: IpAddr = "192.168.1.1".parse().unwrap();
+        assert!(enforcer.can_accept(ip));
     }
 
     #[test]
-    fn test_can_accept_node_basic() -> Result<()> {
-        let config = create_test_diversity_config();
-        let enforcer = IPDiversityEnforcer::new(config);
+    fn test_ip_limit_enforcement() {
+        let config = IPDiversityConfig {
+            max_per_ip: Some(1),
+            max_per_subnet: Some(usize::MAX),
+        };
+        let mut enforcer = BootstrapIpLimiter::new(config);
 
-        let ipv6_addr = create_test_ipv6();
-        let analysis = enforcer.analyze_ip(ipv6_addr)?;
-
-        // Should accept first node
-        assert!(enforcer.can_accept_node(&analysis));
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_add_and_remove_node() -> Result<()> {
-        let config = create_test_diversity_config();
-        let mut enforcer = IPDiversityEnforcer::new(config);
-
-        let ipv6_addr = create_test_ipv6();
-        let analysis = enforcer.analyze_ip(ipv6_addr)?;
-
-        // Add node
-        enforcer.add_node(&analysis)?;
-        assert_eq!(enforcer.subnet_64_counts.get(&analysis.subnet_64), Some(&1));
-
-        // Remove node
-        enforcer.remove_node(&analysis);
-        assert_eq!(enforcer.subnet_64_counts.get(&analysis.subnet_64), None);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_diversity_limits_enforcement() -> Result<()> {
-        let config = create_test_diversity_config();
-        let mut enforcer = IPDiversityEnforcer::new(config);
-
-        let ipv6_addr1 = Ipv6Addr::new(
-            0x2001, 0xdb8, 0x85a3, 0x1234, 0x5678, 0x8a2e, 0x0370, 0x7334,
-        );
-        let ipv6_addr2 = Ipv6Addr::new(
-            0x2001, 0xdb8, 0x85a3, 0x1234, 0x5678, 0x8a2e, 0x0370, 0x7335,
-        ); // Same /64
-
-        let analysis1 = enforcer.analyze_ip(ipv6_addr1)?;
-        let analysis2 = enforcer.analyze_ip(ipv6_addr2)?;
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
 
         // First node should be accepted
-        assert!(enforcer.can_accept_node(&analysis1));
-        enforcer.add_node(&analysis1)?;
+        assert!(enforcer.can_accept(ip));
+        enforcer.track(ip).unwrap();
 
-        // Second node in same /64 should be rejected (max_nodes_per_ipv6_64 = 1)
-        assert!(!enforcer.can_accept_node(&analysis2));
-
-        // But adding should fail
-        let result = enforcer.add_node(&analysis2);
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("IP diversity limits exceeded")
-        );
-
-        Ok(())
+        // Second node with same IP should be rejected
+        assert!(!enforcer.can_accept(ip));
+        assert!(enforcer.track(ip).is_err());
     }
 
     #[test]
-    fn test_hosting_provider_stricter_limits() -> Result<()> {
+    fn test_subnet_limit_enforcement_ipv4() {
         let config = IPDiversityConfig {
-            max_per_subnet: Some(4), // Set higher limit for regular nodes
-            ..create_test_diversity_config()
+            max_per_ip: Some(usize::MAX),
+            max_per_subnet: Some(2),
         };
-        let mut enforcer = IPDiversityEnforcer::new(config);
+        let mut enforcer = BootstrapIpLimiter::new(config);
 
-        let ipv6_addr = create_test_ipv6();
-        let mut analysis = enforcer.analyze_ip(ipv6_addr)?;
-        analysis.is_hosting_provider = true;
+        // Two IPs in same /24 subnet
+        let ip1: IpAddr = "10.0.1.1".parse().unwrap();
+        let ip2: IpAddr = "10.0.1.2".parse().unwrap();
+        let ip3: IpAddr = "10.0.1.3".parse().unwrap();
 
-        // Should accept first hosting provider node
-        assert!(enforcer.can_accept_node(&analysis));
-        enforcer.add_node(&analysis)?;
+        enforcer.track(ip1).unwrap();
+        enforcer.track(ip2).unwrap();
 
-        // Add second hosting provider node in same /64 (should be accepted with limit=2)
-        let ipv6_addr2 = Ipv6Addr::new(
-            0x2001, 0xdb8, 0x85a3, 0x0000, 0x0000, 0x8a2e, 0x0370, 0x7335,
-        );
-        let mut analysis2 = enforcer.analyze_ip(ipv6_addr2)?;
-        analysis2.is_hosting_provider = true;
-        analysis2.subnet_64 = analysis.subnet_64; // Force same subnet
+        // Third in same /24 should be rejected
+        assert!(!enforcer.can_accept(ip3));
+        assert!(enforcer.track(ip3).is_err());
 
-        assert!(enforcer.can_accept_node(&analysis2));
-        enforcer.add_node(&analysis2)?;
-
-        // Should reject third hosting provider node in same /64 (exceeds limit=2)
-        let ipv6_addr3 = Ipv6Addr::new(
-            0x2001, 0xdb8, 0x85a3, 0x0000, 0x0000, 0x8a2e, 0x0370, 0x7336,
-        );
-        let mut analysis3 = enforcer.analyze_ip(ipv6_addr3)?;
-        analysis3.is_hosting_provider = true;
-        analysis3.subnet_64 = analysis.subnet_64; // Force same subnet
-
-        assert!(!enforcer.can_accept_node(&analysis3));
-
-        Ok(())
+        // Different /24 should still be accepted
+        let ip_other: IpAddr = "10.0.2.1".parse().unwrap();
+        assert!(enforcer.can_accept(ip_other));
     }
 
     #[test]
-    fn test_diversity_stats() -> Result<()> {
-        let config = create_test_diversity_config();
-        let mut enforcer = IPDiversityEnforcer::new(config);
+    fn test_subnet_limit_enforcement_ipv6() {
+        let config = IPDiversityConfig {
+            max_per_ip: Some(usize::MAX),
+            max_per_subnet: Some(1),
+        };
+        let mut enforcer = BootstrapIpLimiter::new(config);
 
-        // Add some nodes with different subnets
-        let addresses = [
-            Ipv6Addr::new(
-                0x2001, 0xdb8, 0x85a3, 0x1234, 0x5678, 0x8a2e, 0x0370, 0x7334,
-            ),
-            Ipv6Addr::new(
-                0x2001, 0xdb8, 0x85a4, 0x1234, 0x5678, 0x8a2e, 0x0370, 0x7334,
-            ), // Different /48
-            Ipv6Addr::new(
-                0x2002, 0xdb8, 0x85a3, 0x1234, 0x5678, 0x8a2e, 0x0370, 0x7334,
-            ), // Different /32
-        ];
+        // Two IPs in same /64 subnet
+        let ip1: IpAddr = "2001:db8:85a3:1234::1".parse().unwrap();
+        let ip2: IpAddr = "2001:db8:85a3:1234::2".parse().unwrap();
 
-        for addr in addresses {
-            let analysis = enforcer.analyze_ip(addr)?;
-            enforcer.add_node(&analysis)?;
-        }
+        enforcer.track(ip1).unwrap();
 
-        let stats = enforcer.get_diversity_stats();
-        assert_eq!(stats.total_64_subnets, 3);
-        assert_eq!(stats.max_nodes_per_ipv6_64, 1);
+        // Second in same /64 should be rejected
+        assert!(!enforcer.can_accept(ip2));
 
-        Ok(())
+        // Different /64 should be accepted
+        let ip_other: IpAddr = "2001:db8:85a3:5678::1".parse().unwrap();
+        assert!(enforcer.can_accept(ip_other));
     }
 
     #[test]
-    fn test_extract_subnet_prefix() {
-        let addr = Ipv6Addr::new(
-            0x2001, 0xdb8, 0x85a3, 0x1234, 0x5678, 0x8a2e, 0x0370, 0x7334,
-        );
+    fn test_track_and_untrack() {
+        let config = IPDiversityConfig {
+            max_per_ip: Some(1),
+            max_per_subnet: Some(usize::MAX),
+        };
+        let mut enforcer = BootstrapIpLimiter::new(config);
 
-        // Test /64 prefix
-        let prefix_64 = IPDiversityEnforcer::extract_subnet_prefix(addr, 64);
-        let expected_64 = Ipv6Addr::new(0x2001, 0xdb8, 0x85a3, 0x1234, 0, 0, 0, 0);
-        assert_eq!(prefix_64, expected_64);
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
 
-        // Test /48 prefix
-        let prefix_48 = IPDiversityEnforcer::extract_subnet_prefix(addr, 48);
-        let expected_48 = Ipv6Addr::new(0x2001, 0xdb8, 0x85a3, 0, 0, 0, 0, 0);
-        assert_eq!(prefix_48, expected_48);
+        // Track
+        enforcer.track(ip).unwrap();
+        assert!(!enforcer.can_accept(ip));
 
-        // Test /32 prefix
-        let prefix_32 = IPDiversityEnforcer::extract_subnet_prefix(addr, 32);
-        let expected_32 = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0);
-        assert_eq!(prefix_32, expected_32);
+        // Untrack
+        enforcer.untrack(ip);
+        assert!(enforcer.can_accept(ip));
 
-        // Test /56 prefix (partial byte)
-        let prefix_56 = IPDiversityEnforcer::extract_subnet_prefix(addr, 56);
-        let expected_56 = Ipv6Addr::new(0x2001, 0xdb8, 0x85a3, 0x1200, 0, 0, 0, 0);
-        assert_eq!(prefix_56, expected_56);
+        // Can track again after untrack
+        enforcer.track(ip).unwrap();
+        assert!(!enforcer.can_accept(ip));
+    }
 
-        // Test /128 prefix (full address)
-        let prefix_128 = IPDiversityEnforcer::extract_subnet_prefix(addr, 128);
-        assert_eq!(prefix_128, addr);
+    #[test]
+    fn test_loopback_bypass() {
+        let config = IPDiversityConfig {
+            max_per_ip: Some(1),
+            max_per_subnet: Some(1),
+        };
+
+        // With loopback enabled
+        let enforcer = BootstrapIpLimiter::with_loopback(config.clone(), true);
+        let loopback_v4: IpAddr = "127.0.0.1".parse().unwrap();
+        let loopback_v6: IpAddr = "::1".parse().unwrap();
+        assert!(enforcer.can_accept(loopback_v4));
+        assert!(enforcer.can_accept(loopback_v6));
+
+        // With loopback disabled (default)
+        let mut enforcer_no_lb = BootstrapIpLimiter::new(config);
+        enforcer_no_lb.track(loopback_v4).unwrap();
+        // After tracking once, should be rejected (limit=1)
+        assert!(!enforcer_no_lb.can_accept(loopback_v4));
+    }
+
+    #[test]
+    fn test_subnet_key_ipv4() {
+        let ip: IpAddr = "192.168.42.100".parse().unwrap();
+        let subnet = BootstrapIpLimiter::subnet_key(ip);
+        let expected: IpAddr = "192.168.42.0".parse().unwrap();
+        assert_eq!(subnet, expected);
+    }
+
+    #[test]
+    fn test_subnet_key_ipv6() {
+        let ip: IpAddr = "2001:db8:85a3:1234:5678:8a2e:0370:7334".parse().unwrap();
+        let subnet = BootstrapIpLimiter::subnet_key(ip);
+        let expected: IpAddr = "2001:db8:85a3:1234::".parse().unwrap();
+        assert_eq!(subnet, expected);
+    }
+
+    #[test]
+    fn test_default_limits_are_two() {
+        let config = IPDiversityConfig::default();
+        let mut enforcer = BootstrapIpLimiter::new(config);
+
+        let ip1: IpAddr = "10.0.0.1".parse().unwrap();
+
+        // Default IP limit is 2, so two tracks should succeed
+        enforcer.track(ip1).unwrap();
+        enforcer.track(ip1).unwrap();
+
+        // Third should fail
+        assert!(!enforcer.can_accept(ip1));
     }
 
     #[test]
@@ -1577,111 +1040,5 @@ mod tests {
 
         // Verify the signature
         assert!(ml_dsa_verify(&public_key, message, &signature).is_ok());
-    }
-
-    #[test]
-    fn test_ip_analysis_structure() {
-        let analysis = IPAnalysis {
-            is_loopback: false,
-            subnet_64: Ipv6Addr::new(0x2001, 0xdb8, 0x85a3, 0x1234, 0, 0, 0, 0),
-            subnet_48: Ipv6Addr::new(0x2001, 0xdb8, 0x85a3, 0, 0, 0, 0, 0),
-            subnet_32: Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0),
-            asn: Some(64512),
-            country: Some("US".to_string()),
-            is_hosting_provider: true,
-            is_vpn_provider: false,
-            reputation_score: 0.75,
-        };
-
-        assert_eq!(analysis.asn, Some(64512));
-        assert_eq!(analysis.country, Some("US".to_string()));
-        assert!(analysis.is_hosting_provider);
-        assert!(!analysis.is_vpn_provider);
-        assert_eq!(analysis.reputation_score, 0.75);
-    }
-
-    #[test]
-    fn test_diversity_stats_structure() {
-        let stats = DiversityStats {
-            // IPv6 stats
-            total_64_subnets: 100,
-            max_nodes_per_ipv6_64: 1,
-            // IPv4 stats
-            total_ipv4_32: 80,
-            total_ipv4_24_subnets: 40,
-            max_nodes_per_ipv4_32: 1,
-            max_nodes_per_ipv4_24: 3,
-            // Shared stats
-            total_asns: 15,
-            total_countries: 8,
-        };
-
-        // IPv6 assertions
-        assert_eq!(stats.total_64_subnets, 100);
-        assert_eq!(stats.max_nodes_per_ipv6_64, 1);
-        // IPv4 assertions
-        assert_eq!(stats.total_ipv4_32, 80);
-        assert_eq!(stats.total_ipv4_24_subnets, 40);
-        assert_eq!(stats.max_nodes_per_ipv4_32, 1);
-        assert_eq!(stats.max_nodes_per_ipv4_24, 3);
-        // Shared assertions
-        assert_eq!(stats.total_asns, 15);
-        assert_eq!(stats.total_countries, 8);
-    }
-
-    #[test]
-    fn test_multiple_same_subnet_nodes() -> Result<()> {
-        let config = IPDiversityConfig {
-            max_per_subnet: Some(3), // Allow more nodes in same /64
-            ..create_test_diversity_config()
-        };
-        let mut enforcer = IPDiversityEnforcer::new(config);
-
-        let _base_addr = Ipv6Addr::new(
-            0x2001, 0xdb8, 0x85a3, 0x1234, 0x5678, 0x8a2e, 0x0370, 0x0000,
-        );
-
-        // Add 3 nodes in same /64 subnet
-        for i in 1..=3 {
-            let addr = Ipv6Addr::new(0x2001, 0xdb8, 0x85a3, 0x1234, 0x5678, 0x8a2e, 0x0370, i);
-            let analysis = enforcer.analyze_ip(addr)?;
-            assert!(enforcer.can_accept_node(&analysis));
-            enforcer.add_node(&analysis)?;
-        }
-
-        // 4th node should be rejected
-        let addr4 = Ipv6Addr::new(0x2001, 0xdb8, 0x85a3, 0x1234, 0x5678, 0x8a2e, 0x0370, 4);
-        let analysis4 = enforcer.analyze_ip(addr4)?;
-        assert!(!enforcer.can_accept_node(&analysis4));
-
-        let stats = enforcer.get_diversity_stats();
-        assert_eq!(stats.total_64_subnets, 1);
-        assert_eq!(stats.max_nodes_per_ipv6_64, 3);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_asn_and_country_tracking() -> Result<()> {
-        let config = create_test_diversity_config();
-        let mut enforcer = IPDiversityEnforcer::new(config);
-
-        // Create analysis with ASN and country
-        let ipv6_addr = create_test_ipv6();
-        let mut analysis = enforcer.analyze_ip(ipv6_addr)?;
-        analysis.asn = Some(64512);
-        analysis.country = Some("US".to_string());
-
-        enforcer.add_node(&analysis)?;
-
-        assert_eq!(enforcer.asn_counts.get(&64512), Some(&1));
-        assert_eq!(enforcer.country_counts.get("US"), Some(&1));
-
-        // Remove and check cleanup
-        enforcer.remove_node(&analysis);
-        assert!(!enforcer.asn_counts.contains(&64512));
-        assert!(!enforcer.country_counts.contains("US"));
-
-        Ok(())
     }
 }

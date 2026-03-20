@@ -282,6 +282,7 @@ impl BgpGeoProvider {
     }
 
     /// Look up ASN for an IPv4 address
+    #[allow(dead_code)]
     pub fn lookup_ipv4_asn(&self, ip: Ipv4Addr) -> Option<u32> {
         let ip_u32 = u32::from(ip);
         let prefixes = self.ipv4_prefixes.read();
@@ -296,6 +297,7 @@ impl BgpGeoProvider {
     }
 
     /// Look up ASN for an IPv6 address
+    #[allow(dead_code)]
     pub fn lookup_ipv6_asn(&self, ip: Ipv6Addr) -> Option<u32> {
         // Check if this is an IPv4-mapped address
         if let Some(ipv4) = ip.to_ipv4_mapped() {
@@ -322,6 +324,7 @@ impl BgpGeoProvider {
     }
 
     /// Get country for an ASN
+    #[allow(dead_code)]
     pub fn get_asn_country(&self, asn: u32) -> Option<String> {
         self.asn_info
             .read()
@@ -330,11 +333,13 @@ impl BgpGeoProvider {
     }
 
     /// Check if ASN is a known hosting provider
+    #[allow(dead_code)]
     pub fn is_hosting_asn(&self, asn: u32) -> bool {
         self.hosting_asns.read().contains(&asn)
     }
 
     /// Check if ASN is a known VPN provider
+    #[allow(dead_code)]
     pub fn is_vpn_asn(&self, asn: u32) -> bool {
         self.vpn_asns.read().contains(&asn)
     }
@@ -434,6 +439,7 @@ impl Ipv4Prefix {
 
 impl Ipv6Prefix {
     /// Check if an IPv6 address matches this prefix
+    #[allow(dead_code)]
     pub fn matches(&self, high: u64, low: u64) -> bool {
         if self.prefix_len == 0 {
             return true;

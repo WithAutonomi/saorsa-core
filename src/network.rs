@@ -1832,8 +1832,9 @@ mod diversity_tests {
         };
 
         let manager = build_bootstrap_manager_like_prod(&config).await;
-        assert!(manager.diversity_config().is_relaxed());
-        assert_eq!(manager.diversity_config().max_nodes_per_asn, 5000);
+        // Verify testnet config has permissive IP limits
+        assert_eq!(manager.diversity_config().max_per_ip, Some(usize::MAX));
+        assert_eq!(manager.diversity_config().max_per_subnet, Some(usize::MAX));
     }
 }
 
