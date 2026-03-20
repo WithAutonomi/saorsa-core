@@ -534,18 +534,8 @@ mod tests {
         // Very restrictive rate limiting - only 2 joins per /24 subnet per hour
         // Use permissive diversity config to isolate rate limiting behavior
         let diversity_config = IPDiversityConfig {
-            max_nodes_per_ipv6_64: 100,
-            max_nodes_per_ipv6_48: 100,
-            max_nodes_per_ipv6_32: 100,
-            max_nodes_per_ipv4_32: None, // No static cap for rate limit test
-            max_nodes_per_ipv4_24: None,
-            max_nodes_per_ipv4_16: None,
-            ipv4_limit_floor: None,
-            ipv4_limit_ceiling: None,
-            ipv6_limit_floor: None,
-            ipv6_limit_ceiling: None,
-            max_per_ip_cap: 100,
-            max_network_fraction: 1.0,
+            max_per_ip: Some(usize::MAX),
+            max_per_subnet: Some(usize::MAX),
             max_nodes_per_asn: 1000,
             enable_geolocation_check: false,
             min_geographic_diversity: 0,

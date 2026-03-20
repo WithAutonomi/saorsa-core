@@ -15,6 +15,12 @@
 //!
 //! Provides region-based routing optimization for improved P2P network performance
 //! across different geographic areas with latency and reliability considerations.
+//!
+//! **Note:** The first-octet IP heuristics in `GeographicRegion::from_ip` are
+//! known to be inaccurate. This module is retained for future real GeoIP
+//! integration but is not currently wired into the routing table.
+
+#![allow(dead_code)]
 
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;

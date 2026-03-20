@@ -5,7 +5,6 @@
 
 use crate::PeerId;
 use crate::address::MultiAddr;
-use crate::dht::geographic_routing::GeographicRegion;
 use crate::security::IPDiversityConfig;
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
@@ -260,6 +259,7 @@ impl KademliaRoutingTable {
     }
 
     /// Iterate over every node in the routing table.
+    #[allow(dead_code)]
     fn iter_nodes(&self) -> impl Iterator<Item = &NodeInfo> {
         self.buckets.iter().flat_map(|b| b.get_nodes().iter())
     }
@@ -298,26 +298,14 @@ fn mask_ipv6(addr: Ipv6Addr, prefix_len: u8) -> Ipv6Addr {
     Ipv6Addr::from(bits & mask)
 }
 
-/// Apply optional floor/ceiling overrides to a computed subnet limit.
-/// Floor is applied first (raising the value), then ceiling (lowering it).
-/// When both are set, ceiling wins if floor > ceiling.
-fn clamp_limit(limit: usize, floor: Option<usize>, ceiling: Option<usize>) -> usize {
-    let mut result = limit;
-    if let Some(f) = floor {
-        result = result.max(f);
-    }
-    if let Some(c) = ceiling {
-        result = result.min(c);
-    }
-    result
-}
-
-/// Default maximum nodes from any single geographic region allowed per
-/// k-bucket and within the K closest nodes to self.
-const GEO_DEFAULT_MAX_PER_REGION: usize = 3;
-
 /// K parameter - number of closest nodes per bucket
 const K: usize = 8;
+
+/// Max nodes sharing an exact IP address per bucket/close-group.
+const IP_EXACT_LIMIT: usize = 2;
+
+/// Max nodes in the same subnet (/24 IPv4, /64 IPv6) per bucket/close-group.
+const IP_SUBNET_LIMIT: usize = if K / 4 > 0 { K / 4 } else { 1 };
 
 /// Number of K-buckets in Kademlia routing table (one per bit in 256-bit key space)
 const KADEMLIA_BUCKET_COUNT: usize = 256;
@@ -325,15 +313,6 @@ const KADEMLIA_BUCKET_COUNT: usize = 256;
 /// Candidate expansion factor for find_closest_nodes optimization
 /// Collect 2x requested count before early exit to ensure good selection
 const CANDIDATE_EXPANSION_FACTOR: usize = 2;
-
-/// Subnet diversity multiplier: /24 (IPv4) or /64 (IPv6) limit = per-IP * this.
-const SUBNET_NARROW_MULTIPLIER: usize = 3;
-
-/// Subnet diversity multiplier: /16 (IPv4) or /48 (IPv6) limit = per-IP * this.
-const SUBNET_MEDIUM_MULTIPLIER: usize = 10;
-
-/// Subnet diversity multiplier for IPv6 /32 (widest prefix tier).
-const SUBNET_WIDE_MULTIPLIER: usize = 30;
 
 /// Main DHT Core Engine
 pub struct DhtCoreEngine {
@@ -349,8 +328,6 @@ pub struct DhtCoreEngine {
     /// mutated — `NodeConfig` is the single source of truth. Kept separate
     /// from `IPDiversityConfig` to prevent duplication and drift.
     allow_loopback: bool,
-    /// Maximum nodes per geographic region.
-    geo_max_per_region: usize,
 
     /// Shutdown token for background maintenance tasks
     shutdown: CancellationToken,
@@ -370,7 +347,6 @@ impl DhtCoreEngine {
             routing_table: Arc::new(RwLock::new(KademliaRoutingTable::new(node_id, K))),
             ip_diversity_config: IPDiversityConfig::default(),
             allow_loopback,
-            geo_max_per_region: GEO_DEFAULT_MAX_PER_REGION,
             shutdown: CancellationToken::new(),
         })
     }
@@ -384,12 +360,6 @@ impl DhtCoreEngine {
     #[cfg(test)]
     pub fn set_allow_loopback(&mut self, allow: bool) {
         self.allow_loopback = allow;
-    }
-
-    /// Override the maximum nodes per geographic region (per bucket / close group).
-    #[cfg(test)]
-    pub fn set_geo_max_per_region(&mut self, max: usize) {
-        self.geo_max_per_region = max;
     }
 
     /// Number of peers currently in the routing table.
@@ -446,9 +416,9 @@ impl DhtCoreEngine {
 
     /// Add a node to the DHT with security checks.
     ///
-    /// IP subnet diversity and geographic diversity are both enforced
-    /// per-bucket and for the K closest nodes to self, with closer peers
-    /// swapped in when they contend for the same slot.
+    /// IP subnet diversity is enforced per-bucket and for the K closest
+    /// nodes to self, with closer peers swapped in when they contend for
+    /// the same slot.
     pub async fn add_node(&mut self, node: NodeInfo) -> Result<()> {
         // IP-based transports always have an IP; non-IP transports skip diversity.
         let candidate_ip = match node.ip() {
@@ -477,16 +447,12 @@ impl DhtCoreEngine {
     /// - `Ok(Some(peer_id))` — scope exceeds a limit but the candidate is
     ///   closer than the farthest violating peer; swap that peer out
     /// - `Err` — scope exceeds a limit and the candidate cannot swap in
-    ///
-    /// `network_size` is the global count of non-loopback IP nodes, used
-    /// for the dynamic per-IP formula (kept global for formula stability).
     fn find_ip_swap_in_scope(
         &self,
         nodes: &[NodeInfo],
         candidate_id: &PeerId,
         candidate_ip: IpAddr,
         candidate_distance: &[u8; 32],
-        network_size: usize,
         scope_name: &str,
     ) -> Result<Option<PeerId>> {
         // Loopback candidates bypass IP diversity entirely.
@@ -494,45 +460,21 @@ impl DhtCoreEngine {
             return Ok(None);
         }
 
-        let per_ip = self.dynamic_per_ip_limit(network_size);
         let cfg = &self.ip_diversity_config;
 
         match candidate_ip {
             IpAddr::V4(v4) => {
-                // Compute tiered limits
-                let limit_32 = clamp_limit(
-                    cfg.max_nodes_per_ipv4_32
-                        .map_or(per_ip, |cap| cap.min(per_ip)),
-                    cfg.ipv4_limit_floor,
-                    cfg.ipv4_limit_ceiling,
-                );
-                let limit_24 = clamp_limit(
-                    cfg.max_nodes_per_ipv4_24
-                        .map_or(per_ip * SUBNET_NARROW_MULTIPLIER, |cap| {
-                            cap.min(per_ip * SUBNET_NARROW_MULTIPLIER)
-                        }),
-                    cfg.ipv4_limit_floor,
-                    cfg.ipv4_limit_ceiling,
-                );
-                let limit_16 = clamp_limit(
-                    cfg.max_nodes_per_ipv4_16
-                        .map_or(per_ip * SUBNET_MEDIUM_MULTIPLIER, |cap| {
-                            cap.min(per_ip * SUBNET_MEDIUM_MULTIPLIER)
-                        }),
-                    cfg.ipv4_limit_floor,
-                    cfg.ipv4_limit_ceiling,
-                );
+                // IPv4 limits: use config override if set, otherwise default
+                let limit_ip = cfg.max_per_ip.unwrap_or(IP_EXACT_LIMIT);
+                let limit_subnet = cfg.max_per_subnet.unwrap_or(IP_SUBNET_LIMIT);
 
                 let cand_24 = mask_ipv4(v4, 24);
-                let cand_16 = mask_ipv4(v4, 16);
 
-                // Single pass: count matches and track farthest at each tier
-                let mut count_32: usize = 0;
-                let mut count_24: usize = 0;
-                let mut count_16: usize = 0;
-                let mut farthest_32: Option<(PeerId, [u8; 32])> = None;
-                let mut farthest_24: Option<(PeerId, [u8; 32])> = None;
-                let mut farthest_16: Option<(PeerId, [u8; 32])> = None;
+                // Single pass: count exact-IP and /24 matches, track farthest at each
+                let mut count_ip: usize = 0;
+                let mut count_subnet: usize = 0;
+                let mut farthest_ip: Option<(PeerId, [u8; 32])> = None;
+                let mut farthest_subnet: Option<(PeerId, [u8; 32])> = None;
 
                 for n in nodes {
                     if n.id == *candidate_id {
@@ -551,30 +493,23 @@ impl DhtCoreEngine {
                     let dist = xor_distance_bytes(self.node_id.to_bytes(), n.id.to_bytes());
 
                     if existing_v4 == v4 {
-                        count_32 += 1;
-                        if farthest_32.as_ref().is_none_or(|(_, d)| dist > *d) {
-                            farthest_32 = Some((n.id, dist));
+                        count_ip += 1;
+                        if farthest_ip.as_ref().is_none_or(|(_, d)| dist > *d) {
+                            farthest_ip = Some((n.id, dist));
                         }
                     }
                     if mask_ipv4(existing_v4, 24) == cand_24 {
-                        count_24 += 1;
-                        if farthest_24.as_ref().is_none_or(|(_, d)| dist > *d) {
-                            farthest_24 = Some((n.id, dist));
-                        }
-                    }
-                    if mask_ipv4(existing_v4, 16) == cand_16 {
-                        count_16 += 1;
-                        if farthest_16.as_ref().is_none_or(|(_, d)| dist > *d) {
-                            farthest_16 = Some((n.id, dist));
+                        count_subnet += 1;
+                        if farthest_subnet.as_ref().is_none_or(|(_, d)| dist > *d) {
+                            farthest_subnet = Some((n.id, dist));
                         }
                     }
                 }
 
-                // Check tiers narrowest-first: a swap at /32 also fixes /24 and /16
-                let tiers: [IpSwapTier; 3] = [
-                    (count_32, limit_32, farthest_32, "/32"),
-                    (count_24, limit_24, farthest_24, "/24"),
-                    (count_16, limit_16, farthest_16, "/16"),
+                // Check tiers narrowest-first: a swap at exact-IP also fixes /24
+                let tiers: [IpSwapTier; 2] = [
+                    (count_ip, limit_ip, farthest_ip, "exact-IP"),
+                    (count_subnet, limit_subnet, farthest_subnet, "/24"),
                 ];
 
                 for (count, limit, farthest, tier_name) in &tiers {
@@ -591,32 +526,17 @@ impl DhtCoreEngine {
                 }
             }
             IpAddr::V6(v6) => {
-                let limit_64 = clamp_limit(
-                    std::cmp::min(cfg.max_nodes_per_ipv6_64, per_ip * SUBNET_NARROW_MULTIPLIER),
-                    cfg.ipv6_limit_floor,
-                    cfg.ipv6_limit_ceiling,
-                );
-                let limit_48 = clamp_limit(
-                    std::cmp::min(cfg.max_nodes_per_ipv6_48, per_ip * SUBNET_MEDIUM_MULTIPLIER),
-                    cfg.ipv6_limit_floor,
-                    cfg.ipv6_limit_ceiling,
-                );
-                let limit_32 = clamp_limit(
-                    std::cmp::min(cfg.max_nodes_per_ipv6_32, per_ip * SUBNET_WIDE_MULTIPLIER),
-                    cfg.ipv6_limit_floor,
-                    cfg.ipv6_limit_ceiling,
-                );
+                // IPv6 limits: use config override if set, otherwise default
+                let limit_ip = cfg.max_per_ip.unwrap_or(IP_EXACT_LIMIT);
+                let limit_subnet = cfg.max_per_subnet.unwrap_or(IP_SUBNET_LIMIT);
 
                 let cand_64 = mask_ipv6(v6, 64);
-                let cand_48 = mask_ipv6(v6, 48);
-                let cand_32 = mask_ipv6(v6, 32);
 
-                let mut count_64: usize = 0;
-                let mut count_48: usize = 0;
-                let mut count_32: usize = 0;
-                let mut farthest_64: Option<(PeerId, [u8; 32])> = None;
-                let mut farthest_48: Option<(PeerId, [u8; 32])> = None;
-                let mut farthest_32: Option<(PeerId, [u8; 32])> = None;
+                // Single pass: count exact-IPv6 and /64 matches
+                let mut count_ip: usize = 0;
+                let mut count_subnet: usize = 0;
+                let mut farthest_ip: Option<(PeerId, [u8; 32])> = None;
+                let mut farthest_subnet: Option<(PeerId, [u8; 32])> = None;
 
                 for n in nodes {
                     if n.id == *candidate_id {
@@ -634,30 +554,23 @@ impl DhtCoreEngine {
 
                     let dist = xor_distance_bytes(self.node_id.to_bytes(), n.id.to_bytes());
 
+                    if existing_v6 == v6 {
+                        count_ip += 1;
+                        if farthest_ip.as_ref().is_none_or(|(_, d)| dist > *d) {
+                            farthest_ip = Some((n.id, dist));
+                        }
+                    }
                     if mask_ipv6(existing_v6, 64) == cand_64 {
-                        count_64 += 1;
-                        if farthest_64.as_ref().is_none_or(|(_, d)| dist > *d) {
-                            farthest_64 = Some((n.id, dist));
-                        }
-                    }
-                    if mask_ipv6(existing_v6, 48) == cand_48 {
-                        count_48 += 1;
-                        if farthest_48.as_ref().is_none_or(|(_, d)| dist > *d) {
-                            farthest_48 = Some((n.id, dist));
-                        }
-                    }
-                    if mask_ipv6(existing_v6, 32) == cand_32 {
-                        count_32 += 1;
-                        if farthest_32.as_ref().is_none_or(|(_, d)| dist > *d) {
-                            farthest_32 = Some((n.id, dist));
+                        count_subnet += 1;
+                        if farthest_subnet.as_ref().is_none_or(|(_, d)| dist > *d) {
+                            farthest_subnet = Some((n.id, dist));
                         }
                     }
                 }
 
-                let tiers: [IpSwapTier; 3] = [
-                    (count_64, limit_64, farthest_64, "/64"),
-                    (count_48, limit_48, farthest_48, "/48"),
-                    (count_32, limit_32, farthest_32, "/32"),
+                let tiers: [IpSwapTier; 2] = [
+                    (count_ip, limit_ip, farthest_ip, "exact-IP"),
+                    (count_subnet, limit_subnet, farthest_subnet, "/64"),
                 ];
 
                 for (count, limit, farthest, tier_name) in &tiers {
@@ -678,10 +591,10 @@ impl DhtCoreEngine {
         Ok(None)
     }
 
-    /// Add a node with per-bucket and close-group IP and geographic diversity.
+    /// Add a node with per-bucket and close-group IP diversity enforcement.
     ///
-    /// Enforces that no IP subnet or geographic region exceeds its respective
-    /// limit within any single k-bucket or within the K closest nodes to self.
+    /// Enforces that no IP subnet exceeds its limit within any single
+    /// k-bucket or within the K closest nodes to self.
     ///
     /// When a candidate would exceed a limit, it may still be admitted if it
     /// is closer (XOR distance) to self than the farthest violating peer in
@@ -704,15 +617,8 @@ impl DhtCoreEngine {
             return routing.add_node(node);
         }
 
-        let candidate_region = GeographicRegion::from_ip(candidate_ip);
         let bucket_idx = routing.get_bucket_index(&node.id);
         let candidate_distance = xor_distance_bytes(self.node_id.to_bytes(), node.id.to_bytes());
-
-        // Global network size for the dynamic per-IP formula (excludes loopback).
-        let network_size = routing
-            .iter_nodes()
-            .filter(|n| n.ip().map(|ip| !ip.is_loopback()).unwrap_or(false))
-            .count();
 
         // === Per-bucket IP diversity ===
         let ip_bucket_swap = self.find_ip_swap_in_scope(
@@ -720,67 +626,10 @@ impl DhtCoreEngine {
             &node.id,
             candidate_ip,
             &candidate_distance,
-            network_size,
             &format!("bucket {bucket_idx}"),
         )?;
 
-        // === Per-bucket geographic diversity ===
-        let mut geo_bucket_swap: Option<PeerId> = None;
-        {
-            let is_same_region_peer = |n: &&NodeInfo| {
-                n.id != node.id
-                    && ip_bucket_swap != Some(n.id)
-                    && n.ip()
-                        .map(|ip| {
-                            !ip.is_loopback() && GeographicRegion::from_ip(ip) == candidate_region
-                        })
-                        .unwrap_or(false)
-            };
-
-            let same_region_in_bucket = routing.buckets[bucket_idx]
-                .nodes
-                .iter()
-                .filter(&is_same_region_peer)
-                .count();
-
-            if same_region_in_bucket >= self.geo_max_per_region {
-                let farthest = routing.buckets[bucket_idx]
-                    .nodes
-                    .iter()
-                    .filter(is_same_region_peer)
-                    .max_by(|a, b| {
-                        let da = xor_distance_bytes(self.node_id.to_bytes(), a.id.to_bytes());
-                        let db = xor_distance_bytes(self.node_id.to_bytes(), b.id.to_bytes());
-                        da.cmp(&db)
-                    });
-
-                if let Some(far) = farthest {
-                    let far_distance =
-                        xor_distance_bytes(self.node_id.to_bytes(), far.id.to_bytes());
-                    if candidate_distance < far_distance {
-                        geo_bucket_swap = Some(far.id);
-                    } else {
-                        return Err(anyhow!(
-                            "Geographic diversity: region {candidate_region:?} per-bucket \
-                             limit ({}) exceeded in bucket {bucket_idx}",
-                            self.geo_max_per_region,
-                        ));
-                    }
-                } else {
-                    return Err(anyhow!(
-                        "Geographic diversity: region {candidate_region:?} per-bucket \
-                         limit ({}) exceeded in bucket {bucket_idx}",
-                        self.geo_max_per_region,
-                    ));
-                }
-            }
-        }
-
-        // Collect all bucket-level swaps
-        let bucket_swaps: Vec<PeerId> = [ip_bucket_swap, geo_bucket_swap]
-            .iter()
-            .filter_map(|s| *s)
-            .collect();
+        let bucket_swaps: Vec<PeerId> = ip_bucket_swap.into_iter().collect();
 
         // === Close-group setup ===
         let close_group = routing.find_closest_nodes(&self.node_id, K);
@@ -801,7 +650,6 @@ impl DhtCoreEngine {
                 .unwrap_or(true);
 
         let mut ip_close_swap: Option<PeerId> = None;
-        let mut geo_close_swap: Option<PeerId> = None;
 
         if candidate_in_close {
             // Build hypothetical close group as Vec<NodeInfo>
@@ -824,7 +672,6 @@ impl DhtCoreEngine {
                 &node.id,
                 candidate_ip,
                 &candidate_distance,
-                network_size,
                 "close-group",
             )?;
             // Deduplicate: don't plan a close swap that's already a bucket swap
@@ -832,63 +679,6 @@ impl DhtCoreEngine {
                 && bucket_swaps.contains(&id)
             {
                 ip_close_swap = None;
-            }
-
-            // === Close-group geographic diversity ===
-            {
-                let mut close_candidates: Vec<(PeerId, GeographicRegion, [u8; 32])> = hyp_close
-                    .iter()
-                    .filter(|n| {
-                        !bucket_swaps.contains(&n.id)
-                            && ip_close_swap != Some(n.id)
-                            && n.id != node.id
-                    })
-                    .filter_map(|n| {
-                        let ip = n.ip()?;
-                        if ip.is_loopback() {
-                            return None;
-                        }
-                        let region = GeographicRegion::from_ip(ip);
-                        let dist = xor_distance_bytes(self.node_id.to_bytes(), n.id.to_bytes());
-                        Some((n.id, region, dist))
-                    })
-                    .collect();
-
-                close_candidates.push((node.id, candidate_region, candidate_distance));
-                close_candidates.sort_by(|a, b| a.2.cmp(&b.2));
-                close_candidates.truncate(K);
-
-                let region_count = close_candidates
-                    .iter()
-                    .filter(|(_, region, _)| *region == candidate_region)
-                    .count();
-
-                if region_count > self.geo_max_per_region {
-                    let farthest_same = close_candidates
-                        .iter()
-                        .filter(|(id, region, _)| *id != node.id && *region == candidate_region)
-                        .max_by(|a, b| a.2.cmp(&b.2));
-
-                    if let Some(&(far_id, _, far_dist)) = farthest_same {
-                        if candidate_distance < far_dist {
-                            if !bucket_swaps.contains(&far_id) && ip_close_swap != Some(far_id) {
-                                geo_close_swap = Some(far_id);
-                            }
-                        } else {
-                            return Err(anyhow!(
-                                "Geographic diversity: region {candidate_region:?} \
-                                 close-group limit ({}) exceeded",
-                                self.geo_max_per_region,
-                            ));
-                        }
-                    } else {
-                        return Err(anyhow!(
-                            "Geographic diversity: region {candidate_region:?} \
-                             close-group limit ({}) exceeded",
-                            self.geo_max_per_region,
-                        ));
-                    }
-                }
             }
         }
 
@@ -899,11 +689,7 @@ impl DhtCoreEngine {
             let already_exists = bucket.nodes.iter().any(|n| n.id == node.id);
             let has_room = bucket.nodes.len() < bucket.max_size;
             let swap_frees_slot = ip_bucket_swap.is_some()
-                || geo_bucket_swap.is_some()
                 || ip_close_swap
-                    .map(|id| routing.get_bucket_index(&id) == bucket_idx)
-                    .unwrap_or(false)
-                || geo_close_swap
                     .map(|id| routing.get_bucket_index(&id) == bucket_idx)
                     .unwrap_or(false);
             if !already_exists && !has_room && !swap_frees_slot {
@@ -916,16 +702,8 @@ impl DhtCoreEngine {
         }
 
         // === Execute all swaps (deduplicated) ===
-        let mut executed: Vec<PeerId> = Vec::with_capacity(4);
-        for swap_id in [
-            ip_bucket_swap,
-            geo_bucket_swap,
-            ip_close_swap,
-            geo_close_swap,
-        ]
-        .iter()
-        .filter_map(|s| *s)
-        {
+        let mut executed: Vec<PeerId> = Vec::with_capacity(2);
+        for swap_id in [ip_bucket_swap, ip_close_swap].iter().filter_map(|s| *s) {
             if !executed.contains(&swap_id) {
                 routing.remove_node(&swap_id);
                 executed.push(swap_id);
@@ -933,18 +711,6 @@ impl DhtCoreEngine {
         }
 
         routing.add_node(node)
-    }
-
-    /// Dynamic per-IP limit: `min(cap, floor(network_size * fraction))`,
-    /// clamped to at least 1.  `network_size` excludes loopback nodes so
-    /// devnet environments don't inflate the limit for non-loopback IPs.
-    fn dynamic_per_ip_limit(&self, network_size: usize) -> usize {
-        let fraction =
-            (network_size as f64 * self.ip_diversity_config.max_network_fraction).floor() as usize;
-        std::cmp::min(
-            self.ip_diversity_config.max_per_ip_cap,
-            std::cmp::max(1, fraction),
-        )
     }
 }
 
@@ -961,7 +727,6 @@ impl std::fmt::Debug for DhtCoreEngine {
             .field("close_group_validator", &"Arc<RwLock<CloseGroupValidator>>")
             .field("eviction_manager", &"Arc<RwLock<EvictionManager>>")
             .field("ip_diversity_config", &self.ip_diversity_config)
-            .field("geo_max_per_region", &self.geo_max_per_region)
             .finish()
     }
 }
@@ -1255,20 +1020,14 @@ mod tests {
     // IPv4 diversity: static floor overrides low dynamic limit
     // -----------------------------------------------------------------------
 
-    /// When the network is small the dynamic per-IP formula yields 1, which
-    /// would block additional same-IP nodes.  A configured `ipv4_limit_floor`
-    /// must override the dynamic value so that bootstrap can proceed.
+    /// Testnet config effectively disables IP diversity limits, allowing
+    /// many nodes from the same IP in a single bucket.
     #[tokio::test]
-    async fn test_ipv4_static_floor_overrides_dynamic_limit() {
+    async fn test_testnet_config_disables_ip_diversity() {
         let mut dht = DhtCoreEngine::new_for_tests(PeerId::from_bytes([0u8; 32])).unwrap();
 
-        // Testnet-like config: floor of 100 guarantees at least that many
-        // nodes per subnet regardless of how small the network is.
-        let mut config = IPDiversityConfig::testnet();
-        config.ipv4_limit_floor = Some(100);
-        dht.set_ip_diversity_config(config);
-        // Disable geo limits — this test only exercises IP diversity.
-        dht.set_geo_max_per_region(usize::MAX);
+        // Testnet config sets all IP limits to usize::MAX.
+        dht.set_ip_diversity_config(IPDiversityConfig::testnet());
 
         // All nodes land in bucket 0 (id[0]=0x80, self=[0;32]).
         // Vary id[31] for uniqueness.
@@ -1284,7 +1043,7 @@ mod tests {
             let result = dht.add_node(node).await;
             assert!(
                 result.is_ok(),
-                "node {i} from same IP should be accepted with floor override: {:?}",
+                "node {i} from same IP should be accepted with testnet config: {:?}",
                 result
             );
         }
