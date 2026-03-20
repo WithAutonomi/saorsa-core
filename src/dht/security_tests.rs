@@ -34,15 +34,15 @@ async fn test_ip_diversity_enforcement_ipv6() -> anyhow::Result<()> {
     let mut engine = DhtCoreEngine::new_for_tests(PeerId::from_bytes([0u8; 32]))?;
 
     let node1 = make_node_with_id(bucket0_id(1), "/ip6/2001:db8::1/udp/9000/quic");
-    engine.add_node(node1).await?;
+    engine.add_node_no_trust(node1).await?;
 
     // Second node in same /64 should succeed (subnet limit = K/4 = 2).
     let node2 = make_node_with_id(bucket0_id(2), "/ip6/2001:db8::2/udp/9000/quic");
-    engine.add_node(node2).await?;
+    engine.add_node_no_trust(node2).await?;
 
     // Third node in same /64 should fail (exceeds /64 limit of 2).
     let node3 = make_node_with_id(bucket0_id(3), "/ip6/2001:db8::3/udp/9000/quic");
-    let result = engine.add_node(node3).await;
+    let result = engine.add_node_no_trust(node3).await;
     assert!(result.is_err());
     assert!(
         result.unwrap_err().to_string().contains("IP diversity:"),
@@ -61,15 +61,15 @@ async fn test_ip_diversity_enforcement_ipv4() -> anyhow::Result<()> {
     let mut engine = DhtCoreEngine::new_for_tests(PeerId::from_bytes([0u8; 32]))?;
 
     let node1 = make_node_with_id(bucket0_id(1), "/ip4/192.168.1.1/udp/9000/quic");
-    engine.add_node(node1).await?;
+    engine.add_node_no_trust(node1).await?;
 
     // Second same-IP node should succeed (exact-IP limit = 2).
     let node2 = make_node_with_id(bucket0_id(2), "/ip4/192.168.1.1/udp/9001/quic");
-    engine.add_node(node2).await?;
+    engine.add_node_no_trust(node2).await?;
 
     // Third same-IP node should fail (exceeds exact-IP limit of 2).
     let node3 = make_node_with_id(bucket0_id(3), "/ip4/192.168.1.1/udp/9002/quic");
-    let result = engine.add_node(node3).await;
+    let result = engine.add_node_no_trust(node3).await;
     assert!(result.is_err());
     assert!(
         result.unwrap_err().to_string().contains("IP diversity:"),
@@ -90,13 +90,13 @@ async fn test_ipv4_subnet_24_limit() -> anyhow::Result<()> {
 
     // Two nodes on different IPs but same /24, all in bucket 0.
     engine
-        .add_node(make_node_with_id(
+        .add_node_no_trust(make_node_with_id(
             bucket0_id(1),
             "/ip4/192.168.1.1/udp/9000/quic",
         ))
         .await?;
     engine
-        .add_node(make_node_with_id(
+        .add_node_no_trust(make_node_with_id(
             bucket0_id(2),
             "/ip4/192.168.1.2/udp/9000/quic",
         ))
@@ -104,7 +104,7 @@ async fn test_ipv4_subnet_24_limit() -> anyhow::Result<()> {
 
     // Third should fail (/24 limit = 2).
     let node3 = make_node_with_id(bucket0_id(3), "/ip4/192.168.1.3/udp/9000/quic");
-    let result = engine.add_node(node3).await;
+    let result = engine.add_node_no_trust(node3).await;
     assert!(result.is_err());
     assert!(
         result.unwrap_err().to_string().contains("IP diversity:"),
@@ -124,7 +124,7 @@ async fn test_mixed_ipv4_ipv6_enforcement() -> anyhow::Result<()> {
 
     // IPv4 node
     engine
-        .add_node(make_node_with_id(
+        .add_node_no_trust(make_node_with_id(
             bucket0_id(1),
             "/ip4/192.168.1.1/udp/9000/quic",
         ))
@@ -132,7 +132,7 @@ async fn test_mixed_ipv4_ipv6_enforcement() -> anyhow::Result<()> {
 
     // IPv6 node -- different address family, should succeed
     engine
-        .add_node(make_node_with_id(
+        .add_node_no_trust(make_node_with_id(
             bucket0_id(2),
             "/ip6/2001:db8::1/udp/9000/quic",
         ))
@@ -140,7 +140,7 @@ async fn test_mixed_ipv4_ipv6_enforcement() -> anyhow::Result<()> {
 
     // Second IPv4 on same IP should succeed (exact-IP limit = 2)
     engine
-        .add_node(make_node_with_id(
+        .add_node_no_trust(make_node_with_id(
             bucket0_id(3),
             "/ip4/192.168.1.1/udp/9001/quic",
         ))
@@ -148,7 +148,7 @@ async fn test_mixed_ipv4_ipv6_enforcement() -> anyhow::Result<()> {
 
     // Third IPv4 on same IP should fail (exceeds exact-IP limit of 2)
     let result_v4 = engine
-        .add_node(make_node_with_id(
+        .add_node_no_trust(make_node_with_id(
             bucket0_id(4),
             "/ip4/192.168.1.1/udp/9002/quic",
         ))
@@ -157,7 +157,7 @@ async fn test_mixed_ipv4_ipv6_enforcement() -> anyhow::Result<()> {
 
     // Second IPv6 in same /64 should succeed (/64 limit = 2)
     engine
-        .add_node(make_node_with_id(
+        .add_node_no_trust(make_node_with_id(
             bucket0_id(5),
             "/ip6/2001:db8::2/udp/9000/quic",
         ))
@@ -165,7 +165,7 @@ async fn test_mixed_ipv4_ipv6_enforcement() -> anyhow::Result<()> {
 
     // Third IPv6 in same /64 should fail (exceeds /64 limit of 2)
     let result_v6 = engine
-        .add_node(make_node_with_id(
+        .add_node_no_trust(make_node_with_id(
             bucket0_id(6),
             "/ip6/2001:db8::3/udp/9000/quic",
         ))
@@ -195,12 +195,12 @@ async fn test_ipv4_ip_override_raises_limit() -> anyhow::Result<()> {
             bucket0_id(i),
             &format!("/ip4/192.168.1.1/udp/{}/quic", 9000 + u16::from(i)),
         );
-        engine.add_node(node).await?;
+        engine.add_node_no_trust(node).await?;
     }
 
     // Fourth node should fail (max_per_ip = 3)
     let node4 = make_node_with_id(bucket0_id(4), "/ip4/192.168.1.1/udp/9003/quic");
-    let result = engine.add_node(node4).await;
+    let result = engine.add_node_no_trust(node4).await;
     assert!(result.is_err());
     assert!(result.unwrap_err().to_string().contains("IP diversity:"));
 
@@ -221,11 +221,11 @@ async fn test_ipv4_subnet_override_lowers_limit() -> anyhow::Result<()> {
     });
 
     let node1 = make_node_with_id(bucket0_id(1), "/ip4/10.0.1.1/udp/9000/quic");
-    engine.add_node(node1).await?;
+    engine.add_node_no_trust(node1).await?;
 
     // Different IP but same /24 -- should fail because /24 limit = 1
     let node2 = make_node_with_id(bucket0_id(2), "/ip4/10.0.1.2/udp/9000/quic");
-    let result = engine.add_node(node2).await;
+    let result = engine.add_node_no_trust(node2).await;
     assert!(result.is_err());
     assert!(result.unwrap_err().to_string().contains("IP diversity:"));
 
@@ -248,12 +248,12 @@ async fn test_ipv6_subnet_override_raises_limit() -> anyhow::Result<()> {
 
     for i in 1..=5u8 {
         let node = make_node_with_id(bucket0_id(i), &format!("/ip6/2001:db8::{i}/udp/9000/quic"));
-        engine.add_node(node).await?;
+        engine.add_node_no_trust(node).await?;
     }
 
     // Sixth node should fail
     let node6 = make_node_with_id(bucket0_id(6), "/ip6/2001:db8::6/udp/9000/quic");
-    let result = engine.add_node(node6).await;
+    let result = engine.add_node_no_trust(node6).await;
     assert!(result.is_err());
     assert!(result.unwrap_err().to_string().contains("IP diversity:"));
 
@@ -274,7 +274,7 @@ async fn test_ipv6_subnet_override_lowers_limit() -> anyhow::Result<()> {
     });
 
     engine
-        .add_node(make_node_with_id(
+        .add_node_no_trust(make_node_with_id(
             bucket0_id(1),
             "/ip6/2001:db8::1/udp/9000/quic",
         ))
@@ -282,7 +282,7 @@ async fn test_ipv6_subnet_override_lowers_limit() -> anyhow::Result<()> {
 
     // Second should fail because /64 limit is now 1
     let node2 = make_node_with_id(bucket0_id(2), "/ip6/2001:db8::2/udp/9000/quic");
-    let result = engine.add_node(node2).await;
+    let result = engine.add_node_no_trust(node2).await;
     assert!(result.is_err());
     assert!(result.unwrap_err().to_string().contains("IP diversity:"));
 
@@ -298,7 +298,7 @@ async fn test_no_override_uses_defaults() -> anyhow::Result<()> {
     let mut engine = DhtCoreEngine::new_for_tests(PeerId::from_bytes([0u8; 32]))?;
 
     engine
-        .add_node(make_node_with_id(
+        .add_node_no_trust(make_node_with_id(
             bucket0_id(1),
             "/ip4/192.168.1.1/udp/9000/quic",
         ))
@@ -306,7 +306,7 @@ async fn test_no_override_uses_defaults() -> anyhow::Result<()> {
 
     // Second same-IP should succeed (exact-IP limit = 2)
     engine
-        .add_node(make_node_with_id(
+        .add_node_no_trust(make_node_with_id(
             bucket0_id(2),
             "/ip4/192.168.1.1/udp/9001/quic",
         ))
@@ -314,8 +314,106 @@ async fn test_no_override_uses_defaults() -> anyhow::Result<()> {
 
     // Third same-IP should fail (exceeds exact-IP limit of 2)
     let node3 = make_node_with_id(bucket0_id(3), "/ip4/192.168.1.1/udp/9002/quic");
-    let result = engine.add_node(node3).await;
+    let result = engine.add_node_no_trust(node3).await;
     assert!(result.is_err());
+
+    Ok(())
+}
+
+// -----------------------------------------------------------------------
+// Trust-aware swap-closer protection
+// -----------------------------------------------------------------------
+
+/// A well-trusted peer (score >= 0.7) should keep its routing table slot
+/// even when a closer same-IP candidate arrives that would normally evict it.
+#[tokio::test]
+async fn test_trust_protects_peer_from_swap() -> anyhow::Result<()> {
+    let mut engine = DhtCoreEngine::new_for_tests(PeerId::from_bytes([0u8; 32]))?;
+    engine.set_ip_diversity_config(IPDiversityConfig::default());
+
+    // Two peers in bucket 0, same IP (exact-IP limit = 2).
+    let mut id_far = [0u8; 32];
+    id_far[0] = 0xFF; // farthest from self=[0;32]
+    engine
+        .add_node_no_trust(make_node_with_id(id_far, "/ip4/10.0.1.1/udp/9000/quic"))
+        .await?;
+
+    let mut id_mid = [0u8; 32];
+    id_mid[0] = 0xFE;
+    engine
+        .add_node_no_trust(make_node_with_id(id_mid, "/ip4/10.0.1.1/udp/9001/quic"))
+        .await?;
+
+    // A closer candidate with the same IP tries to join.
+    // The farthest peer (id_far) has trust 0.8 — above TRUST_PROTECTION_THRESHOLD.
+    let mut id_close = [0u8; 32];
+    id_close[0] = 0x80; // closer to self than id_far/id_mid
+    let far_peer = PeerId::from_bytes(id_far);
+
+    let trust_fn = |peer_id: &PeerId| -> f64 {
+        if *peer_id == far_peer {
+            0.8 // trusted — above threshold
+        } else {
+            0.5 // neutral
+        }
+    };
+
+    let result = engine
+        .add_node(
+            make_node_with_id(id_close, "/ip4/10.0.1.1/udp/9002/quic"),
+            &trust_fn,
+        )
+        .await;
+
+    // Should be REJECTED: the only swap candidate (farthest) is trust-protected
+    assert!(result.is_err());
+    assert!(engine.has_node(&far_peer).await);
+
+    Ok(())
+}
+
+/// An untrusted peer (score < 0.7) should be swapped out when a closer
+/// same-IP candidate arrives, preserving the original distance-based behavior.
+#[tokio::test]
+async fn test_untrusted_peer_can_be_swapped() -> anyhow::Result<()> {
+    let mut engine = DhtCoreEngine::new_for_tests(PeerId::from_bytes([0u8; 32]))?;
+    engine.set_ip_diversity_config(IPDiversityConfig::default());
+
+    let mut id_far = [0u8; 32];
+    id_far[0] = 0xFF;
+    engine
+        .add_node_no_trust(make_node_with_id(id_far, "/ip4/10.0.1.1/udp/9000/quic"))
+        .await?;
+
+    let mut id_mid = [0u8; 32];
+    id_mid[0] = 0xFE;
+    engine
+        .add_node_no_trust(make_node_with_id(id_mid, "/ip4/10.0.1.1/udp/9001/quic"))
+        .await?;
+
+    let mut id_close = [0u8; 32];
+    id_close[0] = 0x80;
+    let far_peer = PeerId::from_bytes(id_far);
+
+    let trust_fn = |peer_id: &PeerId| -> f64 {
+        if *peer_id == far_peer {
+            0.3 // low trust — below threshold
+        } else {
+            0.5
+        }
+    };
+
+    let result = engine
+        .add_node(
+            make_node_with_id(id_close, "/ip4/10.0.1.1/udp/9002/quic"),
+            &trust_fn,
+        )
+        .await;
+
+    // Should succeed — far peer is not trust-protected and gets swapped out
+    assert!(result.is_ok());
+    assert!(engine.has_node(&PeerId::from_bytes(id_close)).await);
+    assert!(!engine.has_node(&far_peer).await);
 
     Ok(())
 }

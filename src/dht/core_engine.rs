@@ -14,6 +14,9 @@ use std::time::SystemTime;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
+#[cfg(test)]
+use crate::adaptive::trust::DEFAULT_NEUTRAL_TRUST;
+
 /// DHT key type — now a direct alias for [`PeerId`].
 ///
 /// Both types are `[u8; 32]` wrappers with identity conversions between them.
@@ -308,6 +311,11 @@ const KADEMLIA_BUCKET_COUNT: usize = 256;
 /// Collect 2x requested count before early exit to ensure good selection
 const CANDIDATE_EXPANSION_FACTOR: usize = 2;
 
+/// Trust score above which a peer is protected from swap-closer eviction.
+/// Well-trusted peers (score >= 0.7) keep their routing table slot even
+/// when a closer but less-proven peer arrives.
+const TRUST_PROTECTION_THRESHOLD: f64 = 0.7;
+
 /// Main DHT Core Engine
 pub struct DhtCoreEngine {
     node_id: PeerId,
@@ -413,7 +421,16 @@ impl DhtCoreEngine {
     /// IP subnet diversity is enforced per-bucket and for the K closest
     /// nodes to self, with closer peers swapped in when they contend for
     /// the same slot.
-    pub async fn add_node(&mut self, node: NodeInfo) -> Result<()> {
+    ///
+    /// `trust_score` is a closure that returns the current trust score for
+    /// any peer ID. Well-trusted peers (above [`TRUST_PROTECTION_THRESHOLD`])
+    /// are protected from swap-closer eviction. This decouples the routing
+    /// table from the trust engine implementation.
+    pub async fn add_node(
+        &mut self,
+        node: NodeInfo,
+        trust_score: &impl Fn(&PeerId) -> f64,
+    ) -> Result<()> {
         // IP-based transports always have an IP; non-IP transports skip diversity.
         let candidate_ip = match node.ip() {
             Some(ip) => ip,
@@ -428,9 +445,18 @@ impl DhtCoreEngine {
         // Single write lock covers diversity checks and insertion to avoid
         // a TOCTOU race.
         let mut routing = self.routing_table.write().await;
-        self.add_with_diversity(&mut routing, node, candidate_ip)?;
+        self.add_with_diversity(&mut routing, node, candidate_ip, trust_score)?;
 
         Ok(())
+    }
+
+    /// Convenience method for tests: add a node with neutral trust (0.5).
+    ///
+    /// Preserves existing swap-closer behavior for tests that don't care
+    /// about trust scoring.
+    #[cfg(test)]
+    pub async fn add_node_no_trust(&mut self, node: NodeInfo) -> Result<()> {
+        self.add_node(node, &|_| DEFAULT_NEUTRAL_TRUST).await
     }
 
     /// Check IP diversity within a scoped set of nodes and return a swap
@@ -441,6 +467,10 @@ impl DhtCoreEngine {
     /// - `Ok(Some(peer_id))` — scope exceeds a limit but the candidate is
     ///   closer than the farthest violating peer; swap that peer out
     /// - `Err` — scope exceeds a limit and the candidate cannot swap in
+    ///
+    /// Trust protection: the farthest peer is only swapped out when its trust
+    /// score is below [`TRUST_PROTECTION_THRESHOLD`]. Well-trusted peers hold
+    /// their slot even when a closer candidate arrives.
     fn find_ip_swap_in_scope(
         &self,
         nodes: &[NodeInfo],
@@ -448,6 +478,7 @@ impl DhtCoreEngine {
         candidate_ip: IpAddr,
         candidate_distance: &[u8; 32],
         scope_name: &str,
+        trust_score: &impl Fn(&PeerId) -> f64,
     ) -> Result<Option<PeerId>> {
         // Loopback candidates bypass IP diversity entirely.
         if candidate_ip.is_loopback() {
@@ -510,6 +541,7 @@ impl DhtCoreEngine {
                     if *count >= *limit {
                         if let Some((far_id, far_dist)) = farthest
                             && candidate_distance < far_dist
+                            && trust_score(far_id) < TRUST_PROTECTION_THRESHOLD
                         {
                             return Ok(Some(*far_id));
                         }
@@ -571,6 +603,7 @@ impl DhtCoreEngine {
                     if *count >= *limit {
                         if let Some((far_id, far_dist)) = farthest
                             && candidate_distance < far_dist
+                            && trust_score(far_id) < TRUST_PROTECTION_THRESHOLD
                         {
                             return Ok(Some(*far_id));
                         }
@@ -594,11 +627,15 @@ impl DhtCoreEngine {
     /// is closer (XOR distance) to self than the farthest violating peer in
     /// the scope — the farther peer is evicted and the candidate takes its
     /// slot, preserving the count while improving routing quality.
+    ///
+    /// Trust protection is forwarded to [`Self::find_ip_swap_in_scope`] so
+    /// that well-trusted peers resist eviction.
     fn add_with_diversity(
         &self,
         routing: &mut KademliaRoutingTable,
         node: NodeInfo,
         candidate_ip: IpAddr,
+        trust_score: &impl Fn(&PeerId) -> f64,
     ) -> Result<()> {
         // --- Loopback handling ---
         if candidate_ip.is_loopback() {
@@ -621,6 +658,7 @@ impl DhtCoreEngine {
             candidate_ip,
             &candidate_distance,
             &format!("bucket {bucket_idx}"),
+            trust_score,
         )?;
 
         let bucket_swaps: Vec<PeerId> = ip_bucket_swap.into_iter().collect();
@@ -667,6 +705,7 @@ impl DhtCoreEngine {
                 candidate_ip,
                 &candidate_distance,
                 "close-group",
+                trust_score,
             )?;
             // Deduplicate: don't plan a close swap that's already a bucket swap
             if let Some(id) = ip_close_swap
@@ -961,7 +1000,7 @@ mod tests {
         assert!(!dht.allow_loopback);
 
         let loopback_node = make_node(1, "/ip4/127.0.0.1/udp/9000/quic");
-        let result = dht.add_node(loopback_node).await;
+        let result = dht.add_node_no_trust(loopback_node).await;
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(
@@ -976,7 +1015,7 @@ mod tests {
         assert!(!dht.allow_loopback);
 
         let loopback_node = make_node(2, "/ip6/::1/udp/9000/quic");
-        let result = dht.add_node(loopback_node).await;
+        let result = dht.add_node_no_trust(loopback_node).await;
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(
@@ -991,7 +1030,7 @@ mod tests {
         dht.set_allow_loopback(true);
 
         let loopback_node = make_node(1, "/ip4/127.0.0.1/udp/9000/quic");
-        let result = dht.add_node(loopback_node).await;
+        let result = dht.add_node_no_trust(loopback_node).await;
         assert!(result.is_ok(), "loopback should be accepted: {:?}", result);
     }
 
@@ -1002,7 +1041,7 @@ mod tests {
         assert!(!dht.allow_loopback);
 
         let normal_node = make_node(1, "/ip4/10.0.0.1/udp/9000/quic");
-        let result = dht.add_node(normal_node).await;
+        let result = dht.add_node_no_trust(normal_node).await;
         assert!(
             result.is_ok(),
             "non-loopback should be accepted: {:?}",
@@ -1034,7 +1073,7 @@ mod tests {
                 addresses: vec!["/ip4/203.0.113.1/udp/9000/quic".parse().unwrap()],
                 last_seen: SystemTime::now(),
             };
-            let result = dht.add_node(node).await;
+            let result = dht.add_node_no_trust(node).await;
             assert!(
                 result.is_ok(),
                 "node {i} from same IP should be accepted with testnet config: {:?}",

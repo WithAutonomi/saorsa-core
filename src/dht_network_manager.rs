@@ -21,6 +21,7 @@
 use crate::{
     P2PError, PeerId, Result,
     adaptive::TrustEngine,
+    adaptive::trust::DEFAULT_NEUTRAL_TRUST,
     address::MultiAddr,
     dht::core_engine::NodeInfo,
     dht::{DHTConfig, DhtCoreEngine, DhtKey, Key},
@@ -1691,7 +1692,13 @@ impl DhtNetworkManager {
                 last_seen: SystemTime::now(),
             };
 
-            if let Err(e) = self.dht.write().await.add_node(node_info).await {
+            let trust_fn = |peer_id: &PeerId| -> f64 {
+                self.trust_engine
+                    .as_ref()
+                    .map(|engine| engine.score(peer_id))
+                    .unwrap_or(DEFAULT_NEUTRAL_TRUST)
+            };
+            if let Err(e) = self.dht.write().await.add_node(node_info, &trust_fn).await {
                 warn!(
                     "Failed to add peer {} to DHT routing table: {}",
                     app_peer_id_hex, e
