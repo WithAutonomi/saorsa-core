@@ -5,7 +5,6 @@
 //! and replication are handled by the application layer (saorsa-node).
 
 pub mod core_engine;
-pub mod geographic_routing;
 pub mod network_integration;
 
 // Re-export core engine types

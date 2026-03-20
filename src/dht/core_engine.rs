@@ -258,12 +258,6 @@ impl KademliaRoutingTable {
         self.buckets.iter().map(|b| b.get_nodes().len()).sum()
     }
 
-    /// Iterate over every node in the routing table.
-    #[allow(dead_code)]
-    fn iter_nodes(&self) -> impl Iterator<Item = &NodeInfo> {
-        self.buckets.iter().flat_map(|b| b.get_nodes().iter())
-    }
-
     fn get_bucket_index(&self, node_id: &PeerId) -> usize {
         self.get_bucket_index_for_key(&DhtKey::from_bytes(*node_id.to_bytes()))
     }
