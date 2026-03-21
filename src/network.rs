@@ -17,7 +17,9 @@
 //! It handles peer connections, network events, and node lifecycle management.
 
 use crate::PeerId;
+use crate::adaptive::trust::{TrustRecord, TrustSnapshot};
 use crate::adaptive::{AdaptiveDHT, AdaptiveDhtConfig, TrustEngine, TrustEvent};
+use crate::bootstrap::cache::{CachedCloseGroupPeer, CloseGroupCache};
 use crate::bootstrap::{BootstrapConfig, BootstrapManager};
 use crate::dht_network_manager::{DhtNetworkConfig, DhtNetworkManager};
 use crate::error::{IdentityError, NetworkError, P2PError, P2pResult as Result};
@@ -28,9 +30,10 @@ use crate::quantum_crypto::saorsa_transport_integration::{MlDsaPublicKey, MlDsaS
 use parking_lot::Mutex as ParkingMutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex as TokioMutex, RwLock, broadcast};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -227,6 +230,17 @@ pub struct NodeConfig {
     /// Default: enabled with a block threshold of 0.15.
     #[serde(default)]
     pub adaptive_dht_config: AdaptiveDhtConfig,
+
+    /// Optional path for persisting the close group cache.
+    ///
+    /// When set, the node saves its close group peers and their trust
+    /// scores to this file on shutdown and when the close group changes.
+    /// On startup, cached peers are loaded and contacted first, preserving
+    /// close group consistency across restarts.
+    ///
+    /// When `None`, no close group cache is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub close_group_cache_path: Option<PathBuf>,
 }
 
 /// DHT-specific configuration
@@ -356,6 +370,7 @@ pub struct NodeConfigBuilder {
     custom_user_agent: Option<String>,
     allow_loopback: Option<bool>,
     adaptive_dht_config: Option<AdaptiveDhtConfig>,
+    close_group_cache_path: Option<PathBuf>,
 }
 
 impl Default for NodeConfigBuilder {
@@ -373,6 +388,7 @@ impl Default for NodeConfigBuilder {
             custom_user_agent: None,
             allow_loopback: None,
             adaptive_dht_config: None,
+            close_group_cache_path: None,
         }
     }
 }
@@ -484,6 +500,16 @@ impl NodeConfigBuilder {
         self
     }
 
+    /// Set the close group cache file path.
+    ///
+    /// When set, the node persists its close group peers and their trust
+    /// scores to this file on shutdown. On startup, cached peers are loaded
+    /// and contacted first, preserving close group consistency across restarts.
+    pub fn close_group_cache_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.close_group_cache_path = Some(path.into());
+        self
+    }
+
     /// Build the [`NodeConfig`].
     ///
     /// # Errors
@@ -511,6 +537,7 @@ impl NodeConfigBuilder {
             custom_user_agent: self.custom_user_agent,
             allow_loopback,
             adaptive_dht_config: self.adaptive_dht_config.unwrap_or_default(),
+            close_group_cache_path: self.close_group_cache_path,
         })
     }
 }
@@ -533,6 +560,7 @@ impl Default for NodeConfig {
             custom_user_agent: None,
             allow_loopback: false,
             adaptive_dht_config: AdaptiveDhtConfig::default(),
+            close_group_cache_path: None,
         }
     }
 }
@@ -842,7 +870,7 @@ impl P2PNode {
     /// bootstrap peers and discover new peers.
     pub async fn re_bootstrap(&self) -> Result<()> {
         self.is_bootstrapped.store(false, Ordering::SeqCst);
-        self.connect_bootstrap_peers().await
+        self.connect_bootstrap_peers(None).await
     }
 
     // =========================================================================
@@ -1008,8 +1036,50 @@ impl P2PNode {
         // The old start_message_receiving_system() is no longer needed as it competed with the accept
         // loop for incoming connections, causing messages to be lost.
 
+        // Load close group cache and import trust scores before connecting to peers.
+        // This ensures trust scores are available when peers are added to the routing table.
+        let close_group_cache = if let Some(ref path) = self.config.close_group_cache_path {
+            match CloseGroupCache::load_from_file(path).await {
+                Ok(Some(cache)) => {
+                    let trust_snapshot = TrustSnapshot {
+                        peers: cache
+                            .peers
+                            .iter()
+                            .map(|p| (p.peer_id, p.trust.clone()))
+                            .collect(),
+                    };
+                    self.adaptive_dht
+                        .trust_engine()
+                        .import_snapshot(&trust_snapshot)
+                        .await;
+                    info!(
+                        "Loaded {} peers from close group cache (trust scores imported)",
+                        cache.peers.len()
+                    );
+                    Some(cache)
+                }
+                Ok(None) => {
+                    debug!(
+                        "No close group cache file found at {}, fresh start",
+                        path.display()
+                    );
+                    None
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to load close group cache from {}: {e}",
+                        path.display()
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         // Connect to bootstrap peers
-        self.connect_bootstrap_peers().await?;
+        self.connect_bootstrap_peers(close_group_cache.as_ref())
+            .await?;
 
         self.is_started
             .store(true, std::sync::atomic::Ordering::Release);
@@ -1039,6 +1109,13 @@ impl P2PNode {
     /// Stop the P2P node
     pub async fn stop(&self) -> Result<()> {
         info!("Stopping P2P node...");
+
+        // Save close group cache before tearing down the DHT and transport layers.
+        if let Some(ref path) = self.config.close_group_cache_path
+            && let Err(e) = self.save_close_group_cache(path).await
+        {
+            warn!("Failed to save close group cache on shutdown: {e}");
+        }
 
         // Signal the run loop to exit
         self.shutdown.cancel();
@@ -1635,14 +1712,71 @@ impl P2PNode {
         0
     }
 
-    /// Connect to bootstrap peers and perform initial peer discovery
-    async fn connect_bootstrap_peers(&self) -> Result<()> {
+    /// Connect to bootstrap peers and perform initial peer discovery.
+    ///
+    /// If a `close_group_cache` was loaded on startup, its peers are injected
+    /// as the highest-priority addresses (before configured and cached bootstrap
+    /// peers). Their trust scores were already imported into the `TrustEngine`
+    /// before this method is called.
+    async fn connect_bootstrap_peers(
+        &self,
+        close_group_cache: Option<&CloseGroupCache>,
+    ) -> Result<()> {
         // Each entry is a list of addresses for a single peer.
         let mut bootstrap_addr_sets: Vec<Vec<MultiAddr>> = Vec::new();
         let mut used_cache = false;
         let mut seen_addresses = std::collections::HashSet::new();
 
-        // Configured bootstrap peers take priority -- always include them first.
+        // Priority 0: Cached close group peers (pre-trusted, highest priority).
+        // These peers had trust scores loaded into the TrustEngine earlier in start(),
+        // so they are already known-good when added to the routing table.
+        // Sorted by trust score (highest first), then XOR distance (closest first)
+        // as tiebreaker so we reconnect to the most trusted, closest peers first.
+        if let Some(cache) = close_group_cache {
+            let mut sorted_peers: Vec<&CachedCloseGroupPeer> = cache.peers.iter().collect();
+            sorted_peers.sort_by(|a, b| {
+                b.trust
+                    .score
+                    .partial_cmp(&a.trust.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| {
+                        let da = self.peer_id.xor_distance(&a.peer_id);
+                        let db = self.peer_id.xor_distance(&b.peer_id);
+                        da.cmp(&db)
+                    })
+            });
+
+            let mut added_from_close_group = 0usize;
+            for peer in &sorted_peers {
+                let new_addresses: Vec<MultiAddr> = peer
+                    .addresses
+                    .iter()
+                    .filter(|a| {
+                        a.dialable_socket_addr()
+                            .is_some_and(|sa| !seen_addresses.contains(&sa))
+                    })
+                    .cloned()
+                    .collect();
+
+                if !new_addresses.is_empty() {
+                    for addr in &new_addresses {
+                        if let Some(sa) = addr.socket_addr() {
+                            seen_addresses.insert(sa);
+                        }
+                    }
+                    bootstrap_addr_sets.push(new_addresses);
+                    added_from_close_group += 1;
+                }
+            }
+            if added_from_close_group > 0 {
+                info!(
+                    "Added {} close group cache peers (highest trust first)",
+                    added_from_close_group
+                );
+            }
+        }
+
+        // Priority 1: Configured bootstrap peers.
         if !self.config.bootstrap_peers.is_empty() {
             info!(
                 "Using {} configured bootstrap peers (priority)",
@@ -1787,6 +1921,64 @@ impl P2PNode {
             connected_peer_ids.len()
         );
 
+        // Save close group cache after initial bootstrap so a crash before
+        // graceful shutdown still preserves the newly-discovered close group.
+        if let Some(ref path) = self.config.close_group_cache_path
+            && let Err(e) = self.save_close_group_cache(path).await
+        {
+            warn!("Failed to save close group cache after bootstrap: {e}");
+        }
+
+        Ok(())
+    }
+
+    /// Persist the current close group peers and their trust scores to disk.
+    async fn save_close_group_cache(&self, path: &Path) -> anyhow::Result<()> {
+        let key: crate::dht::Key = *self.peer_id.as_bytes();
+        let k_value = self.config.dht_config.k_value;
+        let close_group = self
+            .dht_manager()
+            .find_closest_nodes_local(&key, k_value)
+            .await;
+
+        if close_group.is_empty() {
+            debug!("No close group peers to save");
+            return Ok(());
+        }
+
+        let trust_engine = self.adaptive_dht.trust_engine();
+        let now_epoch = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        let peers: Vec<CachedCloseGroupPeer> = close_group
+            .into_iter()
+            .map(|dht_node| {
+                let score = trust_engine.score(&dht_node.peer_id);
+                CachedCloseGroupPeer {
+                    peer_id: dht_node.peer_id,
+                    addresses: dht_node.addresses,
+                    trust: TrustRecord {
+                        score,
+                        last_updated_epoch_secs: now_epoch,
+                    },
+                }
+            })
+            .collect();
+
+        let peer_count = peers.len();
+        let cache = CloseGroupCache {
+            peers,
+            saved_at_epoch_secs: now_epoch,
+        };
+
+        cache.save_to_file(path).await?;
+        info!(
+            "Saved {} close group peers to cache at {}",
+            peer_count,
+            path.display()
+        );
         Ok(())
     }
 
@@ -1889,6 +2081,7 @@ mod tests {
             custom_user_agent: None,
             allow_loopback: true,
             adaptive_dht_config: AdaptiveDhtConfig::default(),
+            close_group_cache_path: None,
         }
     }
 
