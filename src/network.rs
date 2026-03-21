@@ -233,14 +233,16 @@ pub struct NodeConfig {
 
     /// Optional path for persisting the close group cache.
     ///
+    /// Directory for persisting the close group cache.
+    ///
     /// When set, the node saves its close group peers and their trust
-    /// scores to this file on shutdown and when the close group changes.
-    /// On startup, cached peers are loaded and contacted first, preserving
-    /// close group consistency across restarts.
+    /// scores to `{dir}/close_group_cache.json` on shutdown and after
+    /// bootstrap. On startup, cached peers are loaded and contacted
+    /// first, preserving close group consistency across restarts.
     ///
     /// When `None`, no close group cache is used.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub close_group_cache_path: Option<PathBuf>,
+    pub close_group_cache_dir: Option<PathBuf>,
 }
 
 /// DHT-specific configuration
@@ -370,7 +372,7 @@ pub struct NodeConfigBuilder {
     custom_user_agent: Option<String>,
     allow_loopback: Option<bool>,
     adaptive_dht_config: Option<AdaptiveDhtConfig>,
-    close_group_cache_path: Option<PathBuf>,
+    close_group_cache_dir: Option<PathBuf>,
 }
 
 impl Default for NodeConfigBuilder {
@@ -388,7 +390,7 @@ impl Default for NodeConfigBuilder {
             custom_user_agent: None,
             allow_loopback: None,
             adaptive_dht_config: None,
-            close_group_cache_path: None,
+            close_group_cache_dir: None,
         }
     }
 }
@@ -500,13 +502,12 @@ impl NodeConfigBuilder {
         self
     }
 
-    /// Set the close group cache file path.
+    /// Set the directory for persisting the close group cache.
     ///
-    /// When set, the node persists its close group peers and their trust
-    /// scores to this file on shutdown. On startup, cached peers are loaded
-    /// and contacted first, preserving close group consistency across restarts.
-    pub fn close_group_cache_path(mut self, path: impl Into<PathBuf>) -> Self {
-        self.close_group_cache_path = Some(path.into());
+    /// The node writes `close_group_cache.json` inside this directory on
+    /// shutdown and after bootstrap, and loads it on startup.
+    pub fn close_group_cache_dir(mut self, path: impl Into<PathBuf>) -> Self {
+        self.close_group_cache_dir = Some(path.into());
         self
     }
 
@@ -537,7 +538,7 @@ impl NodeConfigBuilder {
             custom_user_agent: self.custom_user_agent,
             allow_loopback,
             adaptive_dht_config: self.adaptive_dht_config.unwrap_or_default(),
-            close_group_cache_path: self.close_group_cache_path,
+            close_group_cache_dir: self.close_group_cache_dir,
         })
     }
 }
@@ -560,7 +561,7 @@ impl Default for NodeConfig {
             custom_user_agent: None,
             allow_loopback: false,
             adaptive_dht_config: AdaptiveDhtConfig::default(),
-            close_group_cache_path: None,
+            close_group_cache_dir: None,
         }
     }
 }
@@ -1038,8 +1039,8 @@ impl P2PNode {
 
         // Load close group cache and import trust scores before connecting to peers.
         // This ensures trust scores are available when peers are added to the routing table.
-        let close_group_cache = if let Some(ref path) = self.config.close_group_cache_path {
-            match CloseGroupCache::load_from_file(path).await {
+        let close_group_cache = if let Some(ref dir) = self.config.close_group_cache_dir {
+            match CloseGroupCache::load_from_dir(dir).await {
                 Ok(Some(cache)) => {
                     let trust_snapshot = TrustSnapshot {
                         peers: cache
@@ -1060,15 +1061,15 @@ impl P2PNode {
                 }
                 Ok(None) => {
                     debug!(
-                        "No close group cache file found at {}, fresh start",
-                        path.display()
+                        "No close group cache found in {}, fresh start",
+                        dir.display()
                     );
                     None
                 }
                 Err(e) => {
                     warn!(
                         "Failed to load close group cache from {}: {e}",
-                        path.display()
+                        dir.display()
                     );
                     None
                 }
@@ -1111,8 +1112,8 @@ impl P2PNode {
         info!("Stopping P2P node...");
 
         // Save close group cache before tearing down the DHT and transport layers.
-        if let Some(ref path) = self.config.close_group_cache_path
-            && let Err(e) = self.save_close_group_cache(path).await
+        if let Some(ref dir) = self.config.close_group_cache_dir
+            && let Err(e) = self.save_close_group_cache(dir).await
         {
             warn!("Failed to save close group cache on shutdown: {e}");
         }
@@ -1923,8 +1924,8 @@ impl P2PNode {
 
         // Save close group cache after initial bootstrap so a crash before
         // graceful shutdown still preserves the newly-discovered close group.
-        if let Some(ref path) = self.config.close_group_cache_path
-            && let Err(e) = self.save_close_group_cache(path).await
+        if let Some(ref dir) = self.config.close_group_cache_dir
+            && let Err(e) = self.save_close_group_cache(dir).await
         {
             warn!("Failed to save close group cache after bootstrap: {e}");
         }
@@ -1933,7 +1934,7 @@ impl P2PNode {
     }
 
     /// Persist the current close group peers and their trust scores to disk.
-    async fn save_close_group_cache(&self, path: &Path) -> anyhow::Result<()> {
+    async fn save_close_group_cache(&self, dir: &Path) -> anyhow::Result<()> {
         let key: crate::dht::Key = *self.peer_id.as_bytes();
         let k_value = self.config.dht_config.k_value;
         let close_group = self
@@ -1973,11 +1974,11 @@ impl P2PNode {
             saved_at_epoch_secs: now_epoch,
         };
 
-        cache.save_to_file(path).await?;
+        cache.save_to_dir(dir).await?;
         info!(
-            "Saved {} close group peers to cache at {}",
+            "Saved {} close group peers to cache in {}",
             peer_count,
-            path.display()
+            dir.display()
         );
         Ok(())
     }
@@ -2081,7 +2082,7 @@ mod tests {
             custom_user_agent: None,
             allow_loopback: true,
             adaptive_dht_config: AdaptiveDhtConfig::default(),
-            close_group_cache_path: None,
+            close_group_cache_dir: None,
         }
     }
 

@@ -23,6 +23,9 @@ use crate::address::MultiAddr;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+/// Filename used for the close group cache inside the configured directory.
+const CACHE_FILENAME: &str = "close_group_cache.json";
+
 /// A peer in the persisted close group cache.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CachedCloseGroupPeer {
@@ -48,11 +51,12 @@ pub struct CloseGroupCache {
 }
 
 impl CloseGroupCache {
-    /// Save the cache to a JSON file.
-    pub async fn save_to_file(&self, path: &Path) -> anyhow::Result<()> {
+    /// Save the cache to `{dir}/close_group_cache.json`.
+    pub async fn save_to_dir(&self, dir: &Path) -> anyhow::Result<()> {
+        let path = dir.join(CACHE_FILENAME);
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| anyhow::anyhow!("failed to serialize close group cache: {e}"))?;
-        tokio::fs::write(path, json).await.map_err(|e| {
+        tokio::fs::write(&path, json).await.map_err(|e| {
             anyhow::anyhow!(
                 "failed to write close group cache to {}: {e}",
                 path.display()
@@ -61,11 +65,12 @@ impl CloseGroupCache {
         Ok(())
     }
 
-    /// Load the cache from a JSON file.
+    /// Load the cache from `{dir}/close_group_cache.json`.
     ///
     /// Returns `None` if the file doesn't exist (fresh start).
-    pub async fn load_from_file(path: &Path) -> anyhow::Result<Option<Self>> {
-        match tokio::fs::read_to_string(path).await {
+    pub async fn load_from_dir(dir: &Path) -> anyhow::Result<Option<Self>> {
+        let path = dir.join(CACHE_FILENAME);
+        match tokio::fs::read_to_string(&path).await {
             Ok(json) => {
                 let cache: Self = serde_json::from_str(&json)
                     .map_err(|e| anyhow::anyhow!("failed to deserialize close group cache: {e}"))?;
@@ -110,10 +115,9 @@ mod tests {
         };
 
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("close_group.json");
 
-        cache.save_to_file(&path).await.unwrap();
-        let loaded = CloseGroupCache::load_from_file(&path)
+        cache.save_to_dir(dir.path()).await.unwrap();
+        let loaded = CloseGroupCache::load_from_dir(dir.path())
             .await
             .unwrap()
             .unwrap();
@@ -126,9 +130,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_load_nonexistent_returns_none() {
-        let result = CloseGroupCache::load_from_file(Path::new("/nonexistent/cache.json"))
-            .await
-            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let result = CloseGroupCache::load_from_dir(dir.path()).await.unwrap();
         assert!(result.is_none());
     }
 
@@ -140,10 +143,9 @@ mod tests {
         };
 
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("empty.json");
 
-        cache.save_to_file(&path).await.unwrap();
-        let loaded = CloseGroupCache::load_from_file(&path)
+        cache.save_to_dir(dir.path()).await.unwrap();
+        let loaded = CloseGroupCache::load_from_dir(dir.path())
             .await
             .unwrap()
             .unwrap();
