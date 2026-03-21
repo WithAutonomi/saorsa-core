@@ -17,11 +17,15 @@
 //! Uses saorsa-transport's BootstrapCache internally with additional Sybil protection
 //! via rate limiting and IP diversity enforcement.
 
+pub mod cache;
 pub mod manager;
 
 // Re-export the primary BootstrapManager (wraps saorsa-transport)
 pub use manager::BootstrapManager;
 pub use manager::{BootstrapConfig, BootstrapStats};
+
+// Re-export close group cache types
+pub use cache::{CachedCloseGroupPeer, CloseGroupCache};
 
 #[cfg(test)]
 mod tests {

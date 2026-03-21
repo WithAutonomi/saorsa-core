@@ -20,9 +20,10 @@
 //! Future: full EigenTrust with peer-to-peer trust gossip.
 
 use crate::PeerId;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 
 /// Default trust score for unknown peers
@@ -125,6 +126,23 @@ pub enum NodeStatisticsUpdate {
     FailedResponse,
 }
 
+/// Serializable trust snapshot for persistence across restarts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrustSnapshot {
+    /// Peer trust scores with timestamps.
+    /// The timestamp is seconds since UNIX epoch when the score was last updated.
+    pub peers: HashMap<PeerId, TrustRecord>,
+}
+
+/// A single peer's trust record for serialization.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrustRecord {
+    /// Trust score [0.0, 1.0]
+    pub score: f64,
+    /// When the score was last updated (seconds since UNIX epoch)
+    pub last_updated_epoch_secs: u64,
+}
+
 /// Local trust engine based on direct peer observations.
 ///
 /// Scores are an exponential moving average of success/failure observations
@@ -178,6 +196,49 @@ impl TrustEngine {
     pub async fn remove_node(&self, node_id: &PeerId) {
         let mut peers = self.peers.write().await;
         peers.remove(node_id);
+    }
+
+    /// Export current trust state as a serializable snapshot.
+    ///
+    /// Applies decay to all scores before exporting so the snapshot
+    /// reflects the current effective scores.
+    pub async fn export_snapshot(&self) -> TrustSnapshot {
+        let peers_guard = self.peers.read().await;
+        let now_epoch = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        let peers = peers_guard
+            .iter()
+            .map(|(peer_id, peer_trust)| {
+                let record = TrustRecord {
+                    score: peer_trust.decayed_score(),
+                    last_updated_epoch_secs: now_epoch,
+                };
+                (*peer_id, record)
+            })
+            .collect();
+
+        TrustSnapshot { peers }
+    }
+
+    /// Import trust state from a persisted snapshot.
+    ///
+    /// Scores are restored as-is with `last_updated` set to now.  Decay does
+    /// not run while our node is offline — we can't observe peer behavior
+    /// during downtime, so penalising peers for our absence would be wrong.
+    /// Decay resumes naturally from the moment the node restarts.
+    pub async fn import_snapshot(&self, snapshot: &TrustSnapshot) {
+        let mut peers_guard = self.peers.write().await;
+
+        for (peer_id, record) in &snapshot.peers {
+            let peer_trust = PeerTrust {
+                score: record.score.clamp(MIN_TRUST_SCORE, MAX_TRUST_SCORE),
+                last_updated: Instant::now(),
+            };
+            peers_guard.insert(*peer_id, peer_trust);
+        }
     }
 
     /// Simulate time passing for a peer (test only).
@@ -354,5 +415,81 @@ mod tests {
         let score = PeerTrust::decay_score(0.1, one_week_secs);
 
         assert!(score > 0.1, "Low score should decay upward toward neutral");
+    }
+
+    #[tokio::test]
+    async fn test_export_import_roundtrip() {
+        let engine = TrustEngine::new();
+        let peer1 = PeerId::random();
+        let peer2 = PeerId::random();
+
+        // Build up some trust
+        for _ in 0..20 {
+            engine
+                .update_node_stats(&peer1, NodeStatisticsUpdate::CorrectResponse)
+                .await;
+        }
+        for _ in 0..10 {
+            engine
+                .update_node_stats(&peer2, NodeStatisticsUpdate::FailedResponse)
+                .await;
+        }
+
+        let score1_before = engine.score(&peer1);
+        let score2_before = engine.score(&peer2);
+
+        // Export
+        let snapshot = engine.export_snapshot().await;
+        assert_eq!(snapshot.peers.len(), 2);
+
+        // Import into fresh engine
+        let engine2 = TrustEngine::new();
+        engine2.import_snapshot(&snapshot).await;
+
+        let score1_after = engine2.score(&peer1);
+        let score2_after = engine2.score(&peer2);
+
+        // Scores should be approximately equal (small time drift from test execution)
+        assert!(
+            (score1_before - score1_after).abs() < 0.01,
+            "peer1 score drifted: before={score1_before}, after={score1_after}"
+        );
+        assert!(
+            (score2_before - score2_after).abs() < 0.01,
+            "peer2 score drifted: before={score2_before}, after={score2_after}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_import_preserves_scores_without_decay() {
+        // Create a snapshot with a timestamp 1 day in the past.
+        // Scores should be restored as-is — no decay for offline time.
+        let peer = PeerId::random();
+        let one_day_secs: u64 = 86_400;
+        let one_day_ago = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - one_day_secs;
+
+        let snapshot = TrustSnapshot {
+            peers: HashMap::from([(
+                peer,
+                TrustRecord {
+                    score: 0.9,
+                    last_updated_epoch_secs: one_day_ago,
+                },
+            )]),
+        };
+
+        let engine = TrustEngine::new();
+        engine.import_snapshot(&snapshot).await;
+
+        let score = engine.score(&peer);
+        // Score should be restored at 0.9 — offline time doesn't decay
+        assert!(
+            (score - 0.9).abs() < 0.01,
+            "Score {score} should be ~0.9 (no offline decay)"
+        );
     }
 }
