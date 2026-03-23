@@ -295,14 +295,19 @@ fn mask_ipv6(addr: Ipv6Addr, prefix_len: u8) -> Ipv6Addr {
     Ipv6Addr::from(bits & mask)
 }
 
-/// K parameter - number of closest nodes per bucket
-const K: usize = 8;
+/// Default K parameter — number of closest nodes per bucket.
+/// Used only by test helpers; production code reads from config.
+#[cfg(test)]
+const DEFAULT_K: usize = 20;
 
 /// Max nodes sharing an exact IP address per bucket/close-group.
 const IP_EXACT_LIMIT: usize = 2;
 
-/// Max nodes in the same subnet (/24 IPv4, /64 IPv6) per bucket/close-group.
-const IP_SUBNET_LIMIT: usize = if K / 4 > 0 { K / 4 } else { 1 };
+/// Compute the subnet diversity limit from the active K value.
+/// At least 1 node per subnet is always permitted.
+const fn ip_subnet_limit(k: usize) -> usize {
+    if k / 4 > 0 { k / 4 } else { 1 }
+}
 
 /// Number of K-buckets in Kademlia routing table (one per bit in 256-bit key space)
 const KADEMLIA_BUCKET_COUNT: usize = 256;
@@ -321,6 +326,9 @@ pub struct DhtCoreEngine {
     node_id: PeerId,
     routing_table: Arc<RwLock<KademliaRoutingTable>>,
 
+    /// Kademlia K parameter — bucket capacity and close-group size.
+    k_value: usize,
+
     /// IP diversity limits — checked against the live routing table on each
     /// `add_node` call rather than maintained as incremental counters.
     ip_diversity_config: IPDiversityConfig,
@@ -336,17 +344,18 @@ pub struct DhtCoreEngine {
 }
 
 impl DhtCoreEngine {
-    /// Create new DHT engine for testing
+    /// Create new DHT engine for testing with default K value.
     #[cfg(test)]
     pub fn new_for_tests(node_id: PeerId) -> Result<Self> {
-        Self::new(node_id, false)
+        Self::new(node_id, DEFAULT_K, false)
     }
 
     /// Create a new DHT core engine.
-    pub(crate) fn new(node_id: PeerId, allow_loopback: bool) -> Result<Self> {
+    pub(crate) fn new(node_id: PeerId, k_value: usize, allow_loopback: bool) -> Result<Self> {
         Ok(Self {
             node_id,
-            routing_table: Arc::new(RwLock::new(KademliaRoutingTable::new(node_id, K))),
+            routing_table: Arc::new(RwLock::new(KademliaRoutingTable::new(node_id, k_value))),
+            k_value,
             ip_diversity_config: IPDiversityConfig::default(),
             allow_loopback,
             shutdown: CancellationToken::new(),
@@ -491,7 +500,7 @@ impl DhtCoreEngine {
             IpAddr::V4(v4) => {
                 // IPv4 limits: use config override if set, otherwise default
                 let limit_ip = cfg.max_per_ip.unwrap_or(IP_EXACT_LIMIT);
-                let limit_subnet = cfg.max_per_subnet.unwrap_or(IP_SUBNET_LIMIT);
+                let limit_subnet = cfg.max_per_subnet.unwrap_or(ip_subnet_limit(self.k_value));
 
                 let cand_24 = mask_ipv4(v4, 24);
 
@@ -554,7 +563,7 @@ impl DhtCoreEngine {
             IpAddr::V6(v6) => {
                 // IPv6 limits: use config override if set, otherwise default
                 let limit_ip = cfg.max_per_ip.unwrap_or(IP_EXACT_LIMIT);
-                let limit_subnet = cfg.max_per_subnet.unwrap_or(IP_SUBNET_LIMIT);
+                let limit_subnet = cfg.max_per_subnet.unwrap_or(ip_subnet_limit(self.k_value));
 
                 let cand_64 = mask_ipv6(v6, 64);
 
@@ -664,14 +673,14 @@ impl DhtCoreEngine {
         let bucket_swaps: Vec<PeerId> = ip_bucket_swap.into_iter().collect();
 
         // === Close-group setup ===
-        let close_group = routing.find_closest_nodes(&self.node_id, K);
+        let close_group = routing.find_closest_nodes(&self.node_id, self.k_value);
 
         let effective_close_len = close_group
             .iter()
             .filter(|n| !bucket_swaps.contains(&n.id))
             .count();
 
-        let candidate_in_close = effective_close_len < K
+        let candidate_in_close = effective_close_len < self.k_value
             || close_group
                 .iter()
                 .rfind(|n| !bucket_swaps.contains(&n.id))
@@ -696,7 +705,7 @@ impl DhtCoreEngine {
                 let db = xor_distance_bytes(self.node_id.to_bytes(), b.id.to_bytes());
                 da.cmp(&db)
             });
-            hyp_close.truncate(K);
+            hyp_close.truncate(self.k_value);
 
             // === Close-group IP diversity ===
             ip_close_swap = self.find_ip_swap_in_scope(

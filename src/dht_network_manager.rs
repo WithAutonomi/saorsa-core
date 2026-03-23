@@ -24,7 +24,7 @@ use crate::{
     adaptive::trust::DEFAULT_NEUTRAL_TRUST,
     address::MultiAddr,
     dht::core_engine::NodeInfo,
-    dht::{DHTConfig, DhtCoreEngine, DhtKey, Key},
+    dht::{DhtCoreEngine, DhtKey, Key},
     error::{DhtError, IdentityError, NetworkError},
     network::NodeConfig,
 };
@@ -86,9 +86,7 @@ pub type SerializableDHTNode = DHTNode;
 pub struct DhtNetworkConfig {
     /// This node's peer ID
     pub peer_id: PeerId,
-    /// DHT configuration
-    pub dht_config: DHTConfig,
-    /// Network node configuration
+    /// Network node configuration (includes DHT settings via `NodeConfig.dht_config`)
     pub node_config: NodeConfig,
     /// Request timeout for DHT operations
     pub request_timeout: Duration,
@@ -286,18 +284,17 @@ pub struct DhtNetworkStats {
 }
 
 impl DhtNetworkManager {
-    fn init_dht_core(local_peer_id: &PeerId, allow_loopback: bool) -> Result<DhtCoreEngine> {
-        DhtCoreEngine::new(*local_peer_id, allow_loopback)
-            .map_err(|e| P2PError::Dht(DhtError::OperationFailed(e.to_string().into())))
-    }
-
     fn new_from_components(
         transport: Arc<crate::transport_handle::TransportHandle>,
         trust_engine: Option<Arc<TrustEngine>>,
         config: DhtNetworkConfig,
     ) -> Result<Self> {
-        let mut dht_instance =
-            Self::init_dht_core(&config.peer_id, config.node_config.allow_loopback)?;
+        let mut dht_instance = DhtCoreEngine::new(
+            config.peer_id,
+            config.node_config.dht_config.k_value,
+            config.node_config.allow_loopback,
+        )
+        .map_err(|e| P2PError::Dht(DhtError::OperationFailed(e.to_string().into())))?;
 
         // Propagate IP diversity settings from the node config into the DHT
         // core engine so diversity overrides take effect on routing table
@@ -1932,7 +1929,6 @@ impl Default for DhtNetworkConfig {
     fn default() -> Self {
         Self {
             peer_id: PeerId::from_bytes([0u8; 32]),
-            dht_config: DHTConfig::default(),
             node_config: NodeConfig::default(),
             request_timeout: Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS),
             max_concurrent_operations: DEFAULT_MAX_CONCURRENT_OPS,

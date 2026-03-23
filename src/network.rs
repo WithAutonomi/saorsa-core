@@ -125,9 +125,6 @@ const DEFAULT_MAX_CONNECTIONS: usize = 10_000;
 /// Default connection timeout in seconds.
 const DEFAULT_CONNECTION_TIMEOUT_SECS: u64 = 30;
 
-/// DHT max XOR distance (full 160-bit keyspace).
-const DHT_MAX_DISTANCE: u8 = 160;
-
 /// Number of cached bootstrap peers to retrieve.
 const BOOTSTRAP_PEER_BATCH_SIZE: usize = 20;
 
@@ -801,15 +798,8 @@ impl P2PNode {
             Arc::new(crate::transport_handle::TransportHandle::new(transport_config).await?);
 
         // Initialize AdaptiveDHT — creates the trust engine and DHT manager
-        let manager_dht_config = crate::dht::DHTConfig {
-            bucket_size: config.dht_config.k_value,
-            alpha: config.dht_config.alpha_value,
-            bucket_refresh_interval: config.dht_config.refresh_interval,
-            max_distance: DHT_MAX_DISTANCE,
-        };
         let dht_manager_config = DhtNetworkConfig {
             peer_id,
-            dht_config: manager_dht_config,
             node_config: config.clone(),
             request_timeout: config.connection_timeout,
             max_concurrent_operations: MAX_ACTIVE_REQUESTS,
