@@ -52,13 +52,33 @@ pub struct CloseGroupCache {
 
 impl CloseGroupCache {
     /// Save the cache to `{dir}/close_group_cache.json`.
+    ///
+    /// Uses write-then-rename for atomicity: a crash mid-write leaves the
+    /// previous file intact instead of producing truncated JSON.
     pub async fn save_to_dir(&self, dir: &Path) -> anyhow::Result<()> {
+        // Ensure the directory exists (first run or after cache dir deletion).
+        tokio::fs::create_dir_all(dir).await.map_err(|e| {
+            anyhow::anyhow!(
+                "failed to create close group cache directory {}: {e}",
+                dir.display()
+            )
+        })?;
+
         let path = dir.join(CACHE_FILENAME);
+        let tmp_path = dir.join("close_group_cache.json.tmp");
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| anyhow::anyhow!("failed to serialize close group cache: {e}"))?;
-        tokio::fs::write(&path, json).await.map_err(|e| {
+
+        tokio::fs::write(&tmp_path, json).await.map_err(|e| {
             anyhow::anyhow!(
                 "failed to write close group cache to {}: {e}",
+                tmp_path.display()
+            )
+        })?;
+        tokio::fs::rename(&tmp_path, &path).await.map_err(|e| {
+            anyhow::anyhow!(
+                "failed to rename close group cache {} -> {}: {e}",
+                tmp_path.display(),
                 path.display()
             )
         })?;

@@ -131,6 +131,19 @@ impl BootstrapIpLimiter {
         }
     }
 
+    /// Canonicalize an IP address: map IPv4-mapped IPv6 (`::ffff:a.b.c.d`) to
+    /// its IPv4 equivalent so that diversity limits cannot be bypassed by
+    /// using the mapped form for the same network location.
+    fn canonicalize(ip: IpAddr) -> IpAddr {
+        match ip {
+            IpAddr::V6(v6) => v6
+                .to_ipv4_mapped()
+                .map(IpAddr::V4)
+                .unwrap_or(IpAddr::V6(v6)),
+            other => other,
+        }
+    }
+
     /// Mask an IP to its subnet prefix (/24 for IPv4, /64 for IPv6).
     fn subnet_key(ip: IpAddr) -> IpAddr {
         match ip {
@@ -151,8 +164,14 @@ impl BootstrapIpLimiter {
 
     /// Check if a new node with the given IP can be accepted under diversity limits.
     pub fn can_accept(&self, ip: IpAddr) -> bool {
+        let ip = Self::canonicalize(ip);
         if ip.is_loopback() && self.allow_loopback {
             return true;
+        }
+
+        // Reject addresses that are never valid peer endpoints.
+        if ip.is_unspecified() || ip.is_multicast() {
+            return false;
         }
 
         let ip_limit = self.config.max_per_ip.unwrap_or(BOOTSTRAP_DEFAULT_IP_LIMIT);
@@ -183,6 +202,7 @@ impl BootstrapIpLimiter {
     ///
     /// Returns an error if the IP would exceed diversity limits.
     pub fn track(&mut self, ip: IpAddr) -> Result<()> {
+        let ip = Self::canonicalize(ip);
         if !self.can_accept(ip) {
             return Err(anyhow!("IP diversity limits exceeded"));
         }
@@ -200,18 +220,19 @@ impl BootstrapIpLimiter {
     /// Remove a tracked IP address from the diversity enforcer.
     #[allow(dead_code)]
     pub fn untrack(&mut self, ip: IpAddr) {
-        if let Some(count) = self.ip_counts.pop(&ip) {
-            let new = count.saturating_sub(1);
-            if new > 0 {
-                self.ip_counts.put(ip, new);
+        let ip = Self::canonicalize(ip);
+        if let Some(count) = self.ip_counts.peek_mut(&ip) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.ip_counts.pop(&ip);
             }
         }
 
         let subnet = Self::subnet_key(ip);
-        if let Some(count) = self.subnet_counts.pop(&subnet) {
-            let new = count.saturating_sub(1);
-            if new > 0 {
-                self.subnet_counts.put(subnet, new);
+        if let Some(count) = self.subnet_counts.peek_mut(&subnet) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.subnet_counts.pop(&subnet);
             }
         }
     }
@@ -225,19 +246,27 @@ impl BootstrapIpLimiter {
     }
 }
 
-/// GeoIP/ASN provider trait
+/// GeoIP/ASN provider trait.
+///
+/// Used by `BgpGeoProvider` in the transport layer; kept here so it can be
+/// shared across crates without a circular dependency.
 #[allow(dead_code)]
 pub trait GeoProvider: std::fmt::Debug {
+    /// Look up geo/ASN information for an IP address.
     fn lookup(&self, ip: Ipv6Addr) -> GeoInfo;
 }
 
-/// Geo information
+/// Geo information for a peer's IP address.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct GeoInfo {
+    /// Autonomous System Number
     pub asn: Option<u32>,
+    /// Country code
     pub country: Option<String>,
+    /// Whether the IP belongs to a known hosting provider
     pub is_hosting_provider: bool,
+    /// Whether the IP belongs to a known VPN provider
     pub is_vpn_provider: bool,
 }
 
@@ -414,5 +443,71 @@ mod tests {
 
         // Third should fail
         assert!(!enforcer.can_accept(ip1));
+    }
+
+    #[test]
+    fn test_ipv4_mapped_ipv6_counts_as_ipv4() {
+        let config = IPDiversityConfig {
+            max_per_ip: Some(1),
+            max_per_subnet: Some(usize::MAX),
+        };
+        let mut enforcer = BootstrapIpLimiter::new(config);
+
+        // Track using native IPv4
+        let ipv4: IpAddr = "10.0.0.1".parse().unwrap();
+        enforcer.track(ipv4).unwrap();
+
+        // IPv4-mapped IPv6 form of the same address should be rejected
+        let mapped: IpAddr = "::ffff:10.0.0.1".parse().unwrap();
+        assert!(
+            !enforcer.can_accept(mapped),
+            "IPv4-mapped IPv6 should be canonicalized and hit the IPv4 limit"
+        );
+    }
+
+    #[test]
+    fn test_multicast_rejected() {
+        let config = IPDiversityConfig::default();
+        let enforcer = BootstrapIpLimiter::new(config);
+
+        let multicast_v4: IpAddr = "224.0.0.1".parse().unwrap();
+        assert!(!enforcer.can_accept(multicast_v4));
+
+        let multicast_v6: IpAddr = "ff02::1".parse().unwrap();
+        assert!(!enforcer.can_accept(multicast_v6));
+    }
+
+    #[test]
+    fn test_unspecified_rejected() {
+        let config = IPDiversityConfig::default();
+        let enforcer = BootstrapIpLimiter::new(config);
+
+        let unspec_v4: IpAddr = "0.0.0.0".parse().unwrap();
+        assert!(!enforcer.can_accept(unspec_v4));
+
+        let unspec_v6: IpAddr = "::".parse().unwrap();
+        assert!(!enforcer.can_accept(unspec_v6));
+    }
+
+    #[test]
+    fn test_untrack_ipv4_mapped_ipv6() {
+        let config = IPDiversityConfig {
+            max_per_ip: Some(1),
+            max_per_subnet: Some(usize::MAX),
+        };
+        let mut enforcer = BootstrapIpLimiter::new(config);
+
+        // Track using native IPv4
+        let ipv4: IpAddr = "10.0.0.1".parse().unwrap();
+        enforcer.track(ipv4).unwrap();
+        assert!(!enforcer.can_accept(ipv4));
+
+        // Untrack using the IPv4-mapped IPv6 form — should still decrement
+        let mapped: IpAddr = "::ffff:10.0.0.1".parse().unwrap();
+        enforcer.untrack(mapped);
+        assert!(
+            enforcer.can_accept(ipv4),
+            "untrack via mapped form should decrement the IPv4 counter"
+        );
     }
 }

@@ -157,7 +157,6 @@ impl KBucket {
 pub struct KademliaRoutingTable {
     buckets: Vec<KBucket>,
     node_id: PeerId,
-    _k_value: usize,
 }
 
 impl KademliaRoutingTable {
@@ -167,11 +166,7 @@ impl KademliaRoutingTable {
             buckets.push(KBucket::new(k_value));
         }
 
-        Self {
-            buckets,
-            node_id,
-            _k_value: k_value,
-        }
+        Self { buckets, node_id }
     }
 
     fn add_node(&mut self, node: NodeInfo) -> Result<()> {
@@ -272,6 +267,19 @@ impl KademliaRoutingTable {
 
 /// One entry in the tier-check array used by `find_ip_swap_in_scope`.
 type IpSwapTier = (usize, usize, Option<(PeerId, [u8; 32])>, &'static str);
+
+/// Canonicalize an IP address: map IPv4-mapped IPv6 (`::ffff:a.b.c.d`) to
+/// its IPv4 equivalent so that diversity limits are enforced uniformly
+/// regardless of which address family the transport layer reports.
+fn canonicalize_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(v6)),
+        other => other,
+    }
+}
 
 /// Zero out the host bits of an IPv4 address beyond `prefix_len`.
 fn mask_ipv4(addr: Ipv4Addr, prefix_len: u8) -> Ipv4Addr {
@@ -440,8 +448,15 @@ impl DhtCoreEngine {
         node: NodeInfo,
         trust_score: &impl Fn(&PeerId) -> f64,
     ) -> Result<()> {
+        // Reject self-insertion — a node must never appear in its own routing table.
+        if node.id == self.node_id {
+            return Err(anyhow!("cannot add self to routing table"));
+        }
+
         // IP-based transports always have an IP; non-IP transports skip diversity.
-        let candidate_ip = match node.ip() {
+        // Canonicalize IPv4-mapped IPv6 (::ffff:a.b.c.d) to IPv4 so an attacker
+        // cannot bypass IPv4 diversity limits by using the mapped form.
+        let candidate_ip = match node.ip().map(canonicalize_ip) {
             Some(ip) => ip,
             None => {
                 // Non-IP transports (Bluetooth, LoRa, etc.) bypass IP diversity.
@@ -514,7 +529,7 @@ impl DhtCoreEngine {
                     if n.id == *candidate_id {
                         continue;
                     }
-                    let Some(existing_ip) = n.ip() else {
+                    let Some(existing_ip) = n.ip().map(canonicalize_ip) else {
                         continue;
                     };
                     if existing_ip.is_loopback() {
@@ -577,7 +592,7 @@ impl DhtCoreEngine {
                     if n.id == *candidate_id {
                         continue;
                     }
-                    let Some(existing_ip) = n.ip() else {
+                    let Some(existing_ip) = n.ip().map(canonicalize_ip) else {
                         continue;
                     };
                     if existing_ip.is_loopback() {
@@ -666,7 +681,7 @@ impl DhtCoreEngine {
             &node.id,
             candidate_ip,
             &candidate_distance,
-            &format!("bucket {bucket_idx}"),
+            "bucket",
             trust_score,
         )?;
 
@@ -762,13 +777,9 @@ impl std::fmt::Debug for DhtCoreEngine {
         f.debug_struct("DhtCoreEngine")
             .field("node_id", &self.node_id)
             .field("routing_table", &"Arc<RwLock<KademliaRoutingTable>>")
-            .field(
-                "bucket_refresh_manager",
-                &"Arc<RwLock<BucketRefreshManager>>",
-            )
-            .field("close_group_validator", &"Arc<RwLock<CloseGroupValidator>>")
-            .field("eviction_manager", &"Arc<RwLock<EvictionManager>>")
+            .field("k_value", &self.k_value)
             .field("ip_diversity_config", &self.ip_diversity_config)
+            .field("allow_loopback", &self.allow_loopback)
             .finish()
     }
 }

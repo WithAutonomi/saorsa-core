@@ -20,11 +20,11 @@
 //! Future: full EigenTrust with peer-to-peer trust gossip.
 
 use crate::PeerId;
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::RwLock;
 
 /// Default trust score for unknown peers
 pub const DEFAULT_NEUTRAL_TRUST: f64 = 0.5;
@@ -166,7 +166,7 @@ impl TrustEngine {
 
     /// Record a peer interaction outcome
     pub async fn update_node_stats(&self, node_id: &PeerId, update: NodeStatisticsUpdate) {
-        let mut peers = self.peers.write().await;
+        let mut peers = self.peers.write();
         let entry = peers.entry(*node_id).or_insert_with(PeerTrust::new);
 
         let observation = match update {
@@ -181,20 +181,21 @@ impl TrustEngine {
     ///
     /// Applies time decay lazily — no background task needed.
     /// Returns `DEFAULT_NEUTRAL_TRUST` (0.5) for unknown peers.
+    ///
+    /// Uses `parking_lot::RwLock` so this never falls back to a stale
+    /// neutral value during write contention — it briefly blocks until
+    /// the writer releases.
     pub fn score(&self, node_id: &PeerId) -> f64 {
-        if let Ok(peers) = self.peers.try_read() {
-            peers
-                .get(node_id)
-                .map(|p| p.decayed_score())
-                .unwrap_or(DEFAULT_NEUTRAL_TRUST)
-        } else {
-            DEFAULT_NEUTRAL_TRUST
-        }
+        let peers = self.peers.read();
+        peers
+            .get(node_id)
+            .map(|p| p.decayed_score())
+            .unwrap_or(DEFAULT_NEUTRAL_TRUST)
     }
 
     /// Remove a peer from the trust system entirely
     pub async fn remove_node(&self, node_id: &PeerId) {
-        let mut peers = self.peers.write().await;
+        let mut peers = self.peers.write();
         peers.remove(node_id);
     }
 
@@ -203,7 +204,7 @@ impl TrustEngine {
     /// Applies decay to all scores before exporting so the snapshot
     /// reflects the current effective scores.
     pub async fn export_snapshot(&self) -> TrustSnapshot {
-        let peers_guard = self.peers.read().await;
+        let peers_guard = self.peers.read();
         let now_epoch = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -230,11 +231,18 @@ impl TrustEngine {
     /// during downtime, so penalising peers for our absence would be wrong.
     /// Decay resumes naturally from the moment the node restarts.
     pub async fn import_snapshot(&self, snapshot: &TrustSnapshot) {
-        let mut peers_guard = self.peers.write().await;
+        let mut peers_guard = self.peers.write();
 
         for (peer_id, record) in &snapshot.peers {
+            // Guard against NaN/Infinity from corrupted or malicious snapshots —
+            // non-finite values would propagate through all EMA/decay calculations.
+            let score = if record.score.is_finite() {
+                record.score.clamp(MIN_TRUST_SCORE, MAX_TRUST_SCORE)
+            } else {
+                DEFAULT_NEUTRAL_TRUST
+            };
             let peer_trust = PeerTrust {
-                score: record.score.clamp(MIN_TRUST_SCORE, MAX_TRUST_SCORE),
+                score,
                 last_updated: Instant::now(),
             };
             peers_guard.insert(*peer_id, peer_trust);
@@ -248,7 +256,7 @@ impl TrustEngine {
     /// which panics on Windows when system uptime < `elapsed`.
     #[cfg(test)]
     pub async fn simulate_elapsed(&self, node_id: &PeerId, elapsed: std::time::Duration) {
-        let mut peers = self.peers.write().await;
+        let mut peers = self.peers.write();
         if let Some(trust) = peers.get_mut(node_id) {
             trust.apply_decay_secs(elapsed.as_secs_f64());
         }
@@ -490,6 +498,60 @@ mod tests {
         assert!(
             (score - 0.9).abs() < 0.01,
             "Score {score} should be ~0.9 (no offline decay)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_import_nan_score_falls_back_to_neutral() {
+        let peer = PeerId::random();
+        let snapshot = TrustSnapshot {
+            peers: HashMap::from([(
+                peer,
+                TrustRecord {
+                    score: f64::NAN,
+                    last_updated_epoch_secs: 1_000_000,
+                },
+            )]),
+        };
+
+        let engine = TrustEngine::new();
+        engine.import_snapshot(&snapshot).await;
+
+        let score = engine.score(&peer);
+        assert!(
+            score.is_finite(),
+            "NaN score should have been replaced with a finite value"
+        );
+        assert!(
+            (score - DEFAULT_NEUTRAL_TRUST).abs() < f64::EPSILON,
+            "NaN score should fall back to neutral, got {score}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_import_infinity_score_falls_back_to_neutral() {
+        let peer = PeerId::random();
+        let snapshot = TrustSnapshot {
+            peers: HashMap::from([(
+                peer,
+                TrustRecord {
+                    score: f64::INFINITY,
+                    last_updated_epoch_secs: 1_000_000,
+                },
+            )]),
+        };
+
+        let engine = TrustEngine::new();
+        engine.import_snapshot(&snapshot).await;
+
+        let score = engine.score(&peer);
+        assert!(
+            score.is_finite(),
+            "Infinity score should have been replaced with a finite value"
+        );
+        assert!(
+            (score - DEFAULT_NEUTRAL_TRUST).abs() < f64::EPSILON,
+            "Infinity score should fall back to neutral, got {score}"
         );
     }
 }
