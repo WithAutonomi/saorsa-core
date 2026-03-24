@@ -5,25 +5,25 @@
 ## 1. Purpose
 
 This document specifies routing table behavior as a pure system design, independent of any language, framework, transport, or existing codebase.
-It is designed for a Kademlia-style decentralized network with trust-weighted peer management and data replication, and assumes Kademlia nearest-peer routing semantics.
+It is designed for a Kademlia-style decentralized network with trust-weighted peer management, and assumes Kademlia nearest-peer routing semantics.
 
-Primary goal: validate correctness, safety, and liveness of routing table logic before implementation, ensuring seamless integration with the Replication Logic Specification.
+Primary goal: validate correctness, safety, and liveness of routing table logic before implementation.
+
+The routing table is a **peer phonebook** — it tracks who is on the network and how to reach them. Higher-level concerns such as data storage responsibility, replication, close group semantics, and quorum math are the API consumer's responsibility (e.g., saorsa-node). The routing table exposes `find_closest_nodes_local(K, count)` and `find_closest_nodes_network(K, count)` as generic primitives; the consumer passes whatever `count` it needs.
 
 ## 2. Scope
 
 ### In scope
 
 - Kademlia routing table structure, peer admission, eviction, and maintenance.
-- Close group computation for data storage responsibility.
 - Trust-aware peer management and Sybil resistance via IP diversity.
-- Interaction surface with replication subsystem (definitions consumed by replication logic).
 - Iterative and local peer lookup algorithms.
-- Close neighborhood maintenance for replication correctness.
+- Close neighborhood maintenance for routing correctness.
 
 ### Out of scope
 
 - Concrete wire formats and RPC APIs.
-- Replication logic (covered by Replication Logic Specification).
+- Data storage, replication, close group semantics, and quorum logic (consumer-side).
 - EigenTrust scoring algorithm internals (consumed as an oracle).
 - Transport-layer connection management and NAT traversal.
 - Disk layout, serialization details, and database choices.
@@ -38,13 +38,7 @@ Primary goal: validate correctness, safety, and liveness of routing table logic 
 - `BucketIndex(A, B)`: index of the first bit position (0-indexed from MSB) where `A ⊕ B` differs. Equal IDs have no bucket index (self-insertion is forbidden).
 - `KBucket(i)`: the `i`-th k-bucket (0 ≤ `i` < 256), holding up to `K_BUCKET_SIZE` `NodeInfo` entries for peers whose `BucketIndex` relative to the local node is `i`.
 - `LocalRT(N)`: node `N`'s authenticated local routing-table peer set. Union of all k-bucket contents, excluding `N` itself.
-- `SelfInclusiveRT(N)`: derived view `LocalRT(N) ∪ {N}`, used for responsibility range and local close-group membership evaluations.
-- `CloseGroup(K, view)`: the `CLOSE_GROUP_SIZE` nearest nodes to key `K` in a given routing view, ordered by `Distance(K, node)`.
-- `IsResponsible(N, K)`: true if `N` is among the `CLOSE_GROUP_SIZE` nearest nodes to `K` in `SelfInclusiveRT(N)`.
-- `CloseNeighbors(N)`: the `NEIGHBOR_SYNC_SCOPE` nearest peers to `N` in `LocalRT(N)`, used by replication for neighbor-sync partner selection.
 - `TrustScore(N, P)`: node `N`'s current trust assessment of peer `P`, queried from the EigenTrust subsystem.
-- `QuorumTargets(K)`: up to `CLOSE_GROUP_SIZE` nearest known peers for key `K` in `LocalRT(self)`, excluding `self`.
-- `PaidCloseGroup(K)`: `PAID_LIST_CLOSE_GROUP_SIZE` nearest nodes to key `K` in `SelfInclusiveRT(self)`.
 
 ## 4. Tunable Parameters
 
@@ -53,9 +47,6 @@ All parameters are configurable. Values below are a reference profile used for l
 | Parameter | Meaning | Reference |
 |---|---|---|
 | `K_BUCKET_SIZE` | Maximum number of peers per k-bucket | `20` |
-| `CLOSE_GROUP_SIZE` | Close-group width for data storage responsibility | `7` |
-| `PAID_LIST_CLOSE_GROUP_SIZE` | Close-group width for paid-list consensus | `20` |
-| `NEIGHBOR_SYNC_SCOPE` | Number of closest peers to self eligible for neighbor sync | `20` |
 | `MAX_ADDRESSES_PER_NODE` | Maximum addresses stored per node | `8` |
 | `BUCKET_COUNT` | Number of k-buckets (one per bit in keyspace) | `256` |
 | `ALPHA` | Parallel queries per iteration in network lookups | `3` |
@@ -72,14 +63,11 @@ All parameters are configurable. Values below are a reference profile used for l
 
 Parameter safety constraints (MUST hold):
 
-1. `1 <= CLOSE_GROUP_SIZE <= K_BUCKET_SIZE`.
-2. `CLOSE_GROUP_SIZE <= PAID_LIST_CLOSE_GROUP_SIZE <= K_BUCKET_SIZE * BUCKET_COUNT` (must be achievable from the routing table).
-3. `NEIGHBOR_SYNC_SCOPE >= CLOSE_GROUP_SIZE` (neighbor sync must cover at least the full close group).
-4. `IP_EXACT_LIMIT >= 1`.
-5. `IP_SUBNET_LIMIT >= 1`.
-6. `TRUST_PROTECTION_THRESHOLD > BLOCK_THRESHOLD`.
-7. `ALPHA >= 1`.
-8. If constraints are violated at runtime reconfiguration, node MUST reject the config and keep the previous valid config.
+1. `IP_EXACT_LIMIT >= 1`.
+2. `IP_SUBNET_LIMIT >= 1`.
+3. `TRUST_PROTECTION_THRESHOLD > BLOCK_THRESHOLD`.
+4. `ALPHA >= 1`.
+5. If constraints are violated at runtime reconfiguration, node MUST reject the config and keep the previous valid config.
 
 ## 5. Core Invariants (Must Hold)
 
@@ -94,8 +82,7 @@ Parameter safety constraints (MUST hold):
 9. **Deterministic distance**: `Distance(A, B)` is symmetric, deterministic, and consistent across all nodes. Two nodes compute the same distance between the same pair of keys.
 10. **Atomic admission**: IP diversity checks, capacity checks, swap-closer evictions, and insertion MUST execute within a single write-locked critical section to prevent TOCTOU races.
 11. **Monotonic liveness**: `touch_node` updates `last_seen` to the current time and moves the peer to the tail (most recently seen) of its k-bucket. This preserves Kademlia's eviction preference for long-lived peers.
-12. **Close group consistency**: Two nodes with identical `LocalRT` contents compute identical `CloseGroup(K, ...)` and `IsResponsible(N, K)` results for any key `K`. Disagreements between nodes are caused only by routing table divergence, never by algorithm divergence.
-13. **Replication surface stability**: The definitions `LocalRT`, `SelfInclusiveRT`, `CloseGroup`, `IsResponsible`, `CloseNeighbors`, `QuorumTargets`, and `PaidCloseGroup` are the sole interface between the routing table and the replication subsystem. Replication logic MUST NOT read routing table internals (bucket structure, IP counters, trust scores) directly.
+12. **Lookup determinism**: Two nodes with identical `LocalRT` contents compute identical `find_closest_nodes_local(K, count)` results for any key `K` and count. Disagreements between nodes are caused only by routing table divergence, never by algorithm divergence.
 
 ## 6. Routing Table Structure
 
@@ -197,7 +184,7 @@ When any interaction records a trust failure and `TrustScore(self, P)` drops bel
 3. Silently drop any incoming DHT messages from `P`.
 4. Do not re-admit `P` until `TrustScore(self, P) >= BLOCK_THRESHOLD`.
 
-Blocking is enforced at the routing table layer. Replication logic does not perform its own blocking — it relies on `LocalRT` membership as the gate (Replication Invariant 4: hints from peers outside `LocalRT(self)` are dropped).
+Blocking is enforced at the routing table layer. API consumers can rely on `LocalRT` membership as the trust gate.
 
 ## 8. Peer Lookup
 
@@ -241,41 +228,6 @@ Properties:
 - Trust recording: each RPC outcome is fed to the trust subsystem.
 - Blocked peers: silently excluded from query candidates (they are not in `LocalRT`).
 
-### 8.3 Close Group Computation
-
-The close group for a key `K` from a node `N`'s perspective:
-
-```
-CloseGroup(K, LocalRT(N)) = K_BUCKET_SIZE-closest nodes to K in LocalRT(N), then take CLOSE_GROUP_SIZE nearest
-```
-
-More precisely:
-
-1. Call `find_closest_nodes_local(K, K_BUCKET_SIZE)` — this returns peers from `LocalRT(N)`.
-2. Truncate to `CLOSE_GROUP_SIZE`.
-
-For `SelfInclusiveRT(N)`:
-
-1. Call `find_closest_nodes_local(K, K_BUCKET_SIZE)`.
-2. Insert self into the result at the correct position by `Distance(K, self)`.
-3. Truncate to `CLOSE_GROUP_SIZE`.
-
-`IsResponsible(N, K)` = `N ∈ CloseGroup(K, SelfInclusiveRT(N))`.
-
-### 8.4 QuorumTargets Computation
-
-`QuorumTargets(K)` = up to `CLOSE_GROUP_SIZE` nearest peers to `K` in `LocalRT(self)`, excluding self.
-
-This is identical to `CloseGroup(K, LocalRT(self))` — self is naturally excluded from `LocalRT`.
-
-### 8.5 PaidCloseGroup Computation
-
-`PaidCloseGroup(K)` = `PAID_LIST_CLOSE_GROUP_SIZE` nearest nodes to `K` in `SelfInclusiveRT(self)`.
-
-1. Call `find_closest_nodes_local(K, PAID_LIST_CLOSE_GROUP_SIZE)`.
-2. Insert self into the result at the correct position by `Distance(K, self)`.
-3. Truncate to `PAID_LIST_CLOSE_GROUP_SIZE`.
-
 ## 9. Routing Table Maintenance
 
 ### 9.1 Touch on Interaction
@@ -293,7 +245,7 @@ Nodes MUST periodically perform a network lookup for their own `PeerId` to disco
 
 1. On a randomized timer (`SELF_LOOKUP_INTERVAL`), run `find_closest_nodes_network(self.id, K_BUCKET_SIZE)`.
 2. For each discovered peer not already in `LocalRT(self)`, attempt admission via the full admission flow (Section 7.1).
-3. This keeps `CloseNeighbors(self)` current under churn, which is critical for replication correctness: stale close neighborhoods cause `IsResponsible` misjudgments and delayed repair.
+3. This keeps the close neighborhood current under churn, which is critical for routing correctness and for API consumers that depend on accurate nearest-peer queries.
 
 ### 9.3 Bucket Refresh
 
@@ -311,96 +263,29 @@ Purpose: Kademlia requires periodic refresh to maintain routing table completene
 
 ### 9.4 Routing Table Event Notifications
 
-The routing table SHOULD emit events on membership changes to allow the replication subsystem to react without polling:
+The routing table SHOULD emit events on membership changes to allow consumers to react without polling:
 
-| Event | Trigger | Consumer |
-|---|---|---|
-| `PeerAdded(PeerId)` | New peer inserted into routing table | Replication: may trigger neighbor-sync consideration |
-| `PeerRemoved(PeerId)` | Peer evicted, blocked, or departed | Replication: recompute responsibility ranges |
-| `CloseGroupChanged(old, new)` | Composition of K-closest-to-self changed | Replication: trigger immediate responsibility recheck |
+| Event | Trigger |
+|---|---|
+| `PeerAdded(PeerId)` | New peer inserted into routing table |
+| `PeerRemoved(PeerId)` | Peer evicted, blocked, or departed |
+| `CloseNeighborhoodChanged(old, new)` | Composition of K-closest-to-self changed |
 
-The `CloseGroupChanged` event is the most critical for replication: when the close group to self changes, the set of keys for which `IsResponsible(self, K)` is true also changes. New responsibilities require fetching data; lost responsibilities may eventually trigger pruning (with hysteresis — see Replication Specification Section 11).
+Events are advisory — consumers MUST tolerate missed events by performing periodic recomputation as needed.
 
-Events are advisory — the replication subsystem MUST tolerate missed events by performing periodic recomputation on each neighbor-sync cycle.
+## 10. Churn Handling
 
-## 10. Close Group Semantics for Replication
-
-This section defines the contract between the routing table and the replication subsystem. The routing table is the sole provider of the following computations; the replication subsystem consumes them as read-only queries.
-
-### 10.1 Responsibility Range
-
-`IsResponsible(N, K)` determines whether node `N` should store a record with key `K`.
-
-Evaluation:
-
-1. Compute `SelfInclusiveRT(N)` = `LocalRT(N) ∪ {N}`.
-2. Find the `CLOSE_GROUP_SIZE` nodes in `SelfInclusiveRT(N)` nearest to `K`.
-3. Return `true` if `N` is among those `CLOSE_GROUP_SIZE` nodes.
-
-Properties:
-- Dynamic: changes as `LocalRT(N)` changes (peer joins/leaves).
-- Local: each node evaluates independently, may disagree with other nodes due to routing table divergence.
-- Converges: as routing tables converge (via self-lookups and neighbor sync), `IsResponsible` evaluations across nodes converge.
-
-### 10.2 Undersized Network Behavior
-
-When `|SelfInclusiveRT(N)| < CLOSE_GROUP_SIZE`:
-
-- Every node is responsible for every key. `IsResponsible(N, K)` is trivially true for all `K`.
-- `CloseGroup(K, SelfInclusiveRT(N))` returns all members of `SelfInclusiveRT(N)`.
-- `QuorumTargets(K)` may have fewer than `CLOSE_GROUP_SIZE` members, causing the effective quorum threshold to be computed dynamically per key (see Replication Specification Section 9).
-
-This handles bootstrap and small-network scenarios gracefully.
-
-### 10.3 CloseNeighbors for Neighbor Sync
-
-`CloseNeighbors(N)` = the `NEIGHBOR_SYNC_SCOPE` nearest peers to `N` in `LocalRT(N)`.
-
-Computation: `find_closest_nodes_local(self.id, NEIGHBOR_SYNC_SCOPE)`.
-
-This set is snapshotted at the start of each neighbor-sync cycle (Replication Specification Section 6.2 rule 1) and is not updated mid-cycle.
-
-### 10.4 Holder Target Set for Fresh Replication
-
-When a node accepts a new record with key `K`, it must replicate to the close group:
-
-1. Compute `CloseGroup(K, LocalRT(self))` (excluding self — self already has the record).
-2. Send fresh offers to each member.
-3. Target size is `CLOSE_GROUP_SIZE` peers (not `K_BUCKET_SIZE`).
-
-If the local routing table has fewer than `CLOSE_GROUP_SIZE` peers near `K`, send to all available — the neighbor-sync mechanism will fill gaps as routing tables converge.
-
-### 10.5 Relationship Between K_BUCKET_SIZE and CLOSE_GROUP_SIZE
-
-`K_BUCKET_SIZE` (20) and `CLOSE_GROUP_SIZE` (7) serve different purposes:
-
-| Property | `K_BUCKET_SIZE` | `CLOSE_GROUP_SIZE` |
-|---|---|---|
-| Purpose | Routing table capacity per bucket | Data responsibility group width |
-| Affects | Routing redundancy, lookup efficiency | Storage redundancy, quorum math |
-| Kademlia role | Standard K parameter for routing | Application-layer replication factor |
-| Typical range | 10–20 | 5–9 |
-
-The routing table stores up to `K_BUCKET_SIZE` peers per bucket to ensure routing robustness and diverse path options. The close group for data is `CLOSE_GROUP_SIZE`, a smaller subset of the nearest peers to any key.
-
-Why `CLOSE_GROUP_SIZE < K_BUCKET_SIZE`: storing data on all 20 nearest peers would be wasteful. 7 replicas provide strong durability (tolerates 3 simultaneous failures with a quorum of 4) while keeping storage costs reasonable.
-
-Why `K_BUCKET_SIZE > CLOSE_GROUP_SIZE`: a larger routing table ensures reliable lookups even under churn, provides enough peers for IP diversity enforcement, and gives the replication subsystem more candidates for `QuorumTargets` and `PaidCloseGroup`.
-
-## 11. Churn Handling
-
-### 11.1 Peer Departure Detection
+### 10.1 Peer Departure Detection
 
 Peers are detected as departed through:
 
 1. **RPC failure**: Failed outbound RPC records trust failure. If trust drops below `BLOCK_THRESHOLD`, peer is evicted (Section 7.4).
 2. **Iterative lookup feedback**: Network lookups record success/failure per queried peer.
-3. **Neighbor-sync feedback**: Replication's neighbor-sync detects unreachable peers and reports via trust events.
-4. **Self-lookup refresh**: Periodic self-lookups discover that a previously-close peer is no longer returned by the network.
+3. **Self-lookup refresh**: Periodic self-lookups discover that a previously-close peer is no longer returned by the network.
 
 The routing table does NOT proactively ping peers. Liveness is assessed lazily via actual RPC interactions and trust score decay (idle peers decay toward neutral, never toward blocking unless they fail interactions).
 
-### 11.2 Peer Arrival Handling
+### 10.2 Peer Arrival Handling
 
 New peers enter the routing table through:
 
@@ -411,19 +296,9 @@ New peers enter the routing table through:
 
 All paths converge on the same admission flow (Section 7.1), ensuring consistent IP diversity and trust enforcement.
 
-### 11.3 Impact on Replication
+## 11. Bootstrap
 
-When the routing table changes (peer added or removed), the replication subsystem may need to act:
-
-- **New peer closer to some keys**: `IsResponsible(self, K)` may become false for some keys — those keys drift out of range. The replication subsystem records `RecordOutOfRangeFirstSeen` and prunes with hysteresis.
-- **Departed peer that held keys**: The remaining close group has fewer holders. Neighbor-sync repair fills the gap by replicating to the new closest peer that took the departed peer's place.
-- **Close group to self changes**: The set of peers eligible for neighbor sync changes. A new snapshot is taken at the next cycle start.
-
-The 6-hour prune hysteresis (`PRUNE_HYSTERESIS_DURATION` in the Replication Specification) prevents premature deletion during transient routing table fluctuations.
-
-## 12. Bootstrap
-
-### 12.1 Cold Start
+### 11.1 Cold Start
 
 A node starting with an empty routing table:
 
@@ -434,7 +309,7 @@ A node starting with an empty routing table:
 5. Perform iterative self-lookup to expand close neighborhood.
 6. Repeat self-lookup until routing table stabilizes (no new peers discovered for 2 consecutive lookups, or a configured bootstrap timeout is reached).
 
-### 12.2 Warm Restart
+### 11.2 Warm Restart
 
 A node restarting with a close group cache:
 
@@ -449,42 +324,33 @@ The close group cache (`CloseGroupCache`) stores:
 - Saved at shutdown, loaded at startup.
 - Trust scores are imported without decay for offline time (cannot observe behavior while offline).
 
-### 12.3 Bootstrap Completion and Replication Gate
+## 12. Security Properties
 
-`BootstrapDrained(N)` (defined in the Replication Specification) becomes true when:
-
-- Bootstrap peer requests have all completed (response or timeout).
-- Bootstrap work queues are empty.
-
-This gate prevents premature replication and audit activity. The routing table does not enforce this gate — it is a replication-layer concern. The routing table's role is to populate `LocalRT` as quickly as possible during bootstrap so that `IsResponsible` evaluations are accurate.
-
-## 13. Security Properties
-
-### 13.1 Sybil Resistance via IP Diversity
+### 12.1 Sybil Resistance via IP Diversity
 
 IP diversity enforcement (Section 7.2) limits the influence of a single operator:
 
 - **Per-bucket**: An attacker controlling one IP can place at most `IP_EXACT_LIMIT` (2) nodes in any single bucket. An attacker controlling a `/24` subnet can place at most `IP_SUBNET_LIMIT` (5) nodes per bucket.
-- **Close-group**: The same limits apply to the `K_BUCKET_SIZE` closest peers to self, preventing a single operator from dominating the close group.
-- **Two-scope enforcement**: Both per-bucket and close-group checks must pass. An attacker could fill distant buckets without threatening the close group, but cannot concentrate nodes near any target.
+- **Close-group**: The same limits apply to the `K_BUCKET_SIZE` closest peers to self, preventing a single operator from dominating the close neighborhood.
+- **Two-scope enforcement**: Both per-bucket and close-group checks must pass. An attacker could fill distant buckets without threatening the close neighborhood, but cannot concentrate nodes near any target.
 
 Limitations:
 - An attacker with access to many subnets across diverse providers can still accumulate routing table presence. IP diversity is one layer of defense, complemented by trust scoring and proof-of-work/stake at higher layers.
 - VPN and cloud provider ASNs are identifiable (BGP geo provider) but not currently enforced at the routing table level. Future work may add ASN-level diversity.
 
-### 13.2 Eclipse Attack Resistance
+### 12.2 Eclipse Attack Resistance
 
 An eclipse attack attempts to surround a target node with attacker-controlled peers, isolating it from the honest network.
 
 Defenses:
 
-1. **IP diversity**: Limits attacker concentration per scope (Section 13.1).
+1. **IP diversity**: Limits attacker concentration per scope (Section 12.1).
 2. **Trust protection**: Well-trusted peers (score ≥ 0.7) cannot be evicted by swap-closer, even if the attacker generates IDs closer to the target.
 3. **Authenticated insertion**: Only transport-authenticated peers enter the routing table. An attacker must complete cryptographic handshakes for each fake identity.
 4. **Self-lookup refresh**: Periodic self-lookups discover honest peers that the attacker may be trying to hide.
 5. **Close group cache**: On restart, the node reconnects to previously-trusted close peers before the attacker can fill the empty routing table.
 
-### 13.3 Routing Table Poisoning Resistance
+### 12.3 Routing Table Poisoning Resistance
 
 An attacker attempts to insert malicious entries via `FIND_NODE` responses:
 
@@ -492,61 +358,55 @@ An attacker attempts to insert malicious entries via `FIND_NODE` responses:
 2. **Trust baseline**: New peers start at neutral trust (0.5), well above `BLOCK_THRESHOLD` (0.15) but below `TRUST_PROTECTION_THRESHOLD` (0.7). They must demonstrate good behavior to earn protection.
 3. **IP diversity gates**: Even if an attacker can authenticate many identities, IP diversity limits prevent flooding.
 
-## 14. Interaction with Replication: Contract Summary
+## 13. Consumer API
 
-The routing table provides the following read-only queries to the replication subsystem:
+The routing table exposes the following queries to consumers (e.g., saorsa-node):
 
-| Query | Input | Output | Used By |
+| Query | Input | Output | Description |
 |---|---|---|---|
-| `find_closest_nodes_local(K, count)` | Key, count | `Vec<NodeInfo>` sorted by distance | Close group computation, QuorumTargets, holder target set |
-| `find_closest_nodes_network(K, count)` | Key, count | `Vec<NodeInfo>` sorted by distance | Audit peer discovery, bootstrap, self-lookup |
-| `is_in_routing_table(P)` | PeerId | bool | Neighbor-sync hint admission (Invariant 4 of replication) |
-| `routing_table_size()` | — | usize | Bootstrap completion heuristics |
+| `find_closest_nodes_local(K, count)` | Key, count | `Vec<NodeInfo>` sorted by distance | Nearest peers from local routing table |
+| `find_closest_nodes_network(K, count)` | Key, count | `Vec<NodeInfo>` sorted by distance | Iterative network lookup |
+| `is_in_routing_table(P)` | PeerId | bool | Membership check |
+| `routing_table_size()` | — | usize | Total peer count |
 | `touch_node(P, addr)` | PeerId, optional address | bool | Liveness update on successful interaction |
 
-The replication subsystem MUST NOT:
+Consumers MUST NOT:
 
 - Directly read or write k-bucket contents.
 - Bypass IP diversity or trust checks when admitting peers.
 - Remove peers from the routing table (that is owned by the trust/blocking subsystem).
 
-The replication subsystem MAY:
+Consumers MAY:
 
 - Report trust events via the `TrustEvent` interface, which may indirectly cause routing table changes (eviction on block).
 - Request network lookups to discover new peers (which may be admitted to the routing table as a side effect).
 
-## 15. Logic-Risk Checklist (Pre-Implementation)
+## 14. Logic-Risk Checklist (Pre-Implementation)
 
 Use this list to find design flaws before coding:
 
-1. **Close group oscillation risk**:
-   - Can small routing table changes cause frequent `IsResponsible` flips, triggering unnecessary replication and pruning? Mitigated by 6-hour prune hysteresis, but high churn in the K-closest-to-key set could still cause excess replication traffic.
-
-2. **IP diversity deadlock**:
+1. **IP diversity deadlock**:
    - In networks where many honest peers share subnets (e.g., all on AWS), can IP diversity limits prevent a node from populating its routing table? `IP_SUBNET_LIMIT = K_BUCKET_SIZE / 4` (5 per subnet per scope) allows 5 AWS peers per bucket, which is substantial. Operators with extreme concentration may need testnet/permissive overrides.
 
-3. **Trust cold-start asymmetry**:
+2. **Trust cold-start asymmetry**:
    - New peers start at neutral trust (0.5) and are not protected from swap-closer. A well-established network may be slow to admit new peers if existing peers are all well-trusted (≥ 0.7) and buckets are full. The swap-closer mechanism only evicts below-0.7 peers, so new peers can only enter when:
      a. A bucket has capacity, or
      b. An existing peer is below 0.7 trust.
    This is by design — stable networks resist unnecessary churn — but could delay legitimate new-peer admission.
 
-4. **Self-lookup failure under eclipse**:
+3. **Self-lookup failure under eclipse**:
    - If an attacker eclipses the self-lookup, the node may not discover honest close peers. Mitigation: cache-based warm restart and multiple independent bootstrap endpoints.
 
-5. **Bucket refresh overhead**:
+4. **Bucket refresh overhead**:
    - With 256 buckets and high churn, bucket refresh could generate significant network traffic. Mitigation: only stale buckets are refreshed, and the refresh interval is configurable.
 
-6. **CLOSE_GROUP_SIZE < IP_SUBNET_LIMIT inconsistency**:
-   - `CLOSE_GROUP_SIZE = 7` but `IP_SUBNET_LIMIT = 5` per scope. If 5 of the 7 closest peers are on one subnet, the close group is heavily concentrated. The close-group IP diversity check mitigates this — it enforces subnet limits on the K-closest-to-self set, which is broader than `CLOSE_GROUP_SIZE`. But for a specific key K far from self, the close group IP diversity check is not applied (diversity is checked relative to self, not relative to K).
-
-7. **Stale `last_seen` and false liveness**:
+5. **Stale `last_seen` and false liveness**:
    - A peer could be in the routing table with a recent `last_seen` (from a `touch_node` on an inbound message) but actually be unreachable for outbound connections. Trust scoring handles this: failed outbound RPCs reduce trust, eventually triggering eviction.
 
-8. **Close group cache staleness**:
+6. **Close group cache staleness**:
    - After a long offline period, the close group cache may contain departed peers. Mitigation: warm restart dials cached peers and falls back to bootstrap if they are unreachable. Self-lookup then refreshes the neighborhood.
 
-## 16. Pre-Implementation Test Matrix
+## 15. Pre-Implementation Test Matrix
 
 Each scenario should assert exact expected outcomes and state transitions.
 
@@ -611,103 +471,63 @@ Each scenario should assert exact expected outcomes and state transitions.
 19. **Network lookup includes self in result**:
     - Self competes on distance in network lookup results but is never queried.
 
-### Close Group Tests
-
-20. **IsResponsible correct for in-range key**:
-    - Node is among 7 closest to key K in SelfInclusiveRT. `IsResponsible(self, K)` returns true.
-
-21. **IsResponsible correct for out-of-range key**:
-    - Node is NOT among 7 closest to key K in SelfInclusiveRT. `IsResponsible(self, K)` returns false.
-
-22. **IsResponsible with undersized network**:
-    - Routing table has 3 peers. `|SelfInclusiveRT| = 4 < CLOSE_GROUP_SIZE = 7`. `IsResponsible` is true for all keys.
-
-23. **CloseGroup determinism**:
-    - Two nodes with identical `LocalRT` compute identical `CloseGroup(K)` for any key K.
-
-24. **QuorumTargets excludes self**:
-    - `QuorumTargets(K)` returns up to 7 peers from `LocalRT`, never includes self.
-
-25. **PaidCloseGroup includes self**:
-    - `PaidCloseGroup(K)` is computed from `SelfInclusiveRT` and may include self.
-
 ### Maintenance Tests
 
-26. **Touch moves to tail**:
+20. **Touch moves to tail**:
     - Peer at head of bucket. `touch_node` moves it to tail. Other peers shift forward.
 
-27. **Touch merges address**:
+21. **Touch merges address**:
     - Peer touched with new address. New address prepended. Old address retained. List capped at `MAX_ADDRESSES_PER_NODE`.
 
-28. **Self-lookup discovers new close peers**:
+22. **Self-lookup discovers new close peers**:
     - Peers join network closer to self. Self-lookup discovers them. They pass admission and enter routing table.
 
-29. **Bucket refresh populates stale bucket**:
+23. **Bucket refresh populates stale bucket**:
     - Distant bucket has been idle for > `STALE_BUCKET_THRESHOLD`. Refresh finds peers for that region and populates the bucket.
 
-30. **Blocked peer eviction**:
+24. **Blocked peer eviction**:
     - Peer trust drops below 0.15 after failed interaction. Peer is immediately removed from routing table and disconnected.
 
-31. **Blocked peer re-admission after recovery**:
+25. **Blocked peer re-admission after recovery**:
     - Previously blocked peer's trust decays back above 0.15 (idle decay toward 0.5). Peer can now be re-admitted through normal admission flow.
 
 ### Bootstrap Tests
 
-32. **Cold start populates routing table**:
+26. **Cold start populates routing table**:
     - Empty routing table. Bootstrap peers respond to `FIND_NODE(self)`. Returned peers admitted. Self-lookup expands neighborhood.
 
-33. **Warm restart from cache**:
+27. **Warm restart from cache**:
     - Close group cache loaded. Cached peers dialed successfully. Routing table pre-populated with trusted peers. Self-lookup refines.
 
-34. **Warm restart with stale cache**:
+28. **Warm restart with stale cache**:
     - All cached peers unreachable. Falls back to bootstrap peers. Routing table eventually populated.
 
-35. **Close group cache save/load roundtrip**:
+29. **Close group cache save/load roundtrip**:
     - Save K closest peers + trust scores. Restart. Load cache. Trust scores match (no decay for offline time). Addresses preserved.
-
-### Churn and Replication Integration Tests
-
-36. **Peer departure triggers responsibility change**:
-    - Close peer departs. `IsResponsible(self, K)` changes for some keys. Newly responsible keys need to be fetched (replication concern, but RT change is the trigger).
-
-37. **Peer arrival shrinks responsibility**:
-    - New peer closer to key K arrives. `IsResponsible(self, K)` becomes false. Record enters prune hysteresis.
-
-38. **CloseGroupChanged event fired**:
-    - Peer admitted/evicted that changes the K-closest-to-self set. `CloseGroupChanged` event emitted with old and new composition.
-
-39. **CloseNeighbors computation**:
-    - `CloseNeighbors(self)` returns the 20 nearest peers to self in LocalRT, suitable for neighbor-sync partner selection.
-
-40. **Holder target set for fresh replication**:
-    - `CloseGroup(K, LocalRT(self))` returns 7 nearest peers to K, excluding self. These are the fresh replication targets.
 
 ### Security Tests
 
-41. **IP diversity blocks Sybil cluster**:
+30. **IP diversity blocks Sybil cluster**:
     - Attacker attempts to insert 10 peers from one IP. Only 2 admitted per scope. Remaining 8 rejected.
 
-42. **Subnet diversity limits concentration**:
+31. **Subnet diversity limits concentration**:
     - Attacker attempts to fill a bucket from one `/24`. At most 5 admitted (K/4). Remaining rejected.
 
-43. **Trust protection prevents eclipse displacement**:
+32. **Trust protection prevents eclipse displacement**:
     - Attacker generates IDs closer to target. Existing well-trusted peers (≥ 0.7) hold their slots. Attacker can only displace low-trust or empty slots.
 
-44. **Unauthenticated peer rejected**:
+33. **Unauthenticated peer rejected**:
     - Peer returned by `FIND_NODE` but not yet authenticated. Not admitted to routing table. Must complete handshake first.
 
-45. **Blocked peer messages dropped**:
+34. **Blocked peer messages dropped**:
     - Peer below block threshold sends DHT message. Message silently dropped. No routing table interaction.
 
-## 17. Acceptance Criteria for This Design
+## 16. Acceptance Criteria for This Design
 
 The design is logically acceptable for implementation when:
 
 1. All invariants in Section 5 can be expressed as executable assertions.
-2. Every scenario in Section 16 has deterministic pass/fail expectations.
-3. The contract in Section 14 cleanly separates routing table and replication responsibilities.
-4. `CLOSE_GROUP_SIZE` and `K_BUCKET_SIZE` are independent parameters with documented rationale.
-5. IP diversity, trust protection, and swap-closer interact without deadlock or starvation under all tested topologies.
-6. Close group computation is deterministic and consistent with the Replication Specification's `IsResponsible`, `QuorumTargets`, and `PaidCloseGroup` definitions.
-7. Bootstrap, warm restart, and churn scenarios produce stable routing table states within bounded time.
-8. Security properties (Sybil resistance, eclipse resistance, poisoning resistance) degrade gracefully rather than failing catastrophically.
+2. Every scenario in Section 15 has deterministic pass/fail expectations.
+3. IP diversity, trust protection, and swap-closer interact without deadlock or starvation under all tested topologies.
+4. Bootstrap, warm restart, and churn scenarios produce stable routing table states within bounded time.
+5. Security properties (Sybil resistance, eclipse resistance, poisoning resistance) degrade gracefully rather than failing catastrophically.
