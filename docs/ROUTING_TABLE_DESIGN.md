@@ -263,15 +263,17 @@ Purpose: Kademlia requires periodic refresh to maintain routing table completene
 
 ### 9.4 Routing Table Event Notifications
 
-The routing table SHOULD emit events on membership changes to allow consumers to react without polling:
+The routing table MUST emit events on membership changes to allow consumers to react without polling:
 
 | Event | Trigger |
 |---|---|
 | `PeerAdded(PeerId)` | New peer inserted into routing table |
 | `PeerRemoved(PeerId)` | Peer evicted, blocked, or departed |
-| `CloseNeighborhoodChanged(old, new)` | Composition of K-closest-to-self changed |
+| `KClosestPeersChanged { old, new }` | Composition of the `K_BUCKET_SIZE`-closest peers to self changed |
 
-Events are advisory — consumers MUST tolerate missed events by performing periodic recomputation as needed.
+`KClosestPeersChanged` is emitted when a routing table mutation (admission, eviction, or swap) causes the set of `K_BUCKET_SIZE` nearest peers to self to differ from the pre-mutation set. The routing table snapshots the K-closest set before each mutation and compares after; the event carries both the old and new sets. This fires at most once per mutation, not per swap within a single admission.
+
+Events MUST be emitted reliably for every routing table mutation. Consumers MAY additionally perform periodic recomputation as a defense-in-depth measure, but MUST NOT depend on polling as the primary mechanism.
 
 ## 10. Churn Handling
 
