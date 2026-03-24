@@ -565,7 +565,7 @@ impl Default for NodeConfig {
 
 impl DHTConfig {
     const DEFAULT_K_VALUE: usize = 20;
-    const DEFAULT_ALPHA_VALUE: usize = 5;
+    const DEFAULT_ALPHA_VALUE: usize = 3;
     const DEFAULT_REFRESH_INTERVAL_SECS: u64 = 600;
 }
 
