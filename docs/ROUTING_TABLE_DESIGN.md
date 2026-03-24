@@ -235,9 +235,9 @@ Properties:
 Any successful RPC (inbound or outbound) with a peer `P` triggers `touch_node(P)`:
 
 1. If `P` is in the routing table: update `last_seen` to now, optionally merge the address used, move `P` to the tail of its k-bucket.
-2. If `P` is not in the routing table: no action (touch is not an admission path).
+2. If `P` is not in the routing table: no action (touch is not an admission path). Re-admission of evicted peers happens only through the normal admission flow — either via a new inbound connection (Section 10.2) or via discovery during a network lookup.
 
-This ensures Kademlia's preference for long-lived peers: recently-active peers move to the tail, and head-of-bucket peers become eviction candidates.
+This ensures Kademlia's preference for long-lived peers: recently-active peers move to the tail, and head-of-bucket peers become eviction candidates. It also prevents evicted peers from silently re-entering the routing table by sending RPCs, which would bypass IP diversity and trust checks.
 
 ### 9.2 Self-Lookup for Close Neighborhood Freshness
 
