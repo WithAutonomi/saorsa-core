@@ -69,7 +69,6 @@ All parameters are configurable. Values below are a reference profile used for l
 | `SELF_LOOKUP_INTERVAL` | Periodic self-lookup cadence | random in `[5 min, 10 min]` |
 | `BUCKET_REFRESH_INTERVAL` | Periodic refresh cadence for stale k-buckets | `10 min` |
 | `STALE_BUCKET_THRESHOLD` | Duration after which a bucket without activity is considered stale | `1 hour` |
-| `CANDIDATE_EXPANSION_FACTOR` | Over-fetch multiplier for find_closest_nodes optimization | `2` |
 
 Parameter safety constraints (MUST hold):
 
@@ -208,12 +207,11 @@ Returns the `count` nearest nodes to a key `K` from `LocalRT(self)` without netw
 
 Algorithm:
 
-1. Compute `bucket_start = BucketIndex(self, K)`.
-2. Spiral outward from `bucket_start`: visit `bucket_start`, then alternating `bucket_start + 1`, `bucket_start - 1`, `bucket_start + 2`, etc.
-3. From each visited bucket, collect all entries, computing `Distance(K, entry)` for each.
-4. Early exit: stop visiting buckets when `CANDIDATE_EXPANSION_FACTOR * count` candidates have been collected (the remaining buckets can only contain more distant peers).
-5. Sort all collected candidates by `Distance(K, candidate)`.
-6. Return the top `count`.
+1. Collect all entries from all k-buckets, computing `Distance(K, entry)` for each.
+2. Sort all collected candidates by `Distance(K, candidate)`.
+3. Return the top `count`.
+
+Note: bucket index correlates with distance from self, not distance from key `K`. Peers in buckets far from `BucketIndex(self, K)` in the spiral can still be closer to `K` than peers in nearby buckets. The routing table holds at most `BUCKET_COUNT * K_BUCKET_SIZE` (5,120) entries, so a full scan and sort is trivially fast.
 
 Properties:
 - Read-only: no write lock, safe to call from request handlers.

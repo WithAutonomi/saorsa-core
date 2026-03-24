@@ -187,34 +187,16 @@ impl KademliaRoutingTable {
     }
 
     fn find_closest_nodes(&self, key: &DhtKey, count: usize) -> Vec<NodeInfo> {
-        // Optimization: Start from the bucket closest to the key and work outwards
-        // This avoids collecting all nodes from all 256 buckets when we only need a few
-        let target_bucket = self.get_bucket_index_for_key(key);
-
+        // Collect ALL entries from every bucket. Bucket index correlates with
+        // distance from *self*, not from key K — peers in distant buckets can
+        // be closer to K than peers in nearby buckets. The routing table holds
+        // at most 256 * K_BUCKET_SIZE entries, so a full scan is trivially fast.
         let mut candidates: Vec<(NodeInfo, [u8; 32])> = Vec::with_capacity(count * 2);
 
-        // Visit buckets in order of proximity to target, each exactly once.
-        // Uses checked arithmetic so indices that would exceed [0, 255] are
-        // skipped rather than clamped, preventing duplicate bucket visits.
-        let bucket_iter = std::iter::once(target_bucket).chain(
-            (1..KADEMLIA_BUCKET_COUNT).flat_map(move |offset| {
-                let above = target_bucket
-                    .checked_add(offset)
-                    .filter(|&b| b < KADEMLIA_BUCKET_COUNT);
-                let below = target_bucket.checked_sub(offset);
-                above.into_iter().chain(below)
-            }),
-        );
-
-        for bucket_idx in bucket_iter {
-            for node in self.buckets[bucket_idx].get_nodes() {
+        for bucket in &self.buckets {
+            for node in bucket.get_nodes() {
                 let distance = xor_distance_bytes(node.id.to_bytes(), key.as_bytes());
                 candidates.push((node.clone(), distance));
-            }
-
-            // Early exit: if we have enough candidates, we can stop expanding
-            if candidates.len() >= count * CANDIDATE_EXPANSION_FACTOR {
-                break;
             }
         }
 
@@ -319,10 +301,6 @@ const fn ip_subnet_limit(k: usize) -> usize {
 
 /// Number of K-buckets in Kademlia routing table (one per bit in 256-bit key space)
 const KADEMLIA_BUCKET_COUNT: usize = 256;
-
-/// Candidate expansion factor for find_closest_nodes optimization
-/// Collect 2x requested count before early exit to ensure good selection
-const CANDIDATE_EXPANSION_FACTOR: usize = 2;
 
 /// Trust score above which a peer is protected from swap-closer eviction.
 /// Well-trusted peers (score >= 0.7) keep their routing table slot even
