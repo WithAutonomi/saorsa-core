@@ -170,20 +170,25 @@ impl KademliaRoutingTable {
     }
 
     fn add_node(&mut self, node: NodeInfo) -> Result<()> {
-        let bucket_index = self.get_bucket_index(&node.id);
+        let bucket_index = self
+            .get_bucket_index(&node.id)
+            .ok_or_else(|| anyhow!("cannot insert self into routing table"))?;
         self.buckets[bucket_index].add_node(node)
     }
 
     fn remove_node(&mut self, node_id: &PeerId) {
-        let bucket_index = self.get_bucket_index(node_id);
-        self.buckets[bucket_index].remove_node(node_id);
+        if let Some(bucket_index) = self.get_bucket_index(node_id) {
+            self.buckets[bucket_index].remove_node(node_id);
+        }
     }
 
     /// Update `last_seen` (and optionally merge an address) for a node and
     /// move it to the tail of its k-bucket. Returns `true` if the node was found.
     fn touch_node(&mut self, node_id: &PeerId, address: Option<&MultiAddr>) -> bool {
-        let bucket_index = self.get_bucket_index(node_id);
-        self.buckets[bucket_index].touch_node(node_id, address)
+        match self.get_bucket_index(node_id) {
+            Some(bucket_index) => self.buckets[bucket_index].touch_node(node_id, address),
+            None => false, // Self is never in the routing table
+        }
     }
 
     fn find_closest_nodes(&self, key: &DhtKey, count: usize) -> Vec<NodeInfo> {
@@ -211,7 +216,9 @@ impl KademliaRoutingTable {
             .collect()
     }
 
-    fn get_bucket_index_for_key(&self, key: &DhtKey) -> usize {
+    /// Returns the k-bucket index for a key, or `None` when the key equals
+    /// the local node ID (XOR distance is zero — no valid bucket exists).
+    fn get_bucket_index_for_key(&self, key: &DhtKey) -> Option<usize> {
         let distance = xor_distance_bytes(self.node_id.to_bytes(), key.as_bytes());
 
         // Find first bit that differs
@@ -220,16 +227,16 @@ impl KademliaRoutingTable {
             let bit_index = 7 - (i % 8);
 
             if (distance[byte_index] >> bit_index) & 1 == 1 {
-                return i;
+                return Some(i);
             }
         }
 
-        255 // Same key as node
+        None // XOR distance is zero — key equals local node ID
     }
 
     /// Look up a node by its exact peer ID. O(K) scan of the target bucket.
     fn find_node_by_id(&self, node_id: &PeerId) -> Option<&NodeInfo> {
-        let bucket_index = self.get_bucket_index(node_id);
+        let bucket_index = self.get_bucket_index(node_id)?;
         self.buckets[bucket_index].find_node(node_id)
     }
 
@@ -238,7 +245,9 @@ impl KademliaRoutingTable {
         self.buckets.iter().map(|b| b.get_nodes().len()).sum()
     }
 
-    fn get_bucket_index(&self, node_id: &PeerId) -> usize {
+    /// Returns the k-bucket index for a peer, or `None` when the peer ID
+    /// equals the local node ID (self-insertion is forbidden).
+    fn get_bucket_index(&self, node_id: &PeerId) -> Option<usize> {
         self.get_bucket_index_for_key(&DhtKey::from_bytes(*node_id.to_bytes()))
     }
 }
@@ -650,7 +659,9 @@ impl DhtCoreEngine {
             return routing.add_node(node);
         }
 
-        let bucket_idx = routing.get_bucket_index(&node.id);
+        let bucket_idx = routing
+            .get_bucket_index(&node.id)
+            .ok_or_else(|| anyhow!("cannot insert self into routing table"))?;
         let candidate_distance = xor_distance_bytes(self.node_id.to_bytes(), node.id.to_bytes());
 
         // === Per-bucket IP diversity ===
@@ -725,7 +736,7 @@ impl DhtCoreEngine {
             let has_room = bucket.nodes.len() < bucket.max_size;
             let swap_frees_slot = ip_bucket_swap.is_some()
                 || ip_close_swap
-                    .map(|id| routing.get_bucket_index(&id) == bucket_idx)
+                    .map(|id| routing.get_bucket_index(&id) == Some(bucket_idx))
                     .unwrap_or(false);
             if !already_exists && !has_room && !swap_frees_slot {
                 return Err(anyhow!(
