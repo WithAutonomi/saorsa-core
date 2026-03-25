@@ -2093,7 +2093,7 @@ mod tests {
         let config = DHTConfig::default();
 
         assert_eq!(config.k_value, 20);
-        assert_eq!(config.alpha_value, 5);
+        assert_eq!(config.alpha_value, 3);
         assert_eq!(config.refresh_interval, Duration::from_secs(600));
     }
 
