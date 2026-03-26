@@ -66,6 +66,8 @@ All parameters are configurable. Values below are a reference profile used for l
 | `STALE_REVALIDATION_TIMEOUT` | Maximum time to wait for a stale peer's ping response during admission contention | `1s` |
 | `MAX_CONSUMER_WEIGHT` | Maximum weight multiplier per single consumer-reported event | `5.0` |
 | `MAX_CANDIDATE_NODES` | Maximum entries in the network lookup candidate queue (prevents memory exhaustion from large `FIND_NODE` responses) | `200` |
+| `BOOTSTRAP_STABILIZATION_ROUNDS` | Consecutive self-lookups with no new peers before bootstrap is considered stable | `2` |
+| `BOOTSTRAP_TIMEOUT` | Maximum duration for the bootstrap process before emitting `BootstrapComplete` regardless of stabilization | `60s` |
 
 #### EMA Scoring Model
 
@@ -359,8 +361,11 @@ The routing table MUST emit events on membership changes to allow consumers to r
 | `PeerAdded(PeerId)` | New peer inserted into routing table |
 | `PeerRemoved(PeerId)` | Peer evicted, blocked, or departed |
 | `KClosestPeersChanged { old, new }` | Composition of the `K_BUCKET_SIZE`-closest peers to self changed |
+| `BootstrapComplete { num_peers }` | Bootstrap process finished (routing table stabilized or timeout reached) |
 
 `KClosestPeersChanged` is emitted when a routing table mutation (admission, eviction, or swap) causes the set of `K_BUCKET_SIZE` nearest peers to self to differ from the pre-mutation set. The routing table snapshots the K-closest set before each mutation and compares after; the event carries both the old and new sets. This fires at most once per mutation, not per swap within a single admission.
+
+`BootstrapComplete` is emitted exactly once per node startup when the bootstrap process finishes. It fires when either: (a) the routing table stabilizes — no new peers discovered for `BOOTSTRAP_STABILIZATION_ROUNDS` (2) consecutive self-lookups, or (b) `BOOTSTRAP_TIMEOUT` is reached, whichever comes first. The event carries the total number of peers in the routing table at the time of emission. Consumers (e.g., replication, application-layer services) SHOULD wait for this event before initiating operations that depend on a populated routing table.
 
 Events MUST be emitted reliably for every routing table mutation. Consumers MAY additionally perform periodic recomputation as a defense-in-depth measure, but MUST NOT depend on polling as the primary mechanism.
 
@@ -401,7 +406,8 @@ A node starting with an empty routing table:
 3. Send `FIND_NODE(self.id)` to each bootstrap peer.
 4. Admit returned peers via the standard admission flow.
 5. Perform iterative self-lookup to expand close neighborhood.
-6. Repeat self-lookup until routing table stabilizes (no new peers discovered for 2 consecutive lookups, or a configured bootstrap timeout is reached).
+6. Repeat self-lookup until routing table stabilizes (no new peers discovered for `BOOTSTRAP_STABILIZATION_ROUNDS` consecutive lookups, or `BOOTSTRAP_TIMEOUT` is reached).
+7. Emit `BootstrapComplete { num_peers }` with the current routing table size.
 
 ### 11.2 Warm Restart
 
@@ -411,6 +417,7 @@ A node restarting with a close group cache:
 2. Dial cached peers first (they are likely still alive and nearby).
 3. Fall back to bootstrap peers if cached peers are unreachable.
 4. Perform iterative self-lookup to update stale entries.
+5. Emit `BootstrapComplete { num_peers }` once stabilized or `BOOTSTRAP_TIMEOUT` reached.
 
 The close group cache (`CloseGroupCache`) stores:
 
@@ -744,59 +751,68 @@ Each scenario should assert exact expected outcomes and state transitions.
 40. **Close group cache save/load roundtrip**:
     - Save K closest peers + trust scores. Restart. Load cache. Trust scores match (no decay for offline time). Addresses preserved.
 
+41. **Cold start emits BootstrapComplete on stabilization**:
+    - Empty routing table. Bootstrap and self-lookup discover peers. Two consecutive self-lookups return no new peers. `BootstrapComplete { num_peers }` emitted with correct routing table size. Event fires exactly once.
+
+42. **BootstrapComplete emitted on timeout**:
+    - Bootstrap process does not stabilize within `BOOTSTRAP_TIMEOUT` (network keeps returning new peers). `BootstrapComplete` emitted when timeout expires. `num_peers` reflects routing table size at that moment.
+
+43. **Warm restart emits BootstrapComplete**:
+    - Close group cache loaded. Cached peers dialed. Self-lookup completes. `BootstrapComplete` emitted once stabilized. Event fires exactly once regardless of cold/warm path.
+
 ### Security Tests
 
-41. **IP diversity blocks Sybil cluster**:
+44. **IP diversity blocks Sybil cluster**:
     - Attacker attempts to insert 10 peers from one IP. Only 2 admitted per scope. Remaining 8 rejected.
 
-42. **Subnet diversity limits concentration**:
+45. **Subnet diversity limits concentration**:
     - Attacker attempts to fill a bucket from one `/24`. At most 5 admitted (K/4). Remaining rejected.
 
-43. **Trust protection prevents eclipse displacement (live peers)**:
+46. **Trust protection prevents eclipse displacement (live peers)**:
     - Attacker generates IDs closer to target. Existing well-trusted peers (≥ 0.7) with `last_seen` within `LIVE_THRESHOLD` hold their slots. Attacker can only displace low-trust, stale, or empty slots.
 
-44. **Stale trust-protected peer displaced by attacker**:
+47. **Stale trust-protected peer displaced by attacker**:
     - Existing well-trusted peer (≥ 0.7) has `last_seen` older than `LIVE_THRESHOLD`. Attacker with closer ID displaces it via swap-closer. This is correct behavior — a stale peer should not block a live candidate, even if the candidate is an attacker. The live candidate will be evaluated on its own behavior going forward.
 
-45. **Unauthenticated peer rejected**:
+48. **Unauthenticated peer rejected**:
     - Peer returned by `FIND_NODE` but not yet authenticated. Not admitted to routing table. Must complete handshake first.
 
-46. **Blocked peer messages dropped**:
+49. **Blocked peer messages dropped**:
     - Peer below block threshold sends DHT message. Message silently dropped. No routing table interaction.
 
 ### Consumer Trust Reporting Tests
 
-47. **Consumer reward improves trust**:
+50. **Consumer reward improves trust**:
     - Peer starts at neutral trust (0.5). Consumer reports `ApplicationSuccess(1.0)`. Trust score increases above 0.5 (exact value determined by EMA smoothing factor). Peer remains in routing table.
 
-48. **Consumer penalty degrades trust to blocking**:
+51. **Consumer penalty degrades trust to blocking**:
     - Peer starts at neutral trust (0.5). Consumer reports repeated `ApplicationFailure(3.0)` events. Trust score decreases with each event. After sufficient events, score drops below `BLOCK_THRESHOLD` (0.15). Peer is evicted from routing table and blocked (Section 7.4).
 
-49. **Consumer penalty triggers blocking and eviction**:
+52. **Consumer penalty triggers blocking and eviction**:
     - Peer is in routing table with trust slightly above `BLOCK_THRESHOLD`. Consumer reports `ApplicationFailure(weight)` sufficient to push score below `BLOCK_THRESHOLD`. Peer is immediately evicted from routing table, disconnected at transport layer, and blocked from re-admission. `PeerRemoved` event emitted.
 
-50. **Consumer event for peer not in routing table**:
+53. **Consumer event for peer not in routing table**:
     - Peer has no routing table entry. Consumer reports `ApplicationFailure(2.0)`. Trust engine records the event and updates the EMA score (decreases from neutral 0.5). Routing table is unchanged. If the peer later attempts admission, the recorded low trust may cause rejection (Section 7.1 step 4).
 
-51. **Consumer rewards restore trust protection**:
+54. **Consumer rewards restore trust protection**:
     - Peer has trust below `TRUST_PROTECTION_THRESHOLD` (0.7). Consumer reports enough `ApplicationSuccess` events to push the EMA above 0.7. Peer now resists swap-closer eviction (Invariant 8, if also live).
 
-52. **Consumer and internal events combine in same EMA**:
+55. **Consumer and internal events combine in same EMA**:
     - Peer has moderate trust. DHT layer records `SuccessfulResponse` (internal, weight 1.0). Consumer reports `ApplicationFailure(3.0)`. Both feed the same EMA. The weighted failure has more influence than the unit-weight success, so the net score decreases.
 
-53. **Consumer trust query reflects all event sources**:
+56. **Consumer trust query reflects all event sources**:
     - Peer has trust shaped by a mix of internal and consumer-reported events, all processed through the same EMA. `peer_trust(P)` returns the single EMA-derived score.
 
-54. **Higher weight produces larger score impact**:
+57. **Higher weight produces larger score impact**:
     - Two peers start at identical neutral trust. Consumer reports `ApplicationFailure(1.0)` for peer A and `ApplicationFailure(5.0)` for peer B. Peer B's trust decreases more than peer A's. Both decreases are bounded by EMA smoothing.
 
-55. **Weight clamping at MAX_CONSUMER_WEIGHT**:
+58. **Weight clamping at MAX_CONSUMER_WEIGHT**:
     - Consumer reports `ApplicationFailure(100.0)` with `MAX_CONSUMER_WEIGHT = 5.0`. Weight is clamped to 5.0. Score impact is identical to `ApplicationFailure(5.0)`.
 
-56. **Zero and negative weights rejected**:
+59. **Zero and negative weights rejected**:
     - Consumer reports `ApplicationFailure(0.0)`. Event is rejected (no-op). Trust score unchanged. Consumer reports `ApplicationSuccess(-1.0)`. Event is rejected (no-op). Trust score unchanged.
 
-57. **Time decay applies to consumer events**:
+60. **Time decay applies to consumer events**:
     - Consumer reports `ApplicationFailure(3.0)` for a peer. Trust decreases. Peer has no further interactions for an extended period. Trust decays back toward neutral (0.5). Consumer-reported events do not persist indefinitely — they are subject to the same time decay as internal events.
 
 ## 16. Acceptance Criteria for This Design
