@@ -65,6 +65,7 @@ All parameters are configurable. Values below are a reference profile used for l
 | `LIVE_THRESHOLD` | Duration of no contact after which a peer is considered stale for revalidation and loses trust protection | `15 min` |
 | `STALE_REVALIDATION_TIMEOUT` | Maximum time to wait for a stale peer's ping response during admission contention | `1s` |
 | `MAX_CONSUMER_WEIGHT` | Maximum weight multiplier per single consumer-reported event | `5.0` |
+| `MAX_CANDIDATE_NODES` | Maximum entries in the network lookup candidate queue (prevents memory exhaustion from large `FIND_NODE` responses) | `200` |
 
 #### EMA Scoring Model
 
@@ -77,7 +78,13 @@ score = neutral + (score - neutral) * e^(-DECAY_LAMBDA * elapsed_secs)    // dec
 score = (1 - EMA_ALPHA) * score + EMA_ALPHA * observation                 // blend
 ```
 
-Where `observation` is `1.0` for a positive event and `0.0` for a negative event. For a consumer event with weight `W`, the blend step is applied `W` times consecutively (equivalent to `W` unit-weight events).
+Where `observation` is `1.0` for a positive event and `0.0` for a negative event. For a consumer event with weight `W`, the blend uses the continuous generalization:
+
+```
+score = (1 - EMA_ALPHA)^W * score + (1 - (1 - EMA_ALPHA)^W) * observation
+```
+
+This is equivalent to applying the unit-weight blend step `W` times when `W` is a positive integer, and extends naturally to fractional weights without ambiguity.
 
 **Decay tuning**: `DECAY_LAMBDA = 1.3761e-6` is tuned so that the worst possible score (0.0) takes approximately 3 days of idle time to decay back above `BLOCK_THRESHOLD` (0.15). Derivation: `0.15 = 0.5 - 0.5 * e^(-λ * 259200)` → `λ = -ln(0.7) / 259200`.
 
@@ -154,6 +161,7 @@ Address management rules:
 1. When a known peer is contacted on a new address, that address is prepended to the list. If the address already exists, it is moved to the front.
 2. The list is truncated to `MAX_ADDRESSES_PER_NODE` after each update.
 3. The first address in the list is the preferred dial address.
+4. A peer's address list MUST NOT be updated to include a loopback address (e.g., `127.0.0.0/8`, `::1`) unless the node was originally admitted with loopback allowed. This prevents a peer admitted on a routable IP from later claiming a loopback address via `touch_node` or address merge, which would bypass IP diversity enforcement.
 
 ## 7. Peer Admission
 
@@ -176,7 +184,7 @@ When a candidate peer `P` with `NodeInfo` and IP address `candidate_ip` is prese
    - `P` already exists in the bucket (update path).
    - The bucket has fewer than `K_BUCKET_SIZE` entries.
    - A swap candidate from step 7 frees a slot in this bucket.
-   If none holds, attempt stale peer revalidation (Section 7.5). If revalidation frees at least one slot, proceed. If no slots freed, reject with "bucket at capacity."
+   If none holds, attempt stale peer revalidation (Section 7.5). Stale revalidation releases the write lock for the duration of the parallel pings (up to `STALE_REVALIDATION_TIMEOUT`). After pings complete, the write lock is re-acquired and **all preceding checks (steps 1–7) are re-evaluated** against the current routing table state before proceeding. This prevents TOCTOU races caused by concurrent mutations during the unlocked ping window. If revalidation frees at least one slot and re-evaluation passes, proceed. If no slots freed or re-evaluation fails, reject.
 9. **Execute swaps**: Remove all deduplicated swap candidates.
 10. **Insert**: Add `P` to `KBucket(bucket_idx)`.
 
@@ -240,7 +248,7 @@ When a candidate `P` is presented for admission but `KBucket(bucket_idx)` is at 
 2. If the stale set is empty: no slots can be freed. Reject `P`.
 3. **Ping all stale peers in parallel** (bounded by `STALE_REVALIDATION_TIMEOUT`).
 4. For each peer that responds: `touch_node(S)`, record `SuccessfulResponse` trust event. `S` retains its slot.
-5. For each peer that fails to respond: record `ConnectionFailed` trust event, evict `S` from the bucket.
+5. For each peer that fails to respond: record `ConnectionFailed` trust event, evict `S` from the bucket. Emit `PeerRemoved(S)` event.
 6. If any slots were freed: proceed with admission of `P` (step 9 of Section 7.1).
 7. If no slots were freed (all stale peers responded): reject `P` with "bucket at capacity."
 
@@ -296,12 +304,13 @@ Algorithm:
    a. Select up to `ALPHA` unqueried peers from `best_nodes`, nearest first.
    b. Query each in parallel with `FIND_NODE(K)`.
    c. For each response, record trust outcome (`SuccessfulResponse` or `ConnectionFailed`/`ConnectionTimeout`).
-   d. Merge returned peers into `best_nodes`, deduplicating by `PeerId`.
+   d. Merge returned peers into `best_nodes`, deduplicating by `PeerId`. Cap `best_nodes` at `MAX_CANDIDATE_NODES` entries to bound memory usage.
    e. Sort `best_nodes` by `Distance(K, node)`, truncate to `count`.
-   f. Convergence check: if no new closer node was discovered in this iteration (the closest peer in `best_nodes` is unchanged), increment a stagnation counter. Stop when stagnation reaches 3 or all candidates have been queried.
+   f. Convergence check: if the closest peer in `best_nodes` after this iteration is strictly closer (by XOR distance to `K`) than the closest peer before this iteration, reset the stagnation counter to 0. Otherwise, increment it. Stop when the stagnation counter reaches 3 or all candidates in `best_nodes` have been queried.
 5. Return `best_nodes` (may include self).
 
 Properties:
+- **Per-lookup isolation**: Each invocation of `find_closest_nodes_network` maintains its own `best_nodes` set, queried set, and stagnation counter. Concurrent lookups (e.g., a self-lookup and a consumer-triggered lookup running simultaneously) do not share or interfere with each other's state. They may independently query the same remote peers and independently record trust outcomes.
 - Makes network requests: MUST NOT be called from within DHT request handlers (deadlock risk).
 - Trust recording: each RPC outcome is fed to the trust subsystem.
 - Blocked peers: silently excluded from query candidates (they are not in `LocalRT`).
@@ -521,7 +530,7 @@ All events — internal and consumer-reported — follow the same path through t
 1. **Event received**: `report_trust_event(P, event)` is called (by DHT internals or by the consumer).
 2. **Category mapping**: Event mapped to positive (successful interaction) or negative (failed interaction).
 3. **Weight resolution**: Internal events have implicit weight `1.0`. Consumer events use their caller-specified weight (after validation/clamping).
-4. **EMA update**: The trust engine applies time decay, then blends the observation using the EMA model (Section 4). Positive events use observation `1.0`, negative events use `0.0`. The weight scales influence: a weight of `W` applies the blend step `W` times (equivalent to `W` consecutive unit-weight events). At reference values (`EMA_ALPHA = 0.1`), a single weight-1.0 failure moves a neutral peer's score from 0.5 to 0.45; a single weight-5.0 failure moves it from 0.5 to ~0.30.
+4. **EMA update**: The trust engine applies time decay, then blends the observation using the EMA model (Section 4). Positive events use observation `1.0`, negative events use `0.0`. The weight scales influence via the continuous formula `score = (1 - EMA_ALPHA)^W * score + (1 - (1 - EMA_ALPHA)^W) * observation`, which generalizes naturally to fractional weights. At reference values (`EMA_ALPHA = 0.1`), a single weight-1.0 failure moves a neutral peer's score from 0.5 to 0.45; a single weight-5.0 failure moves it from 0.5 to ~0.30.
 5. **Threshold checks**:
    a. **Block check**: If `TrustScore(self, P)` dropped below `BLOCK_THRESHOLD`, trigger the blocked peer handling flow (Section 7.4) — peer is evicted from the routing table, disconnected, and blocked.
    b. **Protection evaluation**: If `TrustScore(self, P)` crossed `TRUST_PROTECTION_THRESHOLD` in either direction, the peer's swap-closer protection status changes accordingly (Section 7.3).
@@ -529,7 +538,7 @@ All events — internal and consumer-reported — follow the same path through t
 #### Consumer Reporting Invariants
 
 1. **Unified model**: All events (internal and consumer-reported) are processed by the same EMA scoring model. There is no separate scoring path for consumer events. The trust score is a single value derived from the weighted history of all events, with time decay toward neutral.
-2. **Weight as severity**: A consumer event with weight `W` has the same EMA impact as `W` consecutive internal events of the same category. Weight `1.0` is equivalent to a single internal event; weight `5.0` is equivalent to five.
+2. **Weight as severity**: A consumer event with weight `W` has the same EMA impact as `W` consecutive internal events of the same category (exact for integer `W`, continuously interpolated for fractional `W` via the generalized blend formula in Section 4). Weight `1.0` is equivalent to a single internal event; weight `5.0` is equivalent to five.
 3. **Bounded weight**: A single consumer event's weight is capped at `MAX_CONSUMER_WEIGHT`. At reference values (`EMA_ALPHA = 0.1`, `MAX_CONSUMER_WEIGHT = 5.0`), a single maximum-weight failure moves a neutral peer from 0.5 to ~0.30 — significant but not enough to cross `BLOCK_THRESHOLD` (0.15) in one event.
 4. **Natural decay**: Because consumer events flow through the EMA, their influence decays over time just like internal events. A penalty reported last week has less influence on the current score than a penalty reported today. A peer that was penalized but then goes idle will drift back toward neutral (0.5).
 5. **Idempotent path**: Reporting a trust event for a peer not in the routing table is valid. The trust engine maintains scores independently of routing table membership (a peer can have a trust record without being in `LocalRT`).
@@ -584,7 +593,7 @@ Use this list to find design flaws before coding:
    - A peer could be in the routing table with a recent `last_seen` (from a `touch_node` on an inbound message) but actually be unreachable for outbound connections. Trust scoring handles this: failed outbound RPCs reduce trust, eventually triggering eviction.
 
 6. **Stale revalidation admission latency**:
-   - Stale peer revalidation (Section 7.5) adds up to one ping timeout to the admission path when triggered. In a healthy network this path is rarely hit (most peers are within `LIVE_THRESHOLD`). Under mass churn (many stale peers per bucket), parallel pinging bounds the latency to a single timeout regardless of stale-set size. The timeout should be kept short (e.g., 5 seconds) to limit worst-case admission delay.
+   - Stale peer revalidation (Section 7.5) adds up to `STALE_REVALIDATION_TIMEOUT` (1s) to the admission path when triggered. In a healthy network this path is rarely hit (most peers are within `LIVE_THRESHOLD`). Under mass churn (many stale peers per bucket), parallel pinging bounds the latency to a single timeout regardless of stale-set size.
 
 7. **Distant stale peers without contention**:
    - A stale peer in a distant, partially-filled bucket may never face admission contention and thus never be revalidated. It will sit at neutral trust (~0.5) indefinitely. This is acceptable: distant peers don't affect close-group accuracy, don't get selected for close-group-based operations, and the slot cost is negligible. Bucket refresh (Section 9.3) may eventually trigger contention if new peers are discovered for that bucket.
