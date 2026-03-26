@@ -59,13 +59,14 @@ All parameters are configurable. Values below are a reference profile used for l
 | `BLOCK_THRESHOLD` | Trust score below which a peer is evicted and blocked | `0.15` |
 | `EMA_ALPHA` | EMA smoothing factor — weight of each new observation (higher = faster response) | `0.1` |
 | `DECAY_LAMBDA` | Per-second exponential decay rate toward neutral (0.5) | `1.3761e-6` |
-| `SELF_LOOKUP_INTERVAL` | Periodic self-lookup cadence | random in `[5 min, 10 min]` |
+| `SELF_LOOKUP_INTERVAL` | Periodic self-lookup cadence (maintenance phase only; bootstrap self-lookups run back-to-back with no interval) | random in `[5 min, 10 min]` |
 | `BUCKET_REFRESH_INTERVAL` | Periodic refresh cadence for stale k-buckets | `10 min` |
 | `STALE_BUCKET_THRESHOLD` | Duration after which a bucket without activity is considered stale | `1 hour` |
 | `LIVE_THRESHOLD` | Duration of no contact after which a peer is considered stale for revalidation and loses trust protection | `15 min` |
 | `STALE_REVALIDATION_TIMEOUT` | Maximum time to wait for a stale peer's ping response during admission contention | `1s` |
 | `MAX_CONSUMER_WEIGHT` | Maximum weight multiplier per single consumer-reported event | `5.0` |
-| `MAX_CANDIDATE_NODES` | Maximum entries in the network lookup candidate queue (prevents memory exhaustion from large `FIND_NODE` responses) | `200` |
+| `MAX_PEERS_PER_RESPONSE` | Maximum peers accepted from a single `FIND_NODE` response (prevents memory exhaustion from malicious responses) | `K_BUCKET_SIZE` |
+| `LOOKUP_STAGNATION_LIMIT` | Consecutive non-improving iterations before a network lookup terminates | `3` |
 | `BOOTSTRAP_STABILIZATION_ROUNDS` | Consecutive self-lookups with no new peers before bootstrap is considered stable | `2` |
 | `BOOTSTRAP_TIMEOUT` | Maximum duration for the bootstrap process before emitting `BootstrapComplete` regardless of stabilization | `60s` |
 
@@ -121,7 +122,7 @@ Parameter safety constraints (MUST hold):
 3. **Capacity bound**: Each k-bucket holds at most `K_BUCKET_SIZE` entries.
 4. **Address requirement**: A `NodeInfo` with an empty address list MUST NOT be admitted to the routing table.
 5. **Authenticated membership**: Only peers that have completed transport-level authentication are eligible for routing table insertion. Unauthenticated peers MUST NOT enter `LocalRT`.
-6. **IP diversity**: No enforcement scope (per-bucket or close-group) may exceed `IP_EXACT_LIMIT` nodes per exact IP or `IP_SUBNET_LIMIT` nodes per subnet, except via explicit loopback or testnet overrides.
+6. **IP diversity**: No enforcement scope (per-bucket or routing-neighborhood) may exceed `IP_EXACT_LIMIT` nodes per exact IP or `IP_SUBNET_LIMIT` nodes per subnet, except via explicit loopback or testnet overrides.
 7. **Trust blocking**: Peers with `TrustScore(self, P) < BLOCK_THRESHOLD` MUST be evicted from the routing table and MUST NOT be re-admitted until their trust score recovers above `BLOCK_THRESHOLD`.
 8. **Trust protection (staleness-gated)**: A peer with `TrustScore(self, P) >= TRUST_PROTECTION_THRESHOLD` **AND** `last_seen` within `LIVE_THRESHOLD` MUST NOT be evicted by swap-closer admission. A peer whose `last_seen` exceeds `LIVE_THRESHOLD` receives no trust protection regardless of score — stale peers MUST NOT hold slots against live candidates.
 9. **Deterministic distance**: `Distance(A, B)` is symmetric, deterministic, and consistent across all nodes. Two nodes compute the same distance between the same pair of keys.
@@ -148,7 +149,7 @@ For local node `N` and candidate peer `P`:
 3. That position is `BucketIndex(N, P)`.
 4. If `D = 0` (identities are equal), insertion is rejected (Invariant 1).
 
-Property: lower bucket indices correspond to more distant peers. A node has at most 1 bucket-0 peer (the farthest half of the keyspace is sparsely covered), but may fill buckets near 255 with many close peers.
+Property: lower bucket indices correspond to more distant peers.
 
 ### 6.3 NodeInfo Lifecycle
 
@@ -175,26 +176,24 @@ When a candidate peer `P` with `NodeInfo` and IP address `candidate_ip` is prese
 2. **Address check**: If `P.addresses` is empty, reject.
 3. **Authentication check**: If `P` has not completed transport-level authentication, reject.
 4. **Trust block check**: If `TrustScore(self, P) < BLOCK_THRESHOLD`, reject.
-5. **Loopback check**: If `candidate_ip` is loopback and loopback is disallowed, reject. If loopback is allowed, skip all IP diversity checks (step 6–7) and proceed directly to step 8.
-6. **Non-IP transport bypass**: If `P` has no IP-based address (e.g., Bluetooth, LoRa), skip IP diversity checks and proceed directly to step 8.
-7. **IP diversity enforcement** (under write lock — Invariant 10):
+5. **Update short-circuit**: If `P` already exists in `KBucket(BucketIndex(self, P))`, merge addresses (Section 6.3), refresh `last_seen`, move `P` to tail, and return. The peer already holds its slot — IP diversity and capacity checks are skipped.
+6. **Loopback check**: If `candidate_ip` is loopback and loopback is disallowed, reject. If loopback is allowed, skip all IP diversity checks (step 7–8) and proceed directly to step 9.
+7. **Non-IP transport bypass**: If `P` has no IP-based address (e.g., Bluetooth, LoRa), skip IP diversity checks and proceed directly to step 9.
+8. **IP diversity enforcement** (under write lock — Invariant 10):
    a. Compute `bucket_idx = BucketIndex(self, P)`.
    b. Run per-bucket IP diversity check (Section 7.2) against nodes in `KBucket(bucket_idx)`.
-   c. Run close-group IP diversity check (Section 7.2) against the hypothetical close group to self (the `K_BUCKET_SIZE` closest peers to self, including `P` and excluding any bucket-swap candidates).
+   c. Run routing-neighborhood IP diversity check (Section 7.2) against the routing neighborhood (the `K_BUCKET_SIZE` closest peers to self, including `P` and excluding any bucket-swap candidates).
    d. Deduplicate swap candidates from steps (b) and (c).
-8. **Capacity pre-check**: Verify that one of these holds for `KBucket(bucket_idx)`:
-   - `P` already exists in the bucket (update path).
+9. **Capacity pre-check**: Verify that one of these holds for `KBucket(bucket_idx)`:
    - The bucket has fewer than `K_BUCKET_SIZE` entries.
-   - A swap candidate from step 7 frees a slot in this bucket.
-   If none holds, attempt stale peer revalidation (Section 7.5). Stale revalidation releases the write lock for the duration of the parallel pings (up to `STALE_REVALIDATION_TIMEOUT`). After pings complete, the write lock is re-acquired and **all preceding checks (steps 1–7) are re-evaluated** against the current routing table state before proceeding. This prevents TOCTOU races caused by concurrent mutations during the unlocked ping window. If revalidation frees at least one slot and re-evaluation passes, proceed. If no slots freed or re-evaluation fails, reject.
-9. **Execute swaps**: Remove all deduplicated swap candidates.
-10. **Insert**: Add `P` to `KBucket(bucket_idx)`.
-
-If `P` already exists in the bucket, the existing entry is updated (addresses merged, `last_seen` refreshed) rather than creating a duplicate.
+   - A swap candidate from step 8 frees a slot in this bucket.
+   If none holds, attempt stale peer revalidation (Section 7.5). Stale revalidation releases the write lock for the duration of the parallel pings (up to `STALE_REVALIDATION_TIMEOUT`). After pings complete, the write lock is re-acquired and **all preceding checks (steps 1–8) are re-evaluated** against the current routing table state before proceeding. This prevents TOCTOU races caused by concurrent mutations during the unlocked ping window. If revalidation frees at least one slot and re-evaluation passes, proceed. If no slots freed or re-evaluation fails, reject.
+10. **Execute swaps**: Remove all deduplicated swap candidates. Disconnect evicted peers at the transport layer.
+11. **Insert**: Add `P` to `KBucket(bucket_idx)`.
 
 ### 7.2 IP Diversity Enforcement
 
-IP diversity is checked per scope (a set of `NodeInfo` entries: either a single k-bucket or the K-closest-to-self set). For a candidate with `candidate_ip`:
+IP diversity is checked per scope (a set of `NodeInfo` entries: either a single k-bucket or the routing neighborhood — the `K_BUCKET_SIZE` closest peers to self). For a candidate with `candidate_ip`:
 
 **Exact IP check:**
 
@@ -213,10 +212,10 @@ Both checks apply independently. If either fails, the candidate is rejected (unl
 
 When an IP diversity limit is exceeded and a candidate `P` contends for a slot:
 
-1. Among the nodes in scope that share the candidate's IP or subnet (the "violating set"), find the one farthest from the scope's reference point (the local node's ID for close-group scope, or the local node's ID for bucket scope — both use XOR distance to self).
+1. Among the nodes in scope that share the candidate's IP or subnet (the "violating set"), find the one farthest from the scope's reference point (the local node's ID for routing-neighborhood scope, or the local node's ID for bucket scope — both use XOR distance to self).
 2. Let `V` be that farthest violating peer.
 3. If `Distance(self, P) < Distance(self, V)` **AND** (`TrustScore(self, V) < TRUST_PROTECTION_THRESHOLD` **OR** `now - V.last_seen > LIVE_THRESHOLD`):
-   - Swap: evict `V`, admit `P`.
+   - Swap: evict `V`, disconnect `V` at the transport layer, admit `P`.
 4. Otherwise: reject `P`. Live, well-trusted peers hold their slot.
 
 Rationale: swap-closer prefers geographically closer peers (lower XOR distance) while protecting long-lived, recently-seen, well-trusted peers from displacement by unproven newcomers from the same subnet. A peer that has not been seen within `LIVE_THRESHOLD` loses trust protection regardless of its score — it may have silently departed, and holding its slot against a live candidate degrades routing table quality.
@@ -232,7 +231,7 @@ When any interaction records a trust failure and `TrustScore(self, P)` drops bel
 
 Blocking is enforced at both the transport and routing table layers. API consumers can rely on `LocalRT` membership as the trust gate.
 
-Transport-level enforcement: the transport layer MUST reject inbound connections from blocked peers (peers with `TrustScore(self, P) < BLOCK_THRESHOLD`) during or immediately after authentication, before any resource allocation. The transport layer MUST also refuse outbound dials to blocked peers.
+Transport-level enforcement: the transport layer MUST reject inbound connections from blocked peers (peers with `TrustScore(self, P) < BLOCK_THRESHOLD`) during authentication — specifically, after the peer's identity is established but before allocating application-layer resources (buffers, session state, routing table interaction). The transport layer MUST also refuse outbound dials to blocked peers.
 
 Re-admission path: a blocked peer can only re-enter when its trust score recovers above `BLOCK_THRESHOLD` through time-decay toward neutral AND the peer is rediscovered through normal network activity:
 
@@ -250,29 +249,33 @@ When a candidate `P` is presented for admission but `KBucket(bucket_idx)` is at 
 2. If the stale set is empty: no slots can be freed. Reject `P`.
 3. **Ping all stale peers in parallel** (bounded by `STALE_REVALIDATION_TIMEOUT`).
 4. For each peer that responds: `touch_node(S)`, record `SuccessfulResponse` trust event. `S` retains its slot.
-5. For each peer that fails to respond: record `ConnectionFailed` trust event, evict `S` from the bucket. Emit `PeerRemoved(S)` event.
-6. If any slots were freed: proceed with admission of `P` (step 9 of Section 7.1).
+5. For each peer that fails to respond: record `ConnectionFailed` trust event, evict `S` from the bucket, disconnect `S` at the transport layer. Emit `PeerRemoved(S)` event.
+6. If any slots were freed: proceed with admission of `P` (step 10 of Section 7.1).
 7. If no slots were freed (all stale peers responded): reject `P` with "bucket at capacity."
 
-Close-group stale revalidation applies when Section 7.1 step 7c detects a close-group IP diversity violation and the violating peers include stale entries. Because close-group peers span multiple buckets, the flow differs from bucket-level revalidation:
+Routing-neighborhood stale revalidation applies when Section 7.1 step 8c detects a routing-neighborhood IP diversity violation and the violating peers include stale entries. Because routing-neighborhood peers span multiple buckets, the flow differs from bucket-level revalidation:
 
 1. Among peers in the K-closest-to-self set that share IP or subnet with candidate `P` (the violating set), collect those where `now - last_seen > LIVE_THRESHOLD`.
 2. If no stale violators exist: proceed directly to swap-closer (Section 7.3).
 3. Ping all stale violating peers in parallel (bounded by `STALE_REVALIDATION_TIMEOUT`).
 4. For each responder: `touch_node(S)`, record `SuccessfulResponse` trust event. Peer retains its slot and regains live status.
-5. For each non-responder: record `ConnectionFailed` trust event, evict from its respective k-bucket. Emit `PeerRemoved` event.
+5. For each non-responder: record `ConnectionFailed` trust event, evict from its respective k-bucket, disconnect at the transport layer. Emit `PeerRemoved` event.
 6. Recompute the K-closest-to-self set (composition may have changed due to evictions).
-7. Re-run close-group IP diversity check for candidate `P` against the updated set.
-8. If the violation is now resolved: skip swap-closer for the close-group scope and proceed to Section 7.1 step 8 (capacity pre-check).
+7. Re-run routing-neighborhood IP diversity check for candidate `P` against the updated set.
+8. If the violation is now resolved: skip swap-closer for the routing-neighborhood scope and proceed to Section 7.1 step 9 (capacity pre-check).
 9. If violation persists: proceed to swap-closer (Section 7.3) against the remaining live violators.
 
-Note: evicting a close-group violator from its bucket frees a slot in that bucket, not necessarily in the candidate's target bucket. Close-group revalidation resolves IP diversity violations; the capacity pre-check (Section 7.1 step 8) is a separate gate that must still pass independently.
+Note: evicting a routing-neighborhood violator from its bucket frees a slot in that bucket, not necessarily in the candidate's target bucket. Routing-neighborhood revalidation resolves IP diversity violations; the capacity pre-check (Section 7.1 step 9) is a separate gate that must still pass independently.
 
 **Design rationale**: this is a reactive liveness mechanism inspired by original Kademlia's ping-on-insert design, adapted with a staleness threshold (BEP 5's "questionable" concept). Unlike proactive background pinging (Ethereum discv5's revalidation loop) or connection-state tracking (libp2p), it incurs zero network overhead when there is no admission contention. The cost is paid only when a real candidate needs a slot and an incumbent has not been seen recently — exactly the moment when liveness information has the most value.
 
 Pinging all stale peers in the bucket (not just one) revalidates the entire bucket's stale set in a single contention event, freeing multiple slots if several peers have departed. This avoids repeated single-peer probes across successive admission attempts.
 
 **Latency impact**: stale revalidation adds up to `STALE_REVALIDATION_TIMEOUT` to the admission path, but only when the bucket is full AND contains stale peers AND no other admission path (update, capacity, swap) succeeds. In a healthy network where peers interact regularly, most peers remain within `LIVE_THRESHOLD` and this path is never triggered.
+
+**Trust event durability**: trust events recorded during stale revalidation (steps 4–5) are committed regardless of whether the candidate is ultimately admitted. If the write lock is re-acquired and re-evaluation fails (due to concurrent mutations), the candidate is rejected, but the trust events stand — the liveness information they encode is accurate and valuable independent of the admission outcome.
+
+**Eviction and disconnection**: all evictions during stale revalidation result in transport-layer disconnection. This prevents ghost connections — open transport connections to peers no longer in the routing table that would consume resources without routing benefit.
 
 ## 8. Peer Lookup
 
@@ -303,12 +306,12 @@ Algorithm:
 2. Include self in `best_nodes` (self competes on distance but is never queried).
 3. Mark self as "queried" to prevent self-RPC.
 4. Loop (up to `MAX_LOOKUP_ITERATIONS`):
-   a. Select up to `ALPHA` unqueried peers from `best_nodes`, nearest first.
+   a. Select up to `ALPHA` unqueried peers from `best_nodes`, nearest first. Skip any peer with `TrustScore(self, peer) < BLOCK_THRESHOLD` (the peer may have been blocked since it entered `best_nodes`).
    b. Query each in parallel with `FIND_NODE(K)`.
    c. For each response, record trust outcome (`SuccessfulResponse` or `ConnectionFailed`/`ConnectionTimeout`).
-   d. Merge returned peers into `best_nodes`, deduplicating by `PeerId`. Cap `best_nodes` at `MAX_CANDIDATE_NODES` entries to bound memory usage.
+   d. For each response, accept at most `MAX_PEERS_PER_RESPONSE` peers (closest to `K` first; additional entries are silently dropped). Merge accepted peers into `best_nodes`, deduplicating by `PeerId`.
    e. Sort `best_nodes` by `Distance(K, node)`, truncate to `count`.
-   f. Convergence check: if the closest peer in `best_nodes` after this iteration is strictly closer (by XOR distance to `K`) than the closest peer before this iteration, reset the stagnation counter to 0. Otherwise, increment it. Stop when the stagnation counter reaches 3 or all candidates in `best_nodes` have been queried.
+   f. Convergence check: if the closest peer in `best_nodes` after this iteration is strictly closer (by XOR distance to `K`) than the closest peer before this iteration, reset the stagnation counter to 0. Otherwise, increment it. Stop when the stagnation counter reaches `LOOKUP_STAGNATION_LIMIT` or all candidates in `best_nodes` have been queried.
 5. Return `best_nodes` (may include self).
 
 Properties:
@@ -401,23 +404,24 @@ All paths converge on the same admission flow (Section 7.1), ensuring consistent
 
 A node starting with an empty routing table:
 
-1. Load close group cache from disk (if available) to warm the routing table with previously-known trusted peers and their trust scores.
+1. Load close group cache from disk (if available). Import trust scores into the trust subsystem and place cached peers into the dial queue (not the routing table — Invariant 5 requires authentication before insertion).
 2. Dial bootstrap peers (well-known, hardcoded or configured).
 3. Send `FIND_NODE(self.id)` to each bootstrap peer.
 4. Admit returned peers via the standard admission flow.
 5. Perform iterative self-lookup to expand close neighborhood.
-6. Repeat self-lookup until routing table stabilizes (no new peers discovered for `BOOTSTRAP_STABILIZATION_ROUNDS` consecutive lookups, or `BOOTSTRAP_TIMEOUT` is reached).
+6. Repeat self-lookup **back-to-back** (no interval — `SELF_LOOKUP_INTERVAL` applies only to maintenance-phase lookups after bootstrap) until routing table stabilizes (no new peers discovered for `BOOTSTRAP_STABILIZATION_ROUNDS` consecutive lookups, or `BOOTSTRAP_TIMEOUT` is reached).
 7. Emit `BootstrapComplete { num_peers }` with the current routing table size.
 
 ### 11.2 Warm Restart
 
 A node restarting with a close group cache:
 
-1. Load cached peers and their trust scores into the routing table and trust subsystem.
+1. Load cached trust scores into the trust subsystem. Place cached peers into a dial queue (not the routing table — Invariant 5 requires authentication before insertion).
 2. Dial cached peers first (they are likely still alive and nearby).
-3. Fall back to bootstrap peers if cached peers are unreachable.
-4. Perform iterative self-lookup to update stale entries.
-5. Emit `BootstrapComplete { num_peers }` once stabilized or `BOOTSTRAP_TIMEOUT` reached.
+3. For each successful dial + authentication, admit the peer via the standard admission flow (Section 7.1).
+4. Fall back to bootstrap peers if cached peers are unreachable.
+5. Perform iterative self-lookup back-to-back to update stale entries.
+6. Emit `BootstrapComplete { num_peers }` once stabilized or `BOOTSTRAP_TIMEOUT` reached.
 
 The close group cache (`CloseGroupCache`) stores:
 
@@ -432,8 +436,8 @@ The close group cache (`CloseGroupCache`) stores:
 IP diversity enforcement (Section 7.2) limits the influence of a single operator:
 
 - **Per-bucket**: An attacker controlling one IP can place at most `IP_EXACT_LIMIT` (2) nodes in any single bucket. An attacker controlling a `/24` subnet can place at most `IP_SUBNET_LIMIT` (5) nodes per bucket.
-- **Close-group**: The same limits apply to the `K_BUCKET_SIZE` closest peers to self, preventing a single operator from dominating the close neighborhood.
-- **Two-scope enforcement**: Both per-bucket and close-group checks must pass. An attacker could fill distant buckets without threatening the close neighborhood, but cannot concentrate nodes near any target.
+- **Routing-neighborhood**: The same limits apply to the `K_BUCKET_SIZE` closest peers to self, preventing a single operator from dominating the routing neighborhood.
+- **Two-scope enforcement**: Both per-bucket and routing-neighborhood checks must pass. An attacker could fill distant buckets without threatening the routing neighborhood, but cannot concentrate nodes near any target.
 
 Limitations:
 - An attacker with access to many subnets across diverse providers can still accumulate routing table presence. IP diversity is one layer of defense, complemented by trust scoring and proof-of-work/stake at higher layers.
@@ -466,6 +470,7 @@ The routing table exposes the following operations to consumers (e.g., saorsa-no
 | Operation | Input | Output | Description |
 |---|---|---|---|
 | `find_closest_nodes_local(K, count)` | Key, count | `Vec<NodeInfo>` sorted by distance | Nearest peers from local routing table |
+| `find_closest_nodes_local_with_self(K, count)` | Key, count | `Vec<NodeInfo>` sorted by distance | Same as `find_closest_nodes_local` but includes self in the candidate set. Used by consumers to determine storage responsibility. |
 | `find_closest_nodes_network(K, count)` | Key, count | `Vec<NodeInfo>` sorted by distance | Iterative network lookup |
 | `is_in_routing_table(P)` | PeerId | bool | Membership check |
 | `routing_table_size()` | — | usize | Total peer count |
@@ -603,7 +608,7 @@ Use this list to find design flaws before coding:
    - Stale peer revalidation (Section 7.5) adds up to `STALE_REVALIDATION_TIMEOUT` (1s) to the admission path when triggered. In a healthy network this path is rarely hit (most peers are within `LIVE_THRESHOLD`). Under mass churn (many stale peers per bucket), parallel pinging bounds the latency to a single timeout regardless of stale-set size.
 
 7. **Distant stale peers without contention**:
-   - A stale peer in a distant, partially-filled bucket may never face admission contention and thus never be revalidated. It will sit at neutral trust (~0.5) indefinitely. This is acceptable: distant peers don't affect close-group accuracy, don't get selected for close-group-based operations, and the slot cost is negligible. Bucket refresh (Section 9.3) may eventually trigger contention if new peers are discovered for that bucket.
+   - A stale peer in a distant, partially-filled bucket may never face admission contention and thus never be revalidated. It will sit at neutral trust (~0.5) indefinitely. This is acceptable: distant peers don't affect routing-neighborhood accuracy, don't get selected for routing-neighborhood-based operations, and the slot cost is negligible. Bucket refresh (Section 9.3) may eventually trigger contention if new peers are discovered for that bucket.
 
 8. **Close group cache staleness**:
    - After a long offline period, the close group cache may contain departed peers. Mitigation: warm restart dials cached peers and falls back to bootstrap if they are unreachable. Self-lookup then refreshes the neighborhood.
@@ -650,8 +655,8 @@ Each scenario should assert exact expected outcomes and state transitions.
 9. **Subnet limit enforcement**:
    - Insert `IP_SUBNET_LIMIT` peers within same `/24`. Next peer in subnet rejected unless swap-closer applies.
 
-10. **Close-group IP diversity enforcement**:
-    - Bucket admits a peer, but it would violate subnet limit in the K-closest-to-self set. Peer triggers close-group swap-closer. If successful, farthest violating peer in close group is evicted.
+10. **Routing-neighborhood IP diversity enforcement**:
+    - Bucket admits a peer, but it would violate subnet limit in the K-closest-to-self set. Peer triggers routing-neighborhood swap-closer. If successful, farthest violating peer in the routing neighborhood is evicted.
 
 11. **Loopback bypass**:
     - With loopback allowed, peers on 127.0.0.1 skip all IP diversity checks. Multiple loopback peers admitted up to bucket capacity.
@@ -659,8 +664,8 @@ Each scenario should assert exact expected outcomes and state transitions.
 12. **Non-IP transport bypass**:
     - Peer with Bluetooth-only address. IP diversity skipped. Admitted up to bucket capacity.
 
-13. **Duplicate admission (update path)**:
-    - Peer already in routing table is re-admitted with new address. Address is merged, `last_seen` updated. No duplicate entry created.
+13. **Duplicate admission (update short-circuit)**:
+    - Peer already in routing table is re-admitted with new address. Update short-circuit (step 5) fires: address is merged, `last_seen` updated, peer moved to tail. IP diversity and capacity checks are skipped. No duplicate entry created.
 
 14. **Atomic admission under concurrent access**:
     - Two concurrent admissions targeting the same bucket. Write lock ensures both see consistent state. No TOCTOU: diversity check and insertion are atomic.
@@ -688,11 +693,11 @@ Each scenario should assert exact expected outcomes and state transitions.
 21. **Staleness-gated trust protection: live well-trusted peer holds slot**:
     - Same as test 20, but farthest peer has `last_seen` within `LIVE_THRESHOLD`. Swap-closer fails — live well-trusted peer holds its slot. Candidate rejected (or proceeds to stale revalidation if other paths exist).
 
-22. **Close-group stale revalidation resolves violation without swap-closer**:
-    - Close-group IP diversity check finds subnet violation. Two violating peers are stale (in different buckets). Both pinged in parallel. One responds (touch, retains slot), one fails (evicted from its bucket, `PeerRemoved` emitted). K-closest-to-self recomputed. Violation now resolved (only one peer from that subnet remains). Swap-closer skipped. Candidate proceeds to capacity pre-check.
+22. **Routing-neighborhood stale revalidation resolves violation without swap-closer**:
+    - Routing-neighborhood IP diversity check finds subnet violation. Two violating peers are stale (in different buckets). Both pinged in parallel. One responds (touch, retains slot), one fails (evicted from its bucket, disconnected, `PeerRemoved` emitted). K-closest-to-self recomputed. Violation now resolved (only one peer from that subnet remains). Swap-closer skipped. Candidate proceeds to capacity pre-check.
 
-23. **Close-group stale revalidation with persisting violation**:
-    - Close-group IP diversity check finds subnet violation. Two violating peers are stale. Both pinged. Both respond (touch, retain slots). Violation persists. Swap-closer runs against the remaining live violators. Farthest violator has trust < 0.7 — swap succeeds.
+23. **Routing-neighborhood stale revalidation with persisting violation**:
+    - Routing-neighborhood IP diversity check finds subnet violation. Two violating peers are stale. Both pinged. Both respond (touch, retain slots). Violation persists. Swap-closer runs against the remaining live violators. Farthest violator has trust < 0.7 — swap succeeds.
 
 ### Lookup Tests
 
@@ -743,7 +748,7 @@ Each scenario should assert exact expected outcomes and state transitions.
     - Empty routing table. Bootstrap peers respond to `FIND_NODE(self)`. Returned peers admitted. Self-lookup expands neighborhood.
 
 38. **Warm restart from cache**:
-    - Close group cache loaded. Cached peers dialed successfully. Routing table pre-populated with trusted peers. Self-lookup refines.
+    - Close group cache loaded into trust subsystem and dial queue. Cached peers dialed and authenticated successfully. Admitted via standard admission flow. Self-lookup refines.
 
 39. **Warm restart with stale cache**:
     - All cached peers unreachable. Falls back to bootstrap peers. Routing table eventually populated.
