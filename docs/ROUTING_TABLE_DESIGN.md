@@ -38,7 +38,7 @@ The routing table is a **peer phonebook** — it tracks who is on the network an
 - `BucketIndex(A, B)`: index of the first bit position (0-indexed from MSB) where `A ⊕ B` differs. Equal IDs have no bucket index (self-insertion is forbidden).
 - `KBucket(i)`: the `i`-th k-bucket (0 ≤ `i` < 256), holding up to `K_BUCKET_SIZE` `NodeInfo` entries for peers whose `BucketIndex` relative to the local node is `i`.
 - `LocalRT(N)`: node `N`'s authenticated local routing-table peer set. Union of all k-bucket contents, excluding `N` itself.
-- `TrustScore(N, P)`: node `N`'s current trust assessment of peer `P`, queried from the EigenTrust subsystem.
+- `TrustScore(N, P)`: node `N`'s current trust assessment of peer `P`, queried from the trust subsystem. Computed by EMA over the weighted history of all trust events — both internal (DHT-layer) and consumer-reported (application-layer) — with time decay toward neutral (0.5).
 
 ## 4. Tunable Parameters
 
@@ -57,11 +57,40 @@ All parameters are configurable. Values below are a reference profile used for l
 | `IPV6_SUBNET_MASK` | Prefix length for IPv6 subnet grouping | `/64` |
 | `TRUST_PROTECTION_THRESHOLD` | Trust score above which a peer resists swap-closer eviction | `0.7` |
 | `BLOCK_THRESHOLD` | Trust score below which a peer is evicted and blocked | `0.15` |
+| `EMA_ALPHA` | EMA smoothing factor — weight of each new observation (higher = faster response) | `0.1` |
+| `DECAY_LAMBDA` | Per-second exponential decay rate toward neutral (0.5) | `1.3761e-6` |
 | `SELF_LOOKUP_INTERVAL` | Periodic self-lookup cadence | random in `[5 min, 10 min]` |
 | `BUCKET_REFRESH_INTERVAL` | Periodic refresh cadence for stale k-buckets | `10 min` |
 | `STALE_BUCKET_THRESHOLD` | Duration after which a bucket without activity is considered stale | `1 hour` |
 | `LIVE_THRESHOLD` | Duration of no contact after which a peer is considered stale for revalidation and loses trust protection | `15 min` |
 | `STALE_REVALIDATION_TIMEOUT` | Maximum time to wait for a stale peer's ping response during admission contention | `1s` |
+| `MAX_CONSUMER_WEIGHT` | Maximum weight multiplier per single consumer-reported event | `5.0` |
+
+#### EMA Scoring Model
+
+The trust score for a peer is an exponential moving average (EMA) of success/failure observations that decays toward neutral (0.5) when idle.
+
+**Update rule**: On each event, time decay is applied first, then the new observation is blended in:
+
+```
+score = neutral + (score - neutral) * e^(-DECAY_LAMBDA * elapsed_secs)    // decay
+score = (1 - EMA_ALPHA) * score + EMA_ALPHA * observation                 // blend
+```
+
+Where `observation` is `1.0` for a positive event and `0.0` for a negative event. For a consumer event with weight `W`, the blend step is applied `W` times consecutively (equivalent to `W` unit-weight events).
+
+**Decay tuning**: `DECAY_LAMBDA = 1.3761e-6` is tuned so that the worst possible score (0.0) takes approximately 3 days of idle time to decay back above `BLOCK_THRESHOLD` (0.15). Derivation: `0.15 = 0.5 - 0.5 * e^(-λ * 259200)` → `λ = -ln(0.7) / 259200`.
+
+**Failures to block** (consecutive negative events from neutral 0.5 to below `BLOCK_THRESHOLD` 0.15, ignoring decay):
+
+| Event weight | Events to block | Effective failures |
+|---|---|---|
+| `1.0` (internal event) | 12 | 12 |
+| `2.0` | 6 | 12 |
+| `3.0` | 4 | 12 |
+| `5.0` (`MAX_CONSUMER_WEIGHT`) | 3 | 15 |
+
+Note: time decay between events works in the peer's favor — in practice, more events may be needed if failures are spread over time. Interleaved positive events (e.g., successful DHT RPCs) also slow the decline.
 
 Parameter safety constraints (MUST hold):
 
@@ -71,7 +100,10 @@ Parameter safety constraints (MUST hold):
 4. `ALPHA >= 1`.
 5. `LIVE_THRESHOLD > max(SELF_LOOKUP_INTERVAL)` (peers touched by self-lookup must not oscillate between live and stale between consecutive cycles; at reference values: 15 min > 10 min).
 6. `STALE_REVALIDATION_TIMEOUT > 0`.
-7. If constraints are violated at runtime reconfiguration, node MUST reject the config and keep the previous valid config.
+7. `MAX_CONSUMER_WEIGHT >= 1.0`.
+8. `EMA_ALPHA` in (0.0, 1.0). Values near 0 make the score nearly unresponsive to events; values near 1 make it hypersensitive.
+9. `DECAY_LAMBDA > 0`.
+10. If constraints are violated at runtime reconfiguration, node MUST reject the config and keep the previous valid config.
 
 ## 5. Core Invariants (Must Hold)
 
@@ -413,26 +445,119 @@ An attacker attempts to insert malicious entries via `FIND_NODE` responses:
 
 ## 13. Consumer API
 
-The routing table exposes the following queries to consumers (e.g., saorsa-node):
+The routing table exposes the following operations to consumers (e.g., saorsa-node):
 
-| Query | Input | Output | Description |
+| Operation | Input | Output | Description |
 |---|---|---|---|
 | `find_closest_nodes_local(K, count)` | Key, count | `Vec<NodeInfo>` sorted by distance | Nearest peers from local routing table |
 | `find_closest_nodes_network(K, count)` | Key, count | `Vec<NodeInfo>` sorted by distance | Iterative network lookup |
 | `is_in_routing_table(P)` | PeerId | bool | Membership check |
 | `routing_table_size()` | — | usize | Total peer count |
 | `touch_node(P, addr)` | PeerId, optional address | bool | Liveness update on successful interaction |
+| `report_trust_event(P, event)` | PeerId, TrustEvent | — | Report a trust-relevant outcome for a peer (Section 13.1). Consumer events carry a weight multiplier expressing severity. |
+| `peer_trust(P)` | PeerId | float (0.0–1.0) | Query current trust score; returns neutral (0.5) for unknown peers |
 
 Consumers MUST NOT:
 
 - Directly read or write k-bucket contents.
 - Bypass IP diversity or trust checks when admitting peers.
 - Remove peers from the routing table (that is owned by the trust/blocking subsystem).
+- Manipulate trust scores directly — all trust mutations flow through `report_trust_event`.
 
 Consumers MAY:
 
-- Report trust events via the `TrustEvent` interface, which may indirectly cause routing table changes (eviction on block).
+- Report trust events via `report_trust_event` to reward or penalize peers based on application-level outcomes, which may indirectly cause routing table changes (eviction on block, trust protection gain/loss).
+- Query `peer_trust` to make trust-informed decisions (e.g., preferring higher-trust peers for data retrieval).
 - Request network lookups to discover new peers (which may be admitted to the routing table as a side effect).
+
+### 13.1 Consumer Trust Reporting
+
+The trust subsystem accepts trust events from two sources: **internal events** recorded automatically by DHT operations, and **consumer-reported events** submitted by the API consumer via `report_trust_event`. All events flow through the same EMA scoring model. Consumer events carry a weight multiplier that controls how heavily a single event influences the score, allowing the consumer to express severity without needing a separate scoring mechanism.
+
+#### Trust Event Taxonomy
+
+All events are classified as positive (successful interaction) or negative (failed interaction) and processed by the same EMA scoring model. Consumer events additionally carry a `weight` parameter that scales their impact.
+
+**Internal events** (recorded automatically — consumers do not report these):
+
+| Event | Category | Weight | Trigger |
+|---|---|---|---|
+| `SuccessfulResponse` | Positive | `1.0` (implicit) | Peer responded to an outbound DHT RPC |
+| `SuccessfulConnection` | Positive | `1.0` (implicit) | Peer connected and completed authentication |
+| `ConnectionFailed` | Negative | `1.0` (implicit) | Outbound connection could not be established |
+| `ConnectionTimeout` | Negative | `1.0` (implicit) | Outbound connection attempt timed out |
+
+**Consumer-reported events** (submitted via `report_trust_event`):
+
+| Event | Parameter | Category | Trigger (example) |
+|---|---|---|---|
+| `ApplicationSuccess(weight)` | `weight`: severity multiplier in (0.0, `MAX_CONSUMER_WEIGHT`] | Positive | Peer served a valid chunk, fulfilled a storage request, passed an audit |
+| `ApplicationFailure(weight)` | `weight`: severity multiplier in (0.0, `MAX_CONSUMER_WEIGHT`] | Negative | Peer returned corrupted data, failed to serve expected chunk, failed a storage audit |
+
+A weight of `1.0` has the same EMA impact as a single internal event. A weight of `3.0` has the same impact as three consecutive events of the same category. This lets the consumer express that serving corrupted data (e.g., `ApplicationFailure(3.0)`) is more significant than a slow response (e.g., `ApplicationFailure(1.0)`) without needing to call `report_trust_event` multiple times.
+
+#### `MAX_CONSUMER_WEIGHT` Parameter
+
+| Parameter | Meaning | Reference |
+|---|---|---|
+| `MAX_CONSUMER_WEIGHT` | Maximum weight multiplier per single consumer event | `5.0` |
+
+Capping the weight prevents a single consumer event from having disproportionate impact on the EMA. At weight `5.0`, one event is equivalent to 5 internal events — significant, but the EMA's smoothing still prevents an instant score collapse from a single report.
+
+Parameter safety constraint: `MAX_CONSUMER_WEIGHT >= 1.0`. If violated at runtime reconfiguration, the node MUST reject the config and keep the previous valid value.
+
+#### Weight Validation
+
+When `report_trust_event` receives a consumer event:
+
+1. If `weight <= 0.0`: reject the event (no-op). Zero and negative weights are meaningless.
+2. If `weight > MAX_CONSUMER_WEIGHT`: clamp `weight` to `MAX_CONSUMER_WEIGHT`.
+3. Proceed with the validated weight.
+
+#### Scoring Pipeline
+
+All events — internal and consumer-reported — follow the same path through the scoring pipeline:
+
+1. **Event received**: `report_trust_event(P, event)` is called (by DHT internals or by the consumer).
+2. **Category mapping**: Event mapped to positive (successful interaction) or negative (failed interaction).
+3. **Weight resolution**: Internal events have implicit weight `1.0`. Consumer events use their caller-specified weight (after validation/clamping).
+4. **EMA update**: The trust engine applies time decay, then blends the observation using the EMA model (Section 4). Positive events use observation `1.0`, negative events use `0.0`. The weight scales influence: a weight of `W` applies the blend step `W` times (equivalent to `W` consecutive unit-weight events). At reference values (`EMA_ALPHA = 0.1`), a single weight-1.0 failure moves a neutral peer's score from 0.5 to 0.45; a single weight-5.0 failure moves it from 0.5 to ~0.30.
+5. **Threshold checks**:
+   a. **Block check**: If `TrustScore(self, P)` dropped below `BLOCK_THRESHOLD`, trigger the blocked peer handling flow (Section 7.4) — peer is evicted from the routing table, disconnected, and blocked.
+   b. **Protection evaluation**: If `TrustScore(self, P)` crossed `TRUST_PROTECTION_THRESHOLD` in either direction, the peer's swap-closer protection status changes accordingly (Section 7.3).
+
+#### Consumer Reporting Invariants
+
+1. **Unified model**: All events (internal and consumer-reported) are processed by the same EMA scoring model. There is no separate scoring path for consumer events. The trust score is a single value derived from the weighted history of all events, with time decay toward neutral.
+2. **Weight as severity**: A consumer event with weight `W` has the same EMA impact as `W` consecutive internal events of the same category. Weight `1.0` is equivalent to a single internal event; weight `5.0` is equivalent to five.
+3. **Bounded weight**: A single consumer event's weight is capped at `MAX_CONSUMER_WEIGHT`. At reference values (`EMA_ALPHA = 0.1`, `MAX_CONSUMER_WEIGHT = 5.0`), a single maximum-weight failure moves a neutral peer from 0.5 to ~0.30 — significant but not enough to cross `BLOCK_THRESHOLD` (0.15) in one event.
+4. **Natural decay**: Because consumer events flow through the EMA, their influence decays over time just like internal events. A penalty reported last week has less influence on the current score than a penalty reported today. A peer that was penalized but then goes idle will drift back toward neutral (0.5).
+5. **Idempotent path**: Reporting a trust event for a peer not in the routing table is valid. The trust engine maintains scores independently of routing table membership (a peer can have a trust record without being in `LocalRT`).
+6. **No direct score manipulation**: Consumers cannot set a trust score to an arbitrary value. Scores are derived exclusively from the weighted EMA of all events plus time decay.
+
+#### Consumer Guidance: Choosing Weights
+
+The routing table design does not prescribe specific weights for application-level events — that is the consumer's domain. However, the following guidelines help consumers calibrate:
+
+- **Weight `1.0`**: Routine outcomes equivalent in significance to a single connection success/failure. Use for ordinary request completions and minor timeouts.
+- **Weight `2.0–3.0`**: Significant outcomes. A peer failing to serve a chunk it was expected to hold, or serving data that fails integrity verification.
+- **Weight `4.0–5.0`**: Severe outcomes. Provably malicious behavior such as serving corrupted data with a valid-looking wrapper, or consistently failing storage audits.
+- **Asymmetric weighting**: Consumers may reasonably weight penalties higher than rewards. Serving corrupted data is more significant than serving correct data, because correct behavior is the baseline expectation.
+
+#### Design Rationale
+
+The consumer trust reporting API exists because the DHT layer operates as a peer phonebook and cannot observe application-level behavior. A peer that reliably answers DHT `FIND_NODE` queries (generating internal `SuccessfulResponse` events) may still serve corrupted data at the application layer. Without consumer-reported events, such a peer would maintain a high trust score despite being malicious from the application's perspective.
+
+All events (internal and consumer) use the same EMA model because:
+
+1. **One model, one score**: A single scoring mechanism is simpler to reason about than two interacting models (e.g., EMA for internal events plus direct adjustments for consumer events) modifying the same trust score. With one model, the consumer does not need to understand how its adjustments interact with EMA smoothing — its events *are* EMA events.
+2. **Natural time decay for all signals**: Consumer-reported penalties and rewards decay over time, just like internal events. A peer that was penalized for serving bad data a week ago but has since behaved well naturally recovers. With direct adjustments, old penalties would persist until explicitly counteracted.
+3. **Severity via weight**: The consumer expresses severity through the weight multiplier. A `weight: 3.0` failure is three times as influential as a `weight: 1.0` failure within the EMA, which is the same as reporting three separate failures. This is intuitive and requires no knowledge of EMA internals — the consumer just asks "how many unit-failures is this worth?"
+
+By funneling all trust signals through a single `report_trust_event` interface and a single EMA model:
+- The trust engine remains a single source of truth for peer reputation.
+- The routing table's trust-based admission, eviction, and protection mechanisms work identically regardless of event source.
+- The consumer has proportional, bounded control over trust impact without needing to reason about absolute score positions or competing scoring mechanisms.
 
 ## 14. Logic-Risk Checklist (Pre-Implementation)
 
@@ -466,6 +591,15 @@ Use this list to find design flaws before coding:
 
 8. **Close group cache staleness**:
    - After a long offline period, the close group cache may contain departed peers. Mitigation: warm restart dials cached peers and falls back to bootstrap if they are unreachable. Self-lookup then refreshes the neighborhood.
+
+9. **Consumer trust event flooding**:
+   - A misbehaving or buggy consumer could flood `report_trust_event` with `ApplicationFailure(MAX_CONSUMER_WEIGHT)` events, rapidly blocking many peers and depleting the routing table. Mitigation: `MAX_CONSUMER_WEIGHT` caps per-event influence, and the EMA's smoothing factor limits how far a single event can move the score — even at maximum weight, the score change is bounded by EMA dynamics, not by the weight alone. The consumer is a trusted local process. If rate limiting is needed in the future, it can be added at the `report_trust_event` interface without changing the scoring model. For v1, the consumer is assumed to report events honestly and at a reasonable rate.
+
+10. **Internal vs consumer event divergence**:
+    - A peer may appear healthy at the DHT layer (generating internal `SuccessfulResponse` events from FIND_NODE replies) while consistently failing at the application layer (consumer reports `ApplicationFailure`). Because both event streams feed the same EMA, the score reflects their combined weighted history. Internal successes push the score up; consumer failures push it down. The net direction depends on relative rates and weights. A consumer using higher weights for application failures (e.g., `weight: 3.0` for corrupted data) can outpace unit-weight internal successes. A peer that is reachable but serves bad data should eventually be blocked.
+
+11. **Consumer reward inflation**:
+    - A consumer could report `ApplicationSuccess(MAX_CONSUMER_WEIGHT)` for every interaction, inflating a peer's trust toward 1.0. Because all events flow through EMA, the score asymptotically approaches 1.0 but the smoothing factor limits the rate. This is acceptable: the consumer is a trusted local process, and inflating trust simply means the peer gains stronger protection. If the peer later misbehaves, subsequent failures (internal or consumer-reported) will pull the score back down, and time decay ensures idle peers drift toward neutral.
 
 ## 15. Pre-Implementation Test Matrix
 
@@ -620,6 +754,41 @@ Each scenario should assert exact expected outcomes and state transitions.
 
 46. **Blocked peer messages dropped**:
     - Peer below block threshold sends DHT message. Message silently dropped. No routing table interaction.
+
+### Consumer Trust Reporting Tests
+
+47. **Consumer reward improves trust**:
+    - Peer starts at neutral trust (0.5). Consumer reports `ApplicationSuccess(1.0)`. Trust score increases above 0.5 (exact value determined by EMA smoothing factor). Peer remains in routing table.
+
+48. **Consumer penalty degrades trust to blocking**:
+    - Peer starts at neutral trust (0.5). Consumer reports repeated `ApplicationFailure(3.0)` events. Trust score decreases with each event. After sufficient events, score drops below `BLOCK_THRESHOLD` (0.15). Peer is evicted from routing table and blocked (Section 7.4).
+
+49. **Consumer penalty triggers blocking and eviction**:
+    - Peer is in routing table with trust slightly above `BLOCK_THRESHOLD`. Consumer reports `ApplicationFailure(weight)` sufficient to push score below `BLOCK_THRESHOLD`. Peer is immediately evicted from routing table, disconnected at transport layer, and blocked from re-admission. `PeerRemoved` event emitted.
+
+50. **Consumer event for peer not in routing table**:
+    - Peer has no routing table entry. Consumer reports `ApplicationFailure(2.0)`. Trust engine records the event and updates the EMA score (decreases from neutral 0.5). Routing table is unchanged. If the peer later attempts admission, the recorded low trust may cause rejection (Section 7.1 step 4).
+
+51. **Consumer rewards restore trust protection**:
+    - Peer has trust below `TRUST_PROTECTION_THRESHOLD` (0.7). Consumer reports enough `ApplicationSuccess` events to push the EMA above 0.7. Peer now resists swap-closer eviction (Invariant 8, if also live).
+
+52. **Consumer and internal events combine in same EMA**:
+    - Peer has moderate trust. DHT layer records `SuccessfulResponse` (internal, weight 1.0). Consumer reports `ApplicationFailure(3.0)`. Both feed the same EMA. The weighted failure has more influence than the unit-weight success, so the net score decreases.
+
+53. **Consumer trust query reflects all event sources**:
+    - Peer has trust shaped by a mix of internal and consumer-reported events, all processed through the same EMA. `peer_trust(P)` returns the single EMA-derived score.
+
+54. **Higher weight produces larger score impact**:
+    - Two peers start at identical neutral trust. Consumer reports `ApplicationFailure(1.0)` for peer A and `ApplicationFailure(5.0)` for peer B. Peer B's trust decreases more than peer A's. Both decreases are bounded by EMA smoothing.
+
+55. **Weight clamping at MAX_CONSUMER_WEIGHT**:
+    - Consumer reports `ApplicationFailure(100.0)` with `MAX_CONSUMER_WEIGHT = 5.0`. Weight is clamped to 5.0. Score impact is identical to `ApplicationFailure(5.0)`.
+
+56. **Zero and negative weights rejected**:
+    - Consumer reports `ApplicationFailure(0.0)`. Event is rejected (no-op). Trust score unchanged. Consumer reports `ApplicationSuccess(-1.0)`. Event is rejected (no-op). Trust score unchanged.
+
+57. **Time decay applies to consumer events**:
+    - Consumer reports `ApplicationFailure(3.0)` for a peer. Trust decreases. Peer has no further interactions for an extended period. Trust decays back toward neutral (0.5). Consumer-reported events do not persist indefinitely — they are subject to the same time decay as internal events.
 
 ## 16. Acceptance Criteria for This Design
 
