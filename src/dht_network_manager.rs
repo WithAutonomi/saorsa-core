@@ -49,9 +49,6 @@ const MAX_CANDIDATE_NODES: usize = 200;
 /// Messages larger than this are rejected before deserialization
 const MAX_MESSAGE_SIZE: usize = 64 * 1024;
 
-/// Number of closest nodes to return in DHT lookups (Kademlia K parameter)
-const DHT_CLOSEST_NODES_COUNT: usize = 8;
-
 /// Request timeout for DHT message handlers (30 seconds)
 /// Prevents long-running handlers from starving the semaphore permit pool
 /// SEC-001: DoS mitigation via timeout enforcement on concurrent operations
@@ -326,6 +323,11 @@ impl DhtNetworkManager {
         })
     }
 
+    /// Kademlia K parameter — bucket size and lookup count.
+    fn k_value(&self) -> usize {
+        self.config.node_config.dht_config.k_value
+    }
+
     /// Handle a FindNode request by returning the closest nodes from the local routing table.
     async fn handle_find_node_request(
         &self,
@@ -337,9 +339,7 @@ impl DhtNetworkManager {
             hex::encode(key)
         );
 
-        let candidate_nodes = self
-            .find_closest_nodes_local(key, DHT_CLOSEST_NODES_COUNT)
-            .await;
+        let candidate_nodes = self.find_closest_nodes_local(key, self.k_value()).await;
         let closer_nodes = Self::filter_response_nodes(candidate_nodes, requester);
 
         Ok(DhtNetworkResult::NodesFound {
@@ -466,9 +466,7 @@ impl DhtNetworkManager {
     pub async fn find_node(&self, key: &Key) -> Result<DhtNetworkResult> {
         info!("Finding nodes closest to key: {}", hex::encode(key));
 
-        let closest_nodes = self
-            .find_closest_nodes_network(key, DHT_CLOSEST_NODES_COUNT * 2)
-            .await?;
+        let closest_nodes = self.find_closest_nodes_network(key, self.k_value()).await?;
         let serializable_nodes: Vec<SerializableDHTNode> = closest_nodes.into_iter().collect();
 
         info!(
