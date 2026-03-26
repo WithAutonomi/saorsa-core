@@ -1,6 +1,6 @@
 //! DHT Core Engine with Kademlia routing
 //!
-//! Provides peer discovery and routing via a Kademlia DHT with k=8 buckets,
+//! Provides peer discovery and routing via a Kademlia DHT with k=20 buckets,
 //! trust-weighted peer selection, and security-hardened maintenance tasks.
 
 use crate::PeerId;
@@ -11,7 +11,7 @@ use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
@@ -76,10 +76,38 @@ impl NodeInfo {
     }
 }
 
+/// Result of attempting to add a node to a full k-bucket.
+enum BucketInsertResult {
+    /// Node was inserted (bucket had space or node was already present).
+    Inserted,
+    /// Bucket is full. Contains the ID of the least-recently-seen node
+    /// that should be pinged. If it is unresponsive, call `evict_and_insert`
+    /// to replace it with the pending node.
+    BucketFull {
+        /// The least-recently-seen node in the bucket.
+        lrs_node_id: PeerId,
+        /// The node that wants to be inserted.
+        pending_node: NodeInfo,
+    },
+}
+
+/// Maximum size of the replacement cache per bucket.
+/// Nodes that could not be inserted because the bucket is full
+/// are held here until an eviction creates a vacancy.
+const REPLACEMENT_CACHE_SIZE: usize = 5;
+
 /// K-bucket for Kademlia routing
 struct KBucket {
     nodes: Vec<NodeInfo>,
     max_size: usize,
+    /// Replacement cache: nodes that could not be inserted because the
+    /// bucket was full. When a node is evicted, the most recently seen
+    /// replacement is promoted. Standard Kademlia mechanism.
+    replacement_cache: Vec<NodeInfo>,
+    /// Timestamp of the last lookup that touched this bucket.
+    /// Used for periodic refresh: buckets not looked up recently
+    /// need a random-ID lookup to stay populated.
+    last_lookup: Instant,
 }
 
 impl KBucket {
@@ -87,10 +115,12 @@ impl KBucket {
         Self {
             nodes: Vec::new(),
             max_size,
+            replacement_cache: Vec::new(),
+            last_lookup: Instant::now(),
         }
     }
 
-    fn add_node(&mut self, mut node: NodeInfo) -> Result<()> {
+    fn add_node(&mut self, mut node: NodeInfo) -> Result<BucketInsertResult> {
         // Reject nodes with no addresses — a node without reachable
         // addresses is useless in the routing table and would waste a slot.
         if node.addresses.is_empty() {
@@ -106,19 +136,66 @@ impl KBucket {
         if let Some(pos) = self.nodes.iter().position(|n| n.id == node.id) {
             self.nodes.remove(pos);
             self.nodes.push(node);
-            return Ok(());
+            return Ok(BucketInsertResult::Inserted);
         }
 
         if self.nodes.len() < self.max_size {
             self.nodes.push(node);
-            Ok(())
+            Ok(BucketInsertResult::Inserted)
         } else {
-            Err(anyhow!(
-                "K-bucket at capacity ({}/{})",
-                self.nodes.len(),
-                self.max_size
-            ))
+            // Bucket is full. Per Kademlia: the caller should ping the
+            // least-recently-seen node (head of list). If it responds,
+            // move it to tail and discard the new node. If it doesn't
+            // respond, evict it and insert the new node.
+            let lrs_id = self
+                .nodes
+                .first()
+                .map(|n| n.id)
+                .ok_or_else(|| anyhow!("K-bucket empty but at capacity"))?;
+
+            Ok(BucketInsertResult::BucketFull {
+                lrs_node_id: lrs_id,
+                pending_node: node,
+            })
         }
+    }
+
+    /// Evict a specific node and insert a replacement.
+    /// Called after the least-recently-seen node fails to respond to a ping.
+    fn evict_and_insert(&mut self, evict_id: &PeerId, new_node: NodeInfo) -> bool {
+        if let Some(pos) = self.nodes.iter().position(|n| &n.id == evict_id) {
+            self.nodes.remove(pos);
+            self.nodes.push(new_node);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Add a node to the replacement cache. If full, the oldest entry
+    /// is dropped (FIFO). Used when a node cannot be inserted because
+    /// the bucket is full and the LRS node responded to a ping.
+    fn add_to_replacement_cache(&mut self, node: NodeInfo) {
+        // Don't duplicate
+        if self.replacement_cache.iter().any(|n| n.id == node.id) {
+            return;
+        }
+        if self.replacement_cache.len() >= REPLACEMENT_CACHE_SIZE {
+            self.replacement_cache.remove(0);
+        }
+        self.replacement_cache.push(node);
+    }
+
+    /// Promote the most recently seen replacement into the main bucket.
+    /// Called when a node is removed from the bucket for any reason.
+    fn promote_replacement(&mut self) -> bool {
+        if self.nodes.len() < self.max_size {
+            if let Some(replacement) = self.replacement_cache.pop() {
+                self.nodes.push(replacement);
+                return true;
+            }
+        }
+        false
     }
 
     fn remove_node(&mut self, node_id: &PeerId) {
@@ -172,7 +249,7 @@ impl KademliaRoutingTable {
         }
     }
 
-    fn add_node(&mut self, node: NodeInfo) -> Result<()> {
+    fn add_node(&mut self, node: NodeInfo) -> Result<BucketInsertResult> {
         let bucket_index = self.get_bucket_index(&node.id);
         self.buckets[bucket_index].add_node(node)
     }
@@ -180,6 +257,20 @@ impl KademliaRoutingTable {
     fn remove_node(&mut self, node_id: &PeerId) {
         let bucket_index = self.get_bucket_index(node_id);
         self.buckets[bucket_index].remove_node(node_id);
+        // Promote a replacement from the cache if one exists
+        self.buckets[bucket_index].promote_replacement();
+    }
+
+    /// Evict a node from the routing table and insert a new one in its place.
+    fn evict_and_insert(&mut self, evict_id: &PeerId, new_node: NodeInfo) -> bool {
+        let bucket_index = self.get_bucket_index(evict_id);
+        self.buckets[bucket_index].evict_and_insert(evict_id, new_node)
+    }
+
+    /// Add a node to the replacement cache of the appropriate bucket.
+    fn add_to_replacement_cache(&mut self, node: NodeInfo) {
+        let bucket_index = self.get_bucket_index(&node.id);
+        self.buckets[bucket_index].add_to_replacement_cache(node);
     }
 
     /// Update `last_seen` (and optionally merge an address) for a node and
@@ -189,10 +280,10 @@ impl KademliaRoutingTable {
         self.buckets[bucket_index].touch_node(node_id, address)
     }
 
-    fn find_closest_nodes(&self, key: &DhtKey, count: usize) -> Vec<NodeInfo> {
-        // Optimization: Start from the bucket closest to the key and work outwards
-        // This avoids collecting all nodes from all 256 buckets when we only need a few
+    fn find_closest_nodes(&mut self, key: &DhtKey, count: usize) -> Vec<NodeInfo> {
+        // Mark the target bucket as recently looked up for refresh scheduling
         let target_bucket = self.get_bucket_index_for_key(key);
+        self.mark_bucket_lookup(target_bucket);
 
         let mut candidates: Vec<(NodeInfo, [u8; 32])> = Vec::with_capacity(count * 2);
 
@@ -267,6 +358,40 @@ impl KademliaRoutingTable {
     fn get_bucket_index(&self, node_id: &PeerId) -> usize {
         self.get_bucket_index_for_key(&DhtKey::from_bytes(*node_id.to_bytes()))
     }
+
+    /// Mark a bucket as recently looked up (for refresh scheduling).
+    fn mark_bucket_lookup(&mut self, bucket_index: usize) {
+        if let Some(bucket) = self.buckets.get_mut(bucket_index) {
+            bucket.last_lookup = Instant::now();
+        }
+    }
+
+    /// Return indices of buckets that haven't been looked up within `max_age`
+    /// and have at least one node (empty buckets don't need refresh).
+    fn stale_bucket_indices(&self, max_age: std::time::Duration) -> Vec<usize> {
+        self.buckets
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| !b.nodes.is_empty() && b.last_lookup.elapsed() > max_age)
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Generate a random key that falls in the given bucket's range.
+    /// Used for bucket refresh: perform a find_node with this key to
+    /// discover peers in that distance range.
+    fn random_key_in_bucket(&self, bucket_index: usize) -> DhtKey {
+        let mut key_bytes = *self.node_id.to_bytes();
+        // Flip the bit at `bucket_index` to ensure the key is in the bucket's range
+        let byte_idx = bucket_index / 8;
+        let bit_idx = 7 - (bucket_index % 8);
+        key_bytes[byte_idx] ^= 1 << bit_idx;
+        // Randomize remaining bits (after the prefix) for diversity
+        for byte in key_bytes.iter_mut().skip(byte_idx + 1) {
+            *byte = rand::random();
+        }
+        DhtKey::from_bytes(key_bytes)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -329,8 +454,12 @@ fn clamp_limit(limit: usize, floor: Option<usize>, ceiling: Option<usize>) -> us
 /// `GeographicRoutingConfig::max_nodes_per_region` default.
 const GEO_DEFAULT_MAX_PER_REGION: usize = 50;
 
-/// K parameter - number of closest nodes per bucket
-const K: usize = 8;
+/// K parameter — number of closest nodes per bucket.
+///
+/// Standard Kademlia (Maymounkov & Mazieres, 2002) and libp2p both use K=20.
+/// Higher K improves routing table completeness and lookup convergence at the
+/// cost of slightly more memory per bucket.
+const K: usize = 20;
 
 /// Number of K-buckets in Kademlia routing table (one per bit in 256-bit key space)
 const KADEMLIA_BUCKET_COUNT: usize = 256;
@@ -416,7 +545,7 @@ impl DhtCoreEngine {
 
     /// Find nodes closest to a key
     pub async fn find_nodes(&self, key: &DhtKey, count: usize) -> Result<Vec<NodeInfo>> {
-        let routing = self.routing_table.read().await;
+        let mut routing = self.routing_table.write().await;
         Ok(routing.find_closest_nodes(key, count))
     }
 
@@ -456,32 +585,82 @@ impl DhtCoreEngine {
     /// Diversity limits (IP subnet and geographic region) are derived from the
     /// live routing table contents on every call, so counts are always accurate
     /// regardless of evictions, reconnections, or address changes.
-    pub async fn add_node(&mut self, node: NodeInfo) -> Result<()> {
+    /// Add a node to the DHT routing table with diversity checks.
+    ///
+    /// Returns `Ok(None)` if the node was inserted successfully, or
+    /// `Ok(Some((lrs_id, pending_node)))` if the target bucket is full.
+    /// In the latter case, the caller should ping `lrs_id` and either:
+    /// - Call `evict_and_insert(lrs_id, pending_node)` if it is unresponsive
+    /// - Call `add_to_replacement_cache(pending_node)` if it responds (alive)
+    pub async fn add_node(
+        &mut self,
+        node: NodeInfo,
+    ) -> Result<Option<(PeerId, NodeInfo)>> {
         // IP-based transports always have an IP; non-IP transports skip diversity.
         let candidate_ip = match node.ip() {
             Some(ip) => ip,
             None => {
                 // Non-IP transports (Bluetooth, LoRa, etc.) bypass IP diversity.
                 let mut routing = self.routing_table.write().await;
-                routing.add_node(node)?;
-                return Ok(());
+                return match routing.add_node(node)? {
+                    BucketInsertResult::Inserted => Ok(None),
+                    BucketInsertResult::BucketFull {
+                        lrs_node_id,
+                        pending_node,
+                    } => Ok(Some((lrs_node_id, pending_node))),
+                };
             }
         };
 
-        // 2. Security Check: IP + Geographic Diversity
+        // Security Check: IP + Geographic Diversity
         //
         // Counts are derived from the routing table in a single pass.
         // Nodes already present (reconnecting with the same ID) are
         // excluded from the count so they can update their address
         // without inflating limits.
-        // 3. Add to routing table — single write lock for both the diversity
-        //    check and the insertion to avoid a TOCTOU race where touch_node
-        //    could change an address between a read-lock check and the write.
+        //
+        // Single write lock for both the diversity check and the insertion
+        // to avoid a TOCTOU race.
         let mut routing = self.routing_table.write().await;
         self.check_diversity(&routing, &node.id, candidate_ip)?;
-        routing.add_node(node)?;
 
-        Ok(())
+        match routing.add_node(node)? {
+            BucketInsertResult::Inserted => Ok(None),
+            BucketInsertResult::BucketFull {
+                lrs_node_id,
+                pending_node,
+            } => Ok(Some((lrs_node_id, pending_node))),
+        }
+    }
+
+    /// Evict a node from the routing table and insert a new one.
+    /// Called after a ping to the least-recently-seen node fails.
+    pub async fn evict_and_insert(&self, evict_id: &PeerId, new_node: NodeInfo) -> bool {
+        let mut routing = self.routing_table.write().await;
+        routing.evict_and_insert(evict_id, new_node)
+    }
+
+    /// Add a node to the replacement cache of the appropriate bucket.
+    /// Called when the least-recently-seen node in a full bucket is alive.
+    pub async fn add_to_replacement_cache(&self, node: NodeInfo) {
+        let mut routing = self.routing_table.write().await;
+        routing.add_to_replacement_cache(node);
+    }
+
+    /// Return bucket indices that haven't been looked up within `max_age`.
+    /// Used by the periodic refresh task to determine which buckets need
+    /// a random-key lookup.
+    pub async fn stale_bucket_indices(&self, max_age: std::time::Duration) -> Vec<usize> {
+        let routing = self.routing_table.read().await;
+        routing.stale_bucket_indices(max_age)
+    }
+
+    /// Generate a random key in the given bucket's range and mark the
+    /// bucket as recently looked up.
+    pub async fn random_key_for_bucket_refresh(&self, bucket_index: usize) -> DhtKey {
+        let mut routing = self.routing_table.write().await;
+        routing.mark_bucket_lookup(bucket_index);
+        routing.random_key_in_bucket(bucket_index)
     }
 
     /// Check IP subnet and geographic diversity against the live routing table.
@@ -911,7 +1090,7 @@ mod tests {
     #[test]
     fn test_find_closest_nodes_empty_table() {
         let local_id = PeerId::from_bytes([0u8; 32]);
-        let table = KademliaRoutingTable::new(local_id, 8);
+        let mut table = KademliaRoutingTable::new(local_id, 8);
 
         let key = DhtKey::from_bytes([42u8; 32]);
         let results = table.find_closest_nodes(&key, 8);

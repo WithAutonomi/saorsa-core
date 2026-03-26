@@ -397,8 +397,73 @@ impl DhtNetworkManager {
         // Reconcile peers that may have connected before event subscription.
         self.reconcile_connected_peers().await;
 
+        // Start periodic bucket refresh (standard Kademlia maintenance).
+        self.start_bucket_refresh(Arc::clone(self));
+
         info!("DHT Network Manager started successfully");
         Ok(())
+    }
+
+    /// Start the periodic k-bucket refresh background task.
+    ///
+    /// Per Kademlia (Maymounkov & Mazieres, 2002, Section 2.4): "each node
+    /// refreshes a bucket in whose range it has not performed a node lookup
+    /// within an hour. Refreshing means picking a random ID in the bucket's
+    /// range and performing a node search for that ID."
+    fn start_bucket_refresh(&self, self_arc: Arc<Self>) {
+        let shutdown = self.shutdown.clone();
+
+        tokio::spawn(async move {
+            // Wait for initial bootstrap to complete before starting refresh
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+
+            let refresh_interval = std::time::Duration::from_secs(300); // Check every 5 minutes
+            let stale_threshold = std::time::Duration::from_secs(3600); // Refresh after 1 hour
+
+            loop {
+                tokio::select! {
+                    () = shutdown.cancelled() => break,
+                    () = tokio::time::sleep(refresh_interval) => {
+                        let stale = {
+                            let dht = self_arc.dht.read().await;
+                            dht.stale_bucket_indices(stale_threshold).await
+                        };
+
+                        if stale.is_empty() {
+                            continue;
+                        }
+
+                        tracing::debug!(
+                            "Bucket refresh: {} stale buckets to refresh",
+                            stale.len()
+                        );
+
+                        for bucket_idx in stale {
+                            let key = {
+                                let dht = self_arc.dht.read().await;
+                                dht.random_key_for_bucket_refresh(bucket_idx).await
+                            };
+
+                            // Perform a find_node lookup for the random key.
+                            // The lookup itself populates the routing table
+                            // as a side effect of the iterative walk.
+                            // Request 20 closest nodes (K value)
+                            if let Err(e) = self_arc
+                                .find_closest_nodes_network(
+                                    key.as_bytes(),
+                                    20,
+                                )
+                                .await
+                            {
+                                tracing::debug!(
+                                    "Bucket refresh lookup for bucket {bucket_idx} failed: {e}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        });
     }
 
     /// Perform DHT peer discovery from already-connected bootstrap peers.
@@ -1575,6 +1640,15 @@ impl DhtNetworkManager {
     /// routing table entry to move it to the tail of its k-bucket and refresh
     /// the stored address so that `FindNode` responses stay current when a peer
     /// reconnects from a different endpoint.
+    /// Update routing table for a message sender.
+    ///
+    /// Per Kademlia (Section 2.1): "When a Kademlia node receives any
+    /// message from another node, it updates the appropriate k-bucket
+    /// for the sender's node ID."
+    ///
+    /// If the sender is already in the routing table, it is moved to the
+    /// tail (most-recently-seen). If the sender is NOT in the routing
+    /// table, it is added (subject to bucket capacity and diversity checks).
     async fn update_peer_info(&self, peer_id: PeerId, _message: &DhtNetworkMessage) {
         let Some(app_peer_id) = self.canonical_app_peer_id(&peer_id).await else {
             debug!(
@@ -1592,9 +1666,50 @@ impl DhtNetworkManager {
             .await
             .and_then(|info| Self::first_dialable_address(&info.addresses));
 
-        let dht = self.dht.read().await;
-        if dht.touch_node(&app_peer_id, current_address.as_ref()).await {
-            trace!("Touched routing table entry for {}", app_peer_id.to_hex());
+        // Try to touch the existing entry first (move to tail)
+        {
+            let dht = self.dht.read().await;
+            if dht.touch_node(&app_peer_id, current_address.as_ref()).await {
+                trace!("Touched routing table entry for {}", app_peer_id.to_hex());
+                return;
+            }
+        }
+
+        // Node is not in the routing table — try to add it.
+        // This is standard Kademlia: every received message conveys useful
+        // contact information about the sender.
+        if let Some(addr) = current_address {
+            let node_info = NodeInfo {
+                id: app_peer_id,
+                addresses: vec![addr],
+                last_seen: std::time::SystemTime::now(),
+            };
+
+            match self.dht.write().await.add_node(node_info).await {
+                Ok(None) => {
+                    trace!(
+                        "Added message sender {} to routing table",
+                        app_peer_id.to_hex()
+                    );
+                }
+                Ok(Some((lrs_id, pending_node))) => {
+                    // Bucket full — check if LRS is alive, evict if not
+                    let dht = self.dht.clone();
+                    let transport = self.transport.clone();
+                    tokio::spawn(async move {
+                        let lrs_alive = transport.is_peer_connected(&lrs_id).await;
+                        let dht_guard = dht.write().await;
+                        if lrs_alive {
+                            dht_guard.add_to_replacement_cache(pending_node).await;
+                        } else {
+                            dht_guard.evict_and_insert(&lrs_id, pending_node).await;
+                        }
+                    });
+                }
+                Err(_) => {
+                    // Diversity check failed — expected, no action needed
+                }
+            }
         }
     }
 
@@ -1691,13 +1806,39 @@ impl DhtNetworkManager {
                 last_seen: SystemTime::now(),
             };
 
-            if let Err(e) = self.dht.write().await.add_node(node_info).await {
-                warn!(
-                    "Failed to add peer {} to DHT routing table: {}",
-                    app_peer_id_hex, e
-                );
-            } else {
-                info!("Added peer {} to DHT routing table", app_peer_id_hex);
+            match self.dht.write().await.add_node(node_info.clone()).await {
+                Ok(None) => {
+                    info!("Added peer {} to DHT routing table", app_peer_id_hex);
+                }
+                Ok(Some((lrs_id, pending_node))) => {
+                    // Bucket is full. Ping the least-recently-seen node.
+                    // If it doesn't respond, evict it and insert the new node.
+                    debug!(
+                        "K-bucket full for peer {}, pinging LRS node {}",
+                        app_peer_id_hex, lrs_id
+                    );
+                    let dht = self.dht.clone();
+                    let transport = self.transport.clone();
+                    tokio::spawn(async move {
+                        let lrs_alive = transport
+                            .is_peer_connected(&lrs_id)
+                            .await;
+                        let dht_guard = dht.write().await;
+                        if lrs_alive {
+                            // LRS node is still connected — keep it, cache the new node
+                            dht_guard.add_to_replacement_cache(pending_node).await;
+                        } else {
+                            // LRS node is gone — evict and insert new node
+                            dht_guard.evict_and_insert(&lrs_id, pending_node).await;
+                        }
+                    });
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to add peer {} to DHT routing table: {}",
+                        app_peer_id_hex, e
+                    );
+                }
             }
         }
 
