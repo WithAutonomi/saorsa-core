@@ -197,6 +197,10 @@ pub struct DhtNetworkManager {
     stats: Arc<RwLock<DhtNetworkStats>>,
     /// Semaphore for limiting concurrent message handlers (backpressure)
     message_handler_semaphore: Arc<Semaphore>,
+    /// Tracked set of K-closest peers to self for change detection.
+    /// Updated after every routing table mutation; compared to detect
+    /// `KClosestPeersChanged` events.
+    k_closest_peers: Mutex<HashSet<PeerId>>,
     /// Shutdown token for background tasks
     shutdown: CancellationToken,
     /// Handle for the network event handler task
@@ -244,6 +248,19 @@ pub enum DhtNetworkEvent {
     PeerDiscovered { peer_id: PeerId, dht_key: Key },
     /// DHT peer disconnected
     PeerDisconnected { peer_id: PeerId },
+    /// The K-closest peers to this node's own address have changed.
+    ///
+    /// Emitted after routing table mutations (peer added, removed, or evicted)
+    /// when the set of K-closest peers differs from the previous snapshot.
+    /// Callers implementing replication can use this to detect close-group
+    /// topology changes and trigger neighbor-sync or responsibility
+    /// recomputation.
+    KClosestPeersChanged {
+        /// Peers that entered the K-closest set.
+        added: Vec<PeerId>,
+        /// Peers that left the K-closest set.
+        removed: Vec<PeerId>,
+    },
     /// DHT operation completed
     OperationCompleted {
         operation: String,
@@ -318,6 +335,7 @@ impl DhtNetworkManager {
             event_tx,
             stats: Arc::new(RwLock::new(DhtNetworkStats::default())),
             message_handler_semaphore,
+            k_closest_peers: Mutex::new(HashSet::new()),
             shutdown: CancellationToken::new(),
             event_handler_handle: Arc::new(RwLock::new(None)),
         })
@@ -564,6 +582,37 @@ impl DhtNetworkManager {
         }
     }
 
+    /// Find closest nodes to a key using the local routing table, including
+    /// the local node itself in the candidate set.
+    ///
+    /// This is the self-inclusive variant of [`find_closest_nodes_local`] and
+    /// corresponds to `SelfInclusiveRT(N)` in replication designs — the local
+    /// routing table plus the local node. It allows callers to compute
+    /// `IsResponsible(self, K)` by checking whether self appears in the
+    /// top-N results.
+    ///
+    /// Results are sorted by XOR distance to the key and truncated to `count`.
+    pub async fn find_closest_nodes_local_with_self(
+        &self,
+        key: &Key,
+        count: usize,
+    ) -> Vec<DHTNode> {
+        // Get `count` routing-table peers, append self, sort, and truncate
+        // back to `count`. Self may displace the farthest peer.
+        let mut nodes = self.find_closest_nodes_local(key, count).await;
+
+        nodes.push(self.local_dht_node());
+
+        let key_peer = PeerId::from_bytes(*key);
+        nodes.sort_by(|a, b| {
+            let da = a.peer_id.xor_distance(&key_peer);
+            let db = b.peer_id.xor_distance(&key_peer);
+            da.cmp(&db)
+        });
+        nodes.truncate(count);
+        nodes
+    }
+
     /// Find closest nodes to a key using iterative network lookup.
     ///
     /// This implements Kademlia-style iterative lookup:
@@ -720,6 +769,8 @@ impl DhtNetworkManager {
                         );
                         let mut dht = self.dht.write().await;
                         dht.remove_node_by_id(&peer_id).await;
+                        drop(dht);
+                        self.check_and_emit_k_closest_changed().await;
                     }
                     Ok(_) => {
                         self.record_peer_success(&peer_id).await;
@@ -887,6 +938,7 @@ impl DhtNetworkManager {
                 let mut dht = self.dht.write().await;
                 dht.remove_node_by_id(peer_id).await;
                 drop(dht); // Release write lock before disconnect
+                self.check_and_emit_k_closest_changed().await;
                 let _ = self.transport.disconnect_peer(peer_id).await;
                 tracing::info!(
                     peer = peer_id.to_hex(),
@@ -1693,13 +1745,17 @@ impl DhtNetworkManager {
                     .map(|engine| engine.score(peer_id))
                     .unwrap_or(DEFAULT_NEUTRAL_TRUST)
             };
-            if let Err(e) = self.dht.write().await.add_node(node_info, &trust_fn).await {
+            // Bind the result so the write guard drops before the branches —
+            // check_and_emit_k_closest_changed needs a read lock.
+            let add_result = self.dht.write().await.add_node(node_info, &trust_fn).await;
+            if let Err(e) = add_result {
                 warn!(
                     "Failed to add peer {} to DHT routing table: {}",
                     app_peer_id_hex, e
                 );
             } else {
                 info!("Added peer {} to DHT routing table", app_peer_id_hex);
+                self.check_and_emit_k_closest_changed().await;
             }
         }
 
@@ -1858,6 +1914,47 @@ impl DhtNetworkManager {
         Ok(())
     }
 
+    /// Recompute the K-closest peers to self and emit a
+    /// [`DhtNetworkEvent::KClosestPeersChanged`] event if the set differs
+    /// from the previous snapshot.
+    ///
+    /// Call after every routing table mutation (add, remove, evict).
+    async fn check_and_emit_k_closest_changed(&self) {
+        let k = self.k_value();
+        let own_key: Key = *self.config.peer_id.to_bytes();
+        let current: HashSet<PeerId> = self
+            .find_closest_nodes_local(&own_key, k)
+            .await
+            .into_iter()
+            .map(|n| n.peer_id)
+            .collect();
+
+        let (added, removed) = {
+            let mut prev = self
+                .k_closest_peers
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if *prev == current {
+                return;
+            }
+            let added: Vec<PeerId> = current.difference(&prev).copied().collect();
+            let removed: Vec<PeerId> = prev.difference(&current).copied().collect();
+            *prev = current;
+            (added, removed)
+        };
+
+        debug!(
+            "K-closest peers changed: +{} -{} peers",
+            added.len(),
+            removed.len()
+        );
+        if self.event_tx.receiver_count() > 0 {
+            let _ = self
+                .event_tx
+                .send(DhtNetworkEvent::KClosestPeersChanged { added, removed });
+        }
+    }
+
     /// Get current statistics
     pub async fn get_stats(&self) -> DhtNetworkStats {
         self.stats.read().await.clone()
@@ -1885,6 +1982,29 @@ impl DhtNetworkManager {
     pub async fn is_in_routing_table(&self, peer_id: &PeerId) -> bool {
         let dht_guard = self.dht.read().await;
         dht_guard.has_node(peer_id).await
+    }
+
+    /// Return every peer currently in the DHT routing table.
+    ///
+    /// Only peers that passed the `is_dht_participant` security gate are
+    /// included. Useful for diagnostics and for callers that need the full
+    /// `LocalRT(self)` set (e.g. replication hint construction).
+    ///
+    /// The routing table holds at most `256 * k_value` entries, so
+    /// collecting them is inexpensive.
+    pub async fn routing_table_peers(&self) -> Vec<DHTNode> {
+        let dht_guard = self.dht.read().await;
+        dht_guard
+            .all_nodes()
+            .await
+            .into_iter()
+            .map(|node| DHTNode {
+                peer_id: node.id,
+                addresses: node.addresses,
+                distance: None,
+                reliability: SELF_RELIABILITY_SCORE,
+            })
+            .collect()
     }
 
     /// Get this node's peer ID.

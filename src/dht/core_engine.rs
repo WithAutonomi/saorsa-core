@@ -245,6 +245,17 @@ impl KademliaRoutingTable {
         self.buckets.iter().map(|b| b.get_nodes().len()).sum()
     }
 
+    /// Return all nodes from every k-bucket.
+    ///
+    /// The routing table holds at most `256 * k_value` entries, so
+    /// collecting them into a `Vec` is inexpensive.
+    fn all_nodes(&self) -> Vec<NodeInfo> {
+        self.buckets
+            .iter()
+            .flat_map(|b| b.get_nodes().iter().cloned())
+            .collect()
+    }
+
     /// Returns the k-bucket index for a peer, or `None` when the peer ID
     /// equals the local node ID (self-insertion is forbidden).
     fn get_bucket_index(&self, node_id: &PeerId) -> Option<usize> {
@@ -405,6 +416,14 @@ impl DhtCoreEngine {
     pub async fn has_node(&self, peer_id: &PeerId) -> bool {
         let routing = self.routing_table.read().await;
         routing.find_node_by_id(peer_id).is_some()
+    }
+
+    /// Return every peer currently in the routing table.
+    ///
+    /// The routing table holds at most `256 * k_value` entries, so
+    /// collecting them is inexpensive.
+    pub async fn all_nodes(&self) -> Vec<NodeInfo> {
+        self.routing_table.read().await.all_nodes()
     }
 
     /// Record a successful interaction with a peer by updating its `last_seen`
