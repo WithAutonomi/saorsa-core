@@ -24,7 +24,7 @@ The routing table is a **peer phonebook** — it tracks who is on the network an
 
 - Concrete wire formats and RPC APIs.
 - Data storage, replication, close group semantics, and quorum logic (consumer-side).
-- EigenTrust scoring algorithm internals (consumed as an oracle).
+- EMA scoring model internals (Section 4 defines the interface; tuning rationale is implementation guidance, not specification).
 - Transport-layer connection management and NAT traversal.
 - Disk layout, serialization details, and database choices.
 
@@ -68,6 +68,7 @@ All parameters are configurable. Values below are a reference profile used for l
 | `MAX_CONSUMER_WEIGHT` | Maximum weight multiplier per single consumer-reported event | `5.0` |
 | `MAX_PEERS_PER_RESPONSE` | Maximum peers accepted from a single `FIND_NODE` response (prevents memory exhaustion from malicious responses) | `K_BUCKET_SIZE` |
 | `LOOKUP_STAGNATION_LIMIT` | Consecutive non-improving iterations before a network lookup terminates | `3` |
+| `REBOOTSTRAP_COOLDOWN` | Minimum time between consecutive auto re-bootstrap attempts | `5 min` |
 
 #### EMA Scoring Model
 
@@ -99,7 +100,7 @@ This is equivalent to applying the unit-weight blend step `W` times when `W` is 
 | `3.0` | 4 | 12 |
 | `5.0` (`MAX_CONSUMER_WEIGHT`) | 3 | 15 |
 
-Note: time decay between events works in the peer's favor — in practice, more events may be needed if failures are spread over time. Interleaved positive events (e.g., successful DHT RPCs) also slow the decline.
+Note: time decay between events works in the peer's favor — in practice, more events may be needed if failures are spread over time. Interleaved positive events (e.g., successful DHT RPCs) also slow the decline. Higher weights are slightly less efficient per unit weight due to EMA non-linearity: at lower scores, each successive failure has diminishing marginal impact. The "Effective failures" column shows total weight applied (events × weight), not a count of equivalent unit-weight events.
 
 Parameter safety constraints (MUST hold):
 
@@ -107,13 +108,14 @@ Parameter safety constraints (MUST hold):
 2. `IP_SUBNET_LIMIT >= 1`.
 3. `TRUST_PROTECTION_THRESHOLD > BLOCK_THRESHOLD`.
 4. `ALPHA >= 1`.
-5. `LIVE_THRESHOLD > max(SELF_LOOKUP_INTERVAL)` (peers touched by self-lookup must not oscillate between live and stale between consecutive cycles; at reference values: 15 min > 10 min).
+5. `LIVE_THRESHOLD > max(SELF_LOOKUP_INTERVAL)` (peers touched by self-lookup must not oscillate between live and stale between consecutive cycles; at reference values: 15 min > 10 min). The 5-minute margin at reference values is sufficient for typical network latencies (sub-second RTTs). Operators in high-latency environments (satellite, Tor overlay) SHOULD increase `LIVE_THRESHOLD` proportionally.
 6. `STALE_REVALIDATION_TIMEOUT > 0`.
 7. `MAX_CONSUMER_WEIGHT >= 1.0`.
 8. `EMA_ALPHA` in (0.0, 1.0). Values near 0 make the score nearly unresponsive to events; values near 1 make it hypersensitive.
 9. `DECAY_LAMBDA > 0`.
 10. If constraints are violated at runtime reconfiguration, node MUST reject the config and keep the previous valid config.
 11. `AUTO_REBOOTSTRAP_THRESHOLD >= 1`.
+12. `REBOOTSTRAP_COOLDOWN > 0`.
 
 Note: `K_BUCKET_SIZE` values below 4 produce degenerate behavior (single-peer routing neighborhoods, constant swap-closer churn) and are not recommended for production use.
 
@@ -169,6 +171,7 @@ Address management rules:
 2. The list is truncated to `MAX_ADDRESSES_PER_NODE` after each update.
 3. The first address in the list is the preferred dial address.
 4. A peer's address list MUST NOT be updated to include a loopback address (e.g., `127.0.0.0/8`, `::1`) unless the node was originally admitted with loopback allowed. This prevents a peer admitted on a routable IP from later claiming a loopback address via `touch_node` or address merge, which would bypass IP diversity enforcement.
+5. A peer's accumulated address list is not re-checked against IP diversity limits after initial admission. Diversity is enforced at admission time. Address accumulation does not grant additional routing table slots — the peer already holds exactly one slot in its correct bucket.
 
 ## 7. Peer Admission
 
@@ -187,16 +190,28 @@ When a candidate peer `P` with `NodeInfo` and IP address `candidate_ip` is prese
    a. Compute `bucket_idx = BucketIndex(self, P)`.
    b. Run per-bucket IP diversity check (Section 7.2) against nodes in `KBucket(bucket_idx)`.
    c. Run routing-neighborhood IP diversity check (Section 7.2) against the routing neighborhood (the `K_BUCKET_SIZE` closest peers to self, including `P` and excluding any bucket-swap candidates).
-   d. Deduplicate swap candidates from steps (b) and (c). For routing-neighborhood swap candidates whose evictee is NOT in `KBucket(bucket_idx)`: the swap is only executed if `KBucket(bucket_idx)` has capacity (fewer than `K_BUCKET_SIZE` entries) or another swap candidate frees a slot in that bucket. Routing-neighborhood swaps that would not free a slot in the candidate's target bucket are deferred until after the capacity pre-check, and rejected if the bucket remains full.
-9. **Capacity pre-check**: Verify that one of these holds for `KBucket(bucket_idx)`:
+   d. Deduplicate swap candidates from steps (b) and (c). For routing-neighborhood swap candidates whose evictee is NOT in `KBucket(bucket_idx)`, apply the following decision tree:
+      1. Does `KBucket(bucket_idx)` have capacity (fewer than `K_BUCKET_SIZE` entries)?
+         - **Yes**: execute the routing-neighborhood swap (it resolves the diversity violation) and proceed — the candidate enters via existing capacity.
+         - **No**: continue to step 2.
+      2. Does another swap candidate (from step 8b or 8c) free a slot in `KBucket(bucket_idx)`?
+         - **Yes**: execute both swaps and proceed.
+         - **No**: defer the routing-neighborhood swap until after the capacity pre-check (step 9).
+      3. After step 9, does `KBucket(bucket_idx)` now have capacity (e.g., stale revalidation freed a slot)?
+         - **Yes**: execute the deferred routing-neighborhood swap and proceed.
+         - **No**: reject the deferred swap. The candidate is rejected — the routing-neighborhood diversity violation cannot be resolved without displacing a peer from the wrong bucket.
+9. **Stale collection and capacity pre-check**: Verify that one of these holds for `KBucket(bucket_idx)`:
    - The bucket has fewer than `K_BUCKET_SIZE` entries.
    - A per-bucket swap candidate from step 8b frees a slot in this bucket, OR a routing-neighborhood swap candidate from step 8c evicts a peer that happens to reside in this bucket.
-   If none holds, attempt stale peer revalidation (Section 7.5). Stale revalidation releases the write lock for the duration of the parallel pings (up to `STALE_REVALIDATION_TIMEOUT`). After pings complete, the write lock is re-acquired and **the following checks are re-evaluated** against the current routing table state:
+   If none holds, attempt **merged stale peer revalidation** (Section 7.5). Collect ALL stale peers from both scopes into a single revalidation set:
+   - Stale peers in `KBucket(bucket_idx)` (bucket-level contention).
+   - Stale routing-neighborhood violators identified in step 8c (if any).
+   Release the write lock **once**, ping all collected stale peers in parallel (bounded by `STALE_REVALIDATION_TIMEOUT`), then re-acquire the write lock **once** and **re-evaluate the following checks** against the current routing table state:
    - Trust block check (step 4): `TrustScore` may have changed during the unlocked window.
    - Per-bucket IP diversity (step 8b): bucket composition may have changed.
    - Routing-neighborhood IP diversity (step 8c): K-closest set may have changed.
    - Capacity pre-check (this step): slots may have been filled by concurrent admissions.
-   Steps 1–3, 5–7 are not re-evaluated (candidate identity, addresses, authentication, and loopback status are immutable within a single admission attempt). Re-evaluation MUST NOT trigger a second round of stale revalidation — if any check fails during re-evaluation, reject the candidate. This bounds admission latency to a single `STALE_REVALIDATION_TIMEOUT` per admission attempt. This prevents TOCTOU races caused by concurrent mutations during the unlocked ping window. If revalidation frees at least one slot and re-evaluation passes, proceed. If no slots freed or re-evaluation fails, reject.
+   Steps 1–3, 5–7 are not re-evaluated (candidate identity, addresses, authentication, and loopback status are immutable within a single admission attempt). Re-evaluation MUST NOT trigger a second round of stale revalidation — if any check fails during re-evaluation, reject the candidate. This bounds admission latency to a single `STALE_REVALIDATION_TIMEOUT` per admission attempt with a single lock-release window. This prevents TOCTOU races caused by concurrent mutations during the unlocked ping window. If revalidation frees at least one slot and re-evaluation passes, proceed. If no slots freed or re-evaluation fails, reject.
 10. **Execute swaps**: Remove all deduplicated swap candidates. Disconnect evicted peers at the transport layer.
 11. **Insert**: Add `P` to `KBucket(bucket_idx)`.
 
@@ -205,6 +220,8 @@ When a candidate peer `P` with `NodeInfo` and IP address `candidate_ip` is prese
 IP diversity is checked per scope (a set of `NodeInfo` entries: either a single k-bucket or the routing neighborhood — the `K_BUCKET_SIZE` closest peers to self). For a candidate with `candidate_ip`:
 
 When a candidate has multiple IP-based addresses, IP diversity checks apply to ALL of them independently. Each IP in the candidate's address list is checked against both exact-IP and subnet limits. If any IP violates a diversity limit and swap-closer cannot resolve it, the candidate is rejected. This prevents a peer from gaming diversity checks by placing a diverse address first while concentrating other addresses on a single subnet.
+
+Example: a candidate has IPs [1.2.3.4, 5.6.7.8]. Both are checked independently. If 1.2.3.4's `/24` exceeds `IP_SUBNET_LIMIT` and swap-closer fails for that subnet, the candidate is rejected — even though 5.6.7.8 would pass.
 
 **Exact IP check:**
 
@@ -221,9 +238,11 @@ Both checks apply independently. If either fails, the candidate is rejected (unl
 
 ### 7.3 Swap-Closer Eviction
 
+The reference point for both per-bucket and routing-neighborhood scopes is the local node's ID. All distance comparisons in swap-closer use XOR distance to self.
+
 When an IP diversity limit is exceeded and a candidate `P` contends for a slot:
 
-1. Among the nodes in scope that share the candidate's IP or subnet (the "violating set"), find the one farthest from the scope's reference point (the local node's ID for routing-neighborhood scope, or the local node's ID for bucket scope — both use XOR distance to self).
+1. Among the nodes in scope that share the candidate's IP or subnet (the "violating set"), find the one farthest from the local node by XOR distance.
 2. Let `V` be that farthest violating peer.
 3. If `Distance(self, P) < Distance(self, V)` **AND** (`TrustScore(self, V) < TRUST_PROTECTION_THRESHOLD` **OR** `now - V.last_seen > LIVE_THRESHOLD`):
    - Swap: evict `V`, disconnect `V` at the transport layer, admit `P`.
@@ -237,7 +256,7 @@ When any interaction records a trust failure and `TrustScore(self, P)` drops bel
 
 1. Remove `P` from `LocalRT(self)`.
 2. Disconnect `P` at the transport layer.
-   2a. Cancel all in-flight RPCs to or from `P`. Cancelled operations do not record trust events — the eviction/blocking decision has already been made, and partial responses from a blocked peer should not influence trust state.
+   2a. Cancel all in-flight RPCs to or from `P`. Cancelled operations do not record trust events — the eviction/blocking decision has already been made, and partial responses from a blocked peer should not influence trust state. The mechanism for distinguishing cancellation from genuine failure is an implementation choice, but MUST prevent cancelled RPCs from recording trust events.
 3. Silently drop any incoming DHT messages from `P`.
 4. Do not re-admit `P` until `TrustScore(self, P) >= BLOCK_THRESHOLD`.
 
@@ -257,32 +276,23 @@ Implementations SHOULD bound trust record storage for peers not in the routing t
 
 ### 7.5 Stale Peer Revalidation on Admission Contention
 
-When a candidate `P` is presented for admission but `KBucket(bucket_idx)` is at capacity and neither the update path, IP diversity swap, nor available capacity can accommodate `P`:
+When a candidate `P` is presented for admission but `KBucket(bucket_idx)` is at capacity and neither the update path, IP diversity swap, nor available capacity can accommodate `P`, stale peer revalidation merges all stale peers from both scopes into a single revalidation pass:
 
-1. Collect all peers `S` in `KBucket(bucket_idx)` where `now - S.last_seen > LIVE_THRESHOLD`.
-2. If the stale set is empty: no slots can be freed. Reject `P`.
-3. **Ping all stale peers in parallel** (bounded by `STALE_REVALIDATION_TIMEOUT`).
+1. Collect the **merged stale set**:
+   a. All peers `S` in `KBucket(bucket_idx)` where `now - S.last_seen > LIVE_THRESHOLD` (bucket-level stale peers).
+   b. All peers in the K-closest-to-self set that share IP or subnet with candidate `P` (routing-neighborhood violators from step 8c) where `now - last_seen > LIVE_THRESHOLD`.
+   c. Deduplicate (a peer may appear in both sets).
+2. If the merged stale set is empty: no slots can be freed. Reject `P`.
+3. **Ping all stale peers in parallel** (bounded by `STALE_REVALIDATION_TIMEOUT`). This is a single unlock window — the write lock is released once for all pings.
 
-Only one stale revalidation may be in progress per bucket at a time. If a concurrent admission attempt targets the same bucket while revalidation is in progress, it MUST wait for the active revalidation to complete, then re-evaluate against the updated routing table state rather than initiating duplicate pings.
+Only one stale revalidation may be in progress per bucket at a time. At most one additional admission attempt may queue behind the active revalidation. Further concurrent candidates targeting the same bucket are immediately rejected with "revalidation in progress." This bounds blocking to at most 2 × `STALE_REVALIDATION_TIMEOUT` per admission attempt.
 
-4. For each peer that responds: `touch_node(S)`, record `SuccessfulResponse` trust event. `S` retains its slot.
-5. For each peer that fails to respond: record `ConnectionFailed` trust event, evict `S` from the bucket, disconnect `S` at the transport layer. Emit `PeerRemoved(S)` event.
-6. If any slots were freed: proceed with admission of `P` (step 10 of Section 7.1).
-7. If no slots were freed (all stale peers responded): reject `P` with "bucket at capacity."
-
-Routing-neighborhood stale revalidation applies when Section 7.1 step 8c detects a routing-neighborhood IP diversity violation and the violating peers include stale entries. Because routing-neighborhood peers span multiple buckets, the flow differs from bucket-level revalidation:
-
-1. Among peers in the K-closest-to-self set that share IP or subnet with candidate `P` (the violating set), collect those where `now - last_seen > LIVE_THRESHOLD`.
-2. If no stale violators exist: proceed directly to swap-closer (Section 7.3).
-3. Ping all stale violating peers in parallel (bounded by `STALE_REVALIDATION_TIMEOUT`).
-4. For each responder: `touch_node(S)`, record `SuccessfulResponse` trust event. Peer retains its slot and regains live status.
-5. For each non-responder: record `ConnectionFailed` trust event, evict from its respective k-bucket, disconnect at the transport layer. Emit `PeerRemoved` event.
-6. Recompute the K-closest-to-self set (composition may have changed due to evictions).
-7. Re-run routing-neighborhood IP diversity check for candidate `P` against the updated set.
-8. If the violation is now resolved: skip swap-closer for the routing-neighborhood scope and proceed to Section 7.1 step 9 (capacity pre-check).
-9. If violation persists: proceed to swap-closer (Section 7.3) against the remaining live violators.
-
-In both cases (violation resolved or swap-closer executed), the candidate proceeds to the capacity pre-check (Section 7.1 step 9). If stale revalidation was triggered during the capacity pre-check, the post-revalidation re-evaluation (Section 7.1 step 9) applies.
+4. For each peer that responds: `touch_node(S)`, record `SuccessfulResponse` trust event. `S` retains its slot and regains live status.
+5. For each peer that fails to respond: record `ConnectionFailed` trust event, evict `S` from its respective k-bucket, disconnect `S` at the transport layer. Emit `PeerRemoved(S)` event.
+6. Re-acquire the write lock and re-evaluate (see Section 7.1 step 9 for the full re-evaluation list).
+7. If routing-neighborhood violators were in the stale set: recompute the K-closest-to-self set (composition may have changed due to evictions) and re-run the routing-neighborhood IP diversity check. If the violation is now resolved, skip swap-closer for the routing-neighborhood scope. If it persists, proceed to swap-closer (Section 7.3) against the remaining live violators.
+8. If any slots were freed in `KBucket(bucket_idx)` and re-evaluation passes: proceed with admission of `P` (step 10 of Section 7.1).
+9. If no slots were freed or re-evaluation fails: reject `P` with "bucket at capacity."
 
 Note: evicting a routing-neighborhood violator from its bucket frees a slot in that bucket, not necessarily in the candidate's target bucket. Routing-neighborhood revalidation resolves IP diversity violations; the capacity pre-check (Section 7.1 step 9) is a separate gate that must still pass independently.
 
@@ -311,7 +321,7 @@ Algorithm:
 Note: bucket index correlates with distance from self, not distance from key `K`. Peers in buckets far from `BucketIndex(self, K)` in the spiral can still be closer to `K` than peers in nearby buckets. The routing table holds at most `BUCKET_COUNT * K_BUCKET_SIZE` (5,120) entries, so a full scan and sort is trivially fast.
 
 Properties:
-- Read-only: no write lock required, safe to call from request handlers. Concurrent mutations may cause a lookup to observe intermediate state (e.g., a peer evicted but its replacement not yet inserted). This is acceptable — lookups are advisory and callers verify results.
+- Read-only: no write lock required, safe to call from request handlers. Concurrent mutations may cause a lookup to observe intermediate state (e.g., a peer evicted but its replacement not yet inserted). This is acceptable — lookups are advisory and callers verify results. Note: the K-closest snapshot used for `KClosestPeersChanged` event computation (Section 9.4) is taken within the write-locked admission critical section, not via `find_closest_nodes_local`. Consumer-facing local lookups remain lock-free.
 - Excludes self (Invariant 1).
 - Deterministic: same routing table state produces same result.
 
@@ -385,9 +395,9 @@ The routing table MUST emit events on membership changes to allow consumers to r
 | `KClosestPeersChanged { old, new }` | Composition of the `K_BUCKET_SIZE`-closest peers to self changed |
 | `BootstrapComplete { num_peers }` | Bootstrap process finished (routing table stabilized or timeout reached) |
 
-`KClosestPeersChanged` is emitted when a routing table mutation (admission, eviction, or swap) causes the set of `K_BUCKET_SIZE` nearest peers to self to differ from the pre-mutation set. The routing table snapshots the K-closest set before each mutation and compares after; the event carries both the old and new sets. This fires at most once per mutation, not per swap within a single admission.
+`KClosestPeersChanged` is emitted when a routing table admission attempt causes the set of `K_BUCKET_SIZE` nearest peers to self to differ from the pre-admission set. The routing table snapshots the K-closest set before each admission attempt and compares after; the event carries both the old and new sets. This fires at most once per admission attempt — the entire admission (including sub-mutations like swaps and stale evictions) is treated as one logical operation.
 
-`BootstrapComplete` is emitted exactly once per node startup when the bootstrap process finishes. It fires when the initial bootstrap lookups complete — specifically, after the self-lookup and bucket refresh operations (Section 11) have all terminated. The event carries the total number of peers in the routing table at the time of emission. Consumers (e.g., replication, application-layer services) SHOULD wait for this event before initiating operations that depend on a populated routing table.
+`BootstrapComplete` is emitted once per bootstrap cycle — both at initial startup and on each auto re-bootstrap (Section 10.3). It fires when the bootstrap lookups for that cycle complete — specifically, after the self-lookup and bucket refresh operations (Section 11) have all terminated. The event carries the total number of peers in the routing table at the time of emission. Consumers (e.g., replication, application-layer services) SHOULD wait for this event before initiating operations that depend on a populated routing table.
 
 Events MUST be emitted reliably for every routing table mutation. Consumers MAY additionally perform periodic recomputation as a defense-in-depth measure, but MUST NOT depend on polling as the primary mechanism.
 
@@ -421,7 +431,7 @@ All paths converge on the same admission flow (Section 7.1), ensuring consistent
 
 When `routing_table_size()` drops below `AUTO_REBOOTSTRAP_THRESHOLD` (e.g., due to mass blocking or network partition), the node MUST automatically trigger the bootstrap process (Section 11.1 steps 2–7). This prevents permanent isolation when the routing table is depleted.
 
-Re-bootstrap follows the same flow as cold start: dial bootstrap peers, perform self-lookup, refresh buckets, emit `BootstrapComplete`. The close group cache is not reloaded (it reflects the state that led to depletion). Re-bootstrap MAY fire multiple times if the routing table repeatedly drops below the threshold.
+Re-bootstrap follows the same flow as cold start: dial bootstrap peers, perform self-lookup, refresh buckets, emit `BootstrapComplete`. The close group cache is not reloaded (it reflects the state that led to depletion). A minimum cooldown of `REBOOTSTRAP_COOLDOWN` (reference: 5 minutes) MUST elapse between consecutive re-bootstrap attempts to prevent bootstrap node overload during persistent partitions. Re-bootstrap MAY fire multiple times if the routing table repeatedly drops below the threshold, subject to the cooldown.
 
 ## 11. Bootstrap
 
@@ -434,7 +444,7 @@ A node starting with an empty routing table:
 3. Send `FIND_NODE(self.id)` to each bootstrap peer.
 4. Admit returned peers via the standard admission flow.
 5. Perform iterative self-lookup to expand close neighborhood.
-6. Refresh all k-buckets farther than the bucket containing the nearest bootstrap peer by looking up a random key in each bucket's range.
+6. Refresh all k-buckets farther than the bucket containing the nearest bootstrap peer by looking up a random key in each bucket's range. Close buckets are already populated by the self-lookup in step 5; only distant buckets need explicit refresh.
 7. Emit `BootstrapComplete { num_peers }` with the current routing table size.
 
 ### 11.2 Warm Restart
@@ -445,7 +455,7 @@ A node restarting with a close group cache:
 2. Dial cached peers first (they are likely still alive and nearby).
 3. For each successful dial + authentication, admit the peer via the standard admission flow (Section 7.1).
 4. Fall back to bootstrap peers if cached peers are unreachable.
-5. Perform iterative self-lookup back-to-back to update stale entries.
+5. Perform two consecutive self-lookups to ensure the close neighborhood is fully refreshed. The second lookup may discover peers that joined or became reachable during the first lookup.
 6. Refresh stale k-buckets by looking up random keys in their ranges.
 7. Emit `BootstrapComplete { num_peers }` with the current routing table size.
 
@@ -656,8 +666,8 @@ Use this list to find design flaws before coding:
 12. **Routing-neighborhood subnet concentration**:
     - The routing neighborhood (K-closest-to-self) enforces `IP_SUBNET_LIMIT` per `/24` (IPv4) or `/48` (IPv6) subnet, requiring at least `ceil(K_BUCKET_SIZE / IP_SUBNET_LIMIT)` distinct subnets to fill the neighborhood (4 subnets at reference values). In networks where most honest peers are concentrated on fewer subnets (e.g., a small deployment on 2-3 AWS subnets), the routing neighborhood may be permanently underpopulated. Operators in such environments should increase `IP_SUBNET_LIMIT` or deploy across more subnets. This is a known trade-off between Sybil resistance and liveness in low-diversity networks.
 
-13. **Composite eclipse attack**:
-    - An attacker with `ceil(K_BUCKET_SIZE / IP_SUBNET_LIMIT)` distinct subnets (4 at reference values) and free keypair generation can theoretically fill the routing neighborhood by generating IDs close to the target, one subnet at a time. Combined with frequent interactions to earn trust protection (≥ 0.7) within approximately 1 hour, the attacker’s peers become entrenched. Mitigation at the routing table level is bounded by IP diversity limits; higher-layer defenses (quorum verification, data integrity checks, multi-path lookups in the consumer application) are the primary protection against a fully-resourced eclipse attack. Future work may add ASN-level diversity or broader subnet grouping.
+13. **Composite eclipse attack** (routing-neighborhood level):
+    - This describes a routing-neighborhood eclipse (the K-closest-to-self set), not a full routing table eclipse. A full eclipse would require filling many buckets across the keyspace, each subject to its own independent IP diversity limits. An attacker with `ceil(K_BUCKET_SIZE / IP_SUBNET_LIMIT)` distinct subnets (4 at reference values) and free keypair generation can theoretically fill the routing neighborhood by generating IDs close to the target, one subnet at a time. Combined with frequent interactions to earn trust protection (≥ 0.7) within approximately 1 hour, the attacker’s peers become entrenched. Mitigation at the routing table level is bounded by IP diversity limits; higher-layer defenses (quorum verification, data integrity checks, multi-path lookups in the consumer application) are the primary protection against a fully-resourced eclipse attack. Future work may add ASN-level diversity or broader subnet grouping.
 
 14. **Swap-closer Sybil amplification**:
     - The swap-closer mechanism, designed to improve routing quality by preferring closer peers, can be exploited by an attacker generating keypairs with IDs closer to a target. Swap-closer will displace honest peers whose trust is below `TRUST_PROTECTION_THRESHOLD` (0.7) or who are stale. This is an inherent trade-off: preferring closer peers improves routing efficiency but creates a displacement vector. IP diversity limits bound the attack surface (at most `IP_SUBNET_LIMIT` attacker peers per subnet per scope), and trust protection makes displacement permanent once honest peers earn protection. The alternative — never displacing based on distance — would prevent the routing table from improving its topology.
@@ -713,166 +723,166 @@ Each scenario should assert exact expected outcomes and state transitions.
 13. **Duplicate admission (update short-circuit)**:
     - Peer already in routing table is re-admitted with new address. Update short-circuit (step 5) fires: address is merged, `last_seen` updated, peer moved to tail. IP diversity and capacity checks are skipped. No duplicate entry created.
 
-13a. **Loopback address injection prevention**:
+14. **Loopback address injection prevention**:
     - Peer admitted on routable IP (e.g., `1.2.3.4`). Later, `touch_node` is called with a loopback address (`127.0.0.1`). The loopback address is NOT merged into the peer's address list (Section 6.3 rule 4). Address list unchanged.
 
-14. **Atomic admission under concurrent access**:
+15. **Atomic admission under concurrent access**:
     - Two concurrent admissions targeting the same bucket. Write lock ensures both see consistent state. No TOCTOU: diversity check and insertion are atomic.
 
 ### Stale Revalidation Tests
 
-15. **Stale revalidation evicts departed peer**:
+16. **Stale revalidation evicts departed peer**:
     - Bucket at capacity. One peer has `last_seen` older than `LIVE_THRESHOLD`. New candidate arrives. Stale peer is pinged, fails to respond. `ConnectionFailed` trust event recorded. Stale peer evicted. Candidate admitted.
 
-16. **Stale revalidation retains live peer**:
+17. **Stale revalidation retains live peer**:
     - Bucket at capacity. One peer has `last_seen` older than `LIVE_THRESHOLD`. New candidate arrives. Stale peer is pinged, responds successfully. `touch_node` called, `SuccessfulResponse` recorded. Stale peer stays (moved to tail). Candidate rejected.
 
-17. **Bulk stale revalidation (multiple stale peers)**:
+18. **Bulk stale revalidation (multiple stale peers)**:
     - Bucket at capacity with 3 stale peers. New candidate arrives. All 3 pinged in parallel. 2 fail, 1 responds. 2 evicted, 1 stays (moved to tail). Candidate admitted. Bucket now has `K_BUCKET_SIZE - 1` entries (2 freed, 1 filled by candidate).
 
-18. **Stale revalidation not triggered when bucket has capacity**:
+19. **Stale revalidation not triggered when bucket has capacity**:
     - Bucket has room. Candidate admitted directly. No pings sent, even if existing peers are stale.
 
-19. **Stale revalidation not triggered when swap-closer succeeds**:
+20. **Stale revalidation not triggered when swap-closer succeeds**:
     - Bucket at capacity but IP diversity swap-closer frees a slot. Candidate admitted via swap. No stale revalidation pings sent.
 
-20. **Staleness-gated trust protection: swap-closer displaces stale well-trusted peer**:
+21. **Staleness-gated trust protection: swap-closer displaces stale well-trusted peer**:
     - Bucket at capacity. Farthest same-subnet peer has trust ≥ 0.7 but `last_seen` older than `LIVE_THRESHOLD`. Candidate is closer. Swap-closer succeeds — stale peer evicted despite high trust. Candidate admitted.
 
-21. **Staleness-gated trust protection: live well-trusted peer holds slot**:
+22. **Staleness-gated trust protection: live well-trusted peer holds slot**:
     - Same as test 20, but farthest peer has `last_seen` within `LIVE_THRESHOLD`. Swap-closer fails — live well-trusted peer holds its slot. Candidate rejected (or proceeds to stale revalidation if other paths exist).
 
-22. **Routing-neighborhood stale revalidation resolves violation without swap-closer**:
+23. **Routing-neighborhood stale revalidation resolves violation without swap-closer**:
     - Routing-neighborhood IP diversity check finds subnet violation. Two violating peers are stale (in different buckets). Both pinged in parallel. One responds (touch, retains slot), one fails (evicted from its bucket, disconnected, `PeerRemoved` emitted). K-closest-to-self recomputed. Violation now resolved (only one peer from that subnet remains). Swap-closer skipped. Candidate proceeds to capacity pre-check.
 
-23. **Routing-neighborhood stale revalidation with persisting violation**:
+24. **Routing-neighborhood stale revalidation with persisting violation**:
     - Routing-neighborhood IP diversity check finds subnet violation. Two violating peers are stale. Both pinged. Both respond (touch, retain slots). Violation persists. Swap-closer runs against the remaining live violators. Farthest violator has trust < 0.7 — swap succeeds.
 
 ### Lookup Tests
 
-24. **Local lookup correctness**:
+25. **Local lookup correctness**:
     - Insert peers at known distances. `find_closest_nodes_local` returns them in correct XOR distance order.
 
-25. **Local lookup with self-exclusion**:
+26. **Local lookup with self-exclusion**:
     - Self is never returned by `find_closest_nodes_local`.
 
-26. **Network lookup convergence**:
+27. **Network lookup convergence**:
     - Mock network with known topology. Iterative lookup converges to the true K-closest peers within `MAX_LOOKUP_ITERATIONS`.
 
-27. **Network lookup records trust**:
+28. **Network lookup records trust**:
     - Successful query records `SuccessfulResponse`. Failed query records `ConnectionFailed` or `ConnectionTimeout`.
 
-28. **Network lookup includes self in result**:
+29. **Network lookup includes self in result**:
     - Self competes on distance in network lookup results but is never queried.
 
-28a. **FIND_NODE response truncation at MAX_PEERS_PER_RESPONSE**:
+30. **FIND_NODE response truncation at MAX_PEERS_PER_RESPONSE**:
     - Remote peer returns 50 peers in a `FIND_NODE` response. `MAX_PEERS_PER_RESPONSE = 20`. Only the 20 closest to the lookup key are accepted. Remaining 30 are silently dropped.
 
 ### Maintenance Tests
 
-29. **Touch moves to tail**:
+31. **Touch moves to tail**:
     - Peer at head of bucket. `touch_node` moves it to tail. Other peers shift forward.
 
-30. **Touch merges address**:
+32. **Touch merges address**:
     - Peer touched with new address. New address prepended. Old address retained. List capped at `MAX_ADDRESSES_PER_NODE`.
 
-31. **Self-lookup discovers new close peers**:
+33. **Self-lookup discovers new close peers**:
     - Peers join network closer to self. Self-lookup discovers them. They pass admission and enter routing table.
 
-32. **Bucket refresh populates stale bucket**:
+34. **Bucket refresh populates stale bucket**:
     - Distant bucket has been idle for > `STALE_BUCKET_THRESHOLD`. Refresh finds peers for that region and populates the bucket.
 
-32a. **KClosestPeersChanged event emission**:
+35. **KClosestPeersChanged event emission**:
     - Insert a peer into a bucket that affects the K-closest-to-self set. `KClosestPeersChanged` emitted with correct old and new sets. Insert a peer into a distant bucket that does NOT affect the K-closest set. `KClosestPeersChanged` is NOT emitted. Verify at-most-once semantics: a single admission with multiple swaps emits the event at most once.
 
-33. **Blocked peer eviction**:
+36. **Blocked peer eviction**:
     - Peer trust drops below 0.15 after failed interaction. Peer is immediately removed from routing table and disconnected.
 
-34. **Blocked peer inbound connection rejected**:
+37. **Blocked peer inbound connection rejected**:
     - Blocked peer initiates inbound connection. Transport identifies peer during authentication, checks trust score, rejects connection. No resources allocated, no routing table interaction.
 
-35. **Blocked peer skipped in lookup results**:
+38. **Blocked peer skipped in lookup results**:
     - Blocked peer appears in `FIND_NODE` response. Local node checks trust, finds it below `BLOCK_THRESHOLD`. Peer silently skipped — not dialed.
 
-36. **Blocked peer re-admission via lookup discovery after trust recovery**:
+39. **Blocked peer re-admission via lookup discovery after trust recovery**:
     - Previously blocked peer's trust decays back above `BLOCK_THRESHOLD`. Peer appears in `FIND_NODE` response. Local node dials, authenticates, and admits through normal admission flow.
 
 ### Bootstrap Tests
 
-37. **Cold start populates routing table**:
+40. **Cold start populates routing table**:
     - Empty routing table. Bootstrap peers respond to `FIND_NODE(self)`. Returned peers admitted. Self-lookup expands neighborhood.
 
-38. **Warm restart from cache**:
+41. **Warm restart from cache**:
     - Close group cache loaded into trust subsystem and dial queue. Cached peers dialed and authenticated successfully. Admitted via standard admission flow. Self-lookup refines.
 
-39. **Warm restart with stale cache**:
+42. **Warm restart with stale cache**:
     - All cached peers unreachable. Falls back to bootstrap peers. Routing table eventually populated.
 
-40. **Close group cache save/load roundtrip**:
+43. **Close group cache save/load roundtrip**:
     - Save K closest peers + trust scores. Restart. Load cache. Trust scores match (no decay for offline time). Addresses preserved.
 
-41. **Cold start emits BootstrapComplete on lookup completion**:
+44. **Cold start emits BootstrapComplete on lookup completion**:
     - Empty routing table. Bootstrap peers contacted, self-lookup and bucket refreshes run. When all bootstrap lookups complete, `BootstrapComplete { num_peers }` emitted with correct routing table size. Event fires exactly once.
 
-42. **Warm restart emits BootstrapComplete**:
+45. **Warm restart emits BootstrapComplete**:
     - Close group cache loaded. Cached peers dialed. Self-lookup and bucket refreshes complete. `BootstrapComplete` emitted. Event fires exactly once regardless of cold/warm path.
 
-43. **Auto re-bootstrap on routing table depletion**:
+46. **Auto re-bootstrap on routing table depletion**:
     - All peers blocked or departed. `routing_table_size()` drops below `AUTO_REBOOTSTRAP_THRESHOLD`. Bootstrap process automatically triggered. Bootstrap peers dialed, self-lookup runs. Routing table repopulated. `BootstrapComplete` emitted.
 
 ### Security Tests
 
-44. **IP diversity blocks Sybil cluster**:
+47. **IP diversity blocks Sybil cluster**:
     - Attacker attempts to insert 10 peers from one IP. Only 2 admitted per scope. Remaining 8 rejected.
 
-45. **Subnet diversity limits concentration**:
+48. **Subnet diversity limits concentration**:
     - Attacker attempts to fill a bucket from one `/24`. At most 5 admitted (K/4). Remaining rejected.
 
-46. **Trust protection prevents eclipse displacement (live peers)**:
+49. **Trust protection prevents eclipse displacement (live peers)**:
     - Attacker generates IDs closer to target. Existing well-trusted peers (≥ 0.7) with `last_seen` within `LIVE_THRESHOLD` hold their slots. Attacker can only displace low-trust, stale, or empty slots.
 
-47. **Stale trust-protected peer displaced by attacker**:
+50. **Stale trust-protected peer displaced by attacker**:
     - Existing well-trusted peer (≥ 0.7) has `last_seen` older than `LIVE_THRESHOLD`. Attacker with closer ID displaces it via swap-closer. This is correct behavior — a stale peer should not block a live candidate, even if the candidate is an attacker. The live candidate will be evaluated on its own behavior going forward.
 
-48. **Unauthenticated peer rejected**:
+51. **Unauthenticated peer rejected**:
     - Peer returned by `FIND_NODE` but not yet authenticated. Not admitted to routing table. Must complete handshake first.
 
-49. **Blocked peer messages dropped**:
+52. **Blocked peer messages dropped**:
     - Peer below block threshold sends DHT message. Message silently dropped. No routing table interaction.
 
 ### Consumer Trust Reporting Tests
 
-50. **Consumer reward improves trust**:
+53. **Consumer reward improves trust**:
     - Peer starts at neutral trust (0.5). Consumer reports `ApplicationSuccess(1.0)`. Trust score increases above 0.5 (exact value determined by EMA smoothing factor). Peer remains in routing table.
 
-51. **Consumer penalty degrades trust to blocking**:
+54. **Consumer penalty degrades trust to blocking**:
     - Peer starts at neutral trust (0.5). Consumer reports repeated `ApplicationFailure(3.0)` events. Trust score decreases with each event. After sufficient events, score drops below `BLOCK_THRESHOLD` (0.15). Peer is evicted from routing table and blocked (Section 7.4).
 
-52. **Consumer penalty triggers blocking and eviction**:
+55. **Consumer penalty triggers blocking and eviction**:
     - Peer is in routing table with trust slightly above `BLOCK_THRESHOLD`. Consumer reports `ApplicationFailure(weight)` sufficient to push score below `BLOCK_THRESHOLD`. Peer is immediately evicted from routing table, disconnected at transport layer, and blocked from re-admission. `PeerRemoved` event emitted.
 
-53. **Consumer event for peer not in routing table**:
+56. **Consumer event for peer not in routing table**:
     - Peer has no routing table entry. Consumer reports `ApplicationFailure(2.0)`. Trust engine records the event and updates the EMA score (decreases from neutral 0.5). Routing table is unchanged. If the peer later attempts admission, the recorded low trust may cause rejection (Section 7.1 step 4).
 
-54. **Consumer rewards restore trust protection**:
+57. **Consumer rewards restore trust protection**:
     - Peer has trust below `TRUST_PROTECTION_THRESHOLD` (0.7). Consumer reports enough `ApplicationSuccess` events to push the EMA above 0.7. Peer now resists swap-closer eviction (Invariant 8, if also live).
 
-55. **Consumer and internal events combine in same EMA**:
+58. **Consumer and internal events combine in same EMA**:
     - Peer has moderate trust. DHT layer records `SuccessfulResponse` (internal, weight 1.0). Consumer reports `ApplicationFailure(3.0)`. Both feed the same EMA. The weighted failure has more influence than the unit-weight success, so the net score decreases.
 
-56. **Consumer trust query reflects all event sources**:
+59. **Consumer trust query reflects all event sources**:
     - Peer has trust shaped by a mix of internal and consumer-reported events, all processed through the same EMA. `peer_trust(P)` returns the single EMA-derived score.
 
-57. **Higher weight produces larger score impact**:
+60. **Higher weight produces larger score impact**:
     - Two peers start at identical neutral trust. Consumer reports `ApplicationFailure(1.0)` for peer A and `ApplicationFailure(5.0)` for peer B. Peer B's trust decreases more than peer A's. Both decreases are bounded by EMA smoothing.
 
-58. **Weight clamping at MAX_CONSUMER_WEIGHT**:
+61. **Weight clamping at MAX_CONSUMER_WEIGHT**:
     - Consumer reports `ApplicationFailure(100.0)` with `MAX_CONSUMER_WEIGHT = 5.0`. Weight is clamped to 5.0. Score impact is identical to `ApplicationFailure(5.0)`.
 
-59. **Zero and negative weights rejected**:
+62. **Zero and negative weights rejected**:
     - Consumer reports `ApplicationFailure(0.0)`. Event is rejected (no-op). Trust score unchanged. Consumer reports `ApplicationSuccess(-1.0)`. Event is rejected (no-op). Trust score unchanged.
 
-60. **Time decay applies to consumer events**:
+63. **Time decay applies to consumer events**:
     - Consumer reports `ApplicationFailure(3.0)` for a peer. Trust decreases. Peer has no further interactions for an extended period. Trust decays back toward neutral (0.5). Consumer-reported events do not persist indefinitely — they are subject to the same time decay as internal events.
 
 ## 16. Acceptance Criteria for This Design
