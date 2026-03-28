@@ -69,6 +69,7 @@ All parameters are configurable. Values below are a reference profile used for l
 | `MAX_PEERS_PER_RESPONSE` | Maximum peers accepted from a single `FIND_NODE` response (prevents memory exhaustion from malicious responses) | `K_BUCKET_SIZE` |
 | `LOOKUP_STAGNATION_LIMIT` | Consecutive non-improving iterations before a network lookup terminates | `3` |
 | `REBOOTSTRAP_COOLDOWN` | Minimum time between consecutive auto re-bootstrap attempts | `5 min` |
+| `MAX_CONCURRENT_REVALIDATIONS` | Maximum number of stale revalidation passes running simultaneously across all buckets | `8` |
 
 #### EMA Scoring Model
 
@@ -116,6 +117,7 @@ Parameter safety constraints (MUST hold):
 10. If constraints are violated at runtime reconfiguration, node MUST reject the config and keep the previous valid config.
 11. `AUTO_REBOOTSTRAP_THRESHOLD >= 1`.
 12. `REBOOTSTRAP_COOLDOWN > 0`.
+13. `MAX_CONCURRENT_REVALIDATIONS >= 1`.
 
 Note: `K_BUCKET_SIZE` values below 4 produce degenerate behavior (single-peer routing neighborhoods, constant swap-closer churn) and are not recommended for production use.
 
@@ -285,7 +287,9 @@ When a candidate `P` is presented for admission but `KBucket(bucket_idx)` is at 
 2. If the merged stale set is empty: no slots can be freed. Reject `P`.
 3. **Ping all stale peers in parallel** (bounded by `STALE_REVALIDATION_TIMEOUT`). This is a single unlock window — the write lock is released once for all pings.
 
-Only one stale revalidation may be in progress per bucket at a time. At most one additional admission attempt may queue behind the active revalidation. Further concurrent candidates targeting the same bucket are immediately rejected with "revalidation in progress." This bounds blocking to at most 2 × `STALE_REVALIDATION_TIMEOUT` per admission attempt.
+Only one stale revalidation may be in progress per bucket at a time. At most one additional admission attempt may queue behind the active revalidation. Further concurrent candidates targeting the same bucket are immediately rejected with "revalidation in progress." This bounds per-bucket blocking to at most 2 × `STALE_REVALIDATION_TIMEOUT` per admission attempt.
+
+A **global revalidation semaphore** with capacity `MAX_CONCURRENT_REVALIDATIONS` (reference: 8) limits the total number of stale revalidation passes running simultaneously across all buckets. When the semaphore is full, admission attempts that reach stale revalidation are immediately rejected with "global revalidation limit reached" — they do not queue behind the semaphore. This prevents a Sybil flood targeting many buckets simultaneously from creating O(`BUCKET_COUNT`) parallel ping storms, bounding total revalidation network load to at most `MAX_CONCURRENT_REVALIDATIONS × K_BUCKET_SIZE` concurrent pings (160 at reference values).
 
 4. For each peer that responds: `touch_node(S)`, record `SuccessfulResponse` trust event. `S` retains its slot and regains live status.
 5. For each peer that fails to respond: record `ConnectionFailed` trust event, evict `S` from its respective k-bucket, disconnect `S` at the transport layer. Emit `PeerRemoved(S)` event.
