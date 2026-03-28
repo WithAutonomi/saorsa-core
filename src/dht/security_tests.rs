@@ -33,13 +33,13 @@ async fn test_ip_diversity_enforcement_ipv6() -> anyhow::Result<()> {
     // With self=[0;32], all nodes land in bucket 0.
     let mut engine = DhtCoreEngine::new_for_tests(PeerId::from_bytes([0u8; 32]))?;
 
-    // Subnet limit = K/4 = 20/4 = 5. Add 5 nodes in same /64 — all should succeed.
+    // Subnet limit = K/4 = 20/4 = 5. Add 5 nodes in same /48 — all should succeed.
     for i in 1..=5u8 {
         let node = make_node_with_id(bucket0_id(i), &format!("/ip6/2001:db8::{i}/udp/9000/quic"));
         engine.add_node_no_trust(node).await?;
     }
 
-    // Sixth node in same /64 should fail (exceeds /64 limit of 5).
+    // Sixth node in same /48 should fail (exceeds /48 limit of 5).
     let node6 = make_node_with_id(bucket0_id(6), "/ip6/2001:db8::6/udp/9000/quic");
     let result = engine.add_node_no_trust(node6).await;
     assert!(result.is_err());
@@ -150,7 +150,7 @@ async fn test_mixed_ipv4_ipv6_enforcement() -> anyhow::Result<()> {
         .await;
     assert!(result_v4.is_err());
 
-    // IPv6 nodes in same /64 should succeed up to the /64 limit (K/4 = 5).
+    // IPv6 nodes in same /48 should succeed up to the /48 limit (K/4 = 5).
     // We already added one IPv6 node above (bucket0_id(2)), so add 4 more.
     for i in 5..=8u8 {
         engine
@@ -161,7 +161,7 @@ async fn test_mixed_ipv4_ipv6_enforcement() -> anyhow::Result<()> {
             .await?;
     }
 
-    // Sixth IPv6 in same /64 should fail (exceeds /64 limit of 5)
+    // Sixth IPv6 in same /48 should fail (exceeds /48 limit of 5)
     let result_v6 = engine
         .add_node_no_trust(make_node_with_id(
             bucket0_id(9),
@@ -237,7 +237,7 @@ async fn test_ipv4_subnet_override_lowers_limit() -> anyhow::Result<()> {
 #[tokio::test]
 async fn test_ipv6_subnet_override_raises_limit() -> anyhow::Result<()> {
     // Default subnet limit is K/4 = 20/4 = 5. Setting max_per_subnet = 8
-    // should allow 8 nodes in the same /64 subnet.
+    // should allow 8 nodes in the same /48 subnet.
     let mut engine = DhtCoreEngine::new_for_tests(PeerId::from_bytes([0u8; 32]))?;
     engine.set_ip_diversity_config(IPDiversityConfig {
         max_per_subnet: Some(8),
@@ -278,7 +278,7 @@ async fn test_ipv6_subnet_override_lowers_limit() -> anyhow::Result<()> {
         ))
         .await?;
 
-    // Second should fail because /64 limit is now 1
+    // Second should fail because /48 limit is now 1
     let node2 = make_node_with_id(bucket0_id(2), "/ip6/2001:db8::2/udp/9000/quic");
     let result = engine.add_node_no_trust(node2).await;
     assert!(result.is_err());

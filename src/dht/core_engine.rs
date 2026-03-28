@@ -586,9 +586,9 @@ impl DhtCoreEngine {
                 let limit_ip = cfg.max_per_ip.unwrap_or(IP_EXACT_LIMIT);
                 let limit_subnet = cfg.max_per_subnet.unwrap_or(ip_subnet_limit(self.k_value));
 
-                let cand_64 = mask_ipv6(v6, 64);
+                let cand_48 = mask_ipv6(v6, 48);
 
-                // Single pass: count exact-IPv6 and /64 matches
+                // Single pass: count exact-IPv6 and /48 matches
                 let mut count_ip: usize = 0;
                 let mut count_subnet: usize = 0;
                 let mut farthest_ip: Option<(PeerId, [u8; 32])> = None;
@@ -616,7 +616,7 @@ impl DhtCoreEngine {
                             farthest_ip = Some((n.id, dist));
                         }
                     }
-                    if mask_ipv6(existing_v6, 64) == cand_64 {
+                    if mask_ipv6(existing_v6, 48) == cand_48 {
                         count_subnet += 1;
                         if farthest_subnet.as_ref().is_none_or(|(_, d)| dist > *d) {
                             farthest_subnet = Some((n.id, dist));
@@ -626,7 +626,7 @@ impl DhtCoreEngine {
 
                 let tiers: [IpSwapTier; 2] = [
                     (count_ip, limit_ip, farthest_ip, "exact-IP"),
-                    (count_subnet, limit_subnet, farthest_subnet, "/64"),
+                    (count_subnet, limit_subnet, farthest_subnet, "/48"),
                 ];
 
                 for (count, limit, farthest, tier_name) in &tiers {

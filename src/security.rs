@@ -26,7 +26,7 @@ use std::num::NonZeroUsize;
 /// Maximum subnet tracking entries before evicting oldest (prevents memory DoS)
 const BOOTSTRAP_MAX_TRACKED_SUBNETS: usize = 50_000;
 
-/// Default subnet limit for `BootstrapIpLimiter` (/64 IPv6, /24 IPv4).
+/// Default subnet limit for `BootstrapIpLimiter` (/48 IPv6, /24 IPv4).
 /// Used when `IPDiversityConfig::max_per_subnet` is `None`.
 const BOOTSTRAP_DEFAULT_SUBNET_LIMIT: usize = 2;
 
@@ -52,7 +52,7 @@ pub struct IPDiversityConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_per_ip: Option<usize>,
 
-    /// Override for max nodes in the same subnet (/24 IPv4, /64 IPv6).
+    /// Override for max nodes in the same subnet (/24 IPv4, /48 IPv6).
     /// When `None`, uses the K-based default (~25% of bucket size).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_per_subnet: Option<usize>,
@@ -93,7 +93,7 @@ impl IPDiversityConfig {
 /// IP diversity enforcement system
 ///
 /// Tracks per-IP and per-subnet counts to prevent Sybil attacks.
-/// Uses simple 2-tier limits: exact IP and subnet (/24 IPv4, /64 IPv6).
+/// Uses simple 2-tier limits: exact IP and subnet (/24 IPv4, /48 IPv6).
 #[derive(Debug)]
 pub struct BootstrapIpLimiter {
     config: IPDiversityConfig,
@@ -105,7 +105,7 @@ pub struct BootstrapIpLimiter {
     allow_loopback: bool,
     /// Count of nodes per exact IP address
     ip_counts: LruCache<IpAddr, usize>,
-    /// Count of nodes per subnet (/24 IPv4, /64 IPv6)
+    /// Count of nodes per subnet (/24 IPv4, /48 IPv6)
     subnet_counts: LruCache<IpAddr, usize>,
 }
 
@@ -144,7 +144,7 @@ impl BootstrapIpLimiter {
         }
     }
 
-    /// Mask an IP to its subnet prefix (/24 for IPv4, /64 for IPv6).
+    /// Mask an IP to its subnet prefix (/24 for IPv4, /48 for IPv6).
     fn subnet_key(ip: IpAddr) -> IpAddr {
         match ip {
             IpAddr::V4(v4) => {
@@ -153,8 +153,8 @@ impl BootstrapIpLimiter {
             }
             IpAddr::V6(v6) => {
                 let mut o = v6.octets();
-                // Zero out bytes 8-15 (host portion of /64)
-                for b in &mut o[8..] {
+                // Zero out bytes 6-15 (host portion of /48)
+                for b in &mut o[6..] {
                     *b = 0;
                 }
                 IpAddr::V6(Ipv6Addr::from(o))
@@ -356,17 +356,17 @@ mod tests {
         };
         let mut enforcer = BootstrapIpLimiter::new(config);
 
-        // Two IPs in same /64 subnet
+        // Two IPs in same /48 subnet
         let ip1: IpAddr = "2001:db8:85a3:1234::1".parse().unwrap();
-        let ip2: IpAddr = "2001:db8:85a3:1234::2".parse().unwrap();
+        let ip2: IpAddr = "2001:db8:85a3:5678::2".parse().unwrap();
 
         enforcer.track(ip1).unwrap();
 
-        // Second in same /64 should be rejected
+        // Second in same /48 should be rejected
         assert!(!enforcer.can_accept(ip2));
 
-        // Different /64 should be accepted
-        let ip_other: IpAddr = "2001:db8:85a3:5678::1".parse().unwrap();
+        // Different /48 should be accepted
+        let ip_other: IpAddr = "2001:db8:aaaa::1".parse().unwrap();
         assert!(enforcer.can_accept(ip_other));
     }
 
@@ -426,7 +426,7 @@ mod tests {
     fn test_subnet_key_ipv6() {
         let ip: IpAddr = "2001:db8:85a3:1234:5678:8a2e:0370:7334".parse().unwrap();
         let subnet = BootstrapIpLimiter::subnet_key(ip);
-        let expected: IpAddr = "2001:db8:85a3:1234::".parse().unwrap();
+        let expected: IpAddr = "2001:db8:85a3::".parse().unwrap();
         assert_eq!(subnet, expected);
     }
 
