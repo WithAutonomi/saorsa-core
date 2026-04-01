@@ -78,7 +78,4 @@ tempfile = "3.17"
 
 
 [patch.crates-io]
-saorsa-transport = { path = "/home/chris/dev/github.com/jacderida/saorsa-transport-testnet" }
-
-[patch."https://github.com/jacderida/saorsa-transport.git"]
-saorsa-transport = { path = "/home/chris/dev/github.com/jacderida/saorsa-transport-testnet" }
+saorsa-transport = { git = "https://github.com/jacderida/saorsa-transport.git", branch = "feat-masque-relay-data-plane" }

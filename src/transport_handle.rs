@@ -117,7 +117,8 @@ pub struct TransportHandle {
     geo_provider: Arc<BgpGeoProvider>,
     shutdown: CancellationToken,
     /// Peer address updates from ADD_ADDRESS frames (relay address advertisement).
-    peer_address_update_rx: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<(SocketAddr, SocketAddr)>>,
+    peer_address_update_rx:
+        tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<(SocketAddr, SocketAddr)>>,
     /// Relay established events — received when this node sets up a MASQUE relay.
     relay_established_rx: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<SocketAddr>>,
     connection_timeout: Duration,

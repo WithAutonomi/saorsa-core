@@ -2479,6 +2479,7 @@ dependencies = [
 [[package]]
 name = "saorsa-transport"
 version = "0.30.1"
+source = "git+https://github.com/jacderida/saorsa-transport.git?branch=feat-masque-relay-data-plane#2b36363cbeb5d8f822b3f9ea308c5ca2b450b8f3"
 dependencies = [
  "anyhow",
  "async-trait",

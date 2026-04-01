@@ -874,16 +874,15 @@ impl DualStackNetworkNode<P2pLinkTransport> {
                         }) => {
                             tracing::info!(
                                 "ADDR_FWD: received PeerAddressUpdated peer={} addr={}",
-                                peer_addr, advertised_addr
+                                peer_addr,
+                                advertised_addr
                             );
                             let _ = tx_clone.send((
                                 saorsa_transport::shared::normalize_socket_addr(peer_addr),
                                 saorsa_transport::shared::normalize_socket_addr(advertised_addr),
                             ));
                         }
-                        Ok(saorsa_transport::P2pEvent::RelayEstablished {
-                            relay_addr,
-                        }) => {
+                        Ok(saorsa_transport::P2pEvent::RelayEstablished { relay_addr }) => {
                             tracing::info!(
                                 "ADDR_FWD: received RelayEstablished relay_addr={}",
                                 relay_addr

@@ -146,11 +146,11 @@ impl NodeInfo {
                 self.address_types.insert(0, AddressType::Relay);
             }
             AddressType::Direct => {
-                // After all Relay entries, before NATted
+                // After all Relay entries (most recently seen Direct first)
                 let pos = self
                     .address_types
                     .iter()
-                    .position(|t| *t == AddressType::NATted)
+                    .position(|t| *t != AddressType::Relay)
                     .unwrap_or(self.addresses.len());
                 self.addresses.insert(pos, addr);
                 self.address_types.insert(pos, AddressType::Direct);
@@ -1516,7 +1516,11 @@ mod tests {
         // Touch with a new address — should be prepended, old kept
         let new_addr: MultiAddr = "/ip4/5.6.7.8/udp/9000/quic".parse().unwrap();
         let old_addr: MultiAddr = "/ip4/1.2.3.4/udp/9000/quic".parse().unwrap();
-        let found = bucket.touch_node(&PeerId::from_bytes([1u8; 32]), Some(&new_addr));
+        let found = bucket.touch_node_typed(
+            &PeerId::from_bytes([1u8; 32]),
+            Some(&new_addr),
+            AddressType::Direct,
+        );
         assert!(found);
         let addrs = &bucket.get_nodes().last().unwrap().addresses;
         assert_eq!(addrs[0], new_addr);
@@ -1530,7 +1534,8 @@ mod tests {
         let node = make_node(1, "/ip4/1.2.3.4/udp/9000/quic");
         bucket.add_node(node).unwrap();
 
-        let found = bucket.touch_node(&PeerId::from_bytes([1u8; 32]), None);
+        let found =
+            bucket.touch_node_typed(&PeerId::from_bytes([1u8; 32]), None, AddressType::Direct);
         assert!(found);
         let expected: MultiAddr = "/ip4/1.2.3.4/udp/9000/quic".parse().unwrap();
         assert_eq!(bucket.get_nodes().last().unwrap().addresses, vec![expected]);
@@ -1551,7 +1556,7 @@ mod tests {
             .unwrap();
 
         // Touch the first node — it should move to the tail
-        bucket.touch_node(&PeerId::from_bytes([1u8; 32]), None);
+        bucket.touch_node_typed(&PeerId::from_bytes([1u8; 32]), None, AddressType::Direct);
         let ids: Vec<u8> = bucket
             .get_nodes()
             .iter()
@@ -1569,7 +1574,11 @@ mod tests {
             .unwrap();
 
         let new_addr: MultiAddr = "/ip4/9.9.9.9/udp/9000/quic".parse().unwrap();
-        let found = bucket.touch_node(&PeerId::from_bytes([99u8; 32]), Some(&new_addr));
+        let found = bucket.touch_node_typed(
+            &PeerId::from_bytes([99u8; 32]),
+            Some(&new_addr),
+            AddressType::Direct,
+        );
         assert!(!found);
     }
 
@@ -1592,6 +1601,7 @@ mod tests {
                 id: PeerId::from_bytes(id_bytes),
                 addresses: vec!["/ip4/10.0.0.1/udp/9000/quic".parse().unwrap()],
                 last_seen: Instant::now(),
+                address_types: vec![],
             })
             .unwrap();
 
@@ -1602,6 +1612,7 @@ mod tests {
                 id: PeerId::from_bytes(id_bytes),
                 addresses: vec!["/ip4/10.0.0.2/udp/9000/quic".parse().unwrap()],
                 last_seen: Instant::now(),
+                address_types: vec![],
             })
             .unwrap();
 
@@ -1634,6 +1645,7 @@ mod tests {
                 id: PeerId::from_bytes(id_bytes),
                 addresses: vec!["/ip4/10.0.0.1/udp/9000/quic".parse().unwrap()],
                 last_seen: Instant::now(),
+                address_types: vec![],
             })
             .unwrap();
 
@@ -1644,6 +1656,7 @@ mod tests {
                 id: PeerId::from_bytes(id_bytes),
                 addresses: vec!["/ip4/10.0.0.2/udp/9000/quic".parse().unwrap()],
                 last_seen: Instant::now(),
+                address_types: vec![],
             })
             .unwrap();
 
@@ -1677,6 +1690,7 @@ mod tests {
                             .unwrap(),
                     ],
                     last_seen: Instant::now(),
+                    address_types: vec![],
                 })
                 .unwrap();
         }
@@ -1786,6 +1800,7 @@ mod tests {
                 id: PeerId::from_bytes(id),
                 addresses: vec!["/ip4/203.0.113.1/udp/9000/quic".parse().unwrap()],
                 last_seen: Instant::now(),
+                address_types: vec![],
             };
             let result = dht.add_node_no_trust(node).await;
             assert!(
@@ -1807,6 +1822,7 @@ mod tests {
             id: PeerId::from_bytes([1u8; 32]),
             addresses: vec![],
             last_seen: Instant::now(),
+            address_types: vec![],
         };
         assert!(bucket.add_node(node).is_err());
     }
@@ -1825,6 +1841,7 @@ mod tests {
             id: PeerId::from_bytes([1u8; 32]),
             addresses,
             last_seen: Instant::now(),
+            address_types: vec![],
         };
         bucket.add_node(node).unwrap();
 
@@ -1850,6 +1867,7 @@ mod tests {
             id: PeerId::from_bytes([1u8; 32]),
             addresses,
             last_seen: Instant::now(),
+            address_types: vec![],
         };
         bucket.add_node(replacement).unwrap();
 
@@ -1866,6 +1884,7 @@ mod tests {
             id: PeerId::from_bytes(id_bytes),
             addresses: vec![address.parse::<MultiAddr>().unwrap()],
             last_seen: Instant::now(),
+            address_types: vec![],
         }
     }
 
@@ -1919,6 +1938,7 @@ mod tests {
             id: peer_id,
             addresses: vec!["/ip4/10.0.0.2/udp/9000/quic".parse().unwrap()],
             last_seen: Instant::now(),
+            address_types: vec![],
         };
         let result = dht.add_node_no_trust(updated).await;
         assert!(result.is_ok(), "update short-circuit should succeed");
@@ -2101,6 +2121,7 @@ mod tests {
             id: PeerId::from_bytes(id),
             addresses: vec!["/ip4/10.0.0.1/udp/9000/quic".parse().unwrap()],
             last_seen: Instant::now(),
+            address_types: vec![],
         };
 
         let events = dht.add_node_no_trust(node).await.unwrap();
@@ -2613,6 +2634,7 @@ mod tests {
             id: PeerId::from_bytes(id),
             addresses: vec![bt_addr],
             last_seen: Instant::now(),
+            address_types: vec![],
         };
 
         let result = dht.add_node_no_trust(node).await;
@@ -2637,6 +2659,7 @@ mod tests {
                 id: PeerId::from_bytes(node_id),
                 addresses: vec![bt],
                 last_seen: Instant::now(),
+                address_types: vec![],
             };
             let r = dht.add_node_no_trust(n).await;
             assert!(r.is_ok(), "Bluetooth node {i} should be admitted: {:?}", r);

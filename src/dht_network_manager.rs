@@ -716,7 +716,8 @@ impl DhtNetworkManager {
             match self.send_dht_request(peer_id, op, None).await {
                 Ok(DhtNetworkResult::NodesFound { nodes, .. }) => {
                     for node in &nodes {
-                        let all_addrs: Vec<String> = node.addresses.iter().map(|a| format!("{}", a)).collect();
+                        let all_addrs: Vec<String> =
+                            node.addresses.iter().map(|a| format!("{}", a)).collect();
                         let first = Self::first_dialable_address(&node.addresses);
                         info!(
                             "DHT bootstrap: peer={} all_addresses={:?} first_dialable={:?}",
@@ -2629,14 +2630,15 @@ impl DhtNetworkManager {
                 continue; // Skip self
             }
             match self
-                .send_dht_request(&peer.peer_id, op.clone(), Self::first_dialable_address(&peer.addresses).as_ref())
+                .send_dht_request(
+                    &peer.peer_id,
+                    op.clone(),
+                    Self::first_dialable_address(&peer.addresses).as_ref(),
+                )
                 .await
             {
                 Ok(_) => {
-                    info!(
-                        "Published address to peer {}",
-                        peer.peer_id.to_hex()
-                    );
+                    info!("Published address to peer {}", peer.peer_id.to_hex());
                 }
                 Err(e) => {
                     debug!(

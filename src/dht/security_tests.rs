@@ -9,6 +9,7 @@ fn make_node_with_id(id_bytes: [u8; 32], addr: &str) -> NodeInfo {
         id: PeerId::from_bytes(id_bytes),
         addresses: vec![addr.parse().unwrap()],
         last_seen: Instant::now(),
+        address_types: vec![],
     }
 }
 
@@ -433,6 +434,7 @@ async fn test_self_insertion_rejected() -> anyhow::Result<()> {
         id: self_id,
         addresses: vec!["/ip4/10.0.0.1/udp/9000/quic".parse().unwrap()],
         last_seen: Instant::now(),
+        address_types: vec![],
     };
     let result = engine.add_node_no_trust(self_node).await;
     assert!(result.is_err());
