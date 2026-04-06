@@ -32,7 +32,9 @@ use crate::transport::observed_address_cache::ObservedAddressCache;
 use crate::transport::saorsa_transport_adapter::{ConnectionEvent, DualStackNetworkNode};
 use crate::validation::{RateLimitConfig, RateLimiter};
 
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -1465,147 +1467,279 @@ impl TransportHandle {
         Ok(())
     }
 
-    /// Spawns per-stack recv tasks and a dispatcher that routes incoming messages.
+    /// Spawns per-stack recv tasks and a **sharded** dispatcher that routes
+    /// incoming messages across [`MESSAGE_DISPATCH_SHARDS`] parallel consumer
+    /// tasks.
+    ///
+    /// # Why sharded?
+    ///
+    /// The previous implementation used a single consumer task to drain
+    /// every inbound message in the entire node. At 60 peers this kept up
+    /// comfortably, but at 1000 peers it became the dominant serialisation
+    /// point: each message pass through this loop took three async write
+    /// locks (`peer_to_channel`, `channel_to_peers`, `peer_user_agents`)
+    /// and an awaited `register_connection_peer_id` call before the next
+    /// message could even be looked at. Responses arrived late, past the
+    /// 25 s caller timeout, producing the `[STEP 6 FAILED]` and
+    /// `[STEP 5a FAILED] Response channel closed (receiver timed out)`
+    /// cascades observed in the 1000-node testnet logs.
+    ///
+    /// Sharding by hash of the source IP gives each shard its own consumer
+    /// running in parallel, so lock contention is now distributed across N
+    /// simultaneous writers instead of serialised behind a single task.
+    /// Messages from the **same peer** always route to the **same shard**
+    /// (ordering is preserved per peer). The dispatcher task is light
+    /// (hash + channel send) so it is never the bottleneck.
     async fn start_message_receiving_system(&self) -> Result<()> {
-        info!("Starting message receiving system");
+        info!(
+            "Starting message receiving system ({} dispatch shards)",
+            MESSAGE_DISPATCH_SHARDS
+        );
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel(MESSAGE_RECV_CHANNEL_CAPACITY);
+        let (upstream_tx, mut upstream_rx) =
+            tokio::sync::mpsc::channel(MESSAGE_RECV_CHANNEL_CAPACITY);
 
         let mut handles = self
             .dual_node
-            .spawn_recv_tasks(tx.clone(), self.shutdown.clone());
-        drop(tx);
+            .spawn_recv_tasks(upstream_tx.clone(), self.shutdown.clone());
+        drop(upstream_tx);
 
-        let event_tx = self.event_tx.clone();
-        let active_requests = Arc::clone(&self.active_requests);
-        let peer_to_channel = Arc::clone(&self.peer_to_channel);
-        let channel_to_peers = Arc::clone(&self.channel_to_peers);
-        let peer_user_agents = Arc::clone(&self.peer_user_agents);
-        let self_peer_id = *self.node_identity.peer_id();
-        let dual_node_for_peer_reg = Arc::clone(&self.dual_node);
+        // Per-shard capacity so the aggregate buffered depth matches the old
+        // single-channel capacity, keeping memory usage comparable. Floor
+        // at `MIN_SHARD_CHANNEL_CAPACITY` so each shard retains enough
+        // slack for small bursts even if the global capacity is tiny.
+        let per_shard_capacity = (MESSAGE_RECV_CHANNEL_CAPACITY / MESSAGE_DISPATCH_SHARDS)
+            .max(MIN_SHARD_CHANNEL_CAPACITY);
+
+        let mut shard_txs: Vec<tokio::sync::mpsc::Sender<(SocketAddr, Vec<u8>)>> =
+            Vec::with_capacity(MESSAGE_DISPATCH_SHARDS);
+
+        for shard_idx in 0..MESSAGE_DISPATCH_SHARDS {
+            let (shard_tx, shard_rx) = tokio::sync::mpsc::channel(per_shard_capacity);
+            shard_txs.push(shard_tx);
+
+            let event_tx = self.event_tx.clone();
+            let active_requests = Arc::clone(&self.active_requests);
+            let peer_to_channel = Arc::clone(&self.peer_to_channel);
+            let channel_to_peers = Arc::clone(&self.channel_to_peers);
+            let peer_user_agents = Arc::clone(&self.peer_user_agents);
+            let self_peer_id = *self.node_identity.peer_id();
+            let dual_node_for_peer_reg = Arc::clone(&self.dual_node);
+
+            handles.push(tokio::spawn(async move {
+                Self::run_shard_consumer(
+                    shard_idx,
+                    shard_rx,
+                    event_tx,
+                    active_requests,
+                    peer_to_channel,
+                    channel_to_peers,
+                    peer_user_agents,
+                    self_peer_id,
+                    dual_node_for_peer_reg,
+                )
+                .await;
+            }));
+        }
+
+        // Dispatcher: single task whose only job is to hash `from_addr` and
+        // hand the message off to the appropriate shard. The actual heavy
+        // lifting happens in parallel in the shard consumers.
         handles.push(tokio::spawn(async move {
-            info!("Message receive loop started");
-            while let Some((from_addr, bytes)) = rx.recv().await {
-                let channel_id = from_addr.to_string();
-                trace!("Received {} bytes from channel {}", bytes.len(), channel_id);
-
-                match parse_protocol_message(&bytes, &channel_id) {
-                    Some(ParsedMessage {
-                        event,
-                        authenticated_node_id,
-                        user_agent: peer_user_agent,
-                    }) => {
-                        // If the message was signed, record the app↔channel mapping.
-                        // A peer may be reachable over multiple channels simultaneously
-                        // (e.g. QUIC + Bluetooth), so we add to the set — never replace.
-                        // Skip our own identity to avoid self-registration via echoed messages.
-                        if let Some(ref app_id) = authenticated_node_id
-                            && *app_id != self_peer_id
-                        {
-                            let mut p2c = peer_to_channel.write().await;
-                            let is_new_peer = !p2c.contains_key(app_id);
-                            let channels = p2c.entry(*app_id).or_default();
-                            let inserted = channels.insert(channel_id.clone());
-                            if inserted {
-                                channel_to_peers
-                                    .write()
-                                    .await
-                                    .entry(channel_id.clone())
-                                    .or_default()
-                                    .insert(*app_id);
-                            }
-                            // Drop the lock before emitting events.
-                            drop(p2c);
-
-                            // Register peer ID at the low-level transport
-                            // endpoint so PUNCH_ME_NOW relay can find this
-                            // peer by identity instead of socket address.
-                            dual_node_for_peer_reg
-                                .register_connection_peer_id(from_addr, *app_id.to_bytes())
-                                .await;
-
-                            if is_new_peer {
-                                peer_user_agents
-                                    .write()
-                                    .await
-                                    .insert(*app_id, peer_user_agent.clone());
-                                broadcast_event(
-                                    &event_tx,
-                                    P2PEvent::PeerConnected(*app_id, peer_user_agent.clone()),
-                                );
-                            }
-                        }
-
-                        // Identity announces are internal plumbing — don't
-                        // emit as app-level messages.
-                        if let P2PEvent::Message { ref topic, .. } = event
-                            && topic == IDENTITY_ANNOUNCE_PROTOCOL
-                        {
-                            continue;
-                        }
-
-                        if let P2PEvent::Message {
-                            ref topic,
-                            ref data,
-                            ..
-                        } = event
-                            && topic.starts_with("/rr/")
-                            && let Ok(envelope) =
-                                postcard::from_bytes::<RequestResponseEnvelope>(data)
-                            && envelope.is_response
-                        {
-                            let mut reqs = active_requests.write().await;
-                            let expected_peer = match reqs.get(&envelope.message_id) {
-                                Some(pending) => pending.expected_peer,
-                                None => {
-                                    trace!(
-                                        message_id = %envelope.message_id,
-                                        "Unmatched /rr/ response (likely timed out) — suppressing"
-                                    );
-                                    continue;
-                                }
-                            };
-                            // Accept response only if the authenticated app-level
-                            // identity matches. Channel IDs identify connections,
-                            // not peers, so they are not checked here.
-                            if authenticated_node_id.as_ref() != Some(&expected_peer) {
-                                warn!(
-                                    message_id = %envelope.message_id,
-                                    expected = %expected_peer,
-                                    actual_channel = %channel_id,
-                                    authenticated = ?authenticated_node_id,
-                                    "Response origin mismatch — ignoring"
-                                );
-                                continue;
-                            }
-                            if let Some(pending) = reqs.remove(&envelope.message_id) {
-                                if pending.response_tx.send(envelope.payload).is_err() {
-                                    warn!(
-                                        message_id = %envelope.message_id,
-                                        "Response receiver dropped before delivery"
-                                    );
-                                }
-                                continue;
-                            }
-                            trace!(
-                                message_id = %envelope.message_id,
-                                "Unmatched /rr/ response (likely timed out) — suppressing"
-                            );
-                            continue;
-                        }
-                        broadcast_event(&event_tx, event);
-                    }
-                    None => {
-                        warn!("Failed to parse protocol message ({} bytes)", bytes.len());
-                    }
+            info!(
+                "Message dispatcher loop started (sharded across {} consumers)",
+                MESSAGE_DISPATCH_SHARDS
+            );
+            while let Some((from_addr, bytes)) = upstream_rx.recv().await {
+                let shard_idx = shard_index_for_addr(&from_addr);
+                if shard_txs[shard_idx].send((from_addr, bytes)).await.is_err() {
+                    // Shard consumer has exited — shutdown in progress.
+                    break;
                 }
             }
-            info!("Message receive loop ended — channel closed");
+            info!("Message dispatcher loop ended — upstream channel closed");
         }));
 
         *self.recv_handles.write().await = handles;
         Ok(())
     }
+
+    /// Consumer loop for a single dispatch shard.
+    ///
+    /// Each shard runs one of these in its own `tokio::spawn` task. Shard
+    /// assignment is by hash of the source IP, so messages from the same
+    /// peer always go through the same shard (ordering is preserved per
+    /// peer). Shared state (`peer_to_channel`, `active_requests`, etc.) is
+    /// still behind global `RwLock`s but the lock hold times are now
+    /// spread across [`MESSAGE_DISPATCH_SHARDS`] concurrent consumers
+    /// instead of being fully serialised.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_shard_consumer(
+        shard_idx: usize,
+        mut shard_rx: tokio::sync::mpsc::Receiver<(SocketAddr, Vec<u8>)>,
+        event_tx: broadcast::Sender<P2PEvent>,
+        active_requests: Arc<RwLock<HashMap<String, PendingRequest>>>,
+        peer_to_channel: Arc<RwLock<HashMap<PeerId, HashSet<String>>>>,
+        channel_to_peers: Arc<RwLock<HashMap<String, HashSet<PeerId>>>>,
+        peer_user_agents: Arc<RwLock<HashMap<PeerId, String>>>,
+        self_peer_id: PeerId,
+        dual_node_for_peer_reg: Arc<DualStackNetworkNode>,
+    ) {
+        info!("Message dispatch shard {shard_idx} started");
+        while let Some((from_addr, bytes)) = shard_rx.recv().await {
+            let channel_id = from_addr.to_string();
+            trace!(
+                shard = shard_idx,
+                "Received {} bytes from channel {}",
+                bytes.len(),
+                channel_id
+            );
+
+            match parse_protocol_message(&bytes, &channel_id) {
+                Some(ParsedMessage {
+                    event,
+                    authenticated_node_id,
+                    user_agent: peer_user_agent,
+                }) => {
+                    // If the message was signed, record the app↔channel mapping.
+                    // A peer may be reachable over multiple channels simultaneously
+                    // (e.g. QUIC + Bluetooth), so we add to the set — never replace.
+                    // Skip our own identity to avoid self-registration via echoed messages.
+                    if let Some(ref app_id) = authenticated_node_id
+                        && *app_id != self_peer_id
+                    {
+                        let mut p2c = peer_to_channel.write().await;
+                        let is_new_peer = !p2c.contains_key(app_id);
+                        let channels = p2c.entry(*app_id).or_default();
+                        let inserted = channels.insert(channel_id.clone());
+                        if inserted {
+                            channel_to_peers
+                                .write()
+                                .await
+                                .entry(channel_id.clone())
+                                .or_default()
+                                .insert(*app_id);
+                        }
+                        // Drop the lock before emitting events.
+                        drop(p2c);
+
+                        // Register peer ID at the low-level transport
+                        // endpoint so PUNCH_ME_NOW relay can find this
+                        // peer by identity instead of socket address.
+                        dual_node_for_peer_reg
+                            .register_connection_peer_id(from_addr, *app_id.to_bytes())
+                            .await;
+
+                        if is_new_peer {
+                            peer_user_agents
+                                .write()
+                                .await
+                                .insert(*app_id, peer_user_agent.clone());
+                            broadcast_event(
+                                &event_tx,
+                                P2PEvent::PeerConnected(*app_id, peer_user_agent.clone()),
+                            );
+                        }
+                    }
+
+                    // Identity announces are internal plumbing — don't
+                    // emit as app-level messages.
+                    if let P2PEvent::Message { ref topic, .. } = event
+                        && topic == IDENTITY_ANNOUNCE_PROTOCOL
+                    {
+                        continue;
+                    }
+
+                    if let P2PEvent::Message {
+                        ref topic,
+                        ref data,
+                        ..
+                    } = event
+                        && topic.starts_with("/rr/")
+                        && let Ok(envelope) = postcard::from_bytes::<RequestResponseEnvelope>(data)
+                        && envelope.is_response
+                    {
+                        let mut reqs = active_requests.write().await;
+                        let expected_peer = match reqs.get(&envelope.message_id) {
+                            Some(pending) => pending.expected_peer,
+                            None => {
+                                trace!(
+                                    message_id = %envelope.message_id,
+                                    "Unmatched /rr/ response (likely timed out) — suppressing"
+                                );
+                                continue;
+                            }
+                        };
+                        // Accept response only if the authenticated app-level
+                        // identity matches. Channel IDs identify connections,
+                        // not peers, so they are not checked here.
+                        if authenticated_node_id.as_ref() != Some(&expected_peer) {
+                            warn!(
+                                message_id = %envelope.message_id,
+                                expected = %expected_peer,
+                                actual_channel = %channel_id,
+                                authenticated = ?authenticated_node_id,
+                                "Response origin mismatch — ignoring"
+                            );
+                            continue;
+                        }
+                        if let Some(pending) = reqs.remove(&envelope.message_id) {
+                            if pending.response_tx.send(envelope.payload).is_err() {
+                                warn!(
+                                    message_id = %envelope.message_id,
+                                    "Response receiver dropped before delivery"
+                                );
+                            }
+                            continue;
+                        }
+                        trace!(
+                            message_id = %envelope.message_id,
+                            "Unmatched /rr/ response (likely timed out) — suppressing"
+                        );
+                        continue;
+                    }
+                    broadcast_event(&event_tx, event);
+                }
+                None => {
+                    warn!(
+                        shard = shard_idx,
+                        "Failed to parse protocol message ({} bytes)",
+                        bytes.len()
+                    );
+                }
+            }
+        }
+        info!("Message dispatch shard {shard_idx} ended — channel closed");
+    }
+}
+
+/// Number of parallel dispatch shards for inbound messages.
+///
+/// Messages are routed to a shard by hash of the source IP so each peer's
+/// messages are processed by the same consumer (preserving per-peer
+/// ordering) while different peers' messages run in parallel. Picked to
+/// match typical core counts on deployment hardware — tuning higher helps
+/// only if the shared state `RwLock`s are no longer the dominant
+/// contention, which is not the case today.
+const MESSAGE_DISPATCH_SHARDS: usize = 8;
+
+/// Minimum mpsc capacity for an individual dispatch shard channel.
+///
+/// The per-shard capacity is normally `MESSAGE_RECV_CHANNEL_CAPACITY /
+/// MESSAGE_DISPATCH_SHARDS`, but when that division rounds to something
+/// too small for healthy bursts we floor it at this value so each shard
+/// retains a reasonable amount of buffering headroom.
+const MIN_SHARD_CHANNEL_CAPACITY: usize = 16;
+
+/// Pick the dispatch shard for an inbound message.
+///
+/// Hashes by `IpAddr` (not full `SocketAddr`) so a peer re-connecting from
+/// a new ephemeral port still lands in the same shard, preserving
+/// per-peer message ordering across reconnects.
+fn shard_index_for_addr(addr: &SocketAddr) -> usize {
+    let mut hasher = DefaultHasher::new();
+    addr.ip().hash(&mut hasher);
+    (hasher.finish() as usize) % MESSAGE_DISPATCH_SHARDS
 }
 
 // ============================================================================
