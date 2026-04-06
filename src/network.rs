@@ -1150,6 +1150,14 @@ impl P2PNode {
         // invisible to outbound DHT queries until the next tick — causing
         // the first peers to dial direct (and fail) before learning about
         // the relay.
+        //
+        // **Slow work isolation**: the relay-propagation path runs an
+        // iterative DHT lookup (`find_closest_nodes_network`) which can
+        // take many seconds. Doing it inline in the select loop would
+        // starve the peer-address-update branch and back up the bounded
+        // forwarder mpsc into drop territory. Instead, the lookup +
+        // publish is detached into its own task per relay event, so the
+        // select loop keeps polling both branches.
         {
             let transport = Arc::clone(&self.transport);
             let dht = self.adaptive_dht.dht_manager().clone();
@@ -1166,28 +1174,35 @@ impl P2PNode {
                             let normalized = saorsa_transport::shared::normalize_socket_addr(relay_addr);
                             let relay_multi = crate::MultiAddr::quic(normalized);
                             info!(
-                                "DHT_BRIDGE: relay established at {} — self-lookup then PublishAddress to K closest",
+                                "DHT_BRIDGE: relay established at {} — spawning self-lookup + PublishAddress",
                                 relay_addr
                             );
-                            let own_key = *dht.peer_id().to_bytes();
-                            match dht
-                                .find_closest_nodes_network(&own_key, dht.k_value())
-                                .await
-                            {
-                                Ok(nodes) => {
-                                    info!(
-                                        "DHT_BRIDGE: self-lookup found {} nodes — sending PublishAddress",
-                                        nodes.len()
-                                    );
-                                    dht.publish_address_to_peers(vec![relay_multi], &nodes).await;
+                            // Detach the slow work so the select loop is
+                            // free to keep polling peer-address updates.
+                            let dht_for_propagation = dht.clone();
+                            tokio::spawn(async move {
+                                let own_key = *dht_for_propagation.peer_id().to_bytes();
+                                match dht_for_propagation
+                                    .find_closest_nodes_network(&own_key, dht_for_propagation.k_value())
+                                    .await
+                                {
+                                    Ok(nodes) => {
+                                        info!(
+                                            "DHT_BRIDGE: self-lookup found {} nodes — sending PublishAddress",
+                                            nodes.len()
+                                        );
+                                        dht_for_propagation
+                                            .publish_address_to_peers(vec![relay_multi], &nodes)
+                                            .await;
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "DHT_BRIDGE: self-lookup for relay propagation failed: {}",
+                                            e
+                                        );
+                                    }
                                 }
-                                Err(e) => {
-                                    warn!(
-                                        "DHT_BRIDGE: self-lookup for relay propagation failed: {}",
-                                        e
-                                    );
-                                }
-                            }
+                            });
                         }
                         update = transport.recv_peer_address_update() => {
                             let Some((peer_addr, advertised_addr)) = update else { break };

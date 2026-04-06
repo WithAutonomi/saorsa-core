@@ -371,15 +371,20 @@ impl KBucket {
 
     /// Fast path: if `node_id` is in this bucket AND the optional address
     /// merge would be a no-op (address is `None`, address is already
-    /// present, or the loopback-injection rule would skip the merge),
-    /// atomically bump `last_seen` in place and return `Some(true)`.
+    /// present **with the same `addr_type`**, or the loopback-injection
+    /// rule would skip the merge), atomically bump `last_seen` in place
+    /// and return `Some(true)`.
     ///
     /// Returns:
     /// - `Some(true)` — fast path succeeded, `last_seen` updated.
     /// - `Some(false)` — node is not in this bucket.
-    /// - `None` — the address is not yet present and a real merge is
-    ///   needed, so the caller must escalate to the write-lock slow path
-    ///   [`Self::touch_node_typed`].
+    /// - `None` — the address is either not yet present, or present with
+    ///   a *different* type classification (e.g. learned as `Direct`,
+    ///   now being promoted to `Relay`). The slow path must run so
+    ///   [`merge_typed_address`] can re-insert at the type-priority
+    ///   position. Without this guard the relay-promotion path in the
+    ///   network bridge silently degrades to a `last_seen` bump and the
+    ///   address ordering invariant is broken.
     ///
     /// Only requires `&self` — no bucket mutation, just an atomic store on
     /// [`NodeInfo::last_seen`]. This lets the hot touch path (called on
@@ -389,6 +394,7 @@ impl KBucket {
         &self,
         node_id: &PeerId,
         address: Option<&MultiAddr>,
+        addr_type: AddressType,
     ) -> Option<bool> {
         let Some(pos) = self.nodes.iter().position(|n| &n.id == node_id) else {
             return Some(false);
@@ -398,9 +404,12 @@ impl KBucket {
             None => true,
             Some(addr) => {
                 // Already in the list → merge would reinsert at the same
-                // position, which is a no-op for our purposes.
-                if node.addresses.iter().any(|a| a == addr) {
-                    true
+                // position, which is a no-op only if the existing entry
+                // has the same type classification. If the type differs
+                // we MUST escalate to the slow path so merge_typed_address
+                // can re-order by type priority.
+                if let Some(existing_pos) = node.addresses.iter().position(|a| a == addr) {
+                    node.address_type_at(existing_pos) == addr_type
                 } else {
                     // Loopback-injection skip: if the candidate is
                     // loopback and the node already has a non-loopback
@@ -485,13 +494,19 @@ impl KademliaRoutingTable {
     /// - `Some(false)` — node is not in the routing table (fast-path result
     ///   is authoritative; no fallback needed).
     /// - `None` — node is present but the address merge would not be a
-    ///   no-op; the caller must escalate to [`Self::touch_node`] under a
-    ///   write lock.
+    ///   no-op (either the address is missing, or its type classification
+    ///   differs from `addr_type`); the caller must escalate to
+    ///   [`Self::touch_node`] under a write lock.
     ///
     /// Only takes `&self` so this can run under a `RwLock::read()` guard.
-    fn try_touch_last_seen(&self, node_id: &PeerId, address: Option<&MultiAddr>) -> Option<bool> {
+    fn try_touch_last_seen(
+        &self,
+        node_id: &PeerId,
+        address: Option<&MultiAddr>,
+        addr_type: AddressType,
+    ) -> Option<bool> {
         let bucket_index = self.get_bucket_index(node_id)?;
-        self.buckets[bucket_index].touch_last_seen_if_merge_noop(node_id, address)
+        self.buckets[bucket_index].touch_last_seen_if_merge_noop(node_id, address, addr_type)
     }
 
     fn find_closest_nodes(&self, key: &DhtKey, count: usize) -> Vec<NodeInfo> {
@@ -1002,10 +1017,15 @@ impl DhtCoreEngine {
         address: Option<&MultiAddr>,
         addr_type: AddressType,
     ) -> bool {
-        // Fast path: read lock + atomic last_seen store.
+        // Fast path: read lock + atomic last_seen store. The fast path
+        // ALSO requires the address (if any) to already be present with
+        // the same type classification — see `touch_last_seen_if_merge_noop`.
+        // Promotion of an existing address from one classification to
+        // another (e.g. Direct → Relay) is intentionally pushed to the
+        // slow path so the bucket-level `merge_typed_address` can re-order.
         {
             let routing = self.routing_table.read().await;
-            match routing.try_touch_last_seen(node_id, address) {
+            match routing.try_touch_last_seen(node_id, address, addr_type) {
                 Some(true) => return true,
                 Some(false) => return false,
                 // Merge is non-trivial — fall through to the write-lock path.
@@ -1013,7 +1033,7 @@ impl DhtCoreEngine {
             }
         }
 
-        // Slow path: address merge needed, take write lock.
+        // Slow path: address merge or re-classification needed, take write lock.
         let mut routing = self.routing_table.write().await;
         routing.touch_node(node_id, address, addr_type)
     }

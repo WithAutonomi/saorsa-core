@@ -44,6 +44,7 @@ use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr, SocketAddrV6};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::{RwLock, broadcast};
 use tokio::time::sleep;
@@ -125,6 +126,51 @@ pub struct P2PNetworkNode<T: LinkTransport = P2pLinkTransport> {
 /// Default maximum number of concurrent QUIC connections when not
 /// explicitly configured.
 pub const DEFAULT_MAX_CONNECTIONS: usize = 100;
+
+/// Bounded capacity for the relay/peer-address forwarder mpsc channels.
+///
+/// Replaces the previous `unbounded_channel` so a slow consumer (e.g. the
+/// DHT bridge while running an iterative lookup) cannot grow the queue
+/// without limit. When the channel is full the forwarder logs and drops
+/// the event rather than blocking the receive loop, so we still keep
+/// processing newer events.
+pub const ADDRESS_EVENT_CHANNEL_CAPACITY: usize = 256;
+
+/// Log a warning every Nth dropped address-event in the forwarder.
+///
+/// `try_send` failures (channel full) increment a counter; logging at
+/// every drop would flood the log under sustained pressure, so we
+/// coalesce to one warning per `ADDRESS_EVENT_DROP_LOG_INTERVAL` drops.
+const ADDRESS_EVENT_DROP_LOG_INTERVAL: u64 = 32;
+
+/// Increment the drop counter and log periodically when the address-event
+/// forwarder fails to push into a bounded channel.
+///
+/// Used by the forwarder loop in
+/// [`DualStackNetworkNode::spawn_peer_address_update_forwarder`] when the
+/// downstream consumer is too slow to drain. Drops are coalesced to one
+/// warning per [`ADDRESS_EVENT_DROP_LOG_INTERVAL`] events to avoid log
+/// floods under sustained backpressure; the very first drop in any burst
+/// is always logged so operators see the onset.
+fn handle_address_event_drop<T>(
+    counter: &AtomicU64,
+    event_kind: &'static str,
+    err: &tokio::sync::mpsc::error::TrySendError<T>,
+) {
+    let prev = counter.fetch_add(1, Ordering::Relaxed);
+    let kind = match err {
+        tokio::sync::mpsc::error::TrySendError::Full(_) => "channel full",
+        tokio::sync::mpsc::error::TrySendError::Closed(_) => "consumer closed",
+    };
+    if prev.is_multiple_of(ADDRESS_EVENT_DROP_LOG_INTERVAL) {
+        tracing::warn!(
+            event = event_kind,
+            reason = kind,
+            total_drops = prev + 1,
+            "ADDR_FWD: dropped address event"
+        );
+    }
+}
 
 #[allow(dead_code)]
 impl P2PNetworkNode<P2pLinkTransport> {
@@ -912,18 +958,26 @@ impl DualStackNetworkNode<P2pLinkTransport> {
         &self,
         observed_cache: Arc<parking_lot::Mutex<ObservedAddressCache>>,
     ) -> (
-        tokio::sync::mpsc::UnboundedReceiver<(SocketAddr, SocketAddr)>,
-        tokio::sync::mpsc::UnboundedReceiver<SocketAddr>,
+        tokio::sync::mpsc::Receiver<(SocketAddr, SocketAddr)>,
+        tokio::sync::mpsc::Receiver<SocketAddr>,
     ) {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let (relay_tx, relay_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, rx) = tokio::sync::mpsc::channel(ADDRESS_EVENT_CHANNEL_CAPACITY);
+        let (relay_tx, relay_rx) = tokio::sync::mpsc::channel(ADDRESS_EVENT_CHANNEL_CAPACITY);
+        let drop_counter = Arc::new(AtomicU64::new(0));
         for node in [&self.v6, &self.v4].into_iter().flatten() {
             let mut p2p_rx = node.transport.endpoint().subscribe();
             let tx_clone = tx.clone();
             let relay_tx_clone = relay_tx.clone();
             let cache_clone = Arc::clone(&observed_cache);
+            let drops = Arc::clone(&drop_counter);
+            // Capture which local bind owns this forwarder so the cache can
+            // partition observations by interface (multi-homed correctness).
+            let local_bind = node.local_address();
             tokio::spawn(async move {
-                tracing::debug!("ADDR_FWD: peer address update forwarder started");
+                tracing::debug!(
+                    local_bind = %local_bind,
+                    "ADDR_FWD: peer address update forwarder started"
+                );
                 loop {
                     match p2p_rx.recv().await {
                         Ok(saorsa_transport::P2pEvent::PeerAddressUpdated {
@@ -935,17 +989,22 @@ impl DualStackNetworkNode<P2pLinkTransport> {
                                 peer_addr,
                                 advertised_addr
                             );
-                            let _ = tx_clone.send((
+                            let payload = (
                                 saorsa_transport::shared::normalize_socket_addr(peer_addr),
                                 saorsa_transport::shared::normalize_socket_addr(advertised_addr),
-                            ));
+                            );
+                            if let Err(err) = tx_clone.try_send(payload) {
+                                handle_address_event_drop(&drops, "PeerAddressUpdated", &err);
+                            }
                         }
                         Ok(saorsa_transport::P2pEvent::RelayEstablished { relay_addr }) => {
                             tracing::info!(
                                 "ADDR_FWD: received RelayEstablished relay_addr={}",
                                 relay_addr
                             );
-                            let _ = relay_tx_clone.send(relay_addr);
+                            if let Err(err) = relay_tx_clone.try_send(relay_addr) {
+                                handle_address_event_drop(&drops, "RelayEstablished", &err);
+                            }
                         }
                         Ok(saorsa_transport::P2pEvent::ExternalAddressDiscovered { addr }) => {
                             // Convert TransportAddr → SocketAddr for QUIC.
@@ -956,10 +1015,11 @@ impl DualStackNetworkNode<P2pLinkTransport> {
                                 let normalized =
                                     saorsa_transport::shared::normalize_socket_addr(socket_addr);
                                 tracing::debug!(
+                                    local_bind = %local_bind,
                                     "ADDR_FWD: caching observed external address {}",
                                     normalized
                                 );
-                                cache_clone.lock().record(normalized);
+                                cache_clone.lock().record(local_bind, normalized);
                             }
                         }
                         Err(broadcast::error::RecvError::Closed) => {
@@ -1487,6 +1547,27 @@ impl<T: LinkTransport + Send + Sync + 'static> DualStackNetworkNode<T> {
                     .and_then(|v6| v6.get_observed_external_address())
             });
         raw.map(|a| self.normalize(a))
+    }
+
+    /// Return observed external addresses for **every** stack that has one.
+    ///
+    /// Multi-homed publishing path: each stack (v4 / v6) is queried
+    /// independently and any address it reports is included in the
+    /// returned list (deduped, normalised). A multi-homed host that has
+    /// observations on both v4 and v6 will return both — `local_dht_node`
+    /// then publishes both so peers reaching the host on either family
+    /// can dial it.
+    pub fn get_observed_external_addresses(&self) -> Vec<SocketAddr> {
+        let mut out: Vec<SocketAddr> = Vec::new();
+        for stack in [self.v4.as_ref(), self.v6.as_ref()].into_iter().flatten() {
+            if let Some(raw) = stack.get_observed_external_address() {
+                let normalized = self.normalize(raw);
+                if !out.contains(&normalized) {
+                    out.push(normalized);
+                }
+            }
+        }
+        out
     }
 }
 

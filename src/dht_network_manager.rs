@@ -1268,11 +1268,17 @@ impl DhtNetworkManager {
     async fn local_dht_node(&self) -> DHTNode {
         let mut addresses: Vec<MultiAddr> = Vec::new();
 
-        // 1. Observed external address — the post-NAT address peers actually
-        //    see, learned from QUIC OBSERVED_ADDRESS frames. `None` until at
-        //    least one peer has observed us.
-        if let Some(observed) = self.transport.observed_external_address() {
-            addresses.push(MultiAddr::quic(observed));
+        // 1. Observed external addresses — the post-NAT addresses peers
+        //    actually see, learned from QUIC OBSERVED_ADDRESS frames.
+        //    Empty until at least one peer has observed us. On a
+        //    multi-homed host this can return multiple addresses (one per
+        //    local interface that has an observation), and we publish all
+        //    of them so peers reaching us via any interface can dial back.
+        for observed in self.transport.observed_external_addresses() {
+            let resolved = MultiAddr::quic(observed);
+            if !addresses.contains(&resolved) {
+                addresses.push(resolved);
+            }
         }
 
         // 2. Runtime-bound listen addresses with specific IPs only. Wildcards

@@ -37,6 +37,7 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::{RwLock, broadcast};
 use tokio::task::JoinHandle;
@@ -120,10 +121,18 @@ pub struct TransportHandle {
     geo_provider: Arc<BgpGeoProvider>,
     shutdown: CancellationToken,
     /// Peer address updates from ADD_ADDRESS frames (relay address advertisement).
+    ///
+    /// Bounded mpsc — see
+    /// [`crate::transport::saorsa_transport_adapter::ADDRESS_EVENT_CHANNEL_CAPACITY`].
+    /// The producer (`spawn_peer_address_update_forwarder`) drops events
+    /// rather than blocking when the consumer is slow.
     peer_address_update_rx:
-        tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<(SocketAddr, SocketAddr)>>,
+        tokio::sync::Mutex<tokio::sync::mpsc::Receiver<(SocketAddr, SocketAddr)>>,
     /// Relay established events — received when this node sets up a MASQUE relay.
-    relay_established_rx: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<SocketAddr>>,
+    ///
+    /// Bounded mpsc with the same drop semantics as
+    /// `peer_address_update_rx`.
+    relay_established_rx: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<SocketAddr>>,
     /// Frequency- and recency-aware cache of externally-observed addresses.
     /// Populated by the address-update forwarder from
     /// `P2pEvent::ExternalAddressDiscovered` frames; consulted as a fallback
@@ -334,11 +343,15 @@ impl TransportHandle {
             geo_provider: Arc::new(BgpGeoProvider::new()),
             shutdown: CancellationToken::new(),
             peer_address_update_rx: {
-                let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                let (_tx, rx) = tokio::sync::mpsc::channel(
+                    crate::transport::saorsa_transport_adapter::ADDRESS_EVENT_CHANNEL_CAPACITY,
+                );
                 tokio::sync::Mutex::new(rx)
             },
             relay_established_rx: {
-                let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                let (_tx, rx) = tokio::sync::mpsc::channel(
+                    crate::transport::saorsa_transport_adapter::ADDRESS_EVENT_CHANNEL_CAPACITY,
+                );
                 tokio::sync::Mutex::new(rx)
             },
             observed_address_cache: Arc::new(parking_lot::Mutex::new(ObservedAddressCache::new())),
@@ -411,10 +424,42 @@ impl TransportHandle {
     /// spawned in [`Self::new`]; it survives connection drops but is reset
     /// on process restart.
     pub fn observed_external_address(&self) -> Option<SocketAddr> {
-        if let Some(live) = self.dual_node.get_observed_external_address() {
-            return Some(live);
+        // Prefer the plural accessor's first entry so the single-address
+        // path stays consistent with multi-homed publishing.
+        self.observed_external_addresses().into_iter().next()
+    }
+
+    /// Return **all** externally-observed addresses for this node, one per
+    /// local interface that has an observation.
+    ///
+    /// Resolution order matches [`Self::observed_external_address`]:
+    ///
+    /// 1. **Live**: query each stack on `dual_node` independently (v4 and
+    ///    v6) and collect any address it reports.
+    /// 2. **Cache fallback**: for each `(local_bind, observed)` partition
+    ///    in the [`ObservedAddressCache`] that has no live observation
+    ///    yet, append the cache's per-bind best.
+    ///
+    /// The returned list is deduped — if the live source and the cache
+    /// both report the same address, it appears only once. Order is not
+    /// part of the contract; callers that need a specific priority should
+    /// sort the result themselves.
+    ///
+    /// This is the right entry point for publishing the node's self-entry
+    /// to the DHT on a multi-homed host: peers reaching the node via any
+    /// interface in the returned list will be able to dial back.
+    pub fn observed_external_addresses(&self) -> Vec<SocketAddr> {
+        let mut out: Vec<SocketAddr> = self.dual_node.get_observed_external_addresses();
+        let cached = self
+            .observed_address_cache
+            .lock()
+            .most_frequent_recent_per_local_bind();
+        for addr in cached {
+            if !out.contains(&addr) {
+                out.push(addr);
+            }
         }
-        self.observed_address_cache.lock().most_frequent_recent()
+        out
     }
 
     /// Returns the cache-only fallback for the observed external address,
@@ -1545,6 +1590,14 @@ impl TransportHandle {
         // Dispatcher: single task whose only job is to hash `from_addr` and
         // hand the message off to the appropriate shard. The actual heavy
         // lifting happens in parallel in the shard consumers.
+        //
+        // Failure isolation: a single shard's `try_send` failure must NOT
+        // collapse the dispatcher. If a shard channel is full we log and
+        // drop the message (incrementing a counter). If a shard task has
+        // panicked and its receiver is closed we log and drop, but keep
+        // routing to the other healthy shards. The dispatcher only exits
+        // when its upstream channel closes (i.e. transport shutdown).
+        let drop_counter = Arc::new(AtomicU64::new(0));
         handles.push(tokio::spawn(async move {
             info!(
                 "Message dispatcher loop started (sharded across {} consumers)",
@@ -1552,9 +1605,38 @@ impl TransportHandle {
             );
             while let Some((from_addr, bytes)) = upstream_rx.recv().await {
                 let shard_idx = shard_index_for_addr(&from_addr);
-                if shard_txs[shard_idx].send((from_addr, bytes)).await.is_err() {
-                    // Shard consumer has exited — shutdown in progress.
-                    break;
+                match shard_txs[shard_idx].try_send((from_addr, bytes)) {
+                    Ok(()) => {}
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_dropped)) => {
+                        // Backpressure: this shard is overloaded. Drop the
+                        // message rather than blocking the dispatcher and
+                        // starving the other shards. Per-shard ordering for
+                        // this peer is broken for the dropped message but
+                        // preserved for everything that does land.
+                        let prev = drop_counter.fetch_add(1, Ordering::Relaxed);
+                        if prev.is_multiple_of(SHARD_DROP_LOG_INTERVAL) {
+                            warn!(
+                                shard = shard_idx,
+                                from = %from_addr,
+                                total_drops = prev + 1,
+                                "Dispatcher dropped inbound message: shard channel full"
+                            );
+                        }
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_dropped)) => {
+                        // Shard consumer task has exited (likely panic).
+                        // Drop this message but keep routing to the other
+                        // shards — fault isolation, not cascade failure.
+                        let prev = drop_counter.fetch_add(1, Ordering::Relaxed);
+                        if prev.is_multiple_of(SHARD_DROP_LOG_INTERVAL) {
+                            warn!(
+                                shard = shard_idx,
+                                from = %from_addr,
+                                total_drops = prev + 1,
+                                "Dispatcher dropped inbound message: shard consumer closed"
+                            );
+                        }
+                    }
                 }
             }
             info!("Message dispatcher loop ended — upstream channel closed");
@@ -1608,6 +1690,14 @@ impl TransportHandle {
                     if let Some(ref app_id) = authenticated_node_id
                         && *app_id != self_peer_id
                     {
+                        // Hold `peer_to_channel` across the transport-level
+                        // `register_connection_peer_id` call so the app-level
+                        // map and the transport's internal addr→peer map are
+                        // consistent for any concurrent reader. Without this,
+                        // there is a microsecond window in which a hole-punch
+                        // lookup that depends on the registration can fail
+                        // spuriously even though the app-level map already
+                        // says the peer is known.
                         let mut p2c = peer_to_channel.write().await;
                         let is_new_peer = !p2c.contains_key(app_id);
                         let channels = p2c.entry(*app_id).or_default();
@@ -1620,8 +1710,6 @@ impl TransportHandle {
                                 .or_default()
                                 .insert(*app_id);
                         }
-                        // Drop the lock before emitting events.
-                        drop(p2c);
 
                         // Register peer ID at the low-level transport
                         // endpoint so PUNCH_ME_NOW relay can find this
@@ -1629,6 +1717,10 @@ impl TransportHandle {
                         dual_node_for_peer_reg
                             .register_connection_peer_id(from_addr, *app_id.to_bytes())
                             .await;
+
+                        // Drop the lock before emitting events so subscribers
+                        // that re-enter the registry don't deadlock.
+                        drop(p2c);
 
                         if is_new_peer {
                             peer_user_agents
@@ -1731,11 +1823,27 @@ const MESSAGE_DISPATCH_SHARDS: usize = 8;
 /// retains a reasonable amount of buffering headroom.
 const MIN_SHARD_CHANNEL_CAPACITY: usize = 16;
 
+/// Log a warning every Nth dropped message in the dispatcher.
+///
+/// `try_send` failures (channel full, or shard task closed) increment a
+/// global drop counter; logging at every drop would flood the log under
+/// sustained backpressure, so we coalesce to one warning per
+/// `SHARD_DROP_LOG_INTERVAL` drops. The first drop in a burst is always
+/// logged so the operator sees the onset.
+const SHARD_DROP_LOG_INTERVAL: u64 = 64;
+
 /// Pick the dispatch shard for an inbound message.
 ///
 /// Hashes by `IpAddr` (not full `SocketAddr`) so a peer re-connecting from
-/// a new ephemeral port still lands in the same shard, preserving
-/// per-peer message ordering across reconnects.
+/// a new ephemeral port still lands in the same shard.
+///
+/// **Ordering caveat:** ordering is preserved per *source IP*, not per
+/// authenticated peer. If a peer's public IP changes (NAT rebinding to a
+/// new external address, mobile Wi-Fi↔cellular roaming, dual-stack
+/// failover) it now hashes to a different shard, and messages from the
+/// old IP that are still queued in the old shard may be processed
+/// concurrently with new messages from the new IP. Application-layer
+/// causality across an IP change is *not* guaranteed by this dispatcher.
 fn shard_index_for_addr(addr: &SocketAddr) -> usize {
     let mut hasher = DefaultHasher::new();
     addr.ip().hash(&mut hasher);
