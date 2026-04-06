@@ -769,18 +769,24 @@ impl DhtNetworkManager {
             return indices;
         }
         // Build a 32-byte entropy buffer per call. PeerId::random() gives us
-        // 32 bytes, which is enough for ~32 swap decisions — well above the
-        // bootstrap-list sizes we expect (typically 2-5).
+        // 32 bytes, which covers ~16 two-byte swap decisions — well above
+        // the bootstrap-list sizes we expect (typically 2-5).
         let entropy_owner = PeerId::random();
         let entropy = entropy_owner.to_bytes();
         let entropy_len = entropy.len();
         // Fisher-Yates: for i from len-1 down to 1, swap indices[i] with
         // indices[j] where j is uniform in [0, i].
         for i in (1..len).rev() {
-            // Use a single byte from the entropy buffer as the random source
-            // for this swap. Indexing wraps if `len` exceeds the entropy
-            // buffer size, which is fine for the small lists we shuffle.
-            let byte = entropy[(len - 1 - i) % entropy_len] as usize;
+            // Draw a 16-bit window (two bytes) instead of one byte. With a
+            // single byte the modulo bias `byte % (i + 1)` slightly
+            // over-represents low values whenever `(i + 1)` does not
+            // divide 256 — at i = 4 the bias on slot 0 is ~0.4%, which is
+            // exactly the opposite of the load-spreading goal. A 16-bit
+            // window cuts the bias to ~1/65536 for any realistic list
+            // size at zero added complexity.
+            let idx = (len - 1 - i) * 2;
+            let byte = ((entropy[idx % entropy_len] as usize) << 8)
+                | (entropy[(idx + 1) % entropy_len] as usize);
             let j = byte % (i + 1);
             indices.swap(i, j);
         }
