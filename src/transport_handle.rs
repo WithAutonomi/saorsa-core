@@ -721,16 +721,18 @@ impl TransportHandle {
             .await;
     }
 
-    /// Set a preferred coordinator for hole-punching to a specific target.
-    /// The preferred coordinator is a peer that referred us to the target
-    /// during a DHT lookup, so it has a connection to the target.
-    pub async fn set_hole_punch_preferred_coordinator(
+    /// Set an ordered list of preferred coordinators for hole-punching to a
+    /// specific target.
+    ///
+    /// See [`crate::transport::saorsa_transport_adapter::SaorsaDualStackTransport::set_hole_punch_preferred_coordinators`]
+    /// for the rotation semantics.
+    pub async fn set_hole_punch_preferred_coordinators(
         &self,
         target: SocketAddr,
-        coordinator: SocketAddr,
+        coordinators: Vec<SocketAddr>,
     ) {
         self.dual_node
-            .set_hole_punch_preferred_coordinator(target, coordinator)
+            .set_hole_punch_preferred_coordinators(target, coordinators)
             .await;
     }
 

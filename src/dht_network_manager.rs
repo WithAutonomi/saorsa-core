@@ -636,7 +636,7 @@ impl DhtNetworkManager {
                                 if dht_node.peer_id == this.config.peer_id {
                                     continue;
                                 }
-                                this.dial_addresses(&dht_node.peer_id, &dht_node.addresses, None)
+                                this.dial_addresses(&dht_node.peer_id, &dht_node.addresses, &[])
                                     .await;
                             }
                         }
@@ -672,7 +672,7 @@ impl DhtNetworkManager {
                     // Dial if not already connected — try every advertised
                     // address, not just the first, so a stale NAT binding on
                     // one entry doesn't kill the dial.
-                    self.dial_addresses(&dht_node.peer_id, &dht_node.addresses, None)
+                    self.dial_addresses(&dht_node.peer_id, &dht_node.addresses, &[])
                         .await;
                 }
                 Ok(())
@@ -837,12 +837,13 @@ impl DhtNetworkManager {
                             dialable.len()
                         );
                         if seen.insert(node.peer_id) && !dialable.is_empty() {
-                            // Pass `None` as referrer: the bootstrap peer is no
-                            // longer hard-pinned as the hole-punch coordinator
-                            // for these freshly-discovered peers. The next
-                            // iterative lookup will populate proper referrers
-                            // via the round-aware ranking.
-                            self.dial_addresses(&node.peer_id, &node.addresses, None)
+                            // Pass an empty referrer list: the bootstrap
+                            // peer is no longer hard-pinned as the
+                            // hole-punch coordinator for these freshly-
+                            // discovered peers. The next iterative lookup
+                            // will populate proper referrers via the
+                            // round-aware ranking.
+                            self.dial_addresses(&node.peer_id, &node.addresses, &[])
                                 .await;
                         }
                     }
@@ -1149,12 +1150,15 @@ impl DhtNetworkManager {
                 .map(|node| {
                     let peer_id = node.peer_id;
                     let addresses = node.addresses.clone();
-                    // Pick the best-ranked referrer for this target as the
-                    // hole-punch coordinator hint. PR #3 will plumb the full
-                    // ranked list down to saorsa-transport; for now we hand
-                    // over a single best choice.
-                    let referrer =
-                        self.select_best_referrer(referrers.get(&peer_id).map(Vec::as_slice));
+                    // Build the full ranked list of preferred coordinators
+                    // for this target. saorsa-transport rotates through
+                    // them in order with a short per-attempt timeout for
+                    // all but the final candidate, so handing over the
+                    // full list (instead of just the best) lets the
+                    // hole-punch loop fall through busy or unreachable
+                    // referrers without waiting on the strategy timeout.
+                    let referrer_list =
+                        self.rank_referrers_for_target(referrers.get(&peer_id).map(Vec::as_slice));
                     let op = DhtNetworkOperation::FindNode { key: *key };
                     async move {
                         // Try every dialable address, not just the first.
@@ -1162,7 +1166,8 @@ impl DhtNetworkManager {
                         // `send_dht_request` will reuse that channel; if all
                         // fail, `send_dht_request`'s own fallback will retry
                         // with the routing-table addresses.
-                        self.dial_addresses(&peer_id, &addresses, referrer).await;
+                        self.dial_addresses(&peer_id, &addresses, &referrer_list)
+                            .await;
                         let address_hint = Self::first_dialable_address(&addresses);
                         (
                             peer_id,
@@ -1462,13 +1467,17 @@ impl DhtNetworkManager {
         Self::dialable_addresses(addresses).into_iter().next()
     }
 
-    /// Pick the best hole-punch coordinator candidate from a slice of
-    /// referrer observations, using this manager's [`TrustEngine`] (or
-    /// default neutral trust when none is configured).
+    /// Rank a slice of referrer observations into an ordered list of
+    /// hole-punch coordinator addresses, best-first, using this manager's
+    /// [`TrustEngine`] (or default neutral trust when none is configured).
     ///
     /// Thin wrapper around the pure function [`Self::rank_referrers`] —
-    /// see that for the actual ranking logic.
-    fn select_best_referrer(&self, referrers: Option<&[ReferrerInfo]>) -> Option<SocketAddr> {
+    /// see that for the actual ranking logic. The returned `Vec` is what
+    /// gets handed to
+    /// [`crate::transport::saorsa_transport_adapter::SaorsaDualStackTransport::set_hole_punch_preferred_coordinators`]
+    /// so the transport's hole-punch loop can rotate through coordinators
+    /// in order.
+    fn rank_referrers_for_target(&self, referrers: Option<&[ReferrerInfo]>) -> Vec<SocketAddr> {
         let trust_for = |peer_id: &PeerId| -> f64 {
             self.trust_engine
                 .as_ref()
@@ -1478,7 +1487,8 @@ impl DhtNetworkManager {
         Self::rank_referrers(referrers, trust_for)
     }
 
-    /// Pure ranking function that picks the best referrer from a slice.
+    /// Pure ranking function that sorts a slice of referrer observations
+    /// into a best-first list of coordinator addresses.
     ///
     /// Ranking (highest priority first):
     /// 1. **`round_observed` DESC** — referrers seen in later iteration
@@ -1491,42 +1501,49 @@ impl DhtNetworkManager {
     ///    same round, prefer the one with the higher trust score returned
     ///    by `trust_for`.
     /// 3. **deterministic hash tiebreak** — when round and trust both tie,
-    ///    keep the referrer whose `peer_id` byte 0 is **larger**. Using a
-    ///    pure peer-id ordering instead of a random RNG keeps the choice
+    ///    prefer the referrer whose `peer_id` byte 0 is **larger**. Using
+    ///    a pure peer-id ordering instead of a random RNG keeps the choice
     ///    reproducible across runs (useful for tests) while still
     ///    spreading load across coordinators because different targets
     ///    see different referrer sets.
     ///
-    /// Returns `None` when the slice is empty or `None` itself, so the
-    /// caller can pass-through directly to APIs that take an
-    /// `Option<SocketAddr>` referrer hint.
+    /// Returns an empty `Vec` when the slice is empty or `None` itself,
+    /// so the caller can pass-through directly to
+    /// `set_hole_punch_preferred_coordinators` (which treats an empty
+    /// list as "remove the entry").
     ///
     /// Pure function (no `&self`) so it can be unit-tested without
     /// constructing a full [`DhtNetworkManager`].
     fn rank_referrers(
         referrers: Option<&[ReferrerInfo]>,
         trust_for: impl Fn(&PeerId) -> f64,
-    ) -> Option<SocketAddr> {
-        let list = referrers?;
+    ) -> Vec<SocketAddr> {
+        let Some(list) = referrers else {
+            return Vec::new();
+        };
         if list.is_empty() {
-            return None;
+            return Vec::new();
         }
 
-        list.iter()
-            .max_by(|a, b| {
-                // Primary: higher round wins.
-                a.round_observed
-                    .cmp(&b.round_observed)
-                    // Secondary: higher trust wins (total_cmp sidesteps NaN
-                    // issues — score is bounded but total_cmp is safe
-                    // regardless).
-                    .then_with(|| trust_for(&a.peer_id).total_cmp(&trust_for(&b.peer_id)))
-                    // Tertiary: deterministic tiebreak by peer_id byte 0.
-                    // `max_by` keeps the larger one — arbitrary but
-                    // reproducible.
-                    .then_with(|| a.peer_id.to_bytes()[0].cmp(&b.peer_id.to_bytes()[0]))
-            })
-            .map(|r| r.addr)
+        // Pre-compute trust scores once per referrer so the comparator
+        // doesn't re-invoke the closure repeatedly during sort.
+        let mut scored: Vec<(f64, &ReferrerInfo)> =
+            list.iter().map(|r| (trust_for(&r.peer_id), r)).collect();
+
+        scored.sort_by(|a, b| {
+            // Primary: higher round wins → reverse so DESC sort.
+            b.1.round_observed
+                .cmp(&a.1.round_observed)
+                // Secondary: higher trust wins (total_cmp sidesteps NaN
+                // issues — score is bounded but total_cmp is safe
+                // regardless). Reverse for DESC.
+                .then_with(|| b.0.total_cmp(&a.0))
+                // Tertiary: deterministic tiebreak — larger peer_id
+                // byte 0 wins. Reverse for DESC.
+                .then_with(|| b.1.peer_id.to_bytes()[0].cmp(&a.1.peer_id.to_bytes()[0]))
+        });
+
+        scored.into_iter().map(|(_, r)| r.addr).collect()
     }
 
     /// Merge a single referrer observation into the per-target slot table,
@@ -1603,7 +1620,7 @@ impl DhtNetworkManager {
         &self,
         peer_id: &PeerId,
         addresses: &[MultiAddr],
-        referrer: Option<SocketAddr>,
+        referrers: &[SocketAddr],
     ) -> Option<String> {
         let dialable = Self::dialable_addresses(addresses);
         if dialable.is_empty() {
@@ -1614,7 +1631,7 @@ impl DhtNetworkManager {
             return None;
         }
         for addr in &dialable {
-            if let Some(channel_id) = self.dial_candidate(peer_id, addr, referrer).await {
+            if let Some(channel_id) = self.dial_candidate(peer_id, addr, referrers).await {
                 return Some(channel_id);
             }
         }
@@ -1766,7 +1783,7 @@ impl DhtNetworkManager {
                 candidate_addresses.len()
             );
             if let Some(channel_id) = self
-                .dial_addresses(peer_id, &candidate_addresses, None)
+                .dial_addresses(peer_id, &candidate_addresses, &[])
                 .await
             {
                 let identity_timeout = self.config.request_timeout.min(IDENTITY_EXCHANGE_TIMEOUT);
@@ -1927,7 +1944,7 @@ impl DhtNetworkManager {
         &self,
         peer_id: &PeerId,
         address: &MultiAddr,
-        referrer: Option<std::net::SocketAddr>,
+        referrers: &[std::net::SocketAddr],
     ) -> Option<String> {
         let peer_hex = peer_id.to_hex();
 
@@ -1959,18 +1976,23 @@ impl DhtNetworkManager {
                 .await;
         }
 
-        // If we know which peer referred us to this target (from a DHT
-        // FindNode response), set it as the preferred coordinator for
-        // hole-punching. That peer has a connection to the target.
-        if let Some(coordinator_addr) = referrer
-            && let Some(socket_addr) = address.dialable_socket_addr()
-        {
+        // Hand the full ranked list of referrers to saorsa-transport so its
+        // hole-punch loop can rotate through them in order. The first
+        // `K - 1` get a short per-attempt timeout (~1.5s) so a busy or
+        // unreachable referrer is abandoned quickly; the final entry gets
+        // the strategy's full hole-punch timeout to give it time to
+        // actually complete the punch. An empty list removes any prior
+        // preference for this target — see
+        // [`Self::rank_referrers_for_target`].
+        if let Some(socket_addr) = address.dialable_socket_addr() {
             info!(
-                "dial_candidate: setting preferred coordinator for {} = {} (DHT referrer)",
-                socket_addr, coordinator_addr
+                "dial_candidate: setting {} preferred coordinator(s) for {} (DHT referrers): {:?}",
+                referrers.len(),
+                socket_addr,
+                referrers
             );
             self.transport
-                .set_hole_punch_preferred_coordinator(socket_addr, coordinator_addr)
+                .set_hole_punch_preferred_coordinators(socket_addr, referrers.to_vec())
                 .await;
         }
 
@@ -3212,57 +3234,51 @@ mod tests {
     }
 
     #[test]
-    fn rank_referrers_returns_none_for_empty_or_missing() {
-        assert_eq!(
-            DhtNetworkManager::rank_referrers(None, neutral_trust),
-            None,
-            "None input must yield None"
+    fn rank_referrers_returns_empty_for_empty_or_missing() {
+        assert!(
+            DhtNetworkManager::rank_referrers(None, neutral_trust).is_empty(),
+            "None input must yield an empty list"
         );
-        assert_eq!(
-            DhtNetworkManager::rank_referrers(Some(&[]), neutral_trust),
-            None,
-            "empty slice must yield None"
+        assert!(
+            DhtNetworkManager::rank_referrers(Some(&[]), neutral_trust).is_empty(),
+            "empty slice must yield an empty list"
         );
     }
 
     #[test]
     fn rank_referrers_single_referrer_returned() {
         let only = make_referrer(0x01, 1, 0);
-        let chosen = DhtNetworkManager::rank_referrers(Some(&[only]), neutral_trust);
-        assert_eq!(
-            chosen,
-            Some(only.addr),
-            "single-referrer slice must return that referrer's addr"
-        );
+        let ranked = DhtNetworkManager::rank_referrers(Some(&[only]), neutral_trust);
+        assert_eq!(ranked, vec![only.addr]);
     }
 
     #[test]
     fn rank_referrers_prefers_later_round_over_earlier() {
         // Round 0 (bootstrap-equivalent) vs round 3 (deep iteration).
-        // Round 3 must win regardless of order or trust.
+        // Round 3 must come first regardless of input order or trust.
         let round_zero = make_referrer(0xFF, 1, 0);
         let round_three = make_referrer(0x01, 2, 3);
 
-        let chosen_a =
+        let ranked_a =
             DhtNetworkManager::rank_referrers(Some(&[round_zero, round_three]), neutral_trust);
-        let chosen_b =
+        let ranked_b =
             DhtNetworkManager::rank_referrers(Some(&[round_three, round_zero]), neutral_trust);
 
         assert_eq!(
-            chosen_a,
-            Some(round_three.addr),
-            "later round must win regardless of slice order"
+            ranked_a,
+            vec![round_three.addr, round_zero.addr],
+            "later round must come first regardless of input order"
         );
         assert_eq!(
-            chosen_b,
-            Some(round_three.addr),
-            "later round must win regardless of slice order (reversed)"
+            ranked_b,
+            vec![round_three.addr, round_zero.addr],
+            "later round must come first regardless of input order (reversed)"
         );
     }
 
     #[test]
     fn rank_referrers_tiebreaks_round_with_trust() {
-        // Same round, different trust. Higher trust must win.
+        // Same round, different trust. Higher-trust comes first.
         let low_trust = make_referrer(0x55, 1, 2);
         let high_trust = make_referrer(0xAA, 2, 2);
         let trust_for = |peer_id: &PeerId| -> f64 {
@@ -3273,33 +3289,56 @@ mod tests {
             }
         };
 
-        let chosen = DhtNetworkManager::rank_referrers(Some(&[low_trust, high_trust]), trust_for);
+        let ranked = DhtNetworkManager::rank_referrers(Some(&[low_trust, high_trust]), trust_for);
         assert_eq!(
-            chosen,
-            Some(high_trust.addr),
-            "higher trust must win when rounds tie"
+            ranked,
+            vec![high_trust.addr, low_trust.addr],
+            "higher trust must come first when rounds tie"
         );
     }
 
     #[test]
     fn rank_referrers_tiebreaks_round_and_trust_with_peer_id_byte_zero() {
         // Same round, same (neutral) trust. The referrer with the larger
-        // byte-0 must win deterministically.
+        // byte-0 comes first deterministically.
         let small = make_referrer(0x01, 1, 1);
         let large = make_referrer(0xF0, 2, 1);
 
-        let chosen_a = DhtNetworkManager::rank_referrers(Some(&[small, large]), neutral_trust);
-        let chosen_b = DhtNetworkManager::rank_referrers(Some(&[large, small]), neutral_trust);
+        let ranked_a = DhtNetworkManager::rank_referrers(Some(&[small, large]), neutral_trust);
+        let ranked_b = DhtNetworkManager::rank_referrers(Some(&[large, small]), neutral_trust);
 
         assert_eq!(
-            chosen_a,
-            Some(large.addr),
-            "larger peer_id byte 0 must win the tertiary tiebreak"
+            ranked_a,
+            vec![large.addr, small.addr],
+            "larger peer_id byte 0 must come first via tertiary tiebreak"
         );
         assert_eq!(
-            chosen_b,
-            Some(large.addr),
+            ranked_b,
+            vec![large.addr, small.addr],
             "tiebreak must be order-independent"
+        );
+    }
+
+    #[test]
+    fn rank_referrers_full_list_is_sorted_best_first() {
+        // Mixed rounds and trust scores: verify the entire list is sorted
+        // correctly, not just the head.
+        let r0 = make_referrer(0x01, 1, 0); // round 0
+        let r1 = make_referrer(0x02, 2, 1); // round 1
+        let r2_low = make_referrer(0x03, 3, 2); // round 2, low trust
+        let r2_high = make_referrer(0x04, 4, 2); // round 2, high trust
+        let trust_for = |peer_id: &PeerId| -> f64 {
+            if peer_id.to_bytes()[0] == 0x04 {
+                0.9
+            } else {
+                0.5
+            }
+        };
+        let ranked = DhtNetworkManager::rank_referrers(Some(&[r0, r1, r2_low, r2_high]), trust_for);
+        assert_eq!(
+            ranked,
+            vec![r2_high.addr, r2_low.addr, r1.addr, r0.addr],
+            "full list must be sorted (round DESC, trust DESC) end-to-end"
         );
     }
 
