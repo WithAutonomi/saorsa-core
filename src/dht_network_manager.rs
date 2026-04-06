@@ -23,7 +23,7 @@ use crate::{
     adaptive::TrustEngine,
     adaptive::trust::DEFAULT_NEUTRAL_TRUST,
     address::MultiAddr,
-    dht::core_engine::NodeInfo,
+    dht::core_engine::{AtomicInstant, NodeInfo},
     dht::{AdmissionResult, DhtCoreEngine, DhtKey, Key, RoutingTableEvent},
     error::{DhtError, IdentityError, NetworkError},
     network::NodeConfig,
@@ -1590,7 +1590,8 @@ impl DhtNetworkManager {
             let pid_bytes = *peer_id.to_bytes();
             info!(
                 "dial_candidate: setting hole_punch_target_peer_id for {} = {}",
-                socket_addr, hex::encode(&pid_bytes[..8])
+                socket_addr,
+                hex::encode(&pid_bytes[..8])
             );
             self.transport
                 .set_hole_punch_target_peer_id(socket_addr, pid_bytes)
@@ -2111,7 +2112,7 @@ impl DhtNetworkManager {
                 id: node_id,
                 addresses,
                 address_types,
-                last_seen: Instant::now(),
+                last_seen: AtomicInstant::now(),
             };
 
             let trust_fn = |peer_id: &PeerId| -> f64 {

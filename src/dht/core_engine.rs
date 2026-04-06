@@ -7,6 +7,7 @@ use crate::PeerId;
 use crate::address::MultiAddr;
 use crate::security::{IP_EXACT_LIMIT, IPDiversityConfig, canonicalize_ip, ip_subnet_limit};
 use anyhow::{Result, anyhow};
+use parking_lot::Mutex as PlMutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -14,6 +15,71 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
+
+/// An [`Instant`] stored behind a synchronous mutex so it can be updated
+/// from `&self` receivers.
+///
+/// The key property: reads and writes only need `&self`, so the routing
+/// table's hot touch path (called on every inbound DHT message) can run
+/// under a read lock on the routing table instead of an exclusive write
+/// lock. The previous write-lock design serialised all readers behind
+/// every touch, which at 1000 nodes became the dominant contention point.
+///
+/// Why a mutex instead of an atomic: `Instant` is opaque (no stable `u64`
+/// representation) and can legitimately represent times in the past
+/// (tests backdate `last_seen` to mark peers stale). Any epoch-based
+/// `AtomicU64` encoding would have to either (a) panic/saturate on past
+/// times, or (b) pick a process-lifetime epoch in the deep past, which
+/// risks `Instant` underflow on recently booted systems. A
+/// [`parking_lot::Mutex<Instant>`] sidesteps all of this and is still
+/// extremely fast on the uncontended path (single CAS to acquire + store
+/// + single CAS to release — microseconds).
+#[derive(Debug)]
+pub struct AtomicInstant(PlMutex<Instant>);
+
+impl AtomicInstant {
+    /// Return a fresh `AtomicInstant` set to the current time.
+    pub fn now() -> Self {
+        Self(PlMutex::new(Instant::now()))
+    }
+
+    /// Wrap an existing `Instant`.
+    pub fn from_instant(i: Instant) -> Self {
+        Self(PlMutex::new(i))
+    }
+
+    /// Load the current value as an `Instant`.
+    pub fn load(&self) -> Instant {
+        *self.0.lock()
+    }
+
+    /// Atomically store the current time.
+    pub fn store_now(&self) {
+        *self.0.lock() = Instant::now();
+    }
+
+    /// Atomically store a specific `Instant`.
+    pub fn store(&self, i: Instant) {
+        *self.0.lock() = i;
+    }
+
+    /// Time elapsed since the stored instant.
+    pub fn elapsed(&self) -> Duration {
+        self.load().elapsed()
+    }
+}
+
+impl Clone for AtomicInstant {
+    fn clone(&self) -> Self {
+        Self(PlMutex::new(*self.0.lock()))
+    }
+}
+
+impl Default for AtomicInstant {
+    fn default() -> Self {
+        Self::now()
+    }
+}
 
 #[cfg(test)]
 use crate::adaptive::trust::DEFAULT_NEUTRAL_TRUST;
@@ -82,10 +148,13 @@ pub struct NodeInfo {
     #[serde(default)]
     pub address_types: Vec<AddressType>,
     /// Monotonic timestamp of last successful interaction.
-    /// Uses `Instant` to avoid NTP clock-jump issues. Skipped during
+    ///
+    /// Stored as an [`AtomicInstant`] so the routing table's touch path
+    /// can update it under a read lock, not a write lock. Uses `Instant`
+    /// under the hood to avoid NTP clock-jump issues. Skipped during
     /// serialization — deserialized `NodeInfo` defaults to "just seen."
-    #[serde(skip, default = "Instant::now")]
-    pub last_seen: Instant,
+    #[serde(skip, default = "AtomicInstant::now")]
+    pub last_seen: AtomicInstant,
 }
 
 impl NodeInfo {
@@ -233,7 +302,7 @@ impl KBucket {
         // the parallel address_types vec stays in sync.
         if let Some(pos) = self.nodes.iter().position(|n| n.id == node.id) {
             let mut existing = self.nodes.remove(pos);
-            existing.last_seen = node.last_seen;
+            existing.last_seen.store(node.last_seen.load());
             for (i, addr) in node.addresses.into_iter().enumerate() {
                 let addr_type = node
                     .address_types
@@ -264,10 +333,12 @@ impl KBucket {
         self.nodes.retain(|n| &n.id != node_id);
     }
 
-    /// Update `last_seen` (and optionally merge an address) for a node, then
-    /// Update `last_seen` (and optionally merge a typed address) for a node,
-    /// then move it to the tail of the bucket (most recently seen) per Kademlia
-    /// protocol.
+    /// Slow path: update `last_seen`, merge an address, and reorder the
+    /// bucket so the touched node becomes the most-recently-seen entry.
+    ///
+    /// Takes `&mut self` because merging an address may mutate the node's
+    /// address list. For the fast path (just bumping the timestamp when no
+    /// address merge is needed) see [`Self::touch_last_seen_if_merge_noop`].
     fn touch_node_typed(
         &mut self,
         node_id: &PeerId,
@@ -275,7 +346,7 @@ impl KBucket {
         addr_type: AddressType,
     ) -> bool {
         if let Some(pos) = self.nodes.iter().position(|n| &n.id == node_id) {
-            self.nodes[pos].last_seen = Instant::now();
+            self.nodes[pos].last_seen.store_now();
             if let Some(addr) = address {
                 // Loopback injection prevention (Design Section 6.3 rule 4):
                 let addr_is_loopback = addr
@@ -295,6 +366,70 @@ impl KBucket {
             true
         } else {
             false
+        }
+    }
+
+    /// Fast path: if `node_id` is in this bucket AND the optional address
+    /// merge would be a no-op (address is `None`, address is already
+    /// present **with the same `addr_type`**, or the loopback-injection
+    /// rule would skip the merge), atomically bump `last_seen` in place
+    /// and return `Some(true)`.
+    ///
+    /// Returns:
+    /// - `Some(true)` — fast path succeeded, `last_seen` updated.
+    /// - `Some(false)` — node is not in this bucket.
+    /// - `None` — the address is either not yet present, or present with
+    ///   a *different* type classification (e.g. learned as `Direct`,
+    ///   now being promoted to `Relay`). The slow path must run so
+    ///   [`merge_typed_address`] can re-insert at the type-priority
+    ///   position. Without this guard the relay-promotion path in the
+    ///   network bridge silently degrades to a `last_seen` bump and the
+    ///   address ordering invariant is broken.
+    ///
+    /// Only requires `&self` — no bucket mutation, just an atomic store on
+    /// [`NodeInfo::last_seen`]. This lets the hot touch path (called on
+    /// every inbound DHT message) run under a read lock on the routing
+    /// table instead of an exclusive write lock.
+    fn touch_last_seen_if_merge_noop(
+        &self,
+        node_id: &PeerId,
+        address: Option<&MultiAddr>,
+        addr_type: AddressType,
+    ) -> Option<bool> {
+        let Some(pos) = self.nodes.iter().position(|n| &n.id == node_id) else {
+            return Some(false);
+        };
+        let node = &self.nodes[pos];
+        let merge_is_noop = match address {
+            None => true,
+            Some(addr) => {
+                // Already in the list → merge would reinsert at the same
+                // position, which is a no-op only if the existing entry
+                // has the same type classification. If the type differs
+                // we MUST escalate to the slow path so merge_typed_address
+                // can re-order by type priority.
+                if let Some(existing_pos) = node.addresses.iter().position(|a| a == addr) {
+                    node.address_type_at(existing_pos) == addr_type
+                } else {
+                    // Loopback-injection skip: if the candidate is
+                    // loopback and the node already has a non-loopback
+                    // address, the slow path would skip the merge entirely.
+                    let addr_is_loopback = addr
+                        .ip()
+                        .is_some_and(|ip| canonicalize_ip(ip).is_loopback());
+                    let node_has_non_loopback = node
+                        .addresses
+                        .iter()
+                        .any(|a| a.ip().is_some_and(|ip| !canonicalize_ip(ip).is_loopback()));
+                    addr_is_loopback && node_has_non_loopback
+                }
+            }
+        };
+        if merge_is_noop {
+            node.last_seen.store_now();
+            Some(true)
+        } else {
+            None
         }
     }
 
@@ -350,6 +485,28 @@ impl KademliaRoutingTable {
             }
             None => false,
         }
+    }
+
+    /// Fast path for the touch operation.
+    ///
+    /// Returns:
+    /// - `Some(true)` — node found and `last_seen` updated atomically.
+    /// - `Some(false)` — node is not in the routing table (fast-path result
+    ///   is authoritative; no fallback needed).
+    /// - `None` — node is present but the address merge would not be a
+    ///   no-op (either the address is missing, or its type classification
+    ///   differs from `addr_type`); the caller must escalate to
+    ///   [`Self::touch_node`] under a write lock.
+    ///
+    /// Only takes `&self` so this can run under a `RwLock::read()` guard.
+    fn try_touch_last_seen(
+        &self,
+        node_id: &PeerId,
+        address: Option<&MultiAddr>,
+        addr_type: AddressType,
+    ) -> Option<bool> {
+        let bucket_index = self.get_bucket_index(node_id)?;
+        self.buckets[bucket_index].touch_last_seen_if_merge_noop(node_id, address, addr_type)
     }
 
     fn find_closest_nodes(&self, key: &DhtKey, count: usize) -> Vec<NodeInfo> {
@@ -760,7 +917,7 @@ impl DhtCoreEngine {
             id: self.node_id,
             addresses: vec![],
             address_types: vec![],
-            last_seen: Instant::now(),
+            last_seen: AtomicInstant::now(),
         };
         let self_dist = xor_distance_bytes(self.node_id.to_bytes(), key.as_bytes());
 
@@ -838,12 +995,45 @@ impl DhtCoreEngine {
         routing.touch_node(node_id, address, AddressType::Direct)
     }
 
+    /// Touch a peer's routing-table entry with an optional typed address.
+    ///
+    /// **Fast path (read lock + atomic store):** If the peer is in the
+    /// routing table and the address merge would be a no-op (address is
+    /// `None`, or it's already in the peer's list, or the loopback rule
+    /// would skip it), this updates `last_seen` atomically under a read
+    /// lock with no bucket mutation.
+    ///
+    /// **Slow path (write lock):** If an actual address merge is needed,
+    /// the method escalates to a write lock and uses the full
+    /// `touch_node` flow.
+    ///
+    /// This split removes the write lock from the common hot path — at
+    /// 1000 nodes the touch is called on every inbound DHT message, and
+    /// the write-lock version was the dominant contention point on the
+    /// routing table.
     pub async fn touch_node_typed(
         &self,
         node_id: &PeerId,
         address: Option<&MultiAddr>,
         addr_type: AddressType,
     ) -> bool {
+        // Fast path: read lock + atomic last_seen store. The fast path
+        // ALSO requires the address (if any) to already be present with
+        // the same type classification — see `touch_last_seen_if_merge_noop`.
+        // Promotion of an existing address from one classification to
+        // another (e.g. Direct → Relay) is intentionally pushed to the
+        // slow path so the bucket-level `merge_typed_address` can re-order.
+        {
+            let routing = self.routing_table.read().await;
+            match routing.try_touch_last_seen(node_id, address, addr_type) {
+                Some(true) => return true,
+                Some(false) => return false,
+                // Merge is non-trivial — fall through to the write-lock path.
+                None => {}
+            }
+        }
+
+        // Slow path: address merge or re-classification needed, take write lock.
         let mut routing = self.routing_table.write().await;
         routing.touch_node(node_id, address, addr_type)
     }
@@ -1011,13 +1201,13 @@ impl DhtCoreEngine {
                     if matched_ip {
                         count_ip += 1;
                         if farthest_ip.as_ref().is_none_or(|(_, d, _)| dist > *d) {
-                            farthest_ip = Some((n.id, dist, n.last_seen));
+                            farthest_ip = Some((n.id, dist, n.last_seen.load()));
                         }
                     }
                     if matched_subnet {
                         count_subnet += 1;
                         if farthest_subnet.as_ref().is_none_or(|(_, d, _)| dist > *d) {
-                            farthest_subnet = Some((n.id, dist, n.last_seen));
+                            farthest_subnet = Some((n.id, dist, n.last_seen.load()));
                         }
                     }
                 }
@@ -1088,13 +1278,13 @@ impl DhtCoreEngine {
                     if matched_ip {
                         count_ip += 1;
                         if farthest_ip.as_ref().is_none_or(|(_, d, _)| dist > *d) {
-                            farthest_ip = Some((n.id, dist, n.last_seen));
+                            farthest_ip = Some((n.id, dist, n.last_seen.load()));
                         }
                     }
                     if matched_subnet {
                         count_subnet += 1;
                         if farthest_subnet.as_ref().is_none_or(|(_, d, _)| dist > *d) {
-                            farthest_subnet = Some((n.id, dist, n.last_seen));
+                            farthest_subnet = Some((n.id, dist, n.last_seen.load()));
                         }
                     }
                 }
@@ -1234,7 +1424,7 @@ impl DhtCoreEngine {
             .position(|n| n.id == node.id)
         {
             let existing = &mut routing.buckets[bucket_idx].nodes[pos];
-            existing.last_seen = Instant::now();
+            existing.last_seen.store_now();
             // Merge each address from the candidate, respecting loopback injection prevention
             for addr in &node.addresses {
                 let addr_is_loopback = addr
@@ -1531,7 +1721,7 @@ mod tests {
             id: PeerId::from_bytes([byte; 32]),
             addresses: vec![address.parse::<MultiAddr>().unwrap()],
             address_types: vec![AddressType::Direct],
-            last_seen: Instant::now(),
+            last_seen: AtomicInstant::now(),
         }
     }
 
@@ -1633,7 +1823,7 @@ mod tests {
             .add_node(NodeInfo {
                 id: PeerId::from_bytes(id_bytes),
                 addresses: vec!["/ip4/10.0.0.1/udp/9000/quic".parse().unwrap()],
-                last_seen: Instant::now(),
+                last_seen: AtomicInstant::now(),
                 address_types: vec![],
             })
             .unwrap();
@@ -1644,7 +1834,7 @@ mod tests {
             .add_node(NodeInfo {
                 id: PeerId::from_bytes(id_bytes),
                 addresses: vec!["/ip4/10.0.0.2/udp/9000/quic".parse().unwrap()],
-                last_seen: Instant::now(),
+                last_seen: AtomicInstant::now(),
                 address_types: vec![],
             })
             .unwrap();
@@ -1677,7 +1867,7 @@ mod tests {
             .add_node(NodeInfo {
                 id: PeerId::from_bytes(id_bytes),
                 addresses: vec!["/ip4/10.0.0.1/udp/9000/quic".parse().unwrap()],
-                last_seen: Instant::now(),
+                last_seen: AtomicInstant::now(),
                 address_types: vec![],
             })
             .unwrap();
@@ -1688,7 +1878,7 @@ mod tests {
             .add_node(NodeInfo {
                 id: PeerId::from_bytes(id_bytes),
                 addresses: vec!["/ip4/10.0.0.2/udp/9000/quic".parse().unwrap()],
-                last_seen: Instant::now(),
+                last_seen: AtomicInstant::now(),
                 address_types: vec![],
             })
             .unwrap();
@@ -1722,7 +1912,7 @@ mod tests {
                             .parse()
                             .unwrap(),
                     ],
-                    last_seen: Instant::now(),
+                    last_seen: AtomicInstant::now(),
                     address_types: vec![],
                 })
                 .unwrap();
@@ -1832,7 +2022,7 @@ mod tests {
             let node = NodeInfo {
                 id: PeerId::from_bytes(id),
                 addresses: vec!["/ip4/203.0.113.1/udp/9000/quic".parse().unwrap()],
-                last_seen: Instant::now(),
+                last_seen: AtomicInstant::now(),
                 address_types: vec![],
             };
             let result = dht.add_node_no_trust(node).await;
@@ -1854,7 +2044,7 @@ mod tests {
         let node = NodeInfo {
             id: PeerId::from_bytes([1u8; 32]),
             addresses: vec![],
-            last_seen: Instant::now(),
+            last_seen: AtomicInstant::now(),
             address_types: vec![],
         };
         assert!(bucket.add_node(node).is_err());
@@ -1873,7 +2063,7 @@ mod tests {
         let node = NodeInfo {
             id: PeerId::from_bytes([1u8; 32]),
             addresses,
-            last_seen: Instant::now(),
+            last_seen: AtomicInstant::now(),
             address_types: vec![],
         };
         bucket.add_node(node).unwrap();
@@ -1899,7 +2089,7 @@ mod tests {
         let replacement = NodeInfo {
             id: PeerId::from_bytes([1u8; 32]),
             addresses,
-            last_seen: Instant::now(),
+            last_seen: AtomicInstant::now(),
             address_types: vec![],
         };
         bucket.add_node(replacement).unwrap();
@@ -1916,7 +2106,7 @@ mod tests {
         NodeInfo {
             id: PeerId::from_bytes(id_bytes),
             addresses: vec![address.parse::<MultiAddr>().unwrap()],
-            last_seen: Instant::now(),
+            last_seen: AtomicInstant::now(),
             address_types: vec![],
         }
     }
@@ -1970,7 +2160,7 @@ mod tests {
         let updated = NodeInfo {
             id: peer_id,
             addresses: vec!["/ip4/10.0.0.2/udp/9000/quic".parse().unwrap()],
-            last_seen: Instant::now(),
+            last_seen: AtomicInstant::now(),
             address_types: vec![],
         };
         let result = dht.add_node_no_trust(updated).await;
@@ -2039,7 +2229,7 @@ mod tests {
                 .find(|n| n.id == PeerId::from_bytes(id_far))
                 .unwrap();
             // Set last_seen to exceed the test live threshold
-            node.last_seen = Instant::now() - TEST_STALE_AGE;
+            node.last_seen.store(Instant::now() - TEST_STALE_AGE);
         }
 
         // A closer candidate with the same IP
@@ -2153,7 +2343,7 @@ mod tests {
         let node = NodeInfo {
             id: PeerId::from_bytes(id),
             addresses: vec!["/ip4/10.0.0.1/udp/9000/quic".parse().unwrap()],
-            last_seen: Instant::now(),
+            last_seen: AtomicInstant::now(),
             address_types: vec![],
         };
 
@@ -2210,7 +2400,7 @@ mod tests {
                 .iter_mut()
                 .find(|n| n.id == PeerId::from_bytes(id_far))
                 .unwrap();
-            node.last_seen = Instant::now() - TEST_STALE_AGE;
+            node.last_seen.store(Instant::now() - TEST_STALE_AGE);
         }
 
         // A closer candidate with the same IP triggers swap
@@ -2301,7 +2491,7 @@ mod tests {
             id_a[31] = 1;
             let bucket_idx = routing.get_bucket_index(&PeerId::from_bytes(id_a)).unwrap();
             for node in &mut routing.buckets[bucket_idx].nodes {
-                node.last_seen = Instant::now() - TEST_STALE_AGE;
+                node.last_seen.store(Instant::now() - TEST_STALE_AGE);
             }
         }
 
@@ -2488,7 +2678,7 @@ mod tests {
             id_a[31] = 1;
             let bucket_idx = routing.get_bucket_index(&PeerId::from_bytes(id_a)).unwrap();
             for node in &mut routing.buckets[bucket_idx].nodes {
-                node.last_seen = Instant::now() - TEST_STALE_AGE;
+                node.last_seen.store(Instant::now() - TEST_STALE_AGE);
             }
         }
 
@@ -2551,7 +2741,7 @@ mod tests {
                 .iter_mut()
                 .find(|n| n.id == PeerId::from_bytes(id_stale))
                 .unwrap();
-            node.last_seen = Instant::now() - TEST_STALE_AGE;
+            node.last_seen.store(Instant::now() - TEST_STALE_AGE);
 
             let stale = DhtCoreEngine::collect_stale_peers_in_bucket(
                 &routing,
@@ -2668,7 +2858,7 @@ mod tests {
         let node = NodeInfo {
             id: PeerId::from_bytes(id),
             addresses: vec![bt_addr],
-            last_seen: Instant::now(),
+            last_seen: AtomicInstant::now(),
             address_types: vec![],
         };
 
@@ -2693,7 +2883,7 @@ mod tests {
             let n = NodeInfo {
                 id: PeerId::from_bytes(node_id),
                 addresses: vec![bt],
-                last_seen: Instant::now(),
+                last_seen: AtomicInstant::now(),
                 address_types: vec![],
             };
             let r = dht.add_node_no_trust(n).await;
@@ -2890,7 +3080,7 @@ mod tests {
                 .iter_mut()
                 .find(|n| n.id == PeerId::from_bytes(id_far))
                 .unwrap();
-            node.last_seen = Instant::now() - TEST_STALE_AGE;
+            node.last_seen.store(Instant::now() - TEST_STALE_AGE);
         }
 
         let far_peer = PeerId::from_bytes(id_far);
