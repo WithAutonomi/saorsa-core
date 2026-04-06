@@ -23,7 +23,7 @@ use crate::{
     adaptive::TrustEngine,
     adaptive::trust::DEFAULT_NEUTRAL_TRUST,
     address::MultiAddr,
-    dht::core_engine::NodeInfo,
+    dht::core_engine::{AtomicInstant, NodeInfo},
     dht::{AdmissionResult, DhtCoreEngine, DhtKey, Key, RoutingTableEvent},
     error::{DhtError, IdentityError, NetworkError},
     network::NodeConfig,
@@ -2220,7 +2220,7 @@ impl DhtNetworkManager {
                 id: node_id,
                 addresses,
                 address_types,
-                last_seen: Instant::now(),
+                last_seen: AtomicInstant::now(),
             };
 
             let trust_fn = |peer_id: &PeerId| -> f64 {
