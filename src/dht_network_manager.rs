@@ -31,7 +31,7 @@ use crate::{
 use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::net::{IpAddr, SocketAddr, UdpSocket};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::{RwLock, Semaphore, broadcast, oneshot};
@@ -370,51 +370,6 @@ impl Drop for BucketRevalidationGuard {
     fn drop(&mut self) {
         self.active.lock().remove(&self.bucket_idx);
     }
-}
-
-/// IPv4 probe target used by [`primary_local_ip`] to discover the host's
-/// primary outbound interface address. Picked from the TEST-NET-3 range
-/// (RFC 5737) so the address is guaranteed never to be allocated to a real
-/// host. No packets are actually sent — `UdpSocket::connect` only sets the
-/// kernel's default route entry on the socket, after which `local_addr`
-/// returns the IP the kernel would route to that destination.
-const PRIMARY_IP_PROBE_V4: &str = "203.0.113.1:80";
-
-/// IPv6 probe target used by [`primary_local_ip`]. Picked from the
-/// 2001:db8::/32 documentation prefix (RFC 3849) for the same reason as
-/// [`PRIMARY_IP_PROBE_V4`].
-const PRIMARY_IP_PROBE_V6: &str = "[2001:db8::1]:80";
-
-/// Discover the host's primary outbound interface IP for the requested
-/// address family.
-///
-/// Uses the standard "UDP connect to a public address, then read local_addr"
-/// trick: opening a UDP socket and "connecting" it to a remote IP causes the
-/// kernel to consult its routing table and bind the local end of the socket
-/// to the source address it would use for that destination, *without sending
-/// any packets*. The chosen IP is then readable via `local_addr()`.
-///
-/// Returns `None` when:
-/// - the host has no usable interface for the requested family,
-/// - the kernel returns an unspecified address (rare, indicates no default
-///   route),
-/// - or any I/O error occurs.
-fn primary_local_ip(want_ipv4: bool) -> Option<IpAddr> {
-    let bind_addr: &str = if want_ipv4 { "0.0.0.0:0" } else { "[::]:0" };
-    let probe_addr: &str = if want_ipv4 {
-        PRIMARY_IP_PROBE_V4
-    } else {
-        PRIMARY_IP_PROBE_V6
-    };
-
-    let socket = UdpSocket::bind(bind_addr).ok()?;
-    socket.connect(probe_addr).ok()?;
-    let local = socket.local_addr().ok()?;
-
-    if local.ip().is_unspecified() {
-        return None;
-    }
-    Some(local.ip())
 }
 
 impl DhtNetworkManager {
@@ -1293,52 +1248,44 @@ impl DhtNetworkManager {
     /// K-closest results. The local node always participates in distance
     /// ranking but is never queried over the network.
     ///
-    /// The published address list is sourced — in priority order — from:
+    /// The published address list is sourced from:
     ///
     /// 1. The transport's externally-observed reflexive address (set by
-    ///    OBSERVED_ADDRESS frames received from peers). This is the most
-    ///    authoritative source because it is the actual post-NAT address
-    ///    that remote peers see.
-    /// 2. The transport's runtime-bound `listen_addrs`, with any unspecified
-    ///    IP (`0.0.0.0` / `[::]`) substituted for the host's primary outbound
-    ///    interface address. This makes the entry usable on a LAN even before
-    ///    OBSERVED_ADDRESS has flowed.
+    ///    OBSERVED_ADDRESS frames received from peers). This is the only
+    ///    authoritative source for a NAT'd node — it is the actual post-NAT
+    ///    address that remote peers see the connection arrive from.
+    /// 2. The transport's runtime-bound `listen_addrs`, but **only when the
+    ///    bind address has a specific (non-wildcard) IP**. Wildcard binds
+    ///    (`0.0.0.0` / `[::]`) are bind-side concepts meaning "any interface"
+    ///    and are not dialable, so we skip them entirely and rely on (1).
     ///
-    /// **Why not `NodeConfig::listen_addrs()`:** that helper is a pure
-    /// derivation of `(port, ipv6, local)` and returns wildcard IPs and the
-    /// configured port — which is `0` for ephemeral binds. The result was
-    /// being filtered out by every consumer's [`Self::dialable_addresses`]
-    /// (it rejects unspecified IPs), so DHT-based peer discovery for this
-    /// node returned no contactable address — the root cause of sporadic
-    /// NAT traversal failures.
+    /// If neither source produces an address, the returned `DHTNode` has an
+    /// empty `addresses` vec. This is the right answer at the publish layer:
+    /// it tells consumers "I don't know how to be reached yet" rather than
+    /// lying with a bind-side wildcard or a guessed LAN IP that won't work
+    /// from the public internet. The empty window closes naturally once the
+    /// first peer connects to us and OBSERVED_ADDRESS flows.
     async fn local_dht_node(&self) -> DHTNode {
         let mut addresses: Vec<MultiAddr> = Vec::new();
 
-        // 1. Observed external address (most authoritative).
+        // 1. Observed external address — the post-NAT address peers actually
+        //    see, learned from QUIC OBSERVED_ADDRESS frames. `None` until at
+        //    least one peer has observed us.
         if let Some(observed) = self.transport.observed_external_address() {
             addresses.push(MultiAddr::quic(observed));
         }
 
-        // 2. Runtime-bound listen addresses, with wildcards substituted.
+        // 2. Runtime-bound listen addresses with specific IPs only. Wildcards
+        //    and zero ports are pre-bind placeholders or all-interface
+        //    bindings — neither is dialable.
         for la in self.transport.listen_addrs().await {
             let Some(sa) = la.dialable_socket_addr() else {
                 continue;
             };
-            if sa.port() == 0 {
-                // Pre-bind placeholder; never dialable.
+            if sa.port() == 0 || sa.ip().is_unspecified() {
                 continue;
             }
-
-            let resolved_ip = if sa.ip().is_unspecified() {
-                let Some(ip) = primary_local_ip(sa.is_ipv4()) else {
-                    continue;
-                };
-                ip
-            } else {
-                sa.ip()
-            };
-
-            let resolved = MultiAddr::quic(SocketAddr::new(resolved_ip, sa.port()));
+            let resolved = MultiAddr::quic(sa);
             if !addresses.contains(&resolved) {
                 addresses.push(resolved);
             }

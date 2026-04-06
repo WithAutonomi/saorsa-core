@@ -13,10 +13,15 @@
 
 //! Regression tests for the addresses a node publishes about itself in the DHT.
 //!
-//! These tests guard against the failure mode where a node tells other peers
-//! "you can reach me at <unspecified-or-zero-port>", which is silently filtered
-//! out by every consumer's `dialable_addresses()` check and makes the node
-//! invisible to DHT-based peer discovery.
+//! These tests pin the contract that `DhtNetworkManager::local_dht_node()` is
+//! the only place where a node decides what addresses to advertise about
+//! itself, and that those addresses must always survive a receiving peer's
+//! `dialable_addresses()` filter.
+//!
+//! The production failure mode this guards against is a node telling other
+//! peers "you can reach me at <unspecified-or-zero-port>", which is silently
+//! filtered out by every consumer's `dialable_addresses()` check and makes
+//! the node invisible to DHT-based peer discovery.
 //!
 //! Concretely, the production path is:
 //!
@@ -32,11 +37,37 @@
 //! These tests assert (3) succeeds against (2) using the public
 //! `find_closest_nodes_local_with_self()` API, which is the same code path the
 //! DHT response handler invokes.
+//!
+//! ## Address sources
+//!
+//! `local_dht_node()` has exactly two sources:
+//!
+//! - **Loopback / specific-IP listen binds**: when the transport is bound to
+//!   a non-wildcard address (e.g. `127.0.0.1:<port>` from `local: true`
+//!   mode), the bound address is published directly. This path is exercised
+//!   by the single-node `local_mode_*` tests below.
+//! - **OBSERVED_ADDRESS frames**: when the transport is bound to a wildcard
+//!   (`0.0.0.0` / `[::]`), the bound address is *not* published. Instead the
+//!   node waits until at least one peer connects and reports back via QUIC's
+//!   OBSERVED_ADDRESS extension. This path is exercised by the two-node
+//!   `wildcard_*` tests below.
+//!
+//! ## Why we don't substitute wildcards with `primary_local_ip()`
+//!
+//! An earlier iteration of this fix substituted `0.0.0.0` with the host's
+//! primary outbound interface IP (via the standard `UdpSocket::connect`
+//! trick). That worked for VPS / public-IP hosts and for LAN deployments,
+//! but for home-NAT deployments it published an RFC1918 LAN address that
+//! internet peers cannot route to — wasting connection attempts on
+//! guaranteed-failed dials. The current design publishes nothing until
+//! OBSERVED_ADDRESS arrives, which is honest and self-correcting.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use saorsa_core::{Key, MultiAddr, NodeConfig, P2PNode};
+use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
+use tokio::time::timeout;
 
 /// How many results to ask for from the local closest-nodes query. Any value
 /// >= 1 is fine; we only care that the local self-entry is included.
@@ -46,17 +77,31 @@ const QUERY_COUNT: usize = 8;
 /// integration tests use the same value.
 const POST_START_DELAY: Duration = Duration::from_millis(50);
 
-/// Build a node config that mirrors a typical production deployment as
-/// closely as possible while still being runnable inside a unit test:
-///
-/// - `local: false` — use `Public` listen mode (binds to `0.0.0.0` /
-///   `[::]`), which is what `cargo run --release -- --listen 0.0.0.0:10000`
-///   does.
-/// - `port: 0` — let the OS pick an ephemeral port. This matches ant-node's
-///   default `--port 0`.
-/// - `ipv6: false` — IPv4-only is sufficient for the assertion and avoids
-///   IPv6-disabled CI environments.
-fn production_like_config() -> NodeConfig {
+/// Maximum time to wait for an OBSERVED_ADDRESS frame to arrive after a
+/// peer connection completes its handshake. In practice the frame arrives
+/// within tens of milliseconds; the budget is generous to absorb scheduler
+/// jitter on slow CI.
+const OBSERVED_ADDRESS_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Polling interval for waiting on the observed external address.
+const OBSERVED_ADDRESS_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+/// Hard timeout on `connect_peer` and identity exchange in two-node tests.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Loopback-mode config used for the single-node local-bind tests.
+fn local_mode_config() -> NodeConfig {
+    NodeConfig::builder()
+        .local(true)
+        .port(0)
+        .ipv6(false)
+        .build()
+        .expect("test config should be valid")
+}
+
+/// Public-mode (wildcard bind) config used for the two-node OBSERVED_ADDRESS
+/// tests and the empty-self-entry contract test.
+fn wildcard_mode_config() -> NodeConfig {
     NodeConfig::builder()
         .local(false)
         .port(0)
@@ -102,35 +147,61 @@ fn is_dialable(addr: &MultiAddr) -> bool {
     true
 }
 
-/// **PRIMARY REGRESSION TEST FOR THE NAT TRAVERSAL ROOT CAUSE.**
+/// Fetches the local self-entry from the node's DHT manager.
+async fn fetch_self_entry(node: &P2PNode) -> saorsa_core::DHTNode {
+    let key: Key = [0u8; 32];
+    let nodes = node
+        .dht_manager()
+        .find_closest_nodes_local_with_self(&key, QUERY_COUNT)
+        .await;
+    extract_self_entry(&nodes, node.peer_id())
+}
+
+/// Polls `transport.observed_external_address()` until it returns `Some` or
+/// the timeout expires. Returns the observed address, or `None` if it never
+/// arrived.
+async fn wait_for_observed_external_address(
+    node: &P2PNode,
+    deadline: Duration,
+) -> Option<SocketAddr> {
+    let result = timeout(deadline, async {
+        loop {
+            if let Some(addr) = node.transport().observed_external_address() {
+                return addr;
+            }
+            tokio::time::sleep(OBSERVED_ADDRESS_POLL_INTERVAL).await;
+        }
+    })
+    .await;
+    result.ok()
+}
+
+// ---------------------------------------------------------------------------
+// Single-node tests: loopback bind path
+// ---------------------------------------------------------------------------
+
+/// **PRIMARY REGRESSION TEST FOR THE LOOPBACK BIND PATH.**
 ///
-/// A freshly-started node must publish at least one dialable address about
-/// itself in `local_dht_node()`. If this test fails, peers performing DHT
-/// FIND_NODE for this node will receive *zero* usable addresses and will be
-/// unable to connect — manifesting as "sporadic NAT traversal" in production.
+/// A node bound to a specific loopback address (`local: true` →
+/// `127.0.0.1:<bound_port>`) must publish that address directly in its DHT
+/// self-entry. The published port must be the *actually-bound* port — not
+/// `0`, not the configured port (which is also `0`). If this test fails,
+/// peers performing DHT FIND_NODE for this node will receive zero usable
+/// addresses and will be unable to connect.
 ///
-/// On the broken codebase this test fails because `local_dht_node()` reads
+/// On the broken codebase this test failed because `local_dht_node()` read
 /// from `NodeConfig::listen_addrs()` (a static `(port, ipv6, local)`
-/// derivation that returns wildcards in `Public` mode and zero ports for
-/// `--port 0`) instead of from the runtime-bound listener addresses or the
-/// transport's observed external address.
+/// derivation that returns the configured port — `0` for `--port 0`) instead
+/// of from the runtime-bound listener addresses.
 #[tokio::test]
-async fn published_self_entry_contains_a_dialable_address() {
-    let node = P2PNode::new(production_like_config())
+async fn local_mode_publishes_dialable_loopback_address() {
+    let node = P2PNode::new(local_mode_config())
         .await
         .expect("P2PNode::new should succeed");
     node.start().await.expect("node.start() should succeed");
     tokio::time::sleep(POST_START_DELAY).await;
 
-    let peer_id = *node.peer_id();
-    let key: Key = [0u8; 32];
-
-    let nodes = node
-        .dht_manager()
-        .find_closest_nodes_local_with_self(&key, QUERY_COUNT)
-        .await;
-
-    let self_entry = extract_self_entry(&nodes, &peer_id);
+    let self_entry = fetch_self_entry(&node).await;
 
     assert!(
         !self_entry.addresses.is_empty(),
@@ -154,9 +225,10 @@ async fn published_self_entry_contains_a_dialable_address() {
          no contactable address.\n\
          \n\
          Fix: DhtNetworkManager::local_dht_node() must read from the runtime \
-         listen_addrs RwLock and/or the transport's get_observed_external_address() \
-         instead of NodeConfig::listen_addrs() (which is a pure derivation that \
-         returns 0.0.0.0:<port> in Public mode and zero ports for --port 0).",
+         transport state (transport.listen_addrs() and \
+         transport.observed_external_address()) instead of NodeConfig::listen_addrs() \
+         (which is a pure derivation that returns wildcards in Public mode and \
+         zero ports for --port 0).",
         self_entry.addresses.len(),
         self_entry.addresses,
     );
@@ -165,30 +237,26 @@ async fn published_self_entry_contains_a_dialable_address() {
 }
 
 /// The runtime `listen_addrs` read from the transport's RwLock should match
-/// the addresses published in the DHT self-entry. If they diverge, the DHT is
-/// advertising stale or incorrect contact information.
+/// the addresses published in the DHT self-entry for loopback binds. If they
+/// diverge, the DHT is advertising stale or incorrect contact information.
 ///
 /// This test catches the case where someone "fixes" `local_dht_node()` by
 /// reading from the static `NodeConfig` instead of from the live transport
 /// state, which would produce a result that's still wrong but in a different
 /// way (e.g. the configured port instead of the bound port).
 #[tokio::test]
-async fn published_self_entry_matches_runtime_listen_addrs() {
-    let node = P2PNode::new(production_like_config())
+async fn local_mode_published_self_entry_matches_runtime_listen_addrs() {
+    let node = P2PNode::new(local_mode_config())
         .await
         .expect("P2PNode::new should succeed");
     node.start().await.expect("node.start() should succeed");
     tokio::time::sleep(POST_START_DELAY).await;
 
-    // What the transport actually bound to (real ports, possibly real IPs).
+    // What the transport actually bound to (real ports on a specific IP).
     let runtime_addrs = node.listen_addrs().await;
 
     // What the node tells the rest of the network about itself.
-    let nodes = node
-        .dht_manager()
-        .find_closest_nodes_local_with_self(&[0u8; 32], QUERY_COUNT)
-        .await;
-    let self_entry = extract_self_entry(&nodes, node.peer_id());
+    let self_entry = fetch_self_entry(&node).await;
 
     // The published ports must be the actually-bound ports — not 0, and not
     // some statically configured value that might differ from what the OS
@@ -225,33 +293,18 @@ async fn published_self_entry_matches_runtime_listen_addrs() {
     node.stop().await.expect("node.stop() should succeed");
 }
 
-/// A node configured with `local: true` (loopback mode) should publish
-/// loopback addresses with the *actual bound port*, not port 0.
-///
-/// This is a weaker variant of the primary test that catches the same bug via
-/// a different config path: even in `Local` listen mode (where the wildcard-IP
-/// problem does not apply), `NodeConfig::listen_addrs()` still returns the
-/// configured port — which is 0 — instead of the OS-assigned ephemeral port.
+/// A node configured with `local: true` (loopback mode) must never publish a
+/// port-0 address. Port 0 is the kernel's "pick any port" placeholder; it is
+/// never a valid destination.
 #[tokio::test]
-async fn published_self_entry_uses_bound_port_in_local_mode() {
-    let config = NodeConfig::builder()
-        .local(true)
-        .port(0)
-        .ipv6(false)
-        .build()
-        .expect("test config should be valid");
-
-    let node = P2PNode::new(config)
+async fn local_mode_never_publishes_port_zero() {
+    let node = P2PNode::new(local_mode_config())
         .await
         .expect("P2PNode::new should succeed");
     node.start().await.expect("node.start() should succeed");
     tokio::time::sleep(POST_START_DELAY).await;
 
-    let nodes = node
-        .dht_manager()
-        .find_closest_nodes_local_with_self(&[0u8; 32], QUERY_COUNT)
-        .await;
-    let self_entry = extract_self_entry(&nodes, node.peer_id());
+    let self_entry = fetch_self_entry(&node).await;
 
     let zero_port_addrs: Vec<&MultiAddr> = self_entry
         .addresses
@@ -265,12 +318,180 @@ async fn published_self_entry_uses_bound_port_in_local_mode() {
          \n\
          Port 0 is the placeholder the kernel uses for 'pick any port'; it is \
          never a valid destination. Publishing it to the DHT means peers will \
-         try to dial port 0 and fail. The fix is the same as the primary \
-         regression test: read from the runtime transport state, not from \
-         NodeConfig::listen_addrs().",
+         try to dial port 0 and fail.",
         zero_port_addrs.len(),
         zero_port_addrs,
     );
 
     node.stop().await.expect("node.stop() should succeed");
+}
+
+// ---------------------------------------------------------------------------
+// Single-node tests: wildcard bind contract
+// ---------------------------------------------------------------------------
+
+/// **CONTRACT: a wildcard-bound node with no observation publishes nothing.**
+///
+/// When the transport is bound to `0.0.0.0:<port>` (the production default
+/// for VPS / cloud deployments) and no peer has yet connected to send an
+/// OBSERVED_ADDRESS frame, `local_dht_node()` must return an empty
+/// `addresses` vec — *not* the wildcard, *not* a guessed LAN IP, *not* the
+/// configured port-0 placeholder.
+///
+/// This pins the "don't lie when you don't know" contract: it is better to
+/// publish no contact information than to publish bind-side wildcards or
+/// LAN-only addresses that internet peers cannot route to. Once the bootstrap
+/// dial completes and the first OBSERVED_ADDRESS frame arrives, future
+/// queries return the real address (see the `wildcard_*_two_nodes` tests
+/// below).
+#[tokio::test]
+async fn wildcard_bind_with_no_peers_publishes_empty_self_entry() {
+    let node = P2PNode::new(wildcard_mode_config())
+        .await
+        .expect("P2PNode::new should succeed");
+    node.start().await.expect("node.start() should succeed");
+    tokio::time::sleep(POST_START_DELAY).await;
+
+    let self_entry = fetch_self_entry(&node).await;
+
+    assert!(
+        self_entry.addresses.is_empty(),
+        "wildcard-bound node with no peers should publish an empty self-entry, \
+         but published {} address(es): {:?}\n\
+         \n\
+         This is a regression: a freshly-started node must not lie about its \
+         contact information. The acceptable sources are (1) the transport's \
+         observed_external_address() — None until a peer connects, or (2) a \
+         specific-IP bind — N/A for wildcard. Anything else (wildcard \
+         substitution, primary outbound interface IP, etc.) risks publishing \
+         an address that internet peers cannot route to.",
+        self_entry.addresses.len(),
+        self_entry.addresses,
+    );
+
+    node.stop().await.expect("node.stop() should succeed");
+}
+
+// ---------------------------------------------------------------------------
+// Two-node tests: OBSERVED_ADDRESS path
+// ---------------------------------------------------------------------------
+
+/// Build a loopback dial target for a wildcard-bound node. The node's
+/// `listen_addrs()` returns `0.0.0.0:<bound_port>` (not directly dialable),
+/// so we substitute `127.0.0.1` as the destination IP — the kernel routes
+/// loopback traffic to the wildcard-bound socket.
+async fn loopback_dial_target_for(node: &P2PNode) -> MultiAddr {
+    let port = node
+        .listen_addrs()
+        .await
+        .into_iter()
+        .find_map(|a| a.dialable_socket_addr())
+        .expect("wildcard-bound node should have an IPv4 listen address")
+        .port();
+    assert_ne!(port, 0, "bound port must be non-zero after start()");
+    MultiAddr::quic(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port))
+}
+
+/// **PRIMARY REGRESSION TEST FOR THE OBSERVED_ADDRESS PATH.**
+///
+/// Two wildcard-bound (`0.0.0.0:0`) nodes connect to each other over
+/// loopback. After the QUIC handshake completes and OBSERVED_ADDRESS frames
+/// flow, each side learns its post-NAT (here: post-loopback) reflexive
+/// address. The published DHT self-entry must then include that observed
+/// address as a dialable entry.
+///
+/// This is the contract that makes Public-mode deployments work: a fresh
+/// VPS node binds to `0.0.0.0:10000`, dials a bootstrap peer, and the
+/// bootstrap's OBSERVED_ADDRESS frame fills in the node's public IP. From
+/// that point forward, every DHT query for this node returns its public
+/// IP:port.
+///
+/// If this test fails, sporadic NAT traversal failure will return: peers
+/// querying the DHT for a wildcard-bound node will receive empty addresses
+/// even after the node has been observed.
+#[tokio::test]
+async fn wildcard_bind_publishes_observed_address_after_peer_connection() {
+    let node_a = P2PNode::new(wildcard_mode_config())
+        .await
+        .expect("node_a creation should succeed");
+    let node_b = P2PNode::new(wildcard_mode_config())
+        .await
+        .expect("node_b creation should succeed");
+
+    node_a.start().await.expect("node_a.start() should succeed");
+    node_b.start().await.expect("node_b.start() should succeed");
+    tokio::time::sleep(POST_START_DELAY).await;
+
+    // node_b's listen_addrs returns 0.0.0.0:<bound_port> — substitute
+    // 127.0.0.1 to produce a dialable address.
+    let dial_target = loopback_dial_target_for(&node_b).await;
+
+    let channel_id = timeout(CONNECT_TIMEOUT, node_a.connect_peer(&dial_target))
+        .await
+        .expect("connect should not timeout")
+        .expect("connect should succeed");
+
+    let _peer_b = timeout(
+        CONNECT_TIMEOUT,
+        node_a.wait_for_peer_identity(&channel_id, CONNECT_TIMEOUT),
+    )
+    .await
+    .expect("identity exchange should not timeout")
+    .expect("identity exchange should succeed");
+
+    // Wait for the OBSERVED_ADDRESS frame to populate node_a's reflexive
+    // address. This is the moment the wildcard-bind path becomes useful.
+    let observed = wait_for_observed_external_address(&node_a, OBSERVED_ADDRESS_TIMEOUT).await;
+
+    assert!(
+        observed.is_some(),
+        "node_a should have received an OBSERVED_ADDRESS frame from node_b within \
+         {OBSERVED_ADDRESS_TIMEOUT:?} of identity exchange, but observed_external_address() \
+         is still None.\n\
+         \n\
+         Either the saorsa-transport address-discovery extension is not emitting \
+         OBSERVED_ADDRESS frames after handshake completion, or the frames are \
+         not being plumbed through to TransportHandle::observed_external_address(). \
+         Check src/transport/saorsa_transport_adapter.rs and the saorsa-transport \
+         connection layer."
+    );
+    let observed = observed.unwrap();
+
+    let self_entry = fetch_self_entry(&node_a).await;
+
+    assert!(
+        !self_entry.addresses.is_empty(),
+        "node_a's DHT self-entry should contain at least the observed address \
+         {observed} after peer connection, but is empty"
+    );
+
+    let dialable: Vec<&MultiAddr> = self_entry
+        .addresses
+        .iter()
+        .filter(|a| is_dialable(a))
+        .collect();
+
+    assert!(
+        !dialable.is_empty(),
+        "node_a's self-entry has {} address(es) but NONE are dialable: {:?}\n\
+         observed external address = {observed}",
+        self_entry.addresses.len(),
+        self_entry.addresses,
+    );
+
+    let observed_multi = MultiAddr::quic(observed);
+    assert!(
+        self_entry.addresses.contains(&observed_multi),
+        "node_a's self-entry does not include the observed external address \
+         {observed}.\n\
+         Published addresses: {:?}\n\
+         \n\
+         local_dht_node() is failing to read from \
+         transport.observed_external_address(). Without this, wildcard-bound \
+         nodes have no way to advertise themselves to the DHT.",
+        self_entry.addresses,
+    );
+
+    node_a.stop().await.expect("node_a.stop() should succeed");
+    node_b.stop().await.expect("node_b.stop() should succeed");
 }
