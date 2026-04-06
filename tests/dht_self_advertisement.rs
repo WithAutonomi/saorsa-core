@@ -176,6 +176,30 @@ async fn wait_for_observed_external_address(
     result.ok()
 }
 
+/// Polls `transport.cached_observed_external_address()` (cache-only,
+/// bypassing the live read) until it returns `Some` or the timeout expires.
+///
+/// Tests use this to wait for the broadcast `ExternalAddressDiscovered`
+/// event to be processed by the forwarder and recorded in the cache. The
+/// event is fired by saorsa-transport's `poll_discovery_task` on a 1-second
+/// tick, so a generous timeout is needed even though the live read may
+/// already return a value within tens of milliseconds.
+async fn wait_for_cached_observed_address(
+    node: &P2PNode,
+    deadline: Duration,
+) -> Option<SocketAddr> {
+    let result = timeout(deadline, async {
+        loop {
+            if let Some(addr) = node.transport().cached_observed_external_address() {
+                return addr;
+            }
+            tokio::time::sleep(OBSERVED_ADDRESS_POLL_INTERVAL).await;
+        }
+    })
+    .await;
+    result.ok()
+}
+
 // ---------------------------------------------------------------------------
 // Single-node tests: loopback bind path
 // ---------------------------------------------------------------------------
@@ -494,4 +518,132 @@ async fn wildcard_bind_publishes_observed_address_after_peer_connection() {
 
     node_a.stop().await.expect("node_a.stop() should succeed");
     node_b.stop().await.expect("node_b.stop() should succeed");
+}
+
+/// **REGRESSION TEST FOR THE OBSERVED-ADDRESS CACHE FALLBACK.**
+///
+/// `saorsa-transport` exposes the live observed external address only via
+/// active connections — when every connection drops, the live read returns
+/// `None`. Without a fallback, a node that briefly loses connectivity
+/// disappears from the DHT until reconnection.
+///
+/// `TransportHandle::observed_external_address()` therefore consults a
+/// cache populated by `P2pEvent::ExternalAddressDiscovered` events. After
+/// a connection drop the cache should still serve the most-recently-observed
+/// address, keeping the node visible to DHT queries.
+///
+/// This test:
+///
+/// 1. Connects two wildcard-bound nodes over loopback.
+/// 2. Waits for OBSERVED_ADDRESS to populate `node_a`'s reflexive address.
+/// 3. Records the observed value.
+/// 4. Stops `node_b`, which drops the only connection on `node_a`.
+/// 5. Waits for `node_a` to see zero connected peers (the live source is
+///    now empty).
+/// 6. Asserts `node_a.transport().observed_external_address()` still
+///    returns the same address — proving the cache fallback engaged.
+/// 7. Asserts `node_a`'s DHT self-entry still publishes the observed
+///    address, completing the end-to-end contract.
+#[tokio::test]
+async fn observed_address_cache_serves_fallback_after_connection_drop() {
+    let node_a = P2PNode::new(wildcard_mode_config())
+        .await
+        .expect("node_a creation should succeed");
+    let node_b = P2PNode::new(wildcard_mode_config())
+        .await
+        .expect("node_b creation should succeed");
+
+    node_a.start().await.expect("node_a.start() should succeed");
+    node_b.start().await.expect("node_b.start() should succeed");
+    tokio::time::sleep(POST_START_DELAY).await;
+
+    let dial_target = loopback_dial_target_for(&node_b).await;
+    let channel_id = timeout(CONNECT_TIMEOUT, node_a.connect_peer(&dial_target))
+        .await
+        .expect("connect should not timeout")
+        .expect("connect should succeed");
+    let _peer_b = timeout(
+        CONNECT_TIMEOUT,
+        node_a.wait_for_peer_identity(&channel_id, CONNECT_TIMEOUT),
+    )
+    .await
+    .expect("identity exchange should not timeout")
+    .expect("identity exchange should succeed");
+
+    // Step 2-3: wait for the OBSERVED_ADDRESS frame to flow all the way
+    // through to the cache. The live read can return a value as soon as
+    // the QUIC connection has stored an observed address, but the cache is
+    // populated by the broadcast `ExternalAddressDiscovered` event which
+    // is fired by saorsa-transport's `poll_discovery_task` on a 1-second
+    // tick. We poll the cache-only accessor so we know the broadcast event
+    // has been received and recorded *before* we disconnect.
+    let observed = wait_for_cached_observed_address(&node_a, OBSERVED_ADDRESS_TIMEOUT)
+        .await
+        .expect(
+            "ExternalAddressDiscovered event should reach the observed-address cache \
+             within the timeout. If this fails, either saorsa-transport's \
+             poll_discovery_task is not firing the broadcast event, or the \
+             ExternalAddressDiscovered branch in spawn_peer_address_update_forwarder \
+             is not feeding the cache.",
+        );
+
+    // Sanity check: while connected, the live read agrees with the cache.
+    assert_eq!(
+        node_a.transport().observed_external_address(),
+        Some(observed),
+        "live + cache should agree on the observed address while connected"
+    );
+
+    // Step 4: stop node_b. This drops the QUIC connection node_a was using
+    // as its only live source of observed-address data.
+    node_b.stop().await.expect("node_b.stop() should succeed");
+
+    // Step 5: wait for node_a to notice it has no live peers. Without this,
+    // the live `dual_node.get_observed_external_address()` may still return
+    // Some(...) because saorsa-transport's connection cleanup is async.
+    let drained = timeout(CONNECT_TIMEOUT, async {
+        loop {
+            if node_a.connected_peers().await.is_empty() {
+                return;
+            }
+            tokio::time::sleep(OBSERVED_ADDRESS_POLL_INTERVAL).await;
+        }
+    })
+    .await;
+    assert!(
+        drained.is_ok(),
+        "node_a should observe zero connected peers within {CONNECT_TIMEOUT:?} \
+         after stopping node_b"
+    );
+
+    // Step 6: the live source is now empty, so any value returned by
+    // `observed_external_address()` must be coming from the cache. It must
+    // match the address we recorded while the connection was live.
+    let after_drop = node_a.transport().observed_external_address();
+    assert_eq!(
+        after_drop,
+        Some(observed),
+        "observed_external_address() should still return the cached value \
+         {observed} after every live connection has dropped, but returned {after_drop:?}.\n\
+         \n\
+         Either the ExternalAddressDiscovered forwarder is not feeding the \
+         cache (check spawn_peer_address_update_forwarder in \
+         saorsa_transport_adapter.rs), or the fallback path in \
+         TransportHandle::observed_external_address() is not consulting it."
+    );
+
+    // Step 7: end-to-end — the DHT self-entry must still include the
+    // observed address, so peers querying us via the DHT can still find us
+    // even though we have no live connections.
+    let self_entry = fetch_self_entry(&node_a).await;
+    let observed_multi = MultiAddr::quic(observed);
+    assert!(
+        self_entry.addresses.contains(&observed_multi),
+        "node_a's DHT self-entry should still include the cached observed \
+         address {observed} after the live connection dropped.\n\
+         Published addresses: {:?}",
+        self_entry.addresses,
+    );
+
+    node_a.stop().await.expect("node_a.stop() should succeed");
 }

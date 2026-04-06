@@ -39,6 +39,7 @@
 //! automatically enables saorsa-transport's prometheus metrics collection.
 
 use crate::error::{GeoRejectionError, GeographicConfig};
+use crate::transport::observed_address_cache::ObservedAddressCache;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr, SocketAddrV6};
@@ -47,7 +48,7 @@ use std::time::Duration;
 use tokio::sync::{RwLock, broadcast};
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, trace};
+use tracing::{debug, info, trace, warn};
 
 // Import saorsa-transport types using the new LinkTransport API (0.14+)
 use saorsa_transport::{
@@ -203,17 +204,21 @@ impl P2PNetworkNode<P2pLinkTransport> {
     /// This method is specialized for P2pLinkTransport and uses the underlying
     /// P2pEndpoint's send() method which corresponds with recv() for proper
     /// bidirectional communication.
+    ///
+    /// On failure the underlying transport error is preserved via
+    /// `anyhow::Context` so callers can inspect the cause (e.g. QUIC
+    /// `peer did not acknowledge`, `open_uni failed`, `PeerNotFound`).
     pub async fn send_to_peer_optimized(&self, addr: &SocketAddr, data: &[u8]) -> Result<()> {
         trace!(
             "[QUIC SEND] endpoint().send() to {} ({} bytes)",
             addr,
             data.len()
         );
-        let result = self.transport.endpoint().send(addr, data).await;
-        if let Err(ref e) = result {
-            debug!("[QUIC SEND] send failed to {}: {}", addr, e);
-        }
-        result.map_err(|e| anyhow::anyhow!("Send failed: {e}"))
+        self.transport
+            .endpoint()
+            .send(addr, data)
+            .await
+            .with_context(|| format!("QUIC send to {} ({} bytes) failed", addr, data.len()))
     }
 
     /// Disconnect a specific peer, closing the underlying QUIC connection.
@@ -882,14 +887,30 @@ impl DualStackNetworkNode<P2pLinkTransport> {
         }
     }
 
-    /// Spawn background tasks that forward `P2pEvent::PeerAddressUpdated`
-    /// from each stack's `P2pEndpoint` into a channel.
+    /// Spawn background tasks that forward address-related `P2pEvent`s from
+    /// each stack's `P2pEndpoint` to the upper layers.
     ///
-    /// Call after construction. The returned receiver yields
-    /// `(peer_addr, advertised_addr)` pairs when any connected peer
-    /// advertises a new address via ADD_ADDRESS frames.
+    /// Three event flavours are bridged:
+    ///
+    /// - **`PeerAddressUpdated`**: a connected peer advertised a new
+    ///   reachable address via an ADD_ADDRESS frame (typically a relay).
+    ///   Returned via the first mpsc receiver as
+    ///   `(peer_connection_addr, advertised_addr)`.
+    /// - **`RelayEstablished`**: this node set up a MASQUE relay and now
+    ///   needs to publish the relay address to the K closest peers.
+    ///   Returned via the second mpsc receiver.
+    /// - **`ExternalAddressDiscovered`**: a peer reported the address it
+    ///   sees this node at, via a QUIC `OBSERVED_ADDRESS` frame. Recorded
+    ///   directly into the supplied [`ObservedAddressCache`] so the
+    ///   transport layer can fall back to it when no live connection has an
+    ///   observation. See the cache module for the frequency- and
+    ///   recency-aware selection algorithm.
+    ///
+    /// Other `P2pEvent` variants are not consumed by saorsa-core and are
+    /// silently ignored.
     pub fn spawn_peer_address_update_forwarder(
         &self,
+        observed_cache: Arc<parking_lot::Mutex<ObservedAddressCache>>,
     ) -> (
         tokio::sync::mpsc::UnboundedReceiver<(SocketAddr, SocketAddr)>,
         tokio::sync::mpsc::UnboundedReceiver<SocketAddr>,
@@ -900,6 +921,7 @@ impl DualStackNetworkNode<P2pLinkTransport> {
             let mut p2p_rx = node.transport.endpoint().subscribe();
             let tx_clone = tx.clone();
             let relay_tx_clone = relay_tx.clone();
+            let cache_clone = Arc::clone(&observed_cache);
             tokio::spawn(async move {
                 tracing::debug!("ADDR_FWD: peer address update forwarder started");
                 loop {
@@ -925,6 +947,21 @@ impl DualStackNetworkNode<P2pLinkTransport> {
                             );
                             let _ = relay_tx_clone.send(relay_addr);
                         }
+                        Ok(saorsa_transport::P2pEvent::ExternalAddressDiscovered { addr }) => {
+                            // Convert TransportAddr → SocketAddr for QUIC.
+                            // Non-UDP transports (BLE, LoRa) yield None and
+                            // are skipped — the cache only models routable
+                            // IP addresses.
+                            if let Some(socket_addr) = addr.as_socket_addr() {
+                                let normalized =
+                                    saorsa_transport::shared::normalize_socket_addr(socket_addr);
+                                tracing::debug!(
+                                    "ADDR_FWD: caching observed external address {}",
+                                    normalized
+                                );
+                                cache_clone.lock().record(normalized);
+                            }
+                        }
                         Err(broadcast::error::RecvError::Closed) => {
                             tracing::info!("ADDR_FWD: channel closed, exiting");
                             break;
@@ -934,7 +971,13 @@ impl DualStackNetworkNode<P2pLinkTransport> {
                             continue;
                         }
                         Ok(_other) => {
-                            tracing::trace!("ADDR_FWD: ignoring non-address P2pEvent");
+                            // Other P2pEvent variants (PeerConnected,
+                            // PeerDisconnected, NatTraversalProgress,
+                            // BootstrapStatus, PeerAuthenticated,
+                            // DataReceived, …) are not consumed here.
+                            // They are observed via other channels or are
+                            // simply not relevant to saorsa-core.
+                            continue;
                         }
                     }
                 }
@@ -1053,15 +1096,21 @@ impl DualStackNetworkNode<P2pLinkTransport> {
     /// In dual-stack mode, converts plain IPv4 addresses to the mapped form
     /// expected by the v6 transport before sending.
     pub async fn send_to_peer_optimized(&self, addr: &SocketAddr, data: &[u8]) -> Result<()> {
+        // Preserve the underlying error(s) from the v6 and v4 stacks so the
+        // caller can surface them at WARN level. The previous implementation
+        // dropped both errors and returned a hardcoded
+        // "send_to_peer_optimized failed on both stacks" which made every
+        // transport failure look identical in the logs.
+        let mut v6_err: Option<anyhow::Error> = None;
+        let mut v4_err: Option<anyhow::Error> = None;
+
         if let Some(v6) = &self.v6 {
             let wire_addr = self.to_mapped_if_needed(addr);
             match v6.send_to_peer_optimized(&wire_addr, data).await {
                 Ok(()) => return Ok(()),
                 Err(e) => {
-                    trace!(
-                        "[DUAL SEND] IPv6 failed to {}, falling back to IPv4: {}",
-                        addr, e
-                    );
+                    warn!("[DUAL SEND] IPv6 send to {} failed: {:#}", addr, e);
+                    v6_err = Some(e);
                 }
             }
         }
@@ -1069,13 +1118,34 @@ impl DualStackNetworkNode<P2pLinkTransport> {
             match v4.send_to_peer_optimized(addr, data).await {
                 Ok(()) => return Ok(()),
                 Err(e) => {
-                    debug!("[DUAL SEND] IPv4 send failed to {}: {}", addr, e);
+                    warn!("[DUAL SEND] IPv4 send to {} failed: {:#}", addr, e);
+                    v4_err = Some(e);
                 }
             }
         }
-        Err(anyhow::anyhow!(
-            "send_to_peer_optimized failed on both stacks"
-        ))
+
+        // Produce a single error that preserves the full cause chain from
+        // whichever stack(s) were actually tried. In dual-stack-over-v6 mode
+        // (v4 is None) we don't lie about having tried v4.
+        let err = match (v6_err, v4_err) {
+            (Some(v6), Some(v4)) => v6.context(format!(
+                "send_to_peer_optimized to {} failed on both stacks (v4 cause: {:#})",
+                addr, v4
+            )),
+            (Some(v6), None) => v6.context(format!(
+                "send_to_peer_optimized to {} failed (v6-only: no v4 stack bound)",
+                addr
+            )),
+            (None, Some(v4)) => v4.context(format!(
+                "send_to_peer_optimized to {} failed (v4-only: no v6 stack bound)",
+                addr
+            )),
+            (None, None) => anyhow::anyhow!(
+                "send_to_peer_optimized to {}: neither v6 nor v4 stack available",
+                addr
+            ),
+        };
+        Err(err)
     }
 
     /// Disconnect a peer, closing the underlying QUIC connection.

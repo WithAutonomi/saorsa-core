@@ -22,3 +22,8 @@ pub mod saorsa_transport_adapter;
 
 // DHT protocol handler for SharedTransport integration
 pub mod dht_handler;
+
+// Observed-address cache: records `ExternalAddressDiscovered` events from the
+// transport layer and serves as a frequency- and recency-aware fallback when
+// no live connection has an observation.
+pub(crate) mod observed_address_cache;
