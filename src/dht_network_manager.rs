@@ -723,21 +723,23 @@ impl DhtNetworkManager {
         let key = *self.config.peer_id.as_bytes();
         let mut seen = HashSet::new();
         for peer_id in peers {
+            // Resolve the bootstrap peer's socket address so we can set it as
+            // the preferred coordinator for any peers it returns. The bootstrap
+            // peer has connections to those peers, making it a good relay.
+            let bootstrap_addr = self
+                .peer_addresses_for_dial(peer_id)
+                .await
+                .first()
+                .and_then(|a| a.dialable_socket_addr());
+
+            // The bootstrap peer is the natural NAT-traversal referrer for
+            // every node it returns: it has a live connection to us (we just
+            // queried it) and presumably also to the nodes it tells us about.
+            // Passing its socket address as the preferred coordinator lets
+            // hole-punch PUNCH_ME_NOW be relayed through it.
             let op = DhtNetworkOperation::FindNode { key };
             match self.send_dht_request(peer_id, op, None).await {
                 Ok(DhtNetworkResult::NodesFound { nodes, .. }) => {
-                    // The bootstrap peer is the natural NAT-traversal
-                    // referrer for every node it returned: it has a live
-                    // connection to us (we just queried it) and presumably
-                    // also to the nodes it just told us about. Pass its
-                    // socket address as the preferred coordinator so
-                    // hole-punch PUNCH_ME_NOW can be relayed through it.
-                    let bootstrap_referrer: Option<SocketAddr> = self
-                        .peer_addresses_for_dial(peer_id)
-                        .await
-                        .into_iter()
-                        .find_map(|a| a.dialable_socket_addr());
-
                     for node in &nodes {
                         let dialable = Self::dialable_addresses(&node.addresses);
                         debug!(
@@ -747,7 +749,7 @@ impl DhtNetworkManager {
                             dialable.len()
                         );
                         if seen.insert(node.peer_id) && !dialable.is_empty() {
-                            self.dial_addresses(&node.peer_id, &node.addresses, bootstrap_referrer)
+                            self.dial_addresses(&node.peer_id, &node.addresses, bootstrap_addr)
                                 .await;
                         }
                     }
