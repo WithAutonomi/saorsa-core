@@ -364,6 +364,19 @@ impl TransportHandle {
         self.listen_addrs.read().await.clone()
     }
 
+    /// Returns the node's externally-observed address as reported by peers
+    /// (via QUIC `OBSERVED_ADDRESS` frames), or `None` if no peer has yet
+    /// observed this node.
+    ///
+    /// This is the most authoritative source of the node's reflexive
+    /// (post-NAT) address — it is the address remote peers actually saw the
+    /// connection arrive from. Prefer it over `listen_addrs()` (which only
+    /// reflects locally-bound socket addresses) when advertising the node to
+    /// the rest of the network.
+    pub fn observed_external_address(&self) -> Option<SocketAddr> {
+        self.dual_node.get_observed_external_address()
+    }
+
     /// Get the connection timeout duration.
     pub fn connection_timeout(&self) -> Duration {
         self.connection_timeout
@@ -519,6 +532,31 @@ impl TransportHandle {
         rx.try_recv().ok()
     }
 
+    /// Wait for the next peer-address update from an ADD_ADDRESS frame.
+    ///
+    /// Returns `(peer_connection_addr, advertised_addr)` when one arrives,
+    /// or `None` if the underlying channel has closed (transport shut down).
+    ///
+    /// Use this in a `tokio::select!` against a shutdown token to react to
+    /// address updates immediately instead of polling.
+    pub async fn recv_peer_address_update(&self) -> Option<(SocketAddr, SocketAddr)> {
+        let mut rx = self.peer_address_update_rx.lock().await;
+        rx.recv().await
+    }
+
+    /// Wait for the next relay-established event.
+    ///
+    /// Resolves when this node has just set up a MASQUE relay (yielding
+    /// the relay socket address), or `None` if the underlying channel has
+    /// closed (transport shut down).
+    ///
+    /// Use this in a `tokio::select!` against a shutdown token to react to
+    /// relay establishment immediately instead of polling.
+    pub async fn recv_relay_established(&self) -> Option<SocketAddr> {
+        let mut rx = self.relay_established_rx.lock().await;
+        rx.recv().await
+    }
+
     /// Check if an authenticated peer is connected (has at least one active
     /// channel).
     pub async fn is_peer_connected(&self, peer_id: &PeerId) -> bool {
@@ -580,7 +618,9 @@ impl TransportHandle {
     /// Set the target peer ID for a hole-punch attempt to a specific address.
     /// See [`P2pEndpoint::set_hole_punch_target_peer_id`].
     pub async fn set_hole_punch_target_peer_id(&self, target: SocketAddr, peer_id: [u8; 32]) {
-        self.dual_node.set_hole_punch_target_peer_id(target, peer_id).await;
+        self.dual_node
+            .set_hole_punch_target_peer_id(target, peer_id)
+            .await;
     }
 
     /// Set a preferred coordinator for hole-punching to a specific target.
