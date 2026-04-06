@@ -62,7 +62,16 @@ const SELF_RELIABILITY_SCORE: f64 = 1.0;
 
 /// Maximum time to wait for the identity-exchange handshake after dialling
 /// a peer. The actual timeout is `min(request_timeout, this)`.
-const IDENTITY_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(5);
+///
+/// Identity exchange is two RTTs over a freshly-handshaken QUIC connection
+/// plus an ML-DSA-65 signature verification. On a LAN this completes in
+/// well under a second; on congested cellular or cross-region links it can
+/// blow past 5s with retransmits. Kept in lockstep with
+/// `BOOTSTRAP_IDENTITY_TIMEOUT_SECS` in `network.rs` — both budgets exist
+/// to absorb the same slow-link failure mode (the bootstrap variant covers
+/// the initial join, this one covers every subsequent peer dial via
+/// `send_dht_request`).
+const IDENTITY_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Maximum time to wait for a stale peer's ping response during admission contention.
 const STALE_REVALIDATION_TIMEOUT: Duration = Duration::from_secs(1);
