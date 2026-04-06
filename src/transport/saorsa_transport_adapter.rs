@@ -39,15 +39,17 @@
 //! automatically enables saorsa-transport's prometheus metrics collection.
 
 use crate::error::{GeoRejectionError, GeographicConfig};
+use crate::transport::observed_address_cache::ObservedAddressCache;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr, SocketAddrV6};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::{RwLock, broadcast};
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, trace};
+use tracing::{debug, info, trace, warn};
 
 // Import saorsa-transport types using the new LinkTransport API (0.14+)
 use saorsa_transport::{
@@ -124,6 +126,51 @@ pub struct P2PNetworkNode<T: LinkTransport = P2pLinkTransport> {
 /// Default maximum number of concurrent QUIC connections when not
 /// explicitly configured.
 pub const DEFAULT_MAX_CONNECTIONS: usize = 100;
+
+/// Bounded capacity for the relay/peer-address forwarder mpsc channels.
+///
+/// Replaces the previous `unbounded_channel` so a slow consumer (e.g. the
+/// DHT bridge while running an iterative lookup) cannot grow the queue
+/// without limit. When the channel is full the forwarder logs and drops
+/// the event rather than blocking the receive loop, so we still keep
+/// processing newer events.
+pub const ADDRESS_EVENT_CHANNEL_CAPACITY: usize = 256;
+
+/// Log a warning every Nth dropped address-event in the forwarder.
+///
+/// `try_send` failures (channel full) increment a counter; logging at
+/// every drop would flood the log under sustained pressure, so we
+/// coalesce to one warning per `ADDRESS_EVENT_DROP_LOG_INTERVAL` drops.
+const ADDRESS_EVENT_DROP_LOG_INTERVAL: u64 = 32;
+
+/// Increment the drop counter and log periodically when the address-event
+/// forwarder fails to push into a bounded channel.
+///
+/// Used by the forwarder loop in
+/// [`DualStackNetworkNode::spawn_peer_address_update_forwarder`] when the
+/// downstream consumer is too slow to drain. Drops are coalesced to one
+/// warning per [`ADDRESS_EVENT_DROP_LOG_INTERVAL`] events to avoid log
+/// floods under sustained backpressure; the very first drop in any burst
+/// is always logged so operators see the onset.
+fn handle_address_event_drop<T>(
+    counter: &AtomicU64,
+    event_kind: &'static str,
+    err: &tokio::sync::mpsc::error::TrySendError<T>,
+) {
+    let prev = counter.fetch_add(1, Ordering::Relaxed);
+    let kind = match err {
+        tokio::sync::mpsc::error::TrySendError::Full(_) => "channel full",
+        tokio::sync::mpsc::error::TrySendError::Closed(_) => "consumer closed",
+    };
+    if prev.is_multiple_of(ADDRESS_EVENT_DROP_LOG_INTERVAL) {
+        tracing::warn!(
+            event = event_kind,
+            reason = kind,
+            total_drops = prev + 1,
+            "ADDR_FWD: dropped address event"
+        );
+    }
+}
 
 #[allow(dead_code)]
 impl P2PNetworkNode<P2pLinkTransport> {
@@ -203,17 +250,21 @@ impl P2PNetworkNode<P2pLinkTransport> {
     /// This method is specialized for P2pLinkTransport and uses the underlying
     /// P2pEndpoint's send() method which corresponds with recv() for proper
     /// bidirectional communication.
+    ///
+    /// On failure the underlying transport error is preserved via
+    /// `anyhow::Context` so callers can inspect the cause (e.g. QUIC
+    /// `peer did not acknowledge`, `open_uni failed`, `PeerNotFound`).
     pub async fn send_to_peer_optimized(&self, addr: &SocketAddr, data: &[u8]) -> Result<()> {
         trace!(
             "[QUIC SEND] endpoint().send() to {} ({} bytes)",
             addr,
             data.len()
         );
-        let result = self.transport.endpoint().send(addr, data).await;
-        if let Err(ref e) = result {
-            debug!("[QUIC SEND] send failed to {}: {}", addr, e);
-        }
-        result.map_err(|e| anyhow::anyhow!("Send failed: {e}"))
+        self.transport
+            .endpoint()
+            .send(addr, data)
+            .await
+            .with_context(|| format!("QUIC send to {} ({} bytes) failed", addr, data.len()))
     }
 
     /// Disconnect a specific peer, closing the underlying QUIC connection.
@@ -882,26 +933,51 @@ impl DualStackNetworkNode<P2pLinkTransport> {
         }
     }
 
-    /// Spawn background tasks that forward `P2pEvent::PeerAddressUpdated`
-    /// from each stack's `P2pEndpoint` into a channel.
+    /// Spawn background tasks that forward address-related `P2pEvent`s from
+    /// each stack's `P2pEndpoint` to the upper layers.
     ///
-    /// Call after construction. The returned receiver yields
-    /// `(peer_addr, advertised_addr)` pairs when any connected peer
-    /// advertises a new address via ADD_ADDRESS frames.
+    /// Three event flavours are bridged:
+    ///
+    /// - **`PeerAddressUpdated`**: a connected peer advertised a new
+    ///   reachable address via an ADD_ADDRESS frame (typically a relay).
+    ///   Returned via the first mpsc receiver as
+    ///   `(peer_connection_addr, advertised_addr)`.
+    /// - **`RelayEstablished`**: this node set up a MASQUE relay and now
+    ///   needs to publish the relay address to the K closest peers.
+    ///   Returned via the second mpsc receiver.
+    /// - **`ExternalAddressDiscovered`**: a peer reported the address it
+    ///   sees this node at, via a QUIC `OBSERVED_ADDRESS` frame. Recorded
+    ///   directly into the supplied [`ObservedAddressCache`] so the
+    ///   transport layer can fall back to it when no live connection has an
+    ///   observation. See the cache module for the frequency- and
+    ///   recency-aware selection algorithm.
+    ///
+    /// Other `P2pEvent` variants are not consumed by saorsa-core and are
+    /// silently ignored.
     pub fn spawn_peer_address_update_forwarder(
         &self,
+        observed_cache: Arc<parking_lot::Mutex<ObservedAddressCache>>,
     ) -> (
-        tokio::sync::mpsc::UnboundedReceiver<(SocketAddr, SocketAddr)>,
-        tokio::sync::mpsc::UnboundedReceiver<SocketAddr>,
+        tokio::sync::mpsc::Receiver<(SocketAddr, SocketAddr)>,
+        tokio::sync::mpsc::Receiver<SocketAddr>,
     ) {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let (relay_tx, relay_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, rx) = tokio::sync::mpsc::channel(ADDRESS_EVENT_CHANNEL_CAPACITY);
+        let (relay_tx, relay_rx) = tokio::sync::mpsc::channel(ADDRESS_EVENT_CHANNEL_CAPACITY);
+        let drop_counter = Arc::new(AtomicU64::new(0));
         for node in [&self.v6, &self.v4].into_iter().flatten() {
             let mut p2p_rx = node.transport.endpoint().subscribe();
             let tx_clone = tx.clone();
             let relay_tx_clone = relay_tx.clone();
+            let cache_clone = Arc::clone(&observed_cache);
+            let drops = Arc::clone(&drop_counter);
+            // Capture which local bind owns this forwarder so the cache can
+            // partition observations by interface (multi-homed correctness).
+            let local_bind = node.local_address();
             tokio::spawn(async move {
-                tracing::debug!("ADDR_FWD: peer address update forwarder started");
+                tracing::debug!(
+                    local_bind = %local_bind,
+                    "ADDR_FWD: peer address update forwarder started"
+                );
                 loop {
                     match p2p_rx.recv().await {
                         Ok(saorsa_transport::P2pEvent::PeerAddressUpdated {
@@ -913,17 +989,38 @@ impl DualStackNetworkNode<P2pLinkTransport> {
                                 peer_addr,
                                 advertised_addr
                             );
-                            let _ = tx_clone.send((
+                            let payload = (
                                 saorsa_transport::shared::normalize_socket_addr(peer_addr),
                                 saorsa_transport::shared::normalize_socket_addr(advertised_addr),
-                            ));
+                            );
+                            if let Err(err) = tx_clone.try_send(payload) {
+                                handle_address_event_drop(&drops, "PeerAddressUpdated", &err);
+                            }
                         }
                         Ok(saorsa_transport::P2pEvent::RelayEstablished { relay_addr }) => {
                             tracing::info!(
                                 "ADDR_FWD: received RelayEstablished relay_addr={}",
                                 relay_addr
                             );
-                            let _ = relay_tx_clone.send(relay_addr);
+                            if let Err(err) = relay_tx_clone.try_send(relay_addr) {
+                                handle_address_event_drop(&drops, "RelayEstablished", &err);
+                            }
+                        }
+                        Ok(saorsa_transport::P2pEvent::ExternalAddressDiscovered { addr }) => {
+                            // Convert TransportAddr → SocketAddr for QUIC.
+                            // Non-UDP transports (BLE, LoRa) yield None and
+                            // are skipped — the cache only models routable
+                            // IP addresses.
+                            if let Some(socket_addr) = addr.as_socket_addr() {
+                                let normalized =
+                                    saorsa_transport::shared::normalize_socket_addr(socket_addr);
+                                tracing::debug!(
+                                    local_bind = %local_bind,
+                                    "ADDR_FWD: caching observed external address {}",
+                                    normalized
+                                );
+                                cache_clone.lock().record(local_bind, normalized);
+                            }
                         }
                         Err(broadcast::error::RecvError::Closed) => {
                             tracing::info!("ADDR_FWD: channel closed, exiting");
@@ -934,7 +1031,13 @@ impl DualStackNetworkNode<P2pLinkTransport> {
                             continue;
                         }
                         Ok(_other) => {
-                            tracing::trace!("ADDR_FWD: ignoring non-address P2pEvent");
+                            // Other P2pEvent variants (PeerConnected,
+                            // PeerDisconnected, NatTraversalProgress,
+                            // BootstrapStatus, PeerAuthenticated,
+                            // DataReceived, …) are not consumed here.
+                            // They are observed via other channels or are
+                            // simply not relevant to saorsa-core.
+                            continue;
                         }
                     }
                 }
@@ -1053,15 +1156,21 @@ impl DualStackNetworkNode<P2pLinkTransport> {
     /// In dual-stack mode, converts plain IPv4 addresses to the mapped form
     /// expected by the v6 transport before sending.
     pub async fn send_to_peer_optimized(&self, addr: &SocketAddr, data: &[u8]) -> Result<()> {
+        // Preserve the underlying error(s) from the v6 and v4 stacks so the
+        // caller can surface them at WARN level. The previous implementation
+        // dropped both errors and returned a hardcoded
+        // "send_to_peer_optimized failed on both stacks" which made every
+        // transport failure look identical in the logs.
+        let mut v6_err: Option<anyhow::Error> = None;
+        let mut v4_err: Option<anyhow::Error> = None;
+
         if let Some(v6) = &self.v6 {
             let wire_addr = self.to_mapped_if_needed(addr);
             match v6.send_to_peer_optimized(&wire_addr, data).await {
                 Ok(()) => return Ok(()),
                 Err(e) => {
-                    trace!(
-                        "[DUAL SEND] IPv6 failed to {}, falling back to IPv4: {}",
-                        addr, e
-                    );
+                    warn!("[DUAL SEND] IPv6 send to {} failed: {:#}", addr, e);
+                    v6_err = Some(e);
                 }
             }
         }
@@ -1069,13 +1178,34 @@ impl DualStackNetworkNode<P2pLinkTransport> {
             match v4.send_to_peer_optimized(addr, data).await {
                 Ok(()) => return Ok(()),
                 Err(e) => {
-                    debug!("[DUAL SEND] IPv4 send failed to {}: {}", addr, e);
+                    warn!("[DUAL SEND] IPv4 send to {} failed: {:#}", addr, e);
+                    v4_err = Some(e);
                 }
             }
         }
-        Err(anyhow::anyhow!(
-            "send_to_peer_optimized failed on both stacks"
-        ))
+
+        // Produce a single error that preserves the full cause chain from
+        // whichever stack(s) were actually tried. In dual-stack-over-v6 mode
+        // (v4 is None) we don't lie about having tried v4.
+        let err = match (v6_err, v4_err) {
+            (Some(v6), Some(v4)) => v6.context(format!(
+                "send_to_peer_optimized to {} failed on both stacks (v4 cause: {:#})",
+                addr, v4
+            )),
+            (Some(v6), None) => v6.context(format!(
+                "send_to_peer_optimized to {} failed (v6-only: no v4 stack bound)",
+                addr
+            )),
+            (None, Some(v4)) => v4.context(format!(
+                "send_to_peer_optimized to {} failed (v4-only: no v6 stack bound)",
+                addr
+            )),
+            (None, None) => anyhow::anyhow!(
+                "send_to_peer_optimized to {}: neither v6 nor v4 stack available",
+                addr
+            ),
+        };
+        Err(err)
     }
 
     /// Disconnect a peer, closing the underlying QUIC connection.
@@ -1417,6 +1547,27 @@ impl<T: LinkTransport + Send + Sync + 'static> DualStackNetworkNode<T> {
                     .and_then(|v6| v6.get_observed_external_address())
             });
         raw.map(|a| self.normalize(a))
+    }
+
+    /// Return observed external addresses for **every** stack that has one.
+    ///
+    /// Multi-homed publishing path: each stack (v4 / v6) is queried
+    /// independently and any address it reports is included in the
+    /// returned list (deduped, normalised). A multi-homed host that has
+    /// observations on both v4 and v6 will return both — `local_dht_node`
+    /// then publishes both so peers reaching the host on either family
+    /// can dial it.
+    pub fn get_observed_external_addresses(&self) -> Vec<SocketAddr> {
+        let mut out: Vec<SocketAddr> = Vec::new();
+        for stack in [self.v4.as_ref(), self.v6.as_ref()].into_iter().flatten() {
+            if let Some(raw) = stack.get_observed_external_address() {
+                let normalized = self.normalize(raw);
+                if !out.contains(&normalized) {
+                    out.push(normalized);
+                }
+            }
+        }
+        out
     }
 }
 

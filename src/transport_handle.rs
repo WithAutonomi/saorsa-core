@@ -28,6 +28,7 @@ use crate::network::{
     RequestResponseEnvelope, WireMessage, broadcast_event, normalize_wildcard_to_loopback,
     parse_protocol_message, register_new_channel,
 };
+use crate::transport::observed_address_cache::ObservedAddressCache;
 use crate::transport::saorsa_transport_adapter::{ConnectionEvent, DualStackNetworkNode};
 use crate::validation::{RateLimitConfig, RateLimiter};
 
@@ -117,10 +118,24 @@ pub struct TransportHandle {
     geo_provider: Arc<BgpGeoProvider>,
     shutdown: CancellationToken,
     /// Peer address updates from ADD_ADDRESS frames (relay address advertisement).
+    ///
+    /// Bounded mpsc — see
+    /// [`crate::transport::saorsa_transport_adapter::ADDRESS_EVENT_CHANNEL_CAPACITY`].
+    /// The producer (`spawn_peer_address_update_forwarder`) drops events
+    /// rather than blocking when the consumer is slow.
     peer_address_update_rx:
-        tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<(SocketAddr, SocketAddr)>>,
+        tokio::sync::Mutex<tokio::sync::mpsc::Receiver<(SocketAddr, SocketAddr)>>,
     /// Relay established events — received when this node sets up a MASQUE relay.
-    relay_established_rx: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<SocketAddr>>,
+    ///
+    /// Bounded mpsc with the same drop semantics as
+    /// `peer_address_update_rx`.
+    relay_established_rx: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<SocketAddr>>,
+    /// Frequency- and recency-aware cache of externally-observed addresses.
+    /// Populated by the address-update forwarder from
+    /// `P2pEvent::ExternalAddressDiscovered` frames; consulted as a fallback
+    /// by [`Self::observed_external_address`] when no live connection has
+    /// an observation. Survives connection drops; reset on process restart.
+    observed_address_cache: Arc<parking_lot::Mutex<ObservedAddressCache>>,
     connection_timeout: Duration,
     connection_monitor_handle: Arc<RwLock<Option<JoinHandle<()>>>>,
     recv_handles: Arc<RwLock<Vec<JoinHandle<()>>>>,
@@ -193,12 +208,20 @@ impl TransportHandle {
 
         let shutdown = CancellationToken::new();
 
-        // Subscribe to P2pEvent::PeerAddressUpdated from the transport layer.
-        // These are forwarded from ADD_ADDRESS frames when a peer advertises
-        // a new reachable address (e.g., relay). The P2PNode reads these and
-        // updates the DHT routing table.
+        // Cache for externally-observed addresses. The forwarder spawned
+        // below feeds this cache from `P2pEvent::ExternalAddressDiscovered`
+        // events; the cache becomes the fallback for
+        // `observed_external_address()` when no live connection has an
+        // observation (see TransportHandle::observed_external_address).
+        let observed_address_cache = Arc::new(parking_lot::Mutex::new(ObservedAddressCache::new()));
+
+        // Subscribe to address-related P2pEvents from the transport layer:
+        //   - PeerAddressUpdated → mpsc, drained by the DHT bridge
+        //   - RelayEstablished → mpsc, drained by the DHT bridge
+        //   - ExternalAddressDiscovered → recorded directly into the
+        //     observed-address cache above
         let (peer_addr_update_rx, relay_established_rx) =
-            dual_node.spawn_peer_address_update_forwarder();
+            dual_node.spawn_peer_address_update_forwarder(Arc::clone(&observed_address_cache));
 
         // Subscribe to connection events BEFORE spawning the monitor task
         let connection_event_rx = dual_node.subscribe_connection_events();
@@ -254,6 +277,7 @@ impl TransportHandle {
             shutdown,
             peer_address_update_rx: tokio::sync::Mutex::new(peer_addr_update_rx),
             relay_established_rx: tokio::sync::Mutex::new(relay_established_rx),
+            observed_address_cache,
             connection_timeout: config.connection_timeout,
             connection_monitor_handle,
             recv_handles: Arc::new(RwLock::new(Vec::new())),
@@ -316,13 +340,18 @@ impl TransportHandle {
             geo_provider: Arc::new(BgpGeoProvider::new()),
             shutdown: CancellationToken::new(),
             peer_address_update_rx: {
-                let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                let (_tx, rx) = tokio::sync::mpsc::channel(
+                    crate::transport::saorsa_transport_adapter::ADDRESS_EVENT_CHANNEL_CAPACITY,
+                );
                 tokio::sync::Mutex::new(rx)
             },
             relay_established_rx: {
-                let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                let (_tx, rx) = tokio::sync::mpsc::channel(
+                    crate::transport::saorsa_transport_adapter::ADDRESS_EVENT_CHANNEL_CAPACITY,
+                );
                 tokio::sync::Mutex::new(rx)
             },
+            observed_address_cache: Arc::new(parking_lot::Mutex::new(ObservedAddressCache::new())),
             connection_timeout: Duration::from_secs(TEST_CONNECTION_TIMEOUT_SECS),
             connection_monitor_handle: Arc::new(RwLock::new(None)),
             recv_handles: Arc::new(RwLock::new(Vec::new())),
@@ -362,6 +391,85 @@ impl TransportHandle {
     /// Get all current listen addresses.
     pub async fn listen_addrs(&self) -> Vec<MultiAddr> {
         self.listen_addrs.read().await.clone()
+    }
+
+    /// Returns the node's externally-observed address as reported by peers
+    /// (via QUIC `OBSERVED_ADDRESS` frames), or `None` if no peer has ever
+    /// observed this node since process start.
+    ///
+    /// This is the most authoritative source of the node's reflexive
+    /// (post-NAT) address — it is the address remote peers actually saw the
+    /// connection arrive from. Prefer it over `listen_addrs()` (which only
+    /// reflects locally-bound socket addresses) when advertising the node to
+    /// the rest of the network.
+    ///
+    /// ## Resolution order
+    ///
+    /// 1. **Live**: ask `dual_node.get_observed_external_address()` first.
+    ///    This iterates currently-active connections and returns the
+    ///    observation from the first one (preferring known/bootstrap peers
+    ///    inside saorsa-transport). When at least one connection is up,
+    ///    this is always the freshest answer.
+    /// 2. **Cache**: if no live connection has an observation (e.g. every
+    ///    connection has just dropped during a network blip), fall back to
+    ///    the in-memory [`ObservedAddressCache`]. The cache returns the
+    ///    most-frequently-observed address among recent entries, breaking
+    ///    ties by recency. See `observed_address_cache.rs` for the full
+    ///    selection algorithm and rationale.
+    ///
+    /// The cache is populated by the `ExternalAddressDiscovered` forwarder
+    /// spawned in [`Self::new`]; it survives connection drops but is reset
+    /// on process restart.
+    pub fn observed_external_address(&self) -> Option<SocketAddr> {
+        // Prefer the plural accessor's first entry so the single-address
+        // path stays consistent with multi-homed publishing.
+        self.observed_external_addresses().into_iter().next()
+    }
+
+    /// Return **all** externally-observed addresses for this node, one per
+    /// local interface that has an observation.
+    ///
+    /// Resolution order matches [`Self::observed_external_address`]:
+    ///
+    /// 1. **Live**: query each stack on `dual_node` independently (v4 and
+    ///    v6) and collect any address it reports.
+    /// 2. **Cache fallback**: for each `(local_bind, observed)` partition
+    ///    in the [`ObservedAddressCache`] that has no live observation
+    ///    yet, append the cache's per-bind best.
+    ///
+    /// The returned list is deduped — if the live source and the cache
+    /// both report the same address, it appears only once. Order is not
+    /// part of the contract; callers that need a specific priority should
+    /// sort the result themselves.
+    ///
+    /// This is the right entry point for publishing the node's self-entry
+    /// to the DHT on a multi-homed host: peers reaching the node via any
+    /// interface in the returned list will be able to dial back.
+    pub fn observed_external_addresses(&self) -> Vec<SocketAddr> {
+        let mut out: Vec<SocketAddr> = self.dual_node.get_observed_external_addresses();
+        let cached = self
+            .observed_address_cache
+            .lock()
+            .most_frequent_recent_per_local_bind();
+        for addr in cached {
+            if !out.contains(&addr) {
+                out.push(addr);
+            }
+        }
+        out
+    }
+
+    /// Returns the cache-only fallback for the observed external address,
+    /// bypassing the live `dual_node` read entirely.
+    ///
+    /// Production code should call [`Self::observed_external_address`]
+    /// instead — it prefers the live source and only consults the cache
+    /// when no live observation is available. This accessor exists so that
+    /// integration tests can poll for cache population without having to
+    /// race the periodic poll task in saorsa-transport that drives the
+    /// `ExternalAddressDiscovered` event stream.
+    pub fn cached_observed_external_address(&self) -> Option<SocketAddr> {
+        self.observed_address_cache.lock().most_frequent_recent()
     }
 
     /// Get the connection timeout duration.
@@ -519,6 +627,31 @@ impl TransportHandle {
         rx.try_recv().ok()
     }
 
+    /// Wait for the next peer-address update from an ADD_ADDRESS frame.
+    ///
+    /// Returns `(peer_connection_addr, advertised_addr)` when one arrives,
+    /// or `None` if the underlying channel has closed (transport shut down).
+    ///
+    /// Use this in a `tokio::select!` against a shutdown token to react to
+    /// address updates immediately instead of polling.
+    pub async fn recv_peer_address_update(&self) -> Option<(SocketAddr, SocketAddr)> {
+        let mut rx = self.peer_address_update_rx.lock().await;
+        rx.recv().await
+    }
+
+    /// Wait for the next relay-established event.
+    ///
+    /// Resolves when this node has just set up a MASQUE relay (yielding
+    /// the relay socket address), or `None` if the underlying channel has
+    /// closed (transport shut down).
+    ///
+    /// Use this in a `tokio::select!` against a shutdown token to react to
+    /// relay establishment immediately instead of polling.
+    pub async fn recv_relay_established(&self) -> Option<SocketAddr> {
+        let mut rx = self.relay_established_rx.lock().await;
+        rx.recv().await
+    }
+
     /// Check if an authenticated peer is connected (has at least one active
     /// channel).
     pub async fn is_peer_connected(&self, peer_id: &PeerId) -> bool {
@@ -580,7 +713,9 @@ impl TransportHandle {
     /// Set the target peer ID for a hole-punch attempt to a specific address.
     /// See [`P2pEndpoint::set_hole_punch_target_peer_id`].
     pub async fn set_hole_punch_target_peer_id(&self, target: SocketAddr, peer_id: [u8; 32]) {
-        self.dual_node.set_hole_punch_target_peer_id(target, peer_id).await;
+        self.dual_node
+            .set_hole_punch_target_peer_id(target, peer_id)
+            .await;
     }
 
     /// Set a preferred coordinator for hole-punching to a specific target.

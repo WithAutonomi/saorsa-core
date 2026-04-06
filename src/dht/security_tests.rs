@@ -186,7 +186,6 @@ async fn test_ipv4_ip_override_raises_limit() -> anyhow::Result<()> {
     engine.set_ip_diversity_config(IPDiversityConfig {
         max_per_ip: Some(3),
         max_per_subnet: Some(usize::MAX),
-        ..IPDiversityConfig::default()
     });
 
     for i in 1..=3u8 {
