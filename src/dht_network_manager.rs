@@ -97,6 +97,20 @@ const BUCKET_REFRESH_INTERVAL: Duration = Duration::from_secs(600); // 10 minute
 /// Routing table size below which automatic re-bootstrap is triggered.
 const AUTO_REBOOTSTRAP_THRESHOLD: usize = 3;
 
+/// Maximum number of distinct referrers stored per discovered peer during an
+/// iterative DHT lookup. The list is ranked at dial-time to pick the best
+/// hole-punch coordinator candidate (see [`DhtNetworkManager::select_best_referrer`]).
+///
+/// Bound exists to cap per-lookup memory; in practice 4 is more than enough
+/// because Kademlia typically converges before any peer is referred more than
+/// 2-3 times within a single lookup. Compile-time asserted >= 2 because
+/// collecting only one referrer would defeat the purpose of ranking.
+const MAX_REFERRERS_PER_TARGET: usize = 4;
+const _: () = assert!(
+    MAX_REFERRERS_PER_TARGET >= 2,
+    "MAX_REFERRERS_PER_TARGET must be >= 2 for ranking to matter"
+);
+
 /// Minimum time between consecutive auto re-bootstrap attempts.
 const REBOOTSTRAP_COOLDOWN: Duration = Duration::from_secs(300); // 5 minutes
 
@@ -261,6 +275,29 @@ pub struct DhtNetworkManager {
     /// Timestamp of the last automatic re-bootstrap attempt, guarded by a
     /// cooldown to avoid hammering bootstrap peers during transient churn.
     last_rebootstrap: tokio::sync::Mutex<Option<Instant>>,
+}
+
+/// One observation of a peer being referred during an iterative DHT lookup.
+///
+/// When peer R answers a `FindNode` query and returns peer T, R becomes a
+/// referrer for T: R has T in its routing table and presumably has (or
+/// recently had) a connection to T, making R a good candidate to coordinate
+/// hole-punching to T.
+///
+/// During a single iterative lookup we collect up to
+/// [`MAX_REFERRERS_PER_TARGET`] referrers per discovered peer and rank them
+/// at dial-time via [`DhtNetworkManager::select_best_referrer`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ReferrerInfo {
+    /// Peer ID of the referring node (used for trust score lookup and tiebreak).
+    peer_id: PeerId,
+    /// Dialable socket address of the referring node — what we hand to
+    /// saorsa-transport as the preferred coordinator.
+    addr: SocketAddr,
+    /// 0-based iteration round in which this referral was observed.
+    /// Higher round = closer to the lookup target in XOR space = more likely
+    /// to actually have a live connection to the target.
+    round_observed: u32,
 }
 
 /// DHT operation context
@@ -714,29 +751,80 @@ impl DhtNetworkManager {
         min + jitter
     }
 
+    /// Return `[0, len)` in a per-call shuffled order using a Fisher-Yates
+    /// pass driven by [`PeerId::random()`] entropy.
+    ///
+    /// Used to randomise the order in which we visit a fixed input slice
+    /// (e.g. the bootstrap peer list in [`Self::bootstrap_from_peers`]) so
+    /// that across a fleet of nodes the load on any individual element of
+    /// the input is statistically uniform rather than concentrated on
+    /// `input[0]`.
+    ///
+    /// For `len <= 1` this returns a trivial unshuffled vector — there is
+    /// nothing to randomise. The entropy source is not cryptographically
+    /// secure but is more than sufficient for load distribution.
+    fn shuffled_indices(len: usize) -> Vec<usize> {
+        let mut indices: Vec<usize> = (0..len).collect();
+        if len <= 1 {
+            return indices;
+        }
+        // Build a 32-byte entropy buffer per call. PeerId::random() gives us
+        // 32 bytes, which covers ~16 two-byte swap decisions — well above
+        // the bootstrap-list sizes we expect (typically 2-5).
+        let entropy_owner = PeerId::random();
+        let entropy = entropy_owner.to_bytes();
+        let entropy_len = entropy.len();
+        // Fisher-Yates: for i from len-1 down to 1, swap indices[i] with
+        // indices[j] where j is uniform in [0, i].
+        for i in (1..len).rev() {
+            // Draw a 16-bit window (two bytes) instead of one byte. With a
+            // single byte the modulo bias `byte % (i + 1)` slightly
+            // over-represents low values whenever `(i + 1)` does not
+            // divide 256 — at i = 4 the bias on slot 0 is ~0.4%, which is
+            // exactly the opposite of the load-spreading goal. A 16-bit
+            // window cuts the bias to ~1/65536 for any realistic list
+            // size at zero added complexity.
+            let idx = (len - 1 - i) * 2;
+            let byte = ((entropy[idx % entropy_len] as usize) << 8)
+                | (entropy[(idx + 1) % entropy_len] as usize);
+            let j = byte % (i + 1);
+            indices.swap(i, j);
+        }
+        indices
+    }
+
     /// Perform DHT peer discovery from already-connected bootstrap peers.
     ///
     /// Sends FIND_NODE(self) to each peer using the DHT postcard protocol,
     /// then dials any newly-discovered candidates. Returns the total number
     /// of new peers discovered.
+    ///
+    /// **Coordinator selection note**: previously this function pinned the
+    /// bootstrap peer's socket address as the preferred hole-punch
+    /// coordinator for every peer it returned. That concentrated load on
+    /// the small handful of bootstrap nodes (since every cold-starting node
+    /// queried the same ones). The pinning is removed: subsequent
+    /// iterative DHT lookups via `find_closest_nodes_network` collect
+    /// referrers across multiple rounds and rank them via
+    /// [`Self::select_best_referrer`], naturally de-preferring round-0
+    /// bootstrap referrers as the routing table grows.
+    ///
+    /// **Iteration order**: bootstrap peers are visited in a per-call
+    /// shuffled order (PeerId-derived entropy) so that in a fleet of N
+    /// nodes with M bootstrap peers, each bootstrap is the "first asked"
+    /// by ~N/M peers rather than all N hitting `peers[0]`.
     pub async fn bootstrap_from_peers(&self, peers: &[PeerId]) -> Result<usize> {
         let key = *self.config.peer_id.as_bytes();
         let mut seen = HashSet::new();
-        for peer_id in peers {
-            // Resolve the bootstrap peer's socket address so we can set it as
-            // the preferred coordinator for any peers it returns. The bootstrap
-            // peer has connections to those peers, making it a good relay.
-            let bootstrap_addr = self
-                .peer_addresses_for_dial(peer_id)
-                .await
-                .first()
-                .and_then(|a| a.dialable_socket_addr());
-
-            // The bootstrap peer is the natural NAT-traversal referrer for
-            // every node it returns: it has a live connection to us (we just
-            // queried it) and presumably also to the nodes it tells us about.
-            // Passing its socket address as the preferred coordinator lets
-            // hole-punch PUNCH_ME_NOW be relayed through it.
+        let visit_order = Self::shuffled_indices(peers.len());
+        for &idx in &visit_order {
+            // `shuffled_indices(peers.len())` is guaranteed to return values
+            // in `[0, peers.len())`, so this `.get()` always succeeds. We
+            // use `.get()` rather than direct indexing to keep this code
+            // panic-free even if the contract changes in future.
+            let Some(peer_id) = peers.get(idx) else {
+                continue;
+            };
             let op = DhtNetworkOperation::FindNode { key };
             match self.send_dht_request(peer_id, op, None).await {
                 Ok(DhtNetworkResult::NodesFound { nodes, .. }) => {
@@ -749,7 +837,12 @@ impl DhtNetworkManager {
                             dialable.len()
                         );
                         if seen.insert(node.peer_id) && !dialable.is_empty() {
-                            self.dial_addresses(&node.peer_id, &node.addresses, bootstrap_addr)
+                            // Pass `None` as referrer: the bootstrap peer is no
+                            // longer hard-pinned as the hole-punch coordinator
+                            // for these freshly-discovered peers. The next
+                            // iterative lookup will populate proper referrers
+                            // via the round-aware ranking.
+                            self.dial_addresses(&node.peer_id, &node.addresses, None)
                                 .await;
                         }
                     }
@@ -971,12 +1064,18 @@ impl DhtNetworkManager {
         let target_key = DhtKey::from_bytes(*key);
         let mut queried_nodes: HashSet<PeerId> = HashSet::new();
         let mut best_nodes: Vec<DHTNode> = Vec::new();
-        // Track which peer referred us to each discovered peer. When node A
-        // responds to FindNode with node B, node A has B in its routing table
-        // and has a connection to B. We use A as the preferred coordinator
-        // when hole-punching to B.
-        let mut referrers: std::collections::HashMap<PeerId, std::net::SocketAddr> =
-            std::collections::HashMap::new();
+        // Track every peer that referred us to each discovered peer. When
+        // node R responds to FindNode with node T, R has T in its routing
+        // table and presumably has a connection to T — making R a candidate
+        // hole-punch coordinator for T.
+        //
+        // We collect up to MAX_REFERRERS_PER_TARGET observations and rank
+        // them at dial-time via `select_best_referrer`. The ranking prefers
+        // referrers seen in later iteration rounds (closer to the target in
+        // XOR space) over earlier rounds, which naturally de-prefers the
+        // round-0 bootstrap referrers without any explicit bootstrap
+        // tagging.
+        let mut referrers: HashMap<PeerId, Vec<ReferrerInfo>> = HashMap::new();
 
         // Kademlia correctness: the local node must compete on distance in the
         // final K-closest result, but we must never send an RPC to ourselves.
@@ -1050,7 +1149,12 @@ impl DhtNetworkManager {
                 .map(|node| {
                     let peer_id = node.peer_id;
                     let addresses = node.addresses.clone();
-                    let referrer = referrers.get(&peer_id).copied();
+                    // Pick the best-ranked referrer for this target as the
+                    // hole-punch coordinator hint. PR #3 will plumb the full
+                    // ranked list down to saorsa-transport; for now we hand
+                    // over a single best choice.
+                    let referrer =
+                        self.select_best_referrer(referrers.get(&peer_id).map(Vec::as_slice));
                     let op = DhtNetworkOperation::FindNode { key: *key };
                     async move {
                         // Try every dialable address, not just the first.
@@ -1081,7 +1185,7 @@ impl DhtNetworkManager {
                             best_nodes.push(queried_node.clone());
                         }
 
-                        // Track this peer as the referrer for all nodes it returned.
+                        // Track this peer as a referrer for all nodes it returned.
                         let referrer_addr = batch
                             .iter()
                             .find(|n| n.peer_id == peer_id)
@@ -1099,18 +1203,32 @@ impl DhtNetworkManager {
                             {
                                 continue;
                             }
-                            // Record the referrer (first referrer wins)
-                            if let Some(ref_addr) = referrer_addr
-                                && let std::collections::hash_map::Entry::Vacant(e) =
-                                    referrers.entry(node.peer_id)
-                            {
-                                info!(
-                                    "find_closest_nodes_network: peer {} referred by {} ({})",
-                                    hex::encode(&node.peer_id.to_bytes()[..8]),
-                                    hex::encode(&peer_id.to_bytes()[..8]),
-                                    ref_addr
+                            // Append this referrer to the candidate list for
+                            // the discovered peer. We keep up to
+                            // MAX_REFERRERS_PER_TARGET observations and rank
+                            // them at dial-time, so we no longer pin the
+                            // first-seen referrer.
+                            //
+                            // When the slot table is full, we still want to
+                            // accept a *strictly later round* observation by
+                            // evicting the lowest-round entry. Otherwise a
+                            // burst of round-0 referrers (e.g. several
+                            // bootstraps all returning the same hot peer)
+                            // would lock out the higher-round referrers we
+                            // actually prefer at dial-time, defeating the
+                            // round-aware ranking in exactly the case we
+                            // care about.
+                            if let Some(ref_addr) = referrer_addr {
+                                let entry = referrers.entry(node.peer_id).or_default();
+                                Self::merge_referrer_observation(
+                                    entry,
+                                    ReferrerInfo {
+                                        peer_id,
+                                        addr: ref_addr,
+                                        round_observed: iteration as u32,
+                                    },
+                                    &node.peer_id,
                                 );
-                                e.insert(ref_addr);
                             }
                             let dist = node.peer_id.distance(&target_key);
                             let cand_key = (dist, node.peer_id);
@@ -1342,6 +1460,133 @@ impl DhtNetworkManager {
     /// Return the first dialable address from a list of [`MultiAddr`] values.
     fn first_dialable_address(addresses: &[MultiAddr]) -> Option<MultiAddr> {
         Self::dialable_addresses(addresses).into_iter().next()
+    }
+
+    /// Pick the best hole-punch coordinator candidate from a slice of
+    /// referrer observations, using this manager's [`TrustEngine`] (or
+    /// default neutral trust when none is configured).
+    ///
+    /// Thin wrapper around the pure function [`Self::rank_referrers`] —
+    /// see that for the actual ranking logic.
+    fn select_best_referrer(&self, referrers: Option<&[ReferrerInfo]>) -> Option<SocketAddr> {
+        let trust_for = |peer_id: &PeerId| -> f64 {
+            self.trust_engine
+                .as_ref()
+                .map(|engine| engine.score(peer_id))
+                .unwrap_or(DEFAULT_NEUTRAL_TRUST)
+        };
+        Self::rank_referrers(referrers, trust_for)
+    }
+
+    /// Pure ranking function that picks the best referrer from a slice.
+    ///
+    /// Ranking (highest priority first):
+    /// 1. **`round_observed` DESC** — referrers seen in later iteration
+    ///    rounds are by XOR-distance closer to the lookup target and so
+    ///    much more likely to actually have a live connection to it. This
+    ///    naturally de-prefers round-0 bootstrap referrers without any
+    ///    explicit bootstrap tagging, which is exactly the load-shedding
+    ///    behaviour we want.
+    /// 2. **trust score DESC** — when two referrers were observed in the
+    ///    same round, prefer the one with the higher trust score returned
+    ///    by `trust_for`.
+    /// 3. **deterministic hash tiebreak** — when round and trust both tie,
+    ///    keep the referrer whose `peer_id` byte 0 is **larger**. Using a
+    ///    pure peer-id ordering instead of a random RNG keeps the choice
+    ///    reproducible across runs (useful for tests) while still
+    ///    spreading load across coordinators because different targets
+    ///    see different referrer sets.
+    ///
+    /// Returns `None` when the slice is empty or `None` itself, so the
+    /// caller can pass-through directly to APIs that take an
+    /// `Option<SocketAddr>` referrer hint.
+    ///
+    /// Pure function (no `&self`) so it can be unit-tested without
+    /// constructing a full [`DhtNetworkManager`].
+    fn rank_referrers(
+        referrers: Option<&[ReferrerInfo]>,
+        trust_for: impl Fn(&PeerId) -> f64,
+    ) -> Option<SocketAddr> {
+        let list = referrers?;
+        if list.is_empty() {
+            return None;
+        }
+
+        list.iter()
+            .max_by(|a, b| {
+                // Primary: higher round wins.
+                a.round_observed
+                    .cmp(&b.round_observed)
+                    // Secondary: higher trust wins (total_cmp sidesteps NaN
+                    // issues — score is bounded but total_cmp is safe
+                    // regardless).
+                    .then_with(|| trust_for(&a.peer_id).total_cmp(&trust_for(&b.peer_id)))
+                    // Tertiary: deterministic tiebreak by peer_id byte 0.
+                    // `max_by` keeps the larger one — arbitrary but
+                    // reproducible.
+                    .then_with(|| a.peer_id.to_bytes()[0].cmp(&b.peer_id.to_bytes()[0]))
+            })
+            .map(|r| r.addr)
+    }
+
+    /// Merge a single referrer observation into the per-target slot table,
+    /// preserving the round-aware ranking invariant.
+    ///
+    /// Behaviour:
+    /// - Duplicate referrer (same `peer_id` already present): no-op.
+    /// - Slot table not yet full: append.
+    /// - Slot table full AND `new.round_observed` is strictly greater than
+    ///   the current minimum round in the table: evict the lowest-round
+    ///   entry and replace it with `new`.
+    /// - Slot table full AND `new.round_observed <= min(table.rounds)`:
+    ///   drop `new` (it would lose the dial-time ranking against every
+    ///   existing entry anyway).
+    ///
+    /// The eviction path exists so that a burst of round-0 referrers (e.g.
+    /// every bootstrap returning the same hot peer in the first DHT round)
+    /// cannot lock out the higher-round referrers we actually prefer at
+    /// dial-time. Without this, the slot cap silently degrades the
+    /// round-aware ranking in exactly the case the PR is targeting.
+    ///
+    /// Pure function (no `&self`) so it can be unit-tested directly.
+    fn merge_referrer_observation(
+        entry: &mut Vec<ReferrerInfo>,
+        new: ReferrerInfo,
+        target_peer_id: &PeerId,
+    ) {
+        if entry.iter().any(|r| r.peer_id == new.peer_id) {
+            return;
+        }
+        if entry.len() < MAX_REFERRERS_PER_TARGET {
+            info!(
+                "find_closest_nodes_network: peer {} referred by {} ({}) round {}",
+                hex::encode(&target_peer_id.to_bytes()[..8]),
+                hex::encode(&new.peer_id.to_bytes()[..8]),
+                new.addr,
+                new.round_observed,
+            );
+            entry.push(new);
+            return;
+        }
+        // Slot full — evict the lowest-round entry only if `new` is
+        // strictly later.
+        if let Some((min_idx, min_referrer)) = entry
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, r)| r.round_observed)
+            && min_referrer.round_observed < new.round_observed
+        {
+            info!(
+                "find_closest_nodes_network: peer {} referrer slot full — evicting round {} entry ({}) for round {} entry from {} ({})",
+                hex::encode(&target_peer_id.to_bytes()[..8]),
+                min_referrer.round_observed,
+                min_referrer.addr,
+                new.round_observed,
+                hex::encode(&new.peer_id.to_bytes()[..8]),
+                new.addr,
+            );
+            entry[min_idx] = new;
+        }
     }
 
     /// Try dialing each dialable address in `addresses` in order until one
@@ -2943,6 +3188,304 @@ mod tests {
         assert!(
             matches!(decoded.payload, DhtNetworkOperation::Ping),
             "response should echo the request's Ping payload"
+        );
+    }
+
+    // ---- Tier 1.2 + 1.4: hole-punch coordinator selection ----
+
+    /// Helper: build a [`ReferrerInfo`] with a deterministic peer_id whose
+    /// byte 0 is set to `tag`. The remaining bytes come from
+    /// [`PeerId::random()`] so the IDs collide on byte 0 but stay
+    /// otherwise unique.
+    fn make_referrer(tag: u8, addr_octet: u8, round: u32) -> ReferrerInfo {
+        let mut bytes = *PeerId::random().to_bytes();
+        bytes[0] = tag;
+        ReferrerInfo {
+            peer_id: PeerId::from_bytes(bytes),
+            addr: SocketAddr::from(([10, 0, 0, addr_octet], 9000)),
+            round_observed: round,
+        }
+    }
+
+    fn neutral_trust(_: &PeerId) -> f64 {
+        DEFAULT_NEUTRAL_TRUST
+    }
+
+    #[test]
+    fn rank_referrers_returns_none_for_empty_or_missing() {
+        assert_eq!(
+            DhtNetworkManager::rank_referrers(None, neutral_trust),
+            None,
+            "None input must yield None"
+        );
+        assert_eq!(
+            DhtNetworkManager::rank_referrers(Some(&[]), neutral_trust),
+            None,
+            "empty slice must yield None"
+        );
+    }
+
+    #[test]
+    fn rank_referrers_single_referrer_returned() {
+        let only = make_referrer(0x01, 1, 0);
+        let chosen = DhtNetworkManager::rank_referrers(Some(&[only]), neutral_trust);
+        assert_eq!(
+            chosen,
+            Some(only.addr),
+            "single-referrer slice must return that referrer's addr"
+        );
+    }
+
+    #[test]
+    fn rank_referrers_prefers_later_round_over_earlier() {
+        // Round 0 (bootstrap-equivalent) vs round 3 (deep iteration).
+        // Round 3 must win regardless of order or trust.
+        let round_zero = make_referrer(0xFF, 1, 0);
+        let round_three = make_referrer(0x01, 2, 3);
+
+        let chosen_a =
+            DhtNetworkManager::rank_referrers(Some(&[round_zero, round_three]), neutral_trust);
+        let chosen_b =
+            DhtNetworkManager::rank_referrers(Some(&[round_three, round_zero]), neutral_trust);
+
+        assert_eq!(
+            chosen_a,
+            Some(round_three.addr),
+            "later round must win regardless of slice order"
+        );
+        assert_eq!(
+            chosen_b,
+            Some(round_three.addr),
+            "later round must win regardless of slice order (reversed)"
+        );
+    }
+
+    #[test]
+    fn rank_referrers_tiebreaks_round_with_trust() {
+        // Same round, different trust. Higher trust must win.
+        let low_trust = make_referrer(0x55, 1, 2);
+        let high_trust = make_referrer(0xAA, 2, 2);
+        let trust_for = |peer_id: &PeerId| -> f64 {
+            if peer_id.to_bytes()[0] == 0xAA {
+                0.95
+            } else {
+                0.10
+            }
+        };
+
+        let chosen = DhtNetworkManager::rank_referrers(Some(&[low_trust, high_trust]), trust_for);
+        assert_eq!(
+            chosen,
+            Some(high_trust.addr),
+            "higher trust must win when rounds tie"
+        );
+    }
+
+    #[test]
+    fn rank_referrers_tiebreaks_round_and_trust_with_peer_id_byte_zero() {
+        // Same round, same (neutral) trust. The referrer with the larger
+        // byte-0 must win deterministically.
+        let small = make_referrer(0x01, 1, 1);
+        let large = make_referrer(0xF0, 2, 1);
+
+        let chosen_a = DhtNetworkManager::rank_referrers(Some(&[small, large]), neutral_trust);
+        let chosen_b = DhtNetworkManager::rank_referrers(Some(&[large, small]), neutral_trust);
+
+        assert_eq!(
+            chosen_a,
+            Some(large.addr),
+            "larger peer_id byte 0 must win the tertiary tiebreak"
+        );
+        assert_eq!(
+            chosen_b,
+            Some(large.addr),
+            "tiebreak must be order-independent"
+        );
+    }
+
+    // ---- merge_referrer_observation ----
+
+    fn dummy_target() -> PeerId {
+        let mut bytes = [0u8; 32];
+        bytes[0] = 0xCC;
+        PeerId::from_bytes(bytes)
+    }
+
+    #[test]
+    fn merge_referrer_observation_appends_until_full() {
+        let mut entry: Vec<ReferrerInfo> = Vec::new();
+        let target = dummy_target();
+        for i in 0..MAX_REFERRERS_PER_TARGET as u8 {
+            DhtNetworkManager::merge_referrer_observation(
+                &mut entry,
+                make_referrer(0x10 + i, i + 1, 0),
+                &target,
+            );
+        }
+        assert_eq!(
+            entry.len(),
+            MAX_REFERRERS_PER_TARGET,
+            "first MAX_REFERRERS_PER_TARGET observations must all land in the slot table"
+        );
+    }
+
+    #[test]
+    fn merge_referrer_observation_drops_duplicate_peer() {
+        let mut entry: Vec<ReferrerInfo> = Vec::new();
+        let target = dummy_target();
+        let original = make_referrer(0x42, 1, 0);
+        DhtNetworkManager::merge_referrer_observation(&mut entry, original, &target);
+        // True duplicate: identical peer_id, different addr and round.
+        // (`make_referrer` randomises bytes 1..32 per call, so we cannot
+        // produce a duplicate by re-tagging — we have to reuse the
+        // original peer_id directly.)
+        let duplicate = ReferrerInfo {
+            peer_id: original.peer_id,
+            addr: SocketAddr::from(([10, 0, 0, 99], 9000)),
+            round_observed: 5,
+        };
+        DhtNetworkManager::merge_referrer_observation(&mut entry, duplicate, &target);
+        assert_eq!(
+            entry.len(),
+            1,
+            "duplicate referrer (same peer_id) must not consume an additional slot"
+        );
+        assert_eq!(
+            entry[0].addr, original.addr,
+            "duplicate must NOT overwrite — first observation wins for the same peer"
+        );
+    }
+
+    #[test]
+    fn merge_referrer_observation_evicts_lowest_round_when_full_and_new_is_later() {
+        // Fill all 4 slots with round-0 referrers — the worst case the
+        // reviewer flagged: 4+ bootstraps all returning the same hot peer
+        // in round 0 would otherwise lock out later-round referrers.
+        let mut entry: Vec<ReferrerInfo> = Vec::new();
+        let target = dummy_target();
+        for i in 0..MAX_REFERRERS_PER_TARGET as u8 {
+            DhtNetworkManager::merge_referrer_observation(
+                &mut entry,
+                make_referrer(0x10 + i, i + 1, 0),
+                &target,
+            );
+        }
+        assert_eq!(entry.len(), MAX_REFERRERS_PER_TARGET);
+        assert!(
+            entry.iter().all(|r| r.round_observed == 0),
+            "all 4 slots should hold round-0 referrers"
+        );
+
+        // A round-3 referrer arrives — must evict one round-0 entry.
+        let later = make_referrer(0xAA, 99, 3);
+        DhtNetworkManager::merge_referrer_observation(&mut entry, later, &target);
+
+        assert_eq!(
+            entry.len(),
+            MAX_REFERRERS_PER_TARGET,
+            "table size must remain at the cap after eviction"
+        );
+        assert!(
+            entry.iter().any(|r| r.peer_id == later.peer_id),
+            "the new round-3 referrer must be present in the slot table"
+        );
+        // Exactly one round-0 entry was evicted, three remain.
+        let round_zero_count = entry.iter().filter(|r| r.round_observed == 0).count();
+        assert_eq!(
+            round_zero_count,
+            MAX_REFERRERS_PER_TARGET - 1,
+            "exactly one round-0 entry must have been evicted"
+        );
+    }
+
+    #[test]
+    fn merge_referrer_observation_does_not_evict_when_new_is_same_or_lower_round() {
+        // Fill all 4 slots with round-2 referrers, then submit a round-2
+        // and a round-0 referrer. Neither should evict — both would tie
+        // or lose against the existing entries at dial-time anyway.
+        let mut entry: Vec<ReferrerInfo> = Vec::new();
+        let target = dummy_target();
+        for i in 0..MAX_REFERRERS_PER_TARGET as u8 {
+            DhtNetworkManager::merge_referrer_observation(
+                &mut entry,
+                make_referrer(0x10 + i, i + 1, 2),
+                &target,
+            );
+        }
+        let snapshot: Vec<ReferrerInfo> = entry.clone();
+
+        // Same-round arrival: must NOT evict (strictly-greater check).
+        DhtNetworkManager::merge_referrer_observation(
+            &mut entry,
+            make_referrer(0x80, 50, 2),
+            &target,
+        );
+        assert_eq!(
+            entry, snapshot,
+            "same-round referrer must not evict the existing slot table"
+        );
+
+        // Earlier-round arrival: must NOT evict.
+        DhtNetworkManager::merge_referrer_observation(
+            &mut entry,
+            make_referrer(0x90, 60, 0),
+            &target,
+        );
+        assert_eq!(
+            entry, snapshot,
+            "lower-round referrer must not evict the existing slot table"
+        );
+    }
+
+    #[test]
+    fn shuffled_indices_empty_and_singleton_are_identity() {
+        assert_eq!(
+            DhtNetworkManager::shuffled_indices(0),
+            Vec::<usize>::new(),
+            "len 0 must yield an empty vec"
+        );
+        assert_eq!(
+            DhtNetworkManager::shuffled_indices(1),
+            vec![0],
+            "len 1 must yield [0] unchanged"
+        );
+    }
+
+    #[test]
+    fn shuffled_indices_returns_valid_permutation() {
+        // For a wider input, every call must produce a permutation of
+        // [0, len) — same set, possibly different order.
+        const LEN: usize = 10;
+        let result = DhtNetworkManager::shuffled_indices(LEN);
+        assert_eq!(result.len(), LEN, "permutation must have the right length");
+        let mut sorted = result.clone();
+        sorted.sort_unstable();
+        let expected: Vec<usize> = (0..LEN).collect();
+        assert_eq!(
+            sorted, expected,
+            "shuffled output must be a permutation of [0, len)"
+        );
+    }
+
+    #[test]
+    fn shuffled_indices_distributes_across_calls() {
+        // Run many shuffles and assert the position-0 element is not
+        // always the same. With true randomisation across calls, the
+        // probability that 100 calls all return position-0 == 0 for a
+        // 5-element shuffle is negligible.
+        const TRIALS: usize = 100;
+        const LEN: usize = 5;
+        let mut first_positions = std::collections::HashSet::new();
+        for _ in 0..TRIALS {
+            let result = DhtNetworkManager::shuffled_indices(LEN);
+            first_positions.insert(result[0]);
+            if first_positions.len() >= 2 {
+                return; // pass — we observed at least two distinct positions
+            }
+        }
+        panic!(
+            "shuffled_indices(5) returned the same first element across {TRIALS} \
+             calls — entropy source is broken"
         );
     }
 }
