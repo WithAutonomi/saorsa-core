@@ -856,18 +856,30 @@ impl DualStackNetworkNode<P2pLinkTransport> {
         }
     }
 
-    /// Set a preferred coordinator for hole-punching to a specific target.
-    /// The preferred coordinator is a peer that referred us to the target
-    /// during a DHT lookup, so it has a connection to the target.
-    pub async fn set_hole_punch_preferred_coordinator(
+    /// Set an ordered list of preferred coordinators for hole-punching to a
+    /// specific target.
+    ///
+    /// The list is iterated front to back at hole-punch time: every
+    /// coordinator except the last gets a short per-attempt timeout
+    /// (~1.5s) so a busy or unreachable referrer is abandoned quickly,
+    /// and the final coordinator gets the strategy's full hole-punch
+    /// timeout to give it time to actually complete the punch.
+    ///
+    /// The caller (`DhtNetworkManager::dial_candidate`) is expected to
+    /// rank the list best-first using DHT signals — round observed,
+    /// trust score, etc. — via [`DhtNetworkManager::rank_referrers`].
+    ///
+    /// Empty `coordinators` removes any preferred coordinators for
+    /// `target`.
+    pub async fn set_hole_punch_preferred_coordinators(
         &self,
         target: SocketAddr,
-        coordinator: SocketAddr,
+        coordinators: Vec<SocketAddr>,
     ) {
         for node in [&self.v6, &self.v4].into_iter().flatten() {
             node.transport
                 .endpoint()
-                .set_hole_punch_preferred_coordinator(target, coordinator)
+                .set_hole_punch_preferred_coordinators(target, coordinators.clone())
                 .await;
         }
     }

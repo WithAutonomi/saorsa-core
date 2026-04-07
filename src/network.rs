@@ -235,7 +235,7 @@ pub struct NodeConfig {
     ///
     /// Controls whether peers with low trust scores are eligible for
     /// swap-out from the routing table when better candidates arrive. Use
-    /// [`NodeConfigBuilder::trust_enforcement`] for a simple on/off toggle.
+    /// `NodeConfigBuilder::trust_enforcement` for a simple on/off toggle.
     ///
     /// Default: enabled with a swap threshold of 0.35.
     #[serde(default)]
@@ -741,7 +741,7 @@ const QUIC_TEARDOWN_GRACE: Duration = Duration::from_millis(100);
 /// - Handle network events and peer lifecycle
 ///
 /// Transport concerns (connections, messaging, events) are delegated to
-/// [`TransportHandle`](crate::transport_handle::TransportHandle).
+/// `TransportHandle`.
 pub struct P2PNode {
     /// Node configuration
     config: NodeConfig,
@@ -978,7 +978,7 @@ impl P2PNode {
     ///
     /// # Returns
     ///
-    /// A [`PeerResponse`] on success, or an error on timeout / connection failure.
+    /// A `PeerResponse` on success, or an error on timeout / connection failure.
     ///
     /// # Example
     ///

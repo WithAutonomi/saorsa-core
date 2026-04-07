@@ -81,7 +81,7 @@ impl AdaptiveDhtConfig {
 /// consumer's responsibility via [`ApplicationSuccess`](Self::ApplicationSuccess).
 ///
 /// Consumer-reported events carry a weight multiplier that controls the
-/// severity of the update (clamped to [`MAX_CONSUMER_WEIGHT`]).
+/// severity of the update (clamped to `MAX_CONSUMER_WEIGHT`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TrustEvent {
     // === Negative signals (core) ===
