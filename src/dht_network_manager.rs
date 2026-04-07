@@ -99,7 +99,7 @@ const AUTO_REBOOTSTRAP_THRESHOLD: usize = 3;
 
 /// Maximum number of distinct referrers stored per discovered peer during an
 /// iterative DHT lookup. The list is ranked at dial-time to pick the best
-/// hole-punch coordinator candidate (see [`DhtNetworkManager::select_best_referrer`]).
+/// hole-punch coordinator candidate (see [`DhtNetworkManager::rank_referrers_for_target`]).
 ///
 /// Bound exists to cap per-lookup memory; in practice 4 is more than enough
 /// because Kademlia typically converges before any peer is referred more than
@@ -286,7 +286,7 @@ pub struct DhtNetworkManager {
 ///
 /// During a single iterative lookup we collect up to
 /// [`MAX_REFERRERS_PER_TARGET`] referrers per discovered peer and rank them
-/// at dial-time via [`DhtNetworkManager::select_best_referrer`].
+/// at dial-time via [`DhtNetworkManager::rank_referrers_for_target`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ReferrerInfo {
     /// Peer ID of the referring node (used for trust score lookup and tiebreak).
@@ -806,7 +806,7 @@ impl DhtNetworkManager {
     /// queried the same ones). The pinning is removed: subsequent
     /// iterative DHT lookups via `find_closest_nodes_network` collect
     /// referrers across multiple rounds and rank them via
-    /// [`Self::select_best_referrer`], naturally de-preferring round-0
+    /// [`Self::rank_referrers_for_target`], naturally de-preferring round-0
     /// bootstrap referrers as the routing table grows.
     ///
     /// **Iteration order**: bootstrap peers are visited in a per-call
@@ -1071,7 +1071,7 @@ impl DhtNetworkManager {
         // hole-punch coordinator for T.
         //
         // We collect up to MAX_REFERRERS_PER_TARGET observations and rank
-        // them at dial-time via `select_best_referrer`. The ranking prefers
+        // them at dial-time via `rank_referrers_for_target`. The ranking prefers
         // referrers seen in later iteration rounds (closer to the target in
         // XOR space) over earlier rounds, which naturally de-prefers the
         // round-0 bootstrap referrers without any explicit bootstrap
