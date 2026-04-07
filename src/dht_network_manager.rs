@@ -29,12 +29,13 @@ use crate::{
     network::NodeConfig,
 };
 use anyhow::Context as _;
+use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
-use tokio::sync::{RwLock, Semaphore, broadcast, oneshot};
+use tokio::sync::{Notify, RwLock, Semaphore, broadcast, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, trace, warn};
 use uuid::Uuid;
@@ -60,18 +61,16 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// The local node is always considered fully reliable for its own lookups.
 const SELF_RELIABILITY_SCORE: f64 = 1.0;
 
-/// Maximum time to wait for the identity-exchange handshake after dialling
-/// a peer. The actual timeout is `min(request_timeout, this)`.
+/// Defensive upper bound on the wait for a freshly-dialled peer's
+/// TLS-authenticated identity to be registered.
 ///
-/// Identity exchange is two RTTs over a freshly-handshaken QUIC connection
-/// plus an ML-DSA-65 signature verification. On a LAN this completes in
-/// well under a second; on congested cellular or cross-region links it can
-/// blow past 5s with retransmits. Kept in lockstep with
-/// `BOOTSTRAP_IDENTITY_TIMEOUT_SECS` in `network.rs` — both budgets exist
-/// to absorb the same slow-link failure mode (the bootstrap variant covers
-/// the initial join, this one covers every subsequent peer dial via
-/// `send_dht_request`).
-const IDENTITY_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(15);
+/// Since identity is now derived synchronously from the TLS-handshake
+/// SPKI by the connection lifecycle monitor, this wait completes within
+/// a scheduler tick of `connect_peer` returning. The 2 s budget exists
+/// only as a safety net for the lifecycle monitor being wedged or the
+/// peer presenting an unparseable SPKI. The effective wait remains
+/// `min(request_timeout, this)`.
+const IDENTITY_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Maximum time to wait for a stale peer's ping response during admission contention.
 const STALE_REVALIDATION_TIMEOUT: Duration = Duration::from_secs(1);
@@ -275,6 +274,21 @@ pub struct DhtNetworkManager {
     /// Timestamp of the last automatic re-bootstrap attempt, guarded by a
     /// cooldown to avoid hammering bootstrap peers during transient churn.
     last_rebootstrap: tokio::sync::Mutex<Option<Instant>>,
+    /// Per-peer dial coalescing.
+    ///
+    /// When [`Self::send_dht_request`] needs to dial a peer that no other
+    /// task is already dialling, it inserts a fresh `Notify` here and runs
+    /// the dial inline. Concurrent callers targeting the same peer find an
+    /// existing entry, await `notified()`, and then re-check whether the
+    /// peer is now connected. This prevents N parallel iterative lookups
+    /// from each kicking off their own coordinator-rotation cascade against
+    /// the same peer — under symmetric NAT that cascade is what produced
+    /// the "duplicate" connection-close storm during identity exchange.
+    ///
+    /// Entries are removed by the dialing task as soon as the dial returns
+    /// (success or failure), so the map only ever holds peers that have a
+    /// dial actively in progress.
+    inflight_dials: Arc<DashMap<PeerId, Arc<Notify>>>,
 }
 
 /// One observation of a peer being referred during an iterative DHT lookup.
@@ -409,6 +423,29 @@ impl Drop for BucketRevalidationGuard {
     }
 }
 
+/// RAII guard for the dial-coalescing slot owned by a single
+/// [`DhtNetworkManager::dial_or_await_inflight`] caller.
+///
+/// On drop the inflight entry is removed and `notify_waiters()` is called,
+/// so any concurrent callers awaiting on `notified()` are unblocked even if
+/// the owning caller's dial future panicked or was cancelled. Without this
+/// guard, a panic inside `dial_addresses` would leave waiters blocked
+/// indefinitely, because they have no timeout of their own.
+struct InflightDialGuard {
+    inflight: Arc<DashMap<PeerId, Arc<Notify>>>,
+    peer_id: PeerId,
+    notify: Arc<Notify>,
+}
+
+impl Drop for InflightDialGuard {
+    fn drop(&mut self) {
+        // Remove the inflight entry first so any waiter that re-enters
+        // `dial_or_await_inflight` after waking sees a clean state.
+        self.inflight.remove(&self.peer_id);
+        self.notify.notify_waiters();
+    }
+}
+
 impl DhtNetworkManager {
     fn new_from_components(
         transport: Arc<crate::transport_handle::TransportHandle>,
@@ -455,6 +492,7 @@ impl DhtNetworkManager {
             self_lookup_handle: Arc::new(RwLock::new(None)),
             bucket_refresh_handle: Arc::new(RwLock::new(None)),
             last_rebootstrap: tokio::sync::Mutex::new(None),
+            inflight_dials: Arc::new(DashMap::new()),
         })
     }
 
@@ -671,8 +709,10 @@ impl DhtNetworkManager {
                     }
                     // Dial if not already connected — try every advertised
                     // address, not just the first, so a stale NAT binding on
-                    // one entry doesn't kill the dial.
-                    self.dial_addresses(&dht_node.peer_id, &dht_node.addresses, &[])
+                    // one entry doesn't kill the dial. Routed through the
+                    // coalescing helper so a concurrent self-lookup and
+                    // send_dht_request to the same peer share one dial.
+                    self.dial_or_await_inflight(&dht_node.peer_id, &dht_node.addresses, &[])
                         .await;
                 }
                 Ok(())
@@ -843,7 +883,7 @@ impl DhtNetworkManager {
                             // discovered peers. The next iterative lookup
                             // will populate proper referrers via the
                             // round-aware ranking.
-                            self.dial_addresses(&node.peer_id, &node.addresses, &[])
+                            self.dial_or_await_inflight(&node.peer_id, &node.addresses, &[])
                                 .await;
                         }
                     }
@@ -1165,8 +1205,10 @@ impl DhtNetworkManager {
                         // If at least one succeeds the peer is connected and
                         // `send_dht_request` will reuse that channel; if all
                         // fail, `send_dht_request`'s own fallback will retry
-                        // with the routing-table addresses.
-                        self.dial_addresses(&peer_id, &addresses, &referrer_list)
+                        // with the routing-table addresses. The coalescing
+                        // helper ensures the parallel iterative-lookup batch
+                        // shares one dial per peer rather than racing.
+                        self.dial_or_await_inflight(&peer_id, &addresses, &referrer_list)
                             .await;
                         let address_hint = Self::first_dialable_address(&addresses);
                         (
@@ -1652,6 +1694,112 @@ impl DhtNetworkManager {
         }
     }
 
+    /// Dial coalescing: ensure at most one in-flight `dial_addresses` per
+    /// `peer_id` across all concurrent `send_dht_request` calls.
+    ///
+    /// # Outcome shape
+    ///
+    /// Returns `Ok(Some(channel_id))` when this call (or a coalesced
+    /// predecessor) successfully established a channel to `peer_id`.
+    /// Returns `Ok(None)` when the dial attempt completed without yielding
+    /// a usable channel (the peer is unreachable on every candidate
+    /// address). Returns `Err` only if the underlying transport call panics
+    /// out of the dial future — the dial path itself swallows individual
+    /// connect errors and surfaces them as `Ok(None)`.
+    ///
+    /// # Coalescing semantics
+    ///
+    /// 1. The first caller to a peer inserts a fresh `Notify` into
+    ///    `inflight_dials`, runs the dial inline, removes the entry, and
+    ///    finally calls `notify_waiters()` to wake every secondary caller
+    ///    blocked on the same peer.
+    /// 2. Secondary callers find an existing entry, await `notified()`
+    ///    *before* re-checking, and then ask the transport whether the
+    ///    peer is now connected. They do **not** receive the channel_id
+    ///    from the first caller — saorsa-transport's connection map is the
+    ///    canonical source, and querying it after the wake handles every
+    ///    success path uniformly (direct connect, hole-punch, relay).
+    /// 3. If the first caller fails, secondary callers see no live
+    ///    connection after their re-check and propagate the same `None`
+    ///    result rather than starting their own racing dial. They will
+    ///    retry on the *next* `send_dht_request` call, which is the right
+    ///    granularity for backoff.
+    ///
+    /// This eliminates the racing-dial cascade that previously caused N
+    /// concurrent DHT lookups against the same peer to each issue their
+    /// own coordinator-rotation pass, producing the "duplicate connection"
+    /// close storm under symmetric NAT.
+    async fn dial_or_await_inflight(
+        &self,
+        peer_id: &PeerId,
+        addresses: &[MultiAddr],
+        referrers: &[SocketAddr],
+    ) -> Option<String> {
+        // Fast path: peer is already connected — no dial needed.
+        if self.transport.is_peer_connected(peer_id).await {
+            return self
+                .transport
+                .channels_for_peer(peer_id)
+                .await
+                .into_iter()
+                .next();
+        }
+
+        // Try to claim the dial slot for this peer. The DashMap entry API
+        // is the single point of mutual exclusion: exactly one caller
+        // observes `Vacant` and proceeds to dial; everyone else observes
+        // `Occupied` and falls into the wait branch below.
+        enum Slot {
+            Owner(Arc<Notify>),
+            Waiter(Arc<Notify>),
+        }
+        let slot = match self.inflight_dials.entry(*peer_id) {
+            dashmap::mapref::entry::Entry::Vacant(v) => {
+                let notify = Arc::new(Notify::new());
+                v.insert(Arc::clone(&notify));
+                Slot::Owner(notify)
+            }
+            dashmap::mapref::entry::Entry::Occupied(o) => Slot::Waiter(Arc::clone(o.get())),
+        };
+
+        match slot {
+            Slot::Owner(notify) => {
+                // RAII guard ensures the inflight entry is removed and
+                // waiters are notified even if `dial_addresses` panics or
+                // the future is cancelled. Without this, a panic in the
+                // dial path would leave waiters blocked on `notified()`
+                // forever, since they have no timeout of their own.
+                let _guard = InflightDialGuard {
+                    inflight: Arc::clone(&self.inflight_dials),
+                    peer_id: *peer_id,
+                    notify: Arc::clone(&notify),
+                };
+                self.dial_addresses(peer_id, addresses, referrers).await
+            }
+            Slot::Waiter(notify) => {
+                debug!(
+                    peer = %peer_id.to_hex(),
+                    "Dial coalescing: awaiting in-flight dial",
+                );
+                notify.notified().await;
+                // The owning caller's dial has finished. If it succeeded,
+                // the peer is now connected and we can pick up its channel
+                // from the transport. If it failed, we return None and let
+                // the caller surface the failure exactly as it would have
+                // for a direct dial.
+                if self.transport.is_peer_connected(peer_id).await {
+                    self.transport
+                        .channels_for_peer(peer_id)
+                        .await
+                        .into_iter()
+                        .next()
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
     /// Remove expired operations from `active_operations`.
     ///
     /// Uses a 2x timeout multiplier as safety margin. Called at the start of
@@ -1783,7 +1931,7 @@ impl DhtNetworkManager {
                 candidate_addresses.len()
             );
             if let Some(channel_id) = self
-                .dial_addresses(peer_id, &candidate_addresses, &[])
+                .dial_or_await_inflight(peer_id, &candidate_addresses, &[])
                 .await
             {
                 let identity_timeout = self.config.request_timeout.min(IDENTITY_EXCHANGE_TIMEOUT);
@@ -3169,6 +3317,55 @@ mod tests {
             }
             _ => panic!("expected KClosestPeersChanged"),
         }
+    }
+
+    #[tokio::test]
+    async fn inflight_dial_guard_releases_slot_and_wakes_waiters_on_drop() {
+        // Verify the InflightDialGuard's RAII semantics: dropping the
+        // guard (which happens whether the owning future returns
+        // normally, panics, or is cancelled) must remove the inflight
+        // entry AND wake every blocked waiter. Without this, a panic in
+        // the dial path would leave secondary callers blocked on
+        // `notified()` forever.
+        let inflight: Arc<DashMap<PeerId, Arc<Notify>>> = Arc::new(DashMap::new());
+        let peer = PeerId::random();
+        let notify = Arc::new(Notify::new());
+        inflight.insert(peer, Arc::clone(&notify));
+
+        let waiter_inflight = Arc::clone(&inflight);
+        let waiter_notify = Arc::clone(&notify);
+        let waiter = tokio::spawn(async move {
+            waiter_notify.notified().await;
+            // After the wake, the entry must be gone so the waiter that
+            // re-enters the dial path sees a clean state.
+            assert!(
+                !waiter_inflight.contains_key(&peer),
+                "inflight entry should be removed before notify_waiters fires",
+            );
+        });
+
+        // Give the waiter task a chance to register with the Notify.
+        tokio::task::yield_now().await;
+
+        // Drop the guard — this is what `dial_or_await_inflight`'s Owner
+        // branch does on every exit path (success, error, panic, cancel).
+        let guard = InflightDialGuard {
+            inflight: Arc::clone(&inflight),
+            peer_id: peer,
+            notify: Arc::clone(&notify),
+        };
+        drop(guard);
+
+        // The waiter should wake immediately and complete its assertion.
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("waiter must wake within 1s of guard drop")
+            .expect("waiter task should not panic");
+
+        assert!(
+            !inflight.contains_key(&peer),
+            "guard drop must remove the inflight entry",
+        );
     }
 
     #[test]
