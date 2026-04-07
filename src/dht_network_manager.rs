@@ -2604,6 +2604,23 @@ impl DhtNetworkManager {
     async fn handle_peer_connected(&self, node_id: PeerId, user_agent: &str) {
         let app_peer_id_hex = node_id.to_hex();
 
+        // The first `PeerConnected` event for a peer is emitted by the
+        // lifecycle monitor at TLS-handshake time, when the peer's identity
+        // is known but no signed application message has arrived yet — so
+        // its user-agent string is empty. Routing-table classification
+        // requires `is_dht_participant(user_agent)`, which would
+        // misclassify every peer as ephemeral on this first call. Defer
+        // until the shard consumer re-emits `PeerConnected` with the
+        // user-agent extracted from the first signed message (typically a
+        // DHT ping or find_node within one round trip of the handshake).
+        if user_agent.is_empty() {
+            debug!(
+                "DHT peer connected (TLS handshake): app_id={} — deferring routing classification until user_agent learned",
+                app_peer_id_hex
+            );
+            return;
+        }
+
         info!(
             "DHT peer connected: app_id={}, user_agent={}",
             app_peer_id_hex, user_agent

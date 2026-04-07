@@ -1696,16 +1696,34 @@ impl TransportHandle {
                     // populated by the lifecycle monitor at TLS-handshake
                     // time, so we don't touch it here. Skip echoes of our
                     // own identity.
+                    //
+                    // When the user-agent is learned for the first time (or
+                    // changes), re-emit `PeerConnected` so subscribers that
+                    // branch on the user-agent — notably the DHT bridge,
+                    // which uses `is_dht_participant` to gate routing-table
+                    // admission — can re-classify. The original handshake-
+                    // time `PeerConnected` is emitted with an empty
+                    // user-agent because TLS doesn't carry one; this is the
+                    // follow-up that delivers the application-level
+                    // capability bits within one signed-message round trip.
                     if let Some(ref app_id) = authenticated_node_id
                         && *app_id != self_peer_id
                         && !peer_user_agent.is_empty()
                     {
                         let mut uas = peer_user_agents.write().await;
-                        match uas.get(app_id) {
-                            Some(existing) if existing == &peer_user_agent => {}
-                            _ => {
-                                uas.insert(*app_id, peer_user_agent);
-                            }
+                        let changed = match uas.get(app_id) {
+                            Some(existing) => existing != &peer_user_agent,
+                            None => true,
+                        };
+                        if changed {
+                            uas.insert(*app_id, peer_user_agent.clone());
+                            // Drop the lock before emitting so subscribers
+                            // re-entering the registry don't deadlock.
+                            drop(uas);
+                            broadcast_event(
+                                &event_tx,
+                                P2PEvent::PeerConnected(*app_id, peer_user_agent),
+                            );
                         }
                     }
 
