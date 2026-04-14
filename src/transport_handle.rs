@@ -1514,6 +1514,26 @@ impl TransportHandle {
         let rate_limiter = self.rate_limiter.clone();
         let dual = self.dual_node.clone();
 
+        // Channel to offload registration work from the accept loop.
+        // Bounded at 1024 to match the handshake channel capacity —
+        // this can never fill faster than connections arrive.
+        let (reg_tx, mut reg_rx) = tokio::sync::mpsc::channel::<SocketAddr>(1024);
+
+        // Single registration task: serialises write-lock acquisitions
+        // so they don't contend with each other. The accept loop sends
+        // accepted connections here and immediately returns to draining
+        // the handshake channel.
+        let reg_peers = peers.clone();
+        let reg_active = active_connections.clone();
+        tokio::spawn(async move {
+            while let Some(remote_sock) = reg_rx.recv().await {
+                let channel_id = remote_sock.to_string();
+                let remote_addr = MultiAddr::quic(remote_sock);
+                register_new_channel(&reg_peers, &channel_id, &remote_addr).await;
+                reg_active.write().await.insert(channel_id);
+            }
+        });
+
         let handle = tokio::spawn(async move {
             loop {
                 let Some(remote_sock) = dual.accept_any().await else {
@@ -1528,26 +1548,16 @@ impl TransportHandle {
                     continue;
                 }
 
-                // Spawn registration work so the accept loop immediately
-                // returns to draining the handshake channel. Previously
-                // the two write locks below were taken inline, serialising
-                // the accept loop behind `peers` and `active_connections`
-                // contention. In a 1000-node network this caused the
-                // bounded handshake channel (cap 32) to fill, blocking all
-                // new connection handoffs and stalling identity exchange.
-                let peers = peers.clone();
-                let active_connections = active_connections.clone();
-                let handle = tokio::spawn(async move {
-                    let channel_id = remote_sock.to_string();
-                    let remote_addr = MultiAddr::quic(remote_sock);
-                    register_new_channel(&peers, &channel_id, &remote_addr).await;
-                    active_connections.write().await.insert(channel_id);
-                });
-                tokio::spawn(async move {
-                    if let Err(e) = handle.await {
-                        warn!("Accept registration task failed: {}", e);
-                    }
-                });
+                // Send to the registration task instead of doing it inline.
+                // This keeps the accept loop non-blocking (so the handshake
+                // channel never fills) while serialising write-lock
+                // acquisitions in a single task (avoiding the thundering
+                // herd that occurred when each connection was spawned
+                // independently).
+                if reg_tx.send(remote_sock).await.is_err() {
+                    warn!("Registration channel closed, stopping accept loop");
+                    break;
+                }
             }
         });
         *self.listener_handle.write().await = Some(handle);
