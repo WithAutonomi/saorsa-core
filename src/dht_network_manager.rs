@@ -29,6 +29,7 @@ use crate::{
     network::NodeConfig,
 };
 use anyhow::Context as _;
+use futures::stream::{FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
@@ -1232,10 +1233,22 @@ impl DhtNetworkManager {
                 batch.len()
             );
 
-            // Query nodes in parallel
-            // saorsa-transport connection multiplexing lets us keep a single transport socket
-            // while still querying multiple peers concurrently.
-            let query_futures: Vec<_> = batch
+            // Query nodes in parallel.
+            //
+            // saorsa-transport connection multiplexing lets us keep a single
+            // transport socket while still querying multiple peers
+            // concurrently.
+            //
+            // We drive the α queries through `FuturesUnordered` so we can
+            // advance the lookup as soon as there's *something* to work
+            // with. Waiting for every query (`join_all`) lets a single dead
+            // peer — whose dial cascade can take 20–30s — block the whole
+            // iteration; instead, once the first response arrives, we bound
+            // the wait on the stragglers to `ITERATION_GRACE_TIMEOUT_SECS`
+            // and move on with whatever responses came in by then. Any
+            // still-pending queries are dropped (and their futures cancelled)
+            // when the stream goes out of scope.
+            let query_stream: FuturesUnordered<_> = batch
                 .iter()
                 .map(|node| {
                     let peer_id = node.peer_id;
@@ -1259,7 +1272,7 @@ impl DhtNetworkManager {
                 })
                 .collect();
 
-            let results = futures::future::join_all(query_futures).await;
+            let results = Self::collect_iteration_results(query_stream).await;
 
             for (peer_id, result) in results {
                 queried_nodes.insert(peer_id);
@@ -1463,6 +1476,39 @@ impl DhtNetworkManager {
         a.peer_id
             .distance(&target_key)
             .cmp(&b.peer_id.distance(&target_key))
+    }
+
+    /// Drain an iteration's α queries with a bounded wait after first response.
+    ///
+    /// Waits for the first query to complete, then grants the remaining
+    /// queries up to `ITERATION_GRACE_TIMEOUT_SECS` to finish before giving
+    /// up on them and returning whatever has arrived. Any still-pending
+    /// futures are dropped (and cancelled) when the stream is returned.
+    async fn collect_iteration_results<S>(mut stream: S) -> Vec<(PeerId, Result<DhtNetworkResult>)>
+    where
+        S: futures::Stream<Item = (PeerId, Result<DhtNetworkResult>)> + Unpin,
+    {
+        let mut results = Vec::new();
+
+        // Block for the first response — if nothing arrives the iteration
+        // has no new information to work with, so we do need to wait here.
+        let Some(first) = stream.next().await else {
+            return results;
+        };
+        results.push(first);
+
+        // Bounded drain: accept whichever stragglers finish within the
+        // grace window, then move on. `timeout` cancels the inner future
+        // on expiry, which drops the remaining query futures.
+        let grace = Duration::from_secs(ITERATION_GRACE_TIMEOUT_SECS);
+        let _ = tokio::time::timeout(grace, async {
+            while let Some(next) = stream.next().await {
+                results.push(next);
+            }
+        })
+        .await;
+
+        results
     }
 
     /// Return the K-closest candidate nodes, excluding the requester.
@@ -3119,6 +3165,18 @@ impl DhtNetworkManager {
 /// above the relay stage (~10s) so it never truncates the NAT traversal
 /// cascade.
 const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 15;
+
+/// Maximum additional wait for outstanding α queries after the first
+/// response in a Kademlia lookup iteration arrives.
+///
+/// `send_dht_request` runs a full dial cascade (direct → hole-punch → relay)
+/// before the RPC wait even starts, and that cascade can legitimately take
+/// over 20s when the candidate is NAT'd or unresponsive. Waiting for every
+/// α query to finish — as `join_all` does — lets one dead peer stall the
+/// iteration far beyond the point where Kademlia has enough information to
+/// proceed. Once the first response is in, we have new candidates for the
+/// next iteration and can safely cap the wait on the stragglers.
+const ITERATION_GRACE_TIMEOUT_SECS: u64 = 10;
 
 /// Default maximum concurrent DHT operations
 const DEFAULT_MAX_CONCURRENT_OPS: usize = 100;
