@@ -2109,13 +2109,23 @@ impl P2PNode {
         // Perform two consecutive self-lookups to fully refresh the close
         // neighborhood. The second lookup may discover peers that joined or
         // became reachable during the first lookup (Section 11.2 step 5).
-        const SELF_LOOKUP_ROUNDS: u8 = 2;
-        for i in 1..=SELF_LOOKUP_ROUNDS {
-            if let Err(e) = self.dht_manager().trigger_self_lookup().await {
-                warn!("Post-bootstrap self-lookup {i}/{SELF_LOOKUP_ROUNDS} failed: {e}");
-            } else {
-                debug!("Post-bootstrap self-lookup {i}/{SELF_LOOKUP_ROUNDS} completed");
+        //
+        // Client-mode nodes don't serve the DHT, so they don't need an
+        // accurate close neighborhood — they just need enough peers to route
+        // lookups for their own requests, which `bootstrap_from_peers` above
+        // already provides. Skipping the self-lookups here cuts cold-start
+        // latency by tens of seconds when α-sized batches include dead peers.
+        if matches!(self.config.mode, NodeMode::Node) {
+            const SELF_LOOKUP_ROUNDS: u8 = 2;
+            for i in 1..=SELF_LOOKUP_ROUNDS {
+                if let Err(e) = self.dht_manager().trigger_self_lookup().await {
+                    warn!("Post-bootstrap self-lookup {i}/{SELF_LOOKUP_ROUNDS} failed: {e}");
+                } else {
+                    debug!("Post-bootstrap self-lookup {i}/{SELF_LOOKUP_ROUNDS} completed");
+                }
             }
+        } else {
+            debug!("Skipping post-bootstrap self-lookups (client mode)");
         }
 
         // Mark node as bootstrapped - we have connected to bootstrap peers
