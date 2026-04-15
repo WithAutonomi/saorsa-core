@@ -3176,7 +3176,12 @@ const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 15;
 /// iteration far beyond the point where Kademlia has enough information to
 /// proceed. Once the first response is in, we have new candidates for the
 /// next iteration and can safely cap the wait on the stragglers.
-const ITERATION_GRACE_TIMEOUT_SECS: u64 = 10;
+///
+/// Sized at 5s: a peer with an already-open channel replies in well under
+/// a second, so this leaves ample slack for legitimate stragglers while
+/// letting us abandon dial cascades that are almost certainly going to
+/// fail anyway.
+const ITERATION_GRACE_TIMEOUT_SECS: u64 = 5;
 
 /// Default maximum concurrent DHT operations
 const DEFAULT_MAX_CONCURRENT_OPS: usize = 100;
