@@ -278,7 +278,7 @@ impl BgpGeoProvider {
         prefixes.push(Ipv4Prefix::new([51, 77, 0, 0], 16, 16276));
 
         // Sort by prefix length (longest first for most-specific match)
-        prefixes.sort_by(|a, b| b.prefix_len.cmp(&a.prefix_len));
+        prefixes.sort_by_key(|p| std::cmp::Reverse(p.prefix_len));
     }
 
     /// Look up ASN for an IPv4 address
@@ -349,7 +349,7 @@ impl BgpGeoProvider {
     pub fn add_ipv4_prefix(&self, network: [u8; 4], prefix_len: u8, asn: u32) {
         let mut prefixes = self.ipv4_prefixes.write();
         prefixes.push(Ipv4Prefix::new(network, prefix_len, asn));
-        prefixes.sort_by(|a, b| b.prefix_len.cmp(&a.prefix_len));
+        prefixes.sort_by_key(|p| std::cmp::Reverse(p.prefix_len));
     }
 
     /// Add a custom hosting ASN

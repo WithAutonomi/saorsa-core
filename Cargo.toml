@@ -60,6 +60,7 @@ blake3 = "1.6"
 # Performance optimization
 parking_lot = "0.12"
 once_cell = "1.21"
+dashmap = "6.1"
 
 # Networking
 saorsa-transport = "0.32.0"

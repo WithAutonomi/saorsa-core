@@ -45,6 +45,9 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, trace, warn};
 
+use dashmap::DashMap;
+use dashmap::mapref::entry::Entry;
+
 // Test configuration defaults (used by `new_for_tests()` which is available in all builds)
 const TEST_EVENT_CHANNEL_CAPACITY: usize = 16;
 const TEST_MAX_REQUESTS: u32 = 100;
@@ -150,9 +153,23 @@ pub struct TransportHandle {
     /// Maps app-level [`PeerId`] → set of channel IDs (QUIC, Bluetooth, …).
     ///
     /// A single peer may communicate over multiple channels simultaneously.
-    peer_to_channel: Arc<RwLock<HashMap<PeerId, HashSet<String>>>>,
+    ///
+    /// Uses [`DashMap`] (not `RwLock<HashMap>`) so that the 8 shard consumers
+    /// can update peer tracking concurrently. The previous global write lock
+    /// serialised every authenticated inbound message; under load a single
+    /// slow write stalled all other shards (observed: up to 8.5s lock hold
+    /// times in production).
+    peer_to_channel: Arc<DashMap<PeerId, HashSet<String>>>,
     /// Reverse index: channel ID → set of app-level [`PeerId`]s on that channel.
-    channel_to_peers: Arc<RwLock<HashMap<String, HashSet<PeerId>>>>,
+    ///
+    /// Uses [`DashMap`] (not `RwLock<HashMap>`) for the same reason as
+    /// `peer_to_channel`: the hot path updates both maps on every
+    /// authenticated inbound message. Keeping both maps sync also lets the
+    /// shard consumer write both without yielding between them, which
+    /// eliminates the cooperative-scheduling race where a
+    /// `ConnectionEvent::Lost` could observe `peer_to_channel` populated
+    /// but `channel_to_peers` not yet updated (or vice versa).
+    channel_to_peers: Arc<DashMap<String, HashSet<PeerId>>>,
     /// Maps app-level [`PeerId`] → user agent string received during authentication.
     ///
     /// Stored so that late subscribers (e.g. DHT manager reconciliation) can look
@@ -229,8 +246,8 @@ impl TransportHandle {
         // Subscribe to connection events BEFORE spawning the monitor task
         let connection_event_rx = dual_node.subscribe_connection_events();
 
-        let peer_to_channel = Arc::new(RwLock::new(HashMap::new()));
-        let channel_to_peers = Arc::new(RwLock::new(HashMap::new()));
+        let peer_to_channel = Arc::new(DashMap::new());
+        let channel_to_peers = Arc::new(DashMap::new());
         let peer_user_agents: Arc<RwLock<HashMap<PeerId, String>>> =
             Arc::new(RwLock::new(HashMap::new()));
         // (peer_addr_update_tx removed — dedicated forwarder creates its own)
@@ -361,8 +378,8 @@ impl TransportHandle {
             listener_handle: Arc::new(RwLock::new(None)),
             node_identity: identity,
             user_agent: crate::network::user_agent_for_mode(crate::network::NodeMode::Node),
-            peer_to_channel: Arc::new(RwLock::new(HashMap::new())),
-            channel_to_peers: Arc::new(RwLock::new(HashMap::new())),
+            peer_to_channel: Arc::new(DashMap::new()),
+            channel_to_peers: Arc::new(DashMap::new()),
             peer_user_agents: Arc::new(RwLock::new(HashMap::new())),
         })
     }
@@ -488,22 +505,25 @@ impl TransportHandle {
 impl TransportHandle {
     /// Get list of authenticated app-level peer IDs.
     pub async fn connected_peers(&self) -> Vec<PeerId> {
-        self.peer_to_channel.read().await.keys().cloned().collect()
+        self.peer_to_channel
+            .iter()
+            .map(|entry| *entry.key())
+            .collect()
     }
 
     /// Get socket addresses of connected peers (for coordinator hints).
     /// Returns up to `limit` addresses of currently connected peers.
     pub async fn connected_peer_addresses(&self, limit: usize) -> Vec<(SocketAddr, PeerId)> {
-        let p2c = self.peer_to_channel.read().await;
         let mut result = Vec::new();
-        for (peer_id, channels) in p2c.iter() {
+        for entry in self.peer_to_channel.iter() {
             if result.len() >= limit {
                 break;
             }
+            let peer_id = *entry.key();
             // Channel IDs are stringified SocketAddrs (e.g., "45.32.243.72:10012")
-            for channel_id in channels {
+            for channel_id in entry.value() {
                 if let Ok(sa) = channel_id.parse::<SocketAddr>() {
-                    result.push((sa, *peer_id));
+                    result.push((sa, peer_id));
                     break; // One address per peer is enough
                 }
             }
@@ -513,7 +533,7 @@ impl TransportHandle {
 
     /// Get count of authenticated app-level peers.
     pub async fn peer_count(&self) -> usize {
-        self.peer_to_channel.read().await.len()
+        self.peer_to_channel.len()
     }
 
     /// Get the user agent string for a connected peer, if known.
@@ -537,10 +557,12 @@ impl TransportHandle {
     /// Resolves the app-level [`PeerId`] to a channel ID via the
     /// `peer_to_channel` mapping, then looks up the channel's [`PeerInfo`].
     pub async fn peer_info(&self, peer_id: &PeerId) -> Option<PeerInfo> {
-        let p2c = self.peer_to_channel.read().await;
-        let channel = p2c.get(peer_id).and_then(|chs| chs.iter().next())?;
+        let channel = {
+            let entry = self.peer_to_channel.get(peer_id)?;
+            entry.iter().next().cloned()?
+        };
         let peers = self.peers.read().await;
-        peers.get(channel).cloned()
+        peers.get(&channel).cloned()
     }
 
     /// Get info for a transport-level channel by its channel ID (internal only).
@@ -613,11 +635,13 @@ impl TransportHandle {
 
     /// Look up the peer ID for a given connection address.
     pub async fn peer_id_for_addr(&self, addr: &SocketAddr) -> Option<PeerId> {
-        let c2p = self.channel_to_peers.read().await;
-
         // Try the exact stringified address first.
         let channel_id = addr.to_string();
-        if let Some(peer_id) = c2p.get(&channel_id).and_then(|p| p.iter().next().copied()) {
+        if let Some(peer_id) = self
+            .channel_to_peers
+            .get(&channel_id)
+            .and_then(|p| p.iter().next().copied())
+        {
             return Some(peer_id);
         }
 
@@ -625,7 +649,8 @@ impl TransportHandle {
         // while the lookup address was normalized to IPv4 ("1.2.3.4:PORT"), or vice versa.
         let alt_addr = saorsa_transport::shared::dual_stack_alternate(addr)?;
         let alt_channel_id = alt_addr.to_string();
-        c2p.get(&alt_channel_id)
+        self.channel_to_peers
+            .get(&alt_channel_id)
             .and_then(|p| p.iter().next().copied())
     }
 
@@ -678,7 +703,7 @@ impl TransportHandle {
     /// Check if an authenticated peer is connected (has at least one active
     /// channel).
     pub async fn is_peer_connected(&self, peer_id: &PeerId) -> bool {
-        self.peer_to_channel.read().await.contains_key(peer_id)
+        self.peer_to_channel.contains_key(peer_id)
     }
 
     /// Check if a connection to a peer is active at the transport layer (internal only).
@@ -704,25 +729,65 @@ impl TransportHandle {
 
     /// Static version of channel mapping removal — usable from background tasks
     /// that don't have `&self`.
+    ///
+    /// Structured to avoid holding a `DashMap::RefMut` across `.await`: all
+    /// `peer_to_channel` / `channel_to_peers` mutations use sync DashMap ops
+    /// with guards scoped so they drop before the `peer_user_agents.write().await`.
+    ///
+    /// **Known narrow race with the hot path.** The hot path writes
+    /// `peer_to_channel` first, then `channel_to_peers`, with no yield point
+    /// between the two. If `Lost` for a channel fires between those two
+    /// writes, our `channel_to_peers.remove` returns `None` and we return
+    /// without scrubbing the stale `peer_to_channel` entry. This race is
+    /// not new to the DashMap migration — the pre-migration `RwLock<HashMap>`
+    /// code also released the `peer_to_channel` write lock before taking
+    /// `channel_to_peers.write`. Impact is bounded: the stale entry causes
+    /// the next `send_message` to that peer to fail at the transport layer
+    /// (the channel is dead). We intentionally do not add a p2c-scan
+    /// fallback or a second c2p-remove here — `channel_id` is just the
+    /// stringified `SocketAddr`, so either approach can clobber a fresh
+    /// same-address reconnect and tear down a live peer.
     async fn remove_channel_mappings_static(
         channel_id: &str,
-        peer_to_channel: &RwLock<HashMap<PeerId, HashSet<String>>>,
-        channel_to_peers: &RwLock<HashMap<String, HashSet<PeerId>>>,
+        peer_to_channel: &DashMap<PeerId, HashSet<String>>,
+        channel_to_peers: &DashMap<String, HashSet<PeerId>>,
         peer_user_agents: &RwLock<HashMap<PeerId, String>>,
         event_tx: &broadcast::Sender<P2PEvent>,
     ) {
-        let mut p2c = peer_to_channel.write().await;
-        let mut c2p = channel_to_peers.write().await;
-        if let Some(app_peers) = c2p.remove(channel_id) {
-            for app_peer in &app_peers {
-                if let Some(channels) = p2c.get_mut(app_peer) {
-                    channels.remove(channel_id);
-                    if channels.is_empty() {
-                        p2c.remove(app_peer);
-                        peer_user_agents.write().await.remove(app_peer);
-                        let _ = event_tx.send(P2PEvent::PeerDisconnected(*app_peer));
-                    }
+        let app_peers = match channel_to_peers.remove(channel_id) {
+            Some((_, peers)) => peers,
+            None => return,
+        };
+
+        let mut fully_disconnected: Vec<PeerId> = Vec::new();
+        for app_peer in &app_peers {
+            let became_empty = {
+                if let Some(mut channels_ref) = peer_to_channel.get_mut(app_peer) {
+                    channels_ref.remove(channel_id);
+                    channels_ref.is_empty()
+                } else {
+                    false
                 }
+            }; // DashMap RefMut dropped here
+            if became_empty
+                // Only report the peer as disconnected if the key was actually
+                // removed — another shard consumer may have inserted a new
+                // channel for this peer between the RefMut drop and here, in
+                // which case the peer is not disconnected and we must not emit
+                // the event or clear the user agent entry.
+                && peer_to_channel
+                    .remove_if(app_peer, |_, v| v.is_empty())
+                    .is_some()
+            {
+                fully_disconnected.push(*app_peer);
+            }
+        }
+
+        if !fully_disconnected.is_empty() {
+            let mut pua = peer_user_agents.write().await;
+            for app_peer in fully_disconnected {
+                pua.remove(&app_peer);
+                let _ = event_tx.send(P2PEvent::PeerDisconnected(app_peer));
             }
         }
     }
@@ -863,42 +928,80 @@ impl TransportHandle {
     pub async fn disconnect_peer(&self, peer_id: &PeerId) -> Result<()> {
         info!("Disconnecting from peer: {}", peer_id);
 
-        // Remove this peer from the bidirectional maps, collecting channels
-        // that have no remaining peers and should be closed at QUIC level.
-        let orphaned_channels = {
-            let mut p2c = self.peer_to_channel.write().await;
-            let mut c2p = self.channel_to_peers.write().await;
+        // Pre-migration, `disconnect_peer()` and the shard-consumer hot path
+        // serialised on a shared `peer_to_channel` write lock, so the peer
+        // could not reappear in the maps between our `remove()` and the
+        // subsequent cleanup. With DashMap there is no such serialisation:
+        // an authenticated message arriving concurrently can re-insert the
+        // peer after we removed it. Simply suppressing `PeerDisconnected`
+        // in that case would leave the caller's explicit disconnect request
+        // unfulfilled. Instead, we retry the drain a bounded number of
+        // rounds. If the peer keeps reappearing after that, we surface an
+        // error so the caller knows the peer is still active.
+        const MAX_DISCONNECT_ROUNDS: usize = 3;
 
-            let channel_ids = match p2c.remove(peer_id) {
-                Some(chs) => chs,
-                None => {
-                    info!(
-                        "Peer {} has no tracked channels, nothing to disconnect",
-                        peer_id
-                    );
-                    return Ok(());
-                }
-            };
-
-            let mut orphaned = Vec::new();
-            for channel_id in &channel_ids {
-                if let Some(peers) = c2p.get_mut(channel_id) {
-                    peers.remove(peer_id);
-                    if peers.is_empty() {
-                        c2p.remove(channel_id);
-                        orphaned.push(channel_id.clone());
-                    }
-                }
+        let first_channels = match self.peer_to_channel.remove(peer_id) {
+            Some((_, chs)) => chs,
+            None => {
+                info!(
+                    "Peer {} has no tracked channels, nothing to disconnect",
+                    peer_id
+                );
+                return Ok(());
             }
-
-            orphaned
         };
 
-        self.peer_user_agents.write().await.remove(peer_id);
-        let _ = self.event_tx.send(P2PEvent::PeerDisconnected(*peer_id));
+        let mut all_orphaned: Vec<String> = Vec::new();
+        let mut to_scrub: HashSet<String> = first_channels;
+        let mut rounds_done: usize = 0;
+        loop {
+            // Scoped so each `get_mut` RefMut drops before any `remove_if`
+            // on the same key — DashMap would self-deadlock otherwise.
+            for channel_id in &to_scrub {
+                let became_empty = {
+                    if let Some(mut peers_ref) = self.channel_to_peers.get_mut(channel_id) {
+                        peers_ref.remove(peer_id);
+                        peers_ref.is_empty()
+                    } else {
+                        false
+                    }
+                }; // RefMut dropped here
+                if became_empty
+                    && self
+                        .channel_to_peers
+                        .remove_if(channel_id, |_, v| v.is_empty())
+                        .is_some()
+                {
+                    all_orphaned.push(channel_id.clone());
+                }
+            }
+            rounds_done += 1;
+
+            if rounds_done >= MAX_DISCONNECT_ROUNDS {
+                break;
+            }
+
+            // If a concurrent shard consumer re-authenticated the peer
+            // between our drain and here, loop around to drain those too.
+            match self.peer_to_channel.remove(peer_id) {
+                Some((_, chs)) => to_scrub = chs,
+                None => break,
+            }
+        }
+
+        let still_present = self.peer_to_channel.contains_key(peer_id);
+
+        if !still_present {
+            self.peer_user_agents.write().await.remove(peer_id);
+            let _ = self.event_tx.send(P2PEvent::PeerDisconnected(*peer_id));
+        }
 
         // Close QUIC connections for channels with no remaining peers.
-        for channel_id in &orphaned_channels {
+        // We do this regardless of `still_present` because the orphaned
+        // channels themselves are definitively empty at the transport-map
+        // level; closing them also helps terminate any lingering traffic
+        // that fed concurrent re-authentications.
+        for channel_id in &all_orphaned {
             match channel_id.parse::<SocketAddr>() {
                 Ok(addr) => self.dual_node.disconnect_peer_by_addr(&addr).await,
                 Err(e) => {
@@ -914,17 +1017,54 @@ impl TransportHandle {
             self.peers.write().await.remove(channel_id);
         }
 
+        if still_present {
+            warn!(
+                peer = %peer_id,
+                rounds = MAX_DISCONNECT_ROUNDS,
+                "disconnect_peer: peer kept being re-authenticated across drain rounds",
+            );
+            return Err(P2PError::Network(NetworkError::ProtocolError(
+                format!(
+                    "disconnect_peer: peer {} remained mapped after {} drain rounds (concurrent re-authentication)",
+                    peer_id, MAX_DISCONNECT_ROUNDS
+                )
+                .into(),
+            )));
+        }
+
         info!("Disconnected from peer: {}", peer_id);
         Ok(())
     }
 
     /// Disconnect from all peers.
     async fn disconnect_all_peers(&self) -> Result<()> {
-        let peer_ids: Vec<PeerId> = self.peer_to_channel.read().await.keys().cloned().collect();
+        let peer_ids: Vec<PeerId> = self
+            .peer_to_channel
+            .iter()
+            .map(|entry| *entry.key())
+            .collect();
+        // `disconnect_peer` can return `Err` if a peer keeps being
+        // re-authenticated across `MAX_DISCONNECT_ROUNDS` drain rounds.
+        // Pre-migration `disconnect_peer` always succeeded, so propagating
+        // here would silently leave every later peer in `peer_ids` mapped
+        // on shutdown if any single peer is still active. Continue past
+        // individual failures and return the last one so the caller can
+        // observe that a full drain wasn't possible.
+        let mut last_err: Option<P2PError> = None;
         for peer_id in &peer_ids {
-            self.disconnect_peer(peer_id).await?;
+            if let Err(e) = self.disconnect_peer(peer_id).await {
+                warn!(
+                    peer = %peer_id,
+                    error = %e,
+                    "disconnect_all_peers: peer could not be fully drained, continuing",
+                );
+                last_err = Some(e);
+            }
         }
-        Ok(())
+        match last_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 }
 
@@ -947,8 +1087,6 @@ impl TransportHandle {
         let peer_hex = peer_id.to_hex();
         let channels: Vec<String> = self
             .peer_to_channel
-            .read()
-            .await
             .get(peer_id)
             .map(|set| set.iter().cloned().collect())
             .unwrap_or_default();
@@ -1108,8 +1246,6 @@ impl TransportHandle {
     /// Return all channel IDs for an app-level peer, if known.
     pub async fn channels_for_peer(&self, app_peer_id: &PeerId) -> Vec<String> {
         self.peer_to_channel
-            .read()
-            .await
             .get(app_peer_id)
             .map(|channels| channels.iter().cloned().collect())
             .unwrap_or_default()
@@ -1118,8 +1254,6 @@ impl TransportHandle {
     /// Get all authenticated app-level peer IDs communicating over a channel.
     pub(crate) async fn peers_on_channel(&self, channel_id: &str) -> Vec<PeerId> {
         self.channel_to_peers
-            .read()
-            .await
             .get(channel_id)
             .map(|set| set.iter().cloned().collect())
             .unwrap_or_default()
@@ -1127,7 +1261,7 @@ impl TransportHandle {
 
     /// Return true if `peer_id` is a known authenticated app-level peer ID.
     pub async fn is_known_app_peer_id(&self, peer_id: &PeerId) -> bool {
-        self.peer_to_channel.read().await.contains_key(peer_id)
+        self.peer_to_channel.contains_key(peer_id)
     }
 
     /// Wait for the identity exchange to complete on `channel_id` and return
@@ -1406,14 +1540,11 @@ impl TransportHandle {
         // plus any unauthenticated channels.
         let mut peer_channel_groups: Vec<Vec<String>> = Vec::new();
         let mut mapped_channels: HashSet<String> = HashSet::new();
-        {
-            let p2c = self.peer_to_channel.read().await;
-            for channels in p2c.values() {
-                let chs: Vec<String> = channels.iter().cloned().collect();
-                mapped_channels.extend(chs.iter().cloned());
-                if !chs.is_empty() {
-                    peer_channel_groups.push(chs);
-                }
+        for entry in self.peer_to_channel.iter() {
+            let chs: Vec<String> = entry.value().iter().cloned().collect();
+            mapped_channels.extend(chs.iter().cloned());
+            if !chs.is_empty() {
+                peer_channel_groups.push(chs);
             }
         }
 
@@ -1693,8 +1824,8 @@ impl TransportHandle {
         mut shard_rx: tokio::sync::mpsc::Receiver<(SocketAddr, Vec<u8>)>,
         event_tx: broadcast::Sender<P2PEvent>,
         active_requests: Arc<RwLock<HashMap<String, PendingRequest>>>,
-        peer_to_channel: Arc<RwLock<HashMap<PeerId, HashSet<String>>>>,
-        channel_to_peers: Arc<RwLock<HashMap<String, HashSet<PeerId>>>>,
+        peer_to_channel: Arc<DashMap<PeerId, HashSet<String>>>,
+        channel_to_peers: Arc<DashMap<String, HashSet<PeerId>>>,
         peer_user_agents: Arc<RwLock<HashMap<PeerId, String>>>,
         self_peer_id: PeerId,
         dual_node_for_peer_reg: Arc<DualStackNetworkNode>,
@@ -1722,30 +1853,80 @@ impl TransportHandle {
                     if let Some(ref app_id) = authenticated_node_id
                         && *app_id != self_peer_id
                     {
-                        // Update app-level peer↔channel mappings under write locks,
-                        // then drop all locks before the async transport registration.
-                        // This trades a microsecond consistency window (hole-punch
-                        // lookups may briefly miss a peer that the app-level map
-                        // already knows) for dramatically better throughput under
-                        // load — the previous pattern held a write lock across an
-                        // async call, blocking all 8 shard consumers on every
-                        // authenticated message.
-                        let (is_new_peer, inserted) = {
-                            let mut p2c = peer_to_channel.write().await;
-                            let is_new = !p2c.contains_key(app_id);
-                            let channels = p2c.entry(*app_id).or_default();
-                            let ins = channels.insert(channel_id.clone());
-                            (is_new, ins)
-                        }; // p2c lock dropped here
-
-                        if inserted {
+                        // Update app-level peer↔channel mapping on the DashMap,
+                        // then drop the entry guard before the async transport
+                        // registration. The DashMap is sharded internally (64
+                        // shards) so concurrent writes from the 8 shard consumers
+                        // don't serialise on a single lock — the previous
+                        // `RwLock<HashMap>` held a write lock across the entire
+                        // shard consumer path, producing up to 8.5s lock-hold
+                        // times in production under load.
+                        //
+                        // Both `peer_to_channel` and `channel_to_peers` are
+                        // DashMaps: the two inserts happen in a single
+                        // scoped block with no `.await` between them, so
+                        // the shard consumer cannot yield between the two
+                        // map updates. This closes the cooperative-
+                        // scheduling race where `ConnectionEvent::Lost`
+                        // could observe one map populated but not the
+                        // other. A narrower OS-preemption race still
+                        // exists in principle: if a `ConnectionEvent::Lost`
+                        // fires between the `peer_to_channel` insert and
+                        // the `channel_to_peers` insert below,
+                        // `remove_channel_mappings_static` will find no
+                        // `channel_to_peers` entry and return early,
+                        // leaving a stale `peer_to_channel` entry. The
+                        // stale entry causes the next `send_message` to
+                        // that peer to fail at the transport layer
+                        // (dead channel). A `peer_to_channel`-scan
+                        // fallback is intentionally absent — see the doc
+                        // comment on `remove_channel_mappings_static`
+                        // for the reason (it would clobber fresh
+                        // same-address reconnects).
+                        //
+                        // `is_new_peer` is derived by distinguishing
+                        // `Entry::Vacant` (genuinely new peer, emit
+                        // `PeerConnected`) from `Entry::Occupied` (peer
+                        // already known, possibly mid-cleanup with a
+                        // transiently empty channel set). Checking
+                        // `channels.is_empty()` alone would misclassify the
+                        // transient-empty state as new and emit a duplicate
+                        // `PeerConnected` with no matching `PeerDisconnected`.
+                        // Two concurrent shard consumers for the same
+                        // `app_id` serialise on the DashMap shard lock so
+                        // exactly one sees `Entry::Vacant`.
+                        let is_new_peer = {
+                            let is_new = match peer_to_channel.entry(*app_id) {
+                                Entry::Vacant(vacant) => {
+                                    let mut set = HashSet::new();
+                                    set.insert(channel_id.clone());
+                                    vacant.insert(set);
+                                    true
+                                }
+                                Entry::Occupied(mut occupied) => {
+                                    occupied.get_mut().insert(channel_id.clone());
+                                    false
+                                }
+                            }; // p2c Entry guard dropped here
+                            // Always re-insert into `channel_to_peers` rather
+                            // than gating on the p2c `inserted` return.
+                            // Pre-migration, `inserted == false` implied the
+                            // reverse index was already consistent (the
+                            // shared write lock held the invariant). With
+                            // DashMap, a concurrent Lost handler for
+                            // `channel_id` may have cleared `channel_to_peers`
+                            // between the moment `peer_to_channel` got its
+                            // entry for this channel (old connection) and
+                            // now. An unconditional entry().or_default().
+                            // insert() on a HashSet is sync, cheap, and
+                            // idempotent — so we eat the tiny extra cost to
+                            // keep the bidirectional invariant intact.
                             channel_to_peers
-                                .write()
-                                .await
                                 .entry(channel_id.clone())
                                 .or_default()
                                 .insert(*app_id);
-                        }
+                            is_new
+                        }; // no .await anywhere in the block
 
                         // Register peer ID at the low-level transport endpoint.
                         // Now runs without holding any write locks.
@@ -1951,8 +2132,8 @@ impl TransportHandle {
         event_tx: broadcast::Sender<P2PEvent>,
         _geo_provider: Arc<BgpGeoProvider>,
         shutdown: CancellationToken,
-        peer_to_channel: Arc<RwLock<HashMap<PeerId, HashSet<String>>>>,
-        channel_to_peers: Arc<RwLock<HashMap<String, HashSet<PeerId>>>>,
+        peer_to_channel: Arc<DashMap<PeerId, HashSet<String>>>,
+        channel_to_peers: Arc<DashMap<String, HashSet<PeerId>>>,
         peer_user_agents: Arc<RwLock<HashMap<PeerId, String>>>,
         node_identity: Arc<NodeIdentity>,
         user_agent: String,
@@ -2103,17 +2284,276 @@ impl TransportHandle {
     /// `channel_to_peers` (test helper). The bidirectional mapping ensures
     /// `remove_channel` correctly cleans up both maps.
     pub(crate) async fn inject_peer_to_channel(&self, peer_id: PeerId, channel_id: String) {
-        self.peer_to_channel
-            .write()
-            .await
-            .entry(peer_id)
-            .or_default()
-            .insert(channel_id.clone());
+        {
+            let mut channels = self.peer_to_channel.entry(peer_id).or_default();
+            channels.insert(channel_id.clone());
+        } // p2c shard lock dropped before c2p insert to avoid cross-shard guard overlap
         self.channel_to_peers
-            .write()
-            .await
             .entry(channel_id)
             .or_default()
             .insert(peer_id);
+    }
+}
+
+#[cfg(test)]
+mod peer_to_channel_concurrency_tests {
+    //! Concurrency stress tests for the `peer_to_channel` DashMap migration.
+    //!
+    //! These tests exercise the exact patterns used by the migrated hot
+    //! paths (`run_shard_consumer`, `remove_channel_mappings_static`,
+    //! `disconnect_peer`, `inject_peer_to_channel`) under many concurrent
+    //! tasks, wrapped in a `tokio::time::timeout`. A guard held across an
+    //! `.await` anywhere in these patterns would deadlock and trip the
+    //! timeout, failing the test in CI before the bug could ship.
+
+    use super::*;
+    use std::time::Duration;
+
+    fn make_peer(b: u8) -> PeerId {
+        PeerId::from_bytes([b; 32])
+    }
+
+    /// Mirrors the `run_shard_consumer` hot-path write, including the
+    /// unconditional `channel_to_peers` insert that keeps the reverse index
+    /// in sync even when a concurrent Lost handler has cleared it.
+    async fn hot_path_insert(
+        peer_to_channel: &DashMap<PeerId, HashSet<String>>,
+        channel_to_peers: &DashMap<String, HashSet<PeerId>>,
+        app_id: &PeerId,
+        channel_id: &str,
+    ) {
+        {
+            let _is_new = match peer_to_channel.entry(*app_id) {
+                Entry::Vacant(vacant) => {
+                    let mut set = HashSet::new();
+                    set.insert(channel_id.to_string());
+                    vacant.insert(set);
+                    true
+                }
+                Entry::Occupied(mut occupied) => {
+                    occupied.get_mut().insert(channel_id.to_string());
+                    false
+                }
+            };
+            channel_to_peers
+                .entry(channel_id.to_string())
+                .or_default()
+                .insert(*app_id);
+        } // DashMap guards dropped before the .await below
+        tokio::task::yield_now().await;
+    }
+
+    /// Mirrors the simple `remove_channel_mappings_static` pattern:
+    /// single `channel_to_peers.remove`, no p2c scan, no late double-remove.
+    async fn remove_channel_mapping(
+        peer_to_channel: &DashMap<PeerId, HashSet<String>>,
+        channel_to_peers: &DashMap<String, HashSet<PeerId>>,
+        peer_user_agents: &RwLock<HashMap<PeerId, String>>,
+        channel_id: &str,
+    ) {
+        let app_peers = match channel_to_peers.remove(channel_id) {
+            Some((_, peers)) => peers,
+            None => return,
+        };
+
+        let mut fully_disconnected: Vec<PeerId> = Vec::new();
+        for app_peer in &app_peers {
+            let became_empty = {
+                if let Some(mut channels_ref) = peer_to_channel.get_mut(app_peer) {
+                    channels_ref.remove(channel_id);
+                    channels_ref.is_empty()
+                } else {
+                    false
+                }
+            };
+            if became_empty
+                && peer_to_channel
+                    .remove_if(app_peer, |_, v| v.is_empty())
+                    .is_some()
+            {
+                fully_disconnected.push(*app_peer);
+            }
+        }
+
+        if !fully_disconnected.is_empty() {
+            let mut pua = peer_user_agents.write().await;
+            for app_peer in fully_disconnected {
+                pua.remove(&app_peer);
+            }
+        }
+    }
+
+    /// Mirrors `disconnect_peer` post both migrations — both maps DashMap,
+    /// restructured c2p loop to drop RefMut before `remove`.
+    async fn disconnect_peer_pattern(
+        peer_to_channel: &DashMap<PeerId, HashSet<String>>,
+        channel_to_peers: &DashMap<String, HashSet<PeerId>>,
+        peer_id: &PeerId,
+    ) {
+        let channel_ids = match peer_to_channel.remove(peer_id) {
+            Some((_, chs)) => chs,
+            None => return,
+        };
+        for channel_id in &channel_ids {
+            let became_empty = {
+                if let Some(mut peers_ref) = channel_to_peers.get_mut(channel_id) {
+                    peers_ref.remove(peer_id);
+                    peers_ref.is_empty()
+                } else {
+                    false
+                }
+            };
+            if became_empty {
+                channel_to_peers.remove_if(channel_id, |_, v| v.is_empty());
+            }
+        }
+    }
+
+    /// Runs the tokio stress runtime from a `std::thread` so a std-level
+    /// watchdog can still fire if every tokio worker wedges on a DashMap
+    /// shard mutex. A DashMap RefMut held across `.await` eventually blocks
+    /// every worker thread on a sync `parking_lot` mutex, which prevents
+    /// any in-runtime `tokio::time::timeout` from firing — the process
+    /// hangs until CI kills it. The outer std thread is immune to that
+    /// wedge and can assert a clean test failure.
+    #[test]
+    fn concurrent_peer_channel_stress_test() {
+        const NUM_TASKS: usize = 100;
+        const ITERATIONS_PER_TASK: usize = 50;
+        const PEER_POOL_SIZE: u8 = 20;
+        const CHANNEL_POOL_SIZE: usize = 10;
+        const WATCHDOG: Duration = Duration::from_secs(10);
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let _runtime_thread = std::thread::Builder::new()
+            .name("stress-test-runtime".into())
+            .spawn(move || {
+                let rt = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(8)
+                    .enable_all()
+                    .build()
+                    .expect("build stress test runtime");
+                rt.block_on(async move {
+                    let peer_to_channel: Arc<DashMap<PeerId, HashSet<String>>> =
+                        Arc::new(DashMap::new());
+                    let channel_to_peers: Arc<DashMap<String, HashSet<PeerId>>> =
+                        Arc::new(DashMap::new());
+                    let peer_user_agents: Arc<RwLock<HashMap<PeerId, String>>> =
+                        Arc::new(RwLock::new(HashMap::new()));
+
+                    let mut handles = Vec::new();
+                    for task_idx in 0..NUM_TASKS {
+                        let p2c = Arc::clone(&peer_to_channel);
+                        let c2p = Arc::clone(&channel_to_peers);
+                        let pua = Arc::clone(&peer_user_agents);
+                        handles.push(tokio::spawn(async move {
+                            for i in 0..ITERATIONS_PER_TASK {
+                                let peer =
+                                    make_peer(((task_idx * 7 + i) % PEER_POOL_SIZE as usize) as u8);
+                                let channel =
+                                    format!("127.0.0.1:{}", 10000 + (i % CHANNEL_POOL_SIZE));
+
+                                match i % 6 {
+                                    0 => {
+                                        hot_path_insert(&p2c, &c2p, &peer, &channel).await;
+                                        pua.write()
+                                            .await
+                                            .entry(peer)
+                                            .or_insert_with(|| format!("agent-{task_idx}"));
+                                    }
+                                    1 => {
+                                        let _ = p2c.contains_key(&peer);
+                                        let _ = p2c.len();
+                                        let _ = p2c.get(&peer).map(|r| r.len());
+                                    }
+                                    2 => {
+                                        let count = p2c.iter().count();
+                                        assert!(count <= PEER_POOL_SIZE as usize);
+                                        for entry in p2c.iter() {
+                                            let _ = entry.value().len();
+                                        }
+                                    }
+                                    3 => {
+                                        remove_channel_mapping(&p2c, &c2p, &pua, &channel).await;
+                                    }
+                                    4 => {
+                                        disconnect_peer_pattern(&p2c, &c2p, &peer).await;
+                                    }
+                                    5 => {
+                                        let _peers: Vec<PeerId> =
+                                            p2c.iter().map(|e| *e.key()).collect();
+                                    }
+                                    _ => unreachable!(),
+                                }
+                            }
+                        }));
+                    }
+                    for h in handles {
+                        h.await.expect("stress task should not panic");
+                    }
+
+                    assert!(
+                        peer_to_channel.len() <= PEER_POOL_SIZE as usize,
+                        "peer count exceeds pool size: {}",
+                        peer_to_channel.len()
+                    );
+                });
+                let _ = done_tx.send(());
+            })
+            .expect("spawn stress test runtime thread");
+
+        if done_rx.recv_timeout(WATCHDOG).is_err() {
+            // The tokio runtime never signalled completion within the
+            // watchdog window. Every worker thread is almost certainly
+            // blocked on a DashMap shard mutex because some task held a
+            // `RefMut` / `Entry` across an `.await`. We deliberately
+            // abandon the runtime thread (it will be cleaned up when the
+            // test process exits) and panic so the test fails loudly.
+            panic!(
+                "stress test deadlocked — tokio runtime wedged for {WATCHDOG:?}, \
+                 likely a DashMap guard held across .await"
+            );
+        }
+    }
+
+    /// Targeted regression: the restructured `remove_channel_mappings_static`
+    /// must not hold a `DashMap::RefMut` across the `peer_user_agents.write().await`.
+    /// If anyone reverts that restructuring, this test deadlocks.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remove_channel_mapping_does_not_hold_refmut_across_await() {
+        let peer_to_channel: Arc<DashMap<PeerId, HashSet<String>>> = Arc::new(DashMap::new());
+        let channel_to_peers: Arc<DashMap<String, HashSet<PeerId>>> = Arc::new(DashMap::new());
+        let peer_user_agents: Arc<RwLock<HashMap<PeerId, String>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+
+        let peer = make_peer(1);
+        let channel_id = "127.0.0.1:10000".to_string();
+        peer_to_channel
+            .entry(peer)
+            .or_default()
+            .insert(channel_id.clone());
+        channel_to_peers
+            .entry(channel_id.clone())
+            .or_default()
+            .insert(peer);
+        peer_user_agents
+            .write()
+            .await
+            .insert(peer, "agent".to_string());
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            remove_channel_mapping(
+                &peer_to_channel,
+                &channel_to_peers,
+                &peer_user_agents,
+                &channel_id,
+            )
+            .await
+        })
+        .await
+        .expect("remove_channel_mapping timed out — RefMut likely held across .await");
+
+        assert!(!peer_to_channel.contains_key(&peer));
+        assert!(peer_user_agents.read().await.get(&peer).is_none());
     }
 }

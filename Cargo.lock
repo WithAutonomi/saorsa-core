@@ -2466,6 +2466,7 @@ dependencies = [
  "async-trait",
  "blake3",
  "bytes",
+ "dashmap",
  "dirs 6.0.0",
  "futures",
  "hex",
