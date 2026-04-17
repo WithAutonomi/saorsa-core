@@ -3320,4 +3320,41 @@ mod tests {
             "message with mismatched from field should be rejected"
         );
     }
+
+    /// Verify that postcard wire encoding stays within 1.2x of raw payload size
+    /// for typical messages (issue #7: triple JSON encoding caused 3.6x bloat).
+    #[test]
+    fn test_wire_encoding_no_bloat() {
+        let payload_sizes = [1024_usize, 8192, 65536];
+        for payload_size in payload_sizes {
+            let data: Vec<u8> = (0..payload_size).map(|i| (i % 256) as u8).collect();
+            let msg = WireMessage {
+                protocol: "saorsa/msg/v1".to_string(),
+                data,
+                from: PeerId::from_name("sender-peer-id"),
+                timestamp: 1_700_000_000,
+                user_agent: "node/0.23.0".to_string(),
+                public_key: Vec::new(),
+                signature: Vec::new(),
+            };
+
+            let wire_bytes = postcard::to_stdvec(&msg).unwrap();
+            // JSON would encode Vec<u8> as [72,101,...] → ~4x overhead.
+            // Postcard encodes Vec<u8> as length-prefixed raw bytes → minimal overhead.
+            let overhead = wire_bytes.len() as f64 / payload_size as f64;
+
+            assert!(
+                overhead < 1.2,
+                "Wire encoding overhead for {payload_size}B payload is {overhead:.2}x \
+                 (expected <1.2x). Wire size: {} bytes. \
+                 See issue #7: triple JSON encoding caused 3.6x bloat.",
+                wire_bytes.len()
+            );
+
+            // Also verify round-trip fidelity
+            let decoded: WireMessage = postcard::from_bytes(&wire_bytes).unwrap();
+            assert_eq!(decoded.data.len(), payload_size);
+            assert_eq!(decoded.protocol, "saorsa/msg/v1");
+        }
+    }
 }
