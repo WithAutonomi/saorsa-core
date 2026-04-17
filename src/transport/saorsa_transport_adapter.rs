@@ -1182,10 +1182,19 @@ impl DualStackNetworkNode<P2pLinkTransport> {
     /// Send to peer using P2pEndpoint's optimized send method.
     ///
     /// Uses P2pEndpoint::send() which corresponds with recv() for proper
-    /// bidirectional communication. Tries IPv6 first, then IPv4.
+    /// bidirectional communication.
     ///
-    /// In dual-stack mode, converts plain IPv4 addresses to the mapped form
-    /// expected by the v6 transport before sending.
+    /// Dispatch (see [`Self::pick_stacks_for`]):
+    /// - **Dual-stack** (single v6 socket accepting mapped v4): send on v6
+    ///   first — plain IPv4 targets are converted to `[::ffff:x.x.x.x]` —
+    ///   with v4 as fallback if present.
+    /// - **Split-stack** (separate v4/v6 sockets, common on Windows): route
+    ///   by target family. IPv4 targets go to the v4 socket, IPv6 targets
+    ///   go to the v6 socket. Cross-family fallback is only used when the
+    ///   matching socket is absent entirely.
+    ///
+    /// On failure, the returned error preserves the underlying transport
+    /// cause instead of a generic "failed on both stacks" message.
     pub async fn send_to_peer_optimized(&self, addr: &SocketAddr, data: &[u8]) -> Result<()> {
         // Preserve the underlying error(s) so the caller can surface them at
         // WARN level. The previous implementation returned a hardcoded
