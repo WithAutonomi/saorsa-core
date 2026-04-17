@@ -850,6 +850,15 @@ pub struct DualStackNetworkNode<T: LinkTransport = P2pLinkTransport> {
     is_dual_stack: bool,
 }
 
+/// Return value of [`DualStackNetworkNode::pick_stacks_for`]: the primary and
+/// optional fallback `(node, wire_addr)` pair to use when sending to a given
+/// address. Either element may be `None` if that stack is absent or would be a
+/// wasted attempt for the target family.
+type PickedStacks<'a, T> = (
+    Option<(&'a P2PNetworkNode<T>, SocketAddr)>,
+    Option<(&'a P2PNetworkNode<T>, SocketAddr)>,
+);
+
 #[allow(dead_code)]
 impl DualStackNetworkNode<P2pLinkTransport> {
     /// Set the target peer ID for a hole-punch attempt to a specific address.
@@ -1178,44 +1187,43 @@ impl DualStackNetworkNode<P2pLinkTransport> {
     /// In dual-stack mode, converts plain IPv4 addresses to the mapped form
     /// expected by the v6 transport before sending.
     pub async fn send_to_peer_optimized(&self, addr: &SocketAddr, data: &[u8]) -> Result<()> {
-        // Preserve the underlying error(s) from the v6 and v4 stacks so the
-        // caller can surface them at WARN level. The previous implementation
-        // dropped both errors and returned a hardcoded
-        // "send_to_peer_optimized failed on both stacks" which made every
-        // transport failure look identical in the logs.
-        let mut v6_err: Option<anyhow::Error> = None;
-        let mut v4_err: Option<anyhow::Error> = None;
+        // Preserve the underlying error(s) so the caller can surface them at
+        // WARN level. The previous implementation returned a hardcoded
+        // "failed on both stacks" which made every transport failure look
+        // identical in the logs.
+        let (primary, fallback) = self.pick_stacks_for(addr);
+        let mut primary_err: Option<anyhow::Error> = None;
+        let mut fallback_err: Option<anyhow::Error> = None;
 
-        if let Some(v6) = &self.v6 {
-            let wire_addr = self.to_mapped_if_needed(addr);
-            match v6.send_to_peer_optimized(&wire_addr, data).await {
+        if let Some((node, wire_addr)) = primary {
+            match node.send_to_peer_optimized(&wire_addr, data).await {
                 Ok(()) => return Ok(()),
                 Err(e) => {
-                    warn!("[DUAL SEND] IPv6 send to {} failed: {:#}", addr, e);
-                    v6_err = Some(e);
+                    let family = if wire_addr.is_ipv6() { "IPv6" } else { "IPv4" };
+                    warn!("[DUAL SEND] {family} send to {} failed: {:#}", addr, e);
+                    primary_err = Some(e);
                 }
             }
         }
-        if let Some(v4) = &self.v4 {
-            match v4.send_to_peer_optimized(addr, data).await {
+        if let Some((node, wire_addr)) = fallback {
+            match node.send_to_peer_optimized(&wire_addr, data).await {
                 Ok(()) => return Ok(()),
                 Err(e) => {
-                    warn!("[DUAL SEND] IPv4 send to {} failed: {:#}", addr, e);
-                    v4_err = Some(e);
+                    let family = if wire_addr.is_ipv6() { "IPv6" } else { "IPv4" };
+                    warn!("[DUAL SEND] {family} send to {} failed: {:#}", addr, e);
+                    fallback_err = Some(e);
                 }
             }
         }
 
-        // Inline the actual error cause so callers using `{}` (not `{:#}`)
-        // see the real failure reason, not just which IP stack was tried.
-        let err = match (v6_err, v4_err) {
-            (Some(v6), Some(v4)) => anyhow::anyhow!(
-                "send_to_peer_optimized to {addr} failed on both stacks — v6: {v6}, v4: {v4}"
+        let err = match (primary_err, fallback_err) {
+            (Some(p), Some(f)) => anyhow::anyhow!(
+                "send_to_peer_optimized to {addr} failed on both stacks — primary: {p}, fallback: {f}"
             ),
-            (Some(v6), None) => anyhow::anyhow!("send_to_peer_optimized to {addr} failed: {v6}"),
-            (None, Some(v4)) => anyhow::anyhow!("send_to_peer_optimized to {addr} failed: {v4}"),
+            (Some(p), None) => anyhow::anyhow!("send_to_peer_optimized to {addr} failed: {p}"),
+            (None, Some(f)) => anyhow::anyhow!("send_to_peer_optimized to {addr} failed: {f}"),
             (None, None) => anyhow::anyhow!(
-                "send_to_peer_optimized to {addr}: neither v6 nor v4 stack available"
+                "send_to_peer_optimized to {addr}: no stack available for this address family"
             ),
         };
         Err(err)
@@ -1223,15 +1231,29 @@ impl DualStackNetworkNode<P2pLinkTransport> {
 
     /// Disconnect a peer, closing the underlying QUIC connection.
     ///
-    /// Tries both IPv6 and IPv4 stacks. In dual-stack mode, converts
-    /// plain IPv4 to mapped form for the v6 transport.
+    /// In dual-stack mode both stacks may hold connection state, so issue
+    /// disconnects to both. In split-stack mode only the stack matching the
+    /// target family holds the connection — issuing a disconnect to the
+    /// wrong stack is wasted (and on Windows actively triggers
+    /// WSAEADDRNOTAVAIL against a v6-only socket with a v4 target).
     pub async fn disconnect_peer_by_addr(&self, addr: &SocketAddr) {
-        if let Some(ref v6) = self.v6 {
-            let wire_addr = self.to_mapped_if_needed(addr);
-            v6.disconnect_peer_quic(&wire_addr).await;
+        if self.is_dual_stack {
+            if let Some(ref v6) = self.v6 {
+                let wire_addr = self.to_mapped_if_needed(addr);
+                v6.disconnect_peer_quic(&wire_addr).await;
+            }
+            if let Some(ref v4) = self.v4 {
+                v4.disconnect_peer_quic(addr).await;
+            }
+            return;
         }
-        if let Some(ref v4) = self.v4 {
-            v4.disconnect_peer_quic(addr).await;
+
+        let (primary, fallback) = self.pick_stacks_for(addr);
+        if let Some((node, wire_addr)) = primary {
+            node.disconnect_peer_quic(&wire_addr).await;
+        }
+        if let Some((node, wire_addr)) = fallback {
+            node.disconnect_peer_quic(&wire_addr).await;
         }
     }
 
@@ -1313,6 +1335,54 @@ impl<T: LinkTransport + Send + Sync + 'static> DualStackNetworkNode<T> {
             return SocketAddr::V6(SocketAddrV6::new(v4.ip().to_ipv6_mapped(), v4.port(), 0, 0));
         }
         *addr
+    }
+
+    /// Pick the primary and fallback nodes for sending to `addr`, plus the
+    /// wire-format address to use for each.
+    ///
+    /// In **dual-stack** mode (`is_dual_stack=true`) we hold only a v6 socket
+    /// that handles both families via kernel mapping, so v6 is primary for
+    /// every target and v4 addresses are rewritten to `[::ffff:x.x.x.x]` at
+    /// the wire. This path is the historical Linux behaviour.
+    ///
+    /// In **split-stack** mode (`is_dual_stack=false`, both v6 and v4 sockets
+    /// bound) the v6 socket is v6-only and cannot send to a v4 target —
+    /// on Windows that materialises as `WSAEADDRNOTAVAIL`, on others as a
+    /// silent drop. Dispatch by target family so v4 targets go to the v4
+    /// socket directly, v6 targets go to the v6 socket, and no mapped
+    /// addresses are ever synthesized. The fallback stack is only tried as
+    /// a last resort (e.g. if the primary socket has vanished).
+    fn pick_stacks_for<'a>(&'a self, addr: &SocketAddr) -> PickedStacks<'a, T> {
+        // Dual-stack: always v6 first with mapping, v4 second untouched.
+        if self.is_dual_stack {
+            let primary = self
+                .v6
+                .as_ref()
+                .map(|n| (n, self.to_mapped_if_needed(addr)));
+            let fallback = self.v4.as_ref().map(|n| (n, *addr));
+            return (primary, fallback);
+        }
+
+        // Split-stack: route by target family.
+        match addr {
+            SocketAddr::V4(_) => {
+                let primary = self.v4.as_ref().map(|n| (n, *addr));
+                // Fallback to v6 with mapping only if we have no v4 socket.
+                let fallback = if primary.is_none() {
+                    self.v6
+                        .as_ref()
+                        .map(|n| (n, self.to_mapped_if_needed(addr)))
+                } else {
+                    None
+                };
+                (primary, fallback)
+            }
+            SocketAddr::V6(_) => {
+                let primary = self.v6.as_ref().map(|n| (n, *addr));
+                // No meaningful v4 fallback for a v6 target.
+                (primary, None)
+            }
+        }
     }
 
     /// Happy Eyeballs connect: race IPv6 and IPv4 attempts.
@@ -1468,21 +1538,26 @@ impl<T: LinkTransport + Send + Sync + 'static> DualStackNetworkNode<T> {
         out
     }
 
-    /// Send to peer by address; tries IPv6 first, then IPv4.
-    /// In dual-stack mode, converts plain IPv4 to mapped form for v6.
+    /// Send to peer by address. In dual-stack mode the v6 socket handles
+    /// both families (with v4 rewritten to mapped form). In split-stack
+    /// mode, dispatch by target family so v4 targets go to the v4 socket
+    /// directly — avoids WSAEADDRNOTAVAIL on Windows where the v6 socket
+    /// is v6-only.
     pub async fn send_to_peer_raw(&self, addr: &SocketAddr, data: &[u8]) -> Result<()> {
-        if let Some(v6) = &self.v6 {
-            let wire_addr = self.to_mapped_if_needed(addr);
-            if v6.send_to_peer_raw(&wire_addr, data).await.is_ok() {
-                return Ok(());
-            }
-        }
-        if let Some(v4) = &self.v4
-            && v4.send_to_peer_raw(addr, data).await.is_ok()
+        let (primary, fallback) = self.pick_stacks_for(addr);
+        if let Some((node, wire_addr)) = primary
+            && node.send_to_peer_raw(&wire_addr, data).await.is_ok()
         {
             return Ok(());
         }
-        Err(anyhow::anyhow!("send_to_peer_raw failed on both stacks"))
+        if let Some((node, wire_addr)) = fallback
+            && node.send_to_peer_raw(&wire_addr, data).await.is_ok()
+        {
+            return Ok(());
+        }
+        Err(anyhow::anyhow!(
+            "send_to_peer_raw to {addr} failed on all available stacks"
+        ))
     }
 
     /// Send to peer by address.
