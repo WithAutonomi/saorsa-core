@@ -1277,16 +1277,27 @@ impl TransportHandle {
         channel_id: &str,
         timeout: Duration,
     ) -> Result<PeerId> {
-        let deadline = Instant::now() + timeout;
+        let start = Instant::now();
+        let deadline = start + timeout;
         let poll_interval = Duration::from_millis(50);
 
         loop {
             // Check if any app-level peer has been authenticated on this channel.
             let peers = self.peers_on_channel(channel_id).await;
             if let Some(peer_id) = peers.into_iter().next() {
+                debug!(
+                    "identity-exchange-probe: arrived after {:?} on channel {}",
+                    start.elapsed(),
+                    channel_id
+                );
                 return Ok(peer_id);
             }
             if Instant::now() >= deadline {
+                debug!(
+                    "identity-exchange-probe: timed out after {:?} on channel {}",
+                    start.elapsed(),
+                    channel_id
+                );
                 return Err(P2PError::Timeout(timeout));
             }
             tokio::time::sleep(poll_interval).await;
