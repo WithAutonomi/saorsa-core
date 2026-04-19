@@ -725,11 +725,13 @@ pub(crate) struct PendingRequest {
 
 /// Maximum time to wait for identity exchange during a reconnect-on-send dial.
 ///
-/// Raised from 5 s to 15 s to match `BOOTSTRAP_IDENTITY_TIMEOUT_SECS`. The 5 s
-/// budget clipped the tail of observed prod-to-prod identity-exchange latencies
-/// (p99 ≈ 5–7 s on healthy paths) and caused chunk PUT/GET failures on
-/// first-contact peers behind residential NAT / MASQUE relay.
-const RECONNECT_IDENTITY_TIMEOUT: Duration = Duration::from_secs(15);
+/// 5 s reverted from a brief 15 s experiment. Instrumentation showed the
+/// distribution is bimodal: identity either lands within ~500 ms or never lands
+/// in any reasonable budget. Bumping the timeout rescued essentially nothing
+/// while making every dead-channel dial wait 10 s longer. The structural fix
+/// is `identity_exchange_failures` (blacklist + fast-fail) rather than a
+/// longer wait — see `TransportHandle::wait_for_peer_identity`.
+const RECONNECT_IDENTITY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Short grace period after closing stale QUIC connections before re-dialing.
 ///
