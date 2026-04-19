@@ -175,7 +175,21 @@ pub struct TransportHandle {
     /// Stored so that late subscribers (e.g. DHT manager reconciliation) can look
     /// up a peer's mode without re-receiving the `PeerConnected` event.
     peer_user_agents: Arc<RwLock<HashMap<PeerId, String>>>,
+    /// Channels that recently timed out on [`Self::wait_for_peer_identity`],
+    /// mapped to the time of failure.
+    ///
+    /// Instrumentation showed identity-exchange outcomes are bimodal: either
+    /// the announce lands within ~500 ms or it never lands within the dial
+    /// budget. Once a channel has failed the exchange, re-dialling it within
+    /// the blacklist window almost always fails again in exactly the same way,
+    /// wasting the full timeout each time. This map lets the wait helper
+    /// fast-fail repeat attempts within [`IDENTITY_FAILURE_BLACKLIST_TTL`] so
+    /// the caller can move on to a different peer immediately.
+    identity_exchange_failures: Arc<DashMap<String, Instant>>,
 }
+
+/// How long a channel stays on the identity-exchange blacklist after a timeout.
+const IDENTITY_FAILURE_BLACKLIST_TTL: Duration = Duration::from_secs(60);
 
 // ============================================================================
 // Construction
@@ -307,6 +321,7 @@ impl TransportHandle {
             peer_to_channel,
             channel_to_peers,
             peer_user_agents,
+            identity_exchange_failures: Arc::new(DashMap::new()),
         })
     }
 
@@ -381,6 +396,7 @@ impl TransportHandle {
             peer_to_channel: Arc::new(DashMap::new()),
             channel_to_peers: Arc::new(DashMap::new()),
             peer_user_agents: Arc::new(RwLock::new(HashMap::new())),
+            identity_exchange_failures: Arc::new(DashMap::new()),
         })
     }
 }
@@ -1277,6 +1293,26 @@ impl TransportHandle {
         channel_id: &str,
         timeout: Duration,
     ) -> Result<PeerId> {
+        // Fast-fail if this channel recently timed out on identity exchange.
+        // The blacklist TTL bounds how long a known-bad channel can stall new
+        // dials; when it expires the entry is dropped so the channel gets a
+        // fresh chance.
+        if let Some(entry) = self.identity_exchange_failures.get(channel_id) {
+            let age = entry.elapsed();
+            if age < IDENTITY_FAILURE_BLACKLIST_TTL {
+                drop(entry);
+                debug!(
+                    "identity-exchange-blacklist: fast-fail after {:?} on channel {} (last timeout {:?} ago)",
+                    Duration::from_millis(0),
+                    channel_id,
+                    age,
+                );
+                return Err(P2PError::Timeout(timeout));
+            }
+            drop(entry);
+            self.identity_exchange_failures.remove(channel_id);
+        }
+
         let start = Instant::now();
         let deadline = start + timeout;
         let poll_interval = Duration::from_millis(50);
@@ -1285,6 +1321,8 @@ impl TransportHandle {
             // Check if any app-level peer has been authenticated on this channel.
             let peers = self.peers_on_channel(channel_id).await;
             if let Some(peer_id) = peers.into_iter().next() {
+                // Success — clear any stale blacklist entry (peer is working again).
+                self.identity_exchange_failures.remove(channel_id);
                 debug!(
                     "identity-exchange-probe: arrived after {:?} on channel {}",
                     start.elapsed(),
@@ -1293,6 +1331,14 @@ impl TransportHandle {
                 return Ok(peer_id);
             }
             if Instant::now() >= deadline {
+                // Record the failure so subsequent dials can fast-fail.
+                self.identity_exchange_failures
+                    .insert(channel_id.to_string(), Instant::now());
+                debug!(
+                    "identity-exchange-blacklist: recording timeout after {:?} on channel {}",
+                    start.elapsed(),
+                    channel_id
+                );
                 debug!(
                     "identity-exchange-probe: timed out after {:?} on channel {}",
                     start.elapsed(),
