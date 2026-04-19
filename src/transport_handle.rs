@@ -2238,17 +2238,41 @@ impl TransportHandle {
                                 }
 
                                 // Send identity announce so the remote peer can authenticate us.
+                                //
+                                // Instrumented with "identity-announce-send:" probe logs so
+                                // a client run can count how often our side's identity send
+                                // fails vs succeeds. The same code runs on every node, so the
+                                // distribution observed here is representative of what's
+                                // happening on peers too (whose logs we may not have access
+                                // to).
                                 match Self::create_identity_announce_bytes(&node_identity, &user_agent) {
                                     Ok(announce_bytes) => {
-                                        if let Err(e) = dual_node
+                                        let announce_len = announce_bytes.len();
+                                        info!(
+                                            "identity-announce-send: dispatching to {channel_id} ({announce_len} bytes)"
+                                        );
+                                        match dual_node
                                             .send_to_peer_optimized(&remote_address, &announce_bytes)
                                             .await
                                         {
-                                            warn!("Failed to send identity announce to {channel_id}: {e}");
+                                            Ok(()) => {
+                                                info!(
+                                                    "identity-announce-send: OK to {channel_id} ({announce_len} bytes)"
+                                                );
+                                            }
+                                            Err(e) => {
+                                                warn!("Failed to send identity announce to {channel_id}: {e}");
+                                                warn!(
+                                                    "identity-announce-send: FAILED to {channel_id}: {e}"
+                                                );
+                                            }
                                         }
                                     }
                                     Err(e) => {
                                         warn!("Failed to create identity announce: {e}");
+                                        warn!(
+                                            "identity-announce-send: ENCODE-FAILED for {channel_id}: {e}"
+                                        );
                                     }
                                 }
 
