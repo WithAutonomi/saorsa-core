@@ -27,6 +27,7 @@ use crate::error::{IdentityError, NetworkError, P2PError, P2pResult as Result};
 use crate::MultiAddr;
 use crate::identity::node_identity::{NodeIdentity, peer_id_from_public_key};
 use crate::quantum_crypto::saorsa_transport_integration::{MlDsaPublicKey, MlDsaSignature};
+use futures::StreamExt;
 use parking_lot::Mutex as ParkingMutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -144,6 +145,14 @@ const BOOTSTRAP_PEER_BATCH_SIZE: usize = 20;
 /// budget enough headroom for two QUIC handshake retries on a high-latency
 /// link.
 const BOOTSTRAP_IDENTITY_TIMEOUT_SECS: u64 = 15;
+
+/// Maximum number of bootstrap peers dialed concurrently in Phase B.
+///
+/// Bounds the fan-out of CLI + cached bootstrap dials so simultaneous
+/// QUIC+PQC handshakes don't spike CPU or saturate the UDP socket. Chosen
+/// low on purpose: each dial runs a full ML-KEM key exchange and ML-DSA
+/// verification, and a cold-start node has no spare compute budget.
+const MAX_CONCURRENT_BOOTSTRAP_DIALS: usize = 4;
 
 /// Serde helper — returns `true`.
 const fn default_true() -> bool {
@@ -1893,8 +1902,12 @@ impl P2PNode {
         &self,
         close_group_cache: Option<&CloseGroupCache>,
     ) -> Result<()> {
-        // Each entry is a list of addresses for a single peer.
-        let mut bootstrap_addr_sets: Vec<Vec<MultiAddr>> = Vec::new();
+        // Each entry is a list of addresses for a single peer. Close-group
+        // peers are dialed serially to preserve trust-priority ordering; CLI
+        // and cached bootstrap peers are dialed concurrently to cut cold-start
+        // latency when some peers are slow or dead.
+        let mut serial_addr_sets: Vec<Vec<MultiAddr>> = Vec::new();
+        let mut parallel_addr_sets: Vec<Vec<MultiAddr>> = Vec::new();
         let mut used_cache = false;
         let mut seen_addresses = std::collections::HashSet::new();
 
@@ -1950,7 +1963,7 @@ impl P2PNode {
                             seen_addresses.insert(sa);
                         }
                     }
-                    bootstrap_addr_sets.push(new_addresses);
+                    serial_addr_sets.push(new_addresses);
                     added_from_close_group += 1;
                 }
             }
@@ -1974,7 +1987,7 @@ impl P2PNode {
                     continue;
                 };
                 seen_addresses.insert(socket_addr);
-                bootstrap_addr_sets.push(vec![multiaddr.clone()]);
+                parallel_addr_sets.push(vec![multiaddr.clone()]);
             }
         }
 
@@ -2003,7 +2016,7 @@ impl P2PNode {
                                 seen_addresses.insert(sa);
                             }
                         }
-                        bootstrap_addr_sets.push(new_addresses);
+                        parallel_addr_sets.push(new_addresses);
                         added_from_cache += 1;
                     }
                 }
@@ -2017,7 +2030,7 @@ impl P2PNode {
             }
         }
 
-        if bootstrap_addr_sets.is_empty() {
+        if serial_addr_sets.is_empty() && parallel_addr_sets.is_empty() {
             info!("No bootstrap peers configured and no cached peers available");
             return Ok(());
         }
@@ -2028,52 +2041,30 @@ impl P2PNode {
         let mut successful_connections = 0;
         let mut connected_peer_ids: Vec<PeerId> = Vec::new();
 
-        for addrs in &bootstrap_addr_sets {
-            for addr in addrs {
-                match self.connect_peer(addr).await {
-                    Ok(channel_id) => {
-                        // Wait for the remote peer's signed identity announce
-                        // so we get a real cryptographic PeerId.
-                        match self
-                            .transport
-                            .wait_for_peer_identity(&channel_id, identity_timeout)
-                            .await
-                        {
-                            Ok(real_peer_id) => {
-                                successful_connections += 1;
-                                connected_peer_ids.push(real_peer_id);
+        // Phase A: serial close-group dials to preserve trust-priority ordering.
+        for addrs in &serial_addr_sets {
+            if let Some(peer_id) = self
+                .dial_bootstrap_addr_set(addrs, used_cache, identity_timeout)
+                .await
+            {
+                successful_connections += 1;
+                connected_peer_ids.push(peer_id);
+            }
+        }
 
-                                // Update bootstrap cache with successful connection
-                                if let Some(ref bootstrap_manager) = self.bootstrap_manager {
-                                    let manager = bootstrap_manager.read().await;
-                                    if let Some(sa) = addr.socket_addr() {
-                                        manager.record_success(&sa, 100).await;
-                                    }
-                                }
-                                break; // Successfully connected, move to next peer
-                            }
-                            Err(e) => {
-                                warn!(
-                                    "Timeout waiting for identity from bootstrap peer {}: {}, \
-                                     closing channel {}",
-                                    addr, e, channel_id
-                                );
-                                self.disconnect_channel(&channel_id).await;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        warn!("Failed to connect to bootstrap peer {}: {}", addr, e);
-
-                        // Update bootstrap cache with failed connection
-                        if used_cache && let Some(ref bootstrap_manager) = self.bootstrap_manager {
-                            let manager = bootstrap_manager.read().await;
-                            if let Some(sa) = addr.socket_addr() {
-                                manager.record_failure(&sa).await;
-                            }
-                        }
-                    }
-                }
+        // Phase B: concurrent dials of CLI + cached bootstrap peers, bounded
+        // by `MAX_CONCURRENT_BOOTSTRAP_DIALS` to cap simultaneous QUIC+PQC
+        // handshakes.
+        let mut parallel_stream = futures::stream::iter(
+            parallel_addr_sets
+                .iter()
+                .map(|addrs| self.dial_bootstrap_addr_set(addrs, used_cache, identity_timeout)),
+        )
+        .buffer_unordered(MAX_CONCURRENT_BOOTSTRAP_DIALS);
+        while let Some(result) = parallel_stream.next().await {
+            if let Some(peer_id) = result {
+                successful_connections += 1;
+                connected_peer_ids.push(peer_id);
             }
         }
 
@@ -2155,6 +2146,55 @@ impl P2PNode {
         }
 
         Ok(())
+    }
+
+    /// Dial a single bootstrap peer's address set, stopping at the first
+    /// address that completes the identity handshake. Records success/failure
+    /// in the bootstrap cache and returns the remote peer's cryptographic
+    /// PeerId on success. Safe to call concurrently for different peers.
+    async fn dial_bootstrap_addr_set(
+        &self,
+        addrs: &[MultiAddr],
+        used_cache: bool,
+        identity_timeout: Duration,
+    ) -> Option<PeerId> {
+        for addr in addrs {
+            match self.connect_peer(addr).await {
+                Ok(channel_id) => match self
+                    .transport
+                    .wait_for_peer_identity(&channel_id, identity_timeout)
+                    .await
+                {
+                    Ok(real_peer_id) => {
+                        if let Some(ref bootstrap_manager) = self.bootstrap_manager {
+                            let manager = bootstrap_manager.read().await;
+                            if let Some(sa) = addr.socket_addr() {
+                                manager.record_success(&sa, 100).await;
+                            }
+                        }
+                        return Some(real_peer_id);
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Timeout waiting for identity from bootstrap peer {}: {}, \
+                             closing channel {}",
+                            addr, e, channel_id
+                        );
+                        self.disconnect_channel(&channel_id).await;
+                    }
+                },
+                Err(e) => {
+                    warn!("Failed to connect to bootstrap peer {}: {}", addr, e);
+                    if used_cache && let Some(ref bootstrap_manager) = self.bootstrap_manager {
+                        let manager = bootstrap_manager.read().await;
+                        if let Some(sa) = addr.socket_addr() {
+                            manager.record_failure(&sa).await;
+                        }
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Persist the current close group peers and their trust scores to disk.
