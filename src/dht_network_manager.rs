@@ -1646,13 +1646,23 @@ impl DhtNetworkManager {
         queried.insert(self.config.peer_id);
     }
 
-    /// Return all dialable addresses from a list of [`MultiAddr`] values.
+    /// Return all dialable addresses from a list of [`MultiAddr`] values,
+    /// with IPv4 ordered before IPv6.
     ///
     /// Only QUIC addresses are considered dialable. Unspecified (`0.0.0.0`)
     /// addresses are rejected. Loopback addresses are accepted for local/test
     /// use.
+    ///
+    /// The IPv4-first preference centralises here so every caller — dial
+    /// loops (`dial_addresses`), single-pick helpers (`first_dialable_address`
+    /// and its downstream uses for hole-punch hints, routing-table touches,
+    /// PublishAddress, etc.) — inherits the same bias without duplicating the
+    /// sort. IPv6 NAT traversal is less mature on consumer networks, so IPv4
+    /// attempts tend to succeed faster when both families are available.
+    /// Stable sort preserves the caller's relative ordering within each
+    /// family (trust-sort, XOR-distance, etc. stay meaningful).
     fn dialable_addresses(addresses: &[MultiAddr]) -> Vec<MultiAddr> {
-        addresses
+        let mut filtered: Vec<MultiAddr> = addresses
             .iter()
             .filter(|addr| {
                 let Some(sa) = addr.dialable_socket_addr() else {
@@ -1669,7 +1679,9 @@ impl DhtNetworkManager {
                 true
             })
             .cloned()
-            .collect()
+            .collect();
+        filtered.sort_by_key(|a| !a.is_ipv4());
+        filtered
     }
 
     /// Return the first dialable address from a list of [`MultiAddr`] values.

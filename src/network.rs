@@ -1928,7 +1928,7 @@ impl P2PNode {
 
             let mut added_from_close_group = 0usize;
             for peer in &sorted_peers {
-                let new_addresses: Vec<MultiAddr> = peer
+                let mut new_addresses: Vec<MultiAddr> = peer
                     .addresses
                     .iter()
                     .filter(|a| {
@@ -1937,6 +1937,12 @@ impl P2PNode {
                     })
                     .cloned()
                     .collect();
+
+                // Prefer IPv4 over IPv6: IPv6 NAT traversal is less mature
+                // on consumer networks, so an IPv4 attempt tends to succeed
+                // faster when both are available. Stable sort preserves the
+                // relative order within each family.
+                new_addresses.sort_by_key(|a| !a.is_ipv4());
 
                 if !new_addresses.is_empty() {
                     for addr in &new_addresses {
@@ -1982,11 +1988,14 @@ impl P2PNode {
                     let mut addrs = vec![cached.primary_address];
                     addrs.extend(cached.addresses);
                     // Only add addresses we haven't seen from CLI peers
-                    let new_addresses: Vec<MultiAddr> = addrs
+                    let mut new_addresses: Vec<MultiAddr> = addrs
                         .into_iter()
                         .filter(|a| !seen_addresses.contains(a))
                         .map(MultiAddr::quic)
                         .collect();
+
+                    // Prefer IPv4 over IPv6 within each peer's address set.
+                    new_addresses.sort_by_key(|a| !a.is_ipv4());
 
                     if !new_addresses.is_empty() {
                         for addr in &new_addresses {
