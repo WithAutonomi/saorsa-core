@@ -1485,20 +1485,41 @@ impl<T: LinkTransport + Send + Sync + 'static> DualStackNetworkNode<T> {
 
     /// Happy Eyeballs connect: race IPv6 and IPv4 attempts.
     ///
-    /// In dual-stack mode, IPv4 targets are converted to mapped form for the
-    /// v6 transport.  The returned address is always normalised (plain IPv4).
+    /// ### Dual-stack (single v6 socket via kernel mapping)
+    ///
+    /// Dial every target through the v6 socket in caller-provided order —
+    /// v4 targets get rewritten to `[::ffff:x.x.x.x]` wire form. Ordering
+    /// matters: callers sort targets by preference (most-recently-seen,
+    /// best-latency, trust score) and Happy Eyeballs relies on that
+    /// priority. A bucket-then-merge approach would silently reorder
+    /// mixed `[mapped_v4, real_v6]` inputs.
+    ///
+    /// ### Split-stack (family-specific sockets)
+    ///
+    /// Bucket targets by their true post-unmapping family — an
+    /// `[::ffff:x.x.x.x]:port` target (as stored in the DHT by dual-stack
+    /// peers reporting via `ObservedAddress`) un-maps into the v4 bucket
+    /// so v4-only hosts (Windows split-stack, `--ipv4-only`, v6-disabled)
+    /// can dial it. If both stacks have targets, race them with a 50 ms
+    /// Happy Eyeballs head-start for v6.
+    ///
+    /// The returned address is always normalised (plain IPv4).
     pub async fn connect_happy_eyeballs(&self, targets: &[SocketAddr]) -> Result<SocketAddr> {
-        let mut v6_targets: Vec<SocketAddr> = Vec::new();
-        let mut v4_targets: Vec<SocketAddr> = Vec::new();
-        for &t in targets {
-            if t.is_ipv6() {
-                v6_targets.push(t);
-            } else {
-                v4_targets.push(t);
+        // Dual-stack: the v6 socket dials everything; build a single v6-wire
+        // dial list in caller-provided order so attempt priority is preserved
+        // for mixed-family inputs.
+        if self.is_dual_stack {
+            let dial_list = to_dual_stack_dial_list(targets);
+            if dial_list.is_empty() {
+                return Err(anyhow::anyhow!("No suitable transport available"));
             }
+            let addr = self.connect_sequential(&self.v6, &dial_list).await?;
+            return Ok(self.normalize(addr));
         }
 
-        // Race both stacks if both are available with targets
+        // Split-stack: bucket by true family, race if both stacks are populated.
+        let (v6_targets, v4_targets) = bucket_targets(targets);
+
         let (v6_node, v4_node) = match (&self.v6, &self.v4) {
             (Some(v6), Some(v4)) if !v6_targets.is_empty() && !v4_targets.is_empty() => (v6, v4),
             (Some(_), _) if !v6_targets.is_empty() => {
@@ -1507,15 +1528,6 @@ impl<T: LinkTransport + Send + Sync + 'static> DualStackNetworkNode<T> {
             }
             (_, Some(_)) if !v4_targets.is_empty() => {
                 let addr = self.connect_sequential(&self.v4, &v4_targets).await?;
-                return Ok(self.normalize(addr));
-            }
-            // Dual-stack: v6 socket can reach IPv4 peers via mapped addresses
-            (Some(_), None) if !v4_targets.is_empty() => {
-                let mapped: Vec<SocketAddr> = v4_targets
-                    .iter()
-                    .map(|a| self.to_mapped_if_needed(a))
-                    .collect();
-                let addr = self.connect_sequential(&self.v6, &mapped).await?;
                 return Ok(self.normalize(addr));
             }
             _ => return Err(anyhow::anyhow!("No suitable transport available")),
@@ -1757,6 +1769,52 @@ impl<T: LinkTransport + Send + Sync + 'static> DualStackNetworkNode<T> {
     }
 }
 
+/// Bucket `targets` by their true, post-unmapping address family.
+///
+/// DHT-stored peer addresses are whatever form the peer reported —
+/// dual-stack peers advertise themselves via `ObservedAddress` frames
+/// in IPv4-mapped IPv6 (`[::ffff:a.b.c.d]:port`) form, and that
+/// representation propagates through DHT lookups. We un-map before
+/// bucketing so routing decisions are made by the peer's true family,
+/// not by the `SocketAddr` enum variant.
+///
+/// Without this, a mapped-v4 target is classified as v6, and v4-only
+/// callers (Windows split-stack, `--ipv4-only`, v6-disabled hosts) get
+/// `NoSuitableTransport` even though the v4 socket could dial the
+/// underlying v4 peer perfectly well.
+fn bucket_targets(targets: &[SocketAddr]) -> (Vec<SocketAddr>, Vec<SocketAddr>) {
+    let mut v6 = Vec::new();
+    let mut v4 = Vec::new();
+    for &t in targets {
+        let t = saorsa_transport::shared::normalize_socket_addr(t);
+        if t.is_ipv6() {
+            v6.push(t);
+        } else {
+            v4.push(t);
+        }
+    }
+    (v6, v4)
+}
+
+/// Rebuild `targets` as a single v6-wire dial list for dual-stack mode.
+///
+/// Plain IPv4 entries are rewritten to `[::ffff:x.x.x.x]`; v6 entries
+/// (real v6 and already-mapped v4) pass through unchanged. Caller-
+/// provided order is preserved so Happy Eyeballs attempt priority on
+/// mixed `[mapped_v4, real_v6]` inputs is not reordered by a
+/// bucket-then-merge pass.
+fn to_dual_stack_dial_list(targets: &[SocketAddr]) -> Vec<SocketAddr> {
+    targets
+        .iter()
+        .map(|addr| match addr {
+            SocketAddr::V4(v4) => {
+                SocketAddr::V6(SocketAddrV6::new(v4.ip().to_ipv6_mapped(), v4.port(), 0, 0))
+            }
+            SocketAddr::V6(_) => *addr,
+        })
+        .collect()
+}
+
 /// Normalise addresses in a `ConnectionEvent` (IPv4-mapped → plain IPv4).
 fn normalize_connection_event(event: ConnectionEvent) -> ConnectionEvent {
     use saorsa_transport::shared::normalize_socket_addr;
@@ -1798,7 +1856,11 @@ fn normalize_connection_event(event: ConnectionEvent) -> ConnectionEvent {
 
 #[cfg(test)]
 mod tests {
-    use super::{DispatchPlan, StackChoice, StackRole, decide_dispatch};
+    use super::{
+        DispatchPlan, StackChoice, StackRole, bucket_targets, decide_dispatch,
+        to_dual_stack_dial_list,
+    };
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
     /// Test TDD: verify no duplicate peer registration
     ///
@@ -1959,5 +2021,149 @@ mod tests {
                 fallback: Some(V4),
             }
         );
+    }
+
+    // ------------------------------------------------------------------
+    // `bucket_targets`: split-stack uses this to un-map mapped-v4 into
+    // the v4 bucket. Removing the un-mapping call must make these tests
+    // fail (a test of upstream `normalize_socket_addr` would not).
+    // ------------------------------------------------------------------
+
+    fn mapped_v4(a: u8, b: u8, c: u8, d: u8, port: u16) -> SocketAddr {
+        SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::new(
+                0,
+                0,
+                0,
+                0,
+                0,
+                0xffff,
+                ((a as u16) << 8) | b as u16,
+                ((c as u16) << 8) | d as u16,
+            )),
+            port,
+        )
+    }
+
+    fn plain_v4(a: u8, b: u8, c: u8, d: u8, port: u16) -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(a, b, c, d)), port)
+    }
+
+    fn real_v6(port: u16) -> SocketAddr {
+        SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+            port,
+        )
+    }
+
+    #[test]
+    fn bucket_targets_unmaps_mapped_v4_into_v4_bucket() {
+        let (v6, v4) = bucket_targets(&[mapped_v4(1, 2, 3, 4, 5000)]);
+        assert!(v6.is_empty(), "mapped-v4 must not stay in v6 bucket");
+        assert_eq!(v4, vec![plain_v4(1, 2, 3, 4, 5000)]);
+    }
+
+    #[test]
+    fn bucket_targets_passes_plain_v4_through() {
+        let (v6, v4) = bucket_targets(&[plain_v4(10, 0, 0, 1, 4242)]);
+        assert!(v6.is_empty());
+        assert_eq!(v4, vec![plain_v4(10, 0, 0, 1, 4242)]);
+    }
+
+    #[test]
+    fn bucket_targets_passes_real_v6_through() {
+        let (v6, v4) = bucket_targets(&[real_v6(6000)]);
+        assert_eq!(v6, vec![real_v6(6000)]);
+        assert!(v4.is_empty());
+    }
+
+    #[test]
+    fn bucket_targets_mixed_inputs_split_by_true_family() {
+        let (v6, v4) = bucket_targets(&[
+            real_v6(1),
+            mapped_v4(192, 168, 1, 1, 2),
+            plain_v4(10, 0, 0, 1, 3),
+        ]);
+        assert_eq!(v6, vec![real_v6(1)], "real v6 stays in v6 bucket");
+        assert_eq!(
+            v4,
+            vec![plain_v4(192, 168, 1, 1, 2), plain_v4(10, 0, 0, 1, 3)],
+            "mapped-v4 un-maps and joins plain v4 in v4 bucket"
+        );
+    }
+
+    #[test]
+    fn bucket_targets_preserves_order_within_bucket() {
+        let (v6, v4) = bucket_targets(&[
+            plain_v4(1, 1, 1, 1, 1),
+            mapped_v4(2, 2, 2, 2, 2),
+            plain_v4(3, 3, 3, 3, 3),
+        ]);
+        assert!(v6.is_empty());
+        assert_eq!(
+            v4,
+            vec![
+                plain_v4(1, 1, 1, 1, 1),
+                plain_v4(2, 2, 2, 2, 2),
+                plain_v4(3, 3, 3, 3, 3),
+            ],
+            "bucket must preserve input order (Happy Eyeballs race relies on this)"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // `to_dual_stack_dial_list`: the key contract is *ordering*. Happy
+    // Eyeballs races in caller-provided priority order. A bucket-then-
+    // merge approach would silently reorder mixed-family inputs — these
+    // tests pin down the caller-order guarantee.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn to_dual_stack_dial_list_maps_plain_v4_to_mapped_wire_form() {
+        let out = to_dual_stack_dial_list(&[plain_v4(1, 2, 3, 4, 5000)]);
+        assert_eq!(out, vec![mapped_v4(1, 2, 3, 4, 5000)]);
+    }
+
+    #[test]
+    fn to_dual_stack_dial_list_passes_already_mapped_v4_through() {
+        let already_mapped = mapped_v4(10, 0, 0, 1, 1234);
+        let out = to_dual_stack_dial_list(&[already_mapped]);
+        assert_eq!(out, vec![already_mapped]);
+    }
+
+    #[test]
+    fn to_dual_stack_dial_list_passes_real_v6_through() {
+        let out = to_dual_stack_dial_list(&[real_v6(6000)]);
+        assert_eq!(out, vec![real_v6(6000)]);
+    }
+
+    #[test]
+    fn to_dual_stack_dial_list_preserves_caller_order_on_mixed_input() {
+        // Regression guard: given `[mapped_v4, real_v6]`, a bucket-then-
+        // merge produced `[real_v6, mapped_v4]` (v4 appended after v6),
+        // inverting attempt priority. The correct list mirrors input
+        // order, with plain-v4 entries in wire form.
+        let input = [
+            mapped_v4(1, 1, 1, 1, 1),
+            real_v6(2),
+            plain_v4(3, 3, 3, 3, 3),
+            real_v6(4),
+        ];
+        let out = to_dual_stack_dial_list(&input);
+        assert_eq!(
+            out,
+            vec![
+                mapped_v4(1, 1, 1, 1, 1),
+                real_v6(2),
+                mapped_v4(3, 3, 3, 3, 3),
+                real_v6(4),
+            ],
+            "dial list must match caller-provided order exactly"
+        );
+    }
+
+    #[test]
+    fn to_dual_stack_dial_list_empty_input_empty_output() {
+        assert!(to_dual_stack_dial_list(&[]).is_empty());
     }
 }
