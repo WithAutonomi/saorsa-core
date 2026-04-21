@@ -850,6 +850,101 @@ pub struct DualStackNetworkNode<T: LinkTransport = P2pLinkTransport> {
     is_dual_stack: bool,
 }
 
+/// Return value of [`DualStackNetworkNode::pick_stacks_for`]: the primary and
+/// optional fallback `(node, wire_addr)` pair to use when sending to a given
+/// address. Either element may be `None` if that stack is absent or would be a
+/// wasted attempt for the target family.
+type PickedStacks<'a, T> = (
+    Option<(&'a P2PNetworkNode<T>, SocketAddr)>,
+    Option<(&'a P2PNetworkNode<T>, SocketAddr)>,
+);
+
+/// Which concrete stack a [`DispatchPlan`] slot points at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StackRole {
+    V4,
+    V6,
+}
+
+/// One slot of a [`DispatchPlan`]: which stack to use, and whether the v4
+/// address must be rewritten to `[::ffff:x.x.x.x]` form for the v6 wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StackChoice {
+    role: StackRole,
+    /// True iff the caller should wrap a plain-IPv4 `addr` as IPv4-mapped IPv6
+    /// before handing it to the chosen node. Only ever set when routing a
+    /// v4 target through the v6 socket in dual-stack mode.
+    mapped: bool,
+}
+
+/// Primary + fallback stack decision produced by [`decide_dispatch`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct DispatchPlan {
+    primary: Option<StackChoice>,
+    fallback: Option<StackChoice>,
+}
+
+/// Pure decision: given the dual-stack state and target address family, which
+/// stack(s) should a send/disconnect go to, and does the v4 address need
+/// mapping to the v6 wire form?
+///
+/// Isolated from the `DualStackNetworkNode` struct so the (is_dual_stack ×
+/// has_v6 × has_v4 × addr.family) matrix is unit-testable without having to
+/// bind real sockets.
+///
+/// Invariant maintained by every constructor in this module:
+/// `is_dual_stack ⟺ (has_v6 && !has_v4)`. That makes the "v4-target, no v4
+/// socket, split-stack" branch unreachable in practice — `has_v4=false &&
+/// !is_dual_stack` forces `has_v6=false`. The function still returns a
+/// well-defined plan (an empty one) for that shape so callers can't observe
+/// a panic if the invariant is ever loosened.
+fn decide_dispatch(
+    is_dual_stack: bool,
+    has_v6: bool,
+    has_v4: bool,
+    addr_is_v4: bool,
+) -> DispatchPlan {
+    if is_dual_stack {
+        // Dual-stack (Linux default): the v6 socket handles both families via
+        // kernel mapping. v4 addresses are rewritten to `[::ffff:x.x.x.x]` at
+        // the wire; v6 addresses pass through untouched.
+        //
+        // Under the invariant `has_v4=false` here, but we still compute a v4
+        // fallback slot defensively for the case where a caller hand-builds
+        // a node with both sockets AND `is_dual_stack=true`.
+        let primary = has_v6.then_some(StackChoice {
+            role: StackRole::V6,
+            mapped: addr_is_v4,
+        });
+        let fallback = has_v4.then_some(StackChoice {
+            role: StackRole::V4,
+            mapped: false,
+        });
+        return DispatchPlan { primary, fallback };
+    }
+
+    // Split-stack: route strictly by target family. The v6 socket is v6-only
+    // (Windows default) and cannot reach v4 targets; the v4 socket cannot
+    // reach v6 targets. No mapped addresses are ever synthesised — mapping
+    // onto a v6-only socket is exactly the WSAEADDRNOTAVAIL bug this
+    // dispatcher exists to avoid.
+    let primary = if addr_is_v4 {
+        has_v4.then_some(StackChoice {
+            role: StackRole::V4,
+            mapped: false,
+        })
+    } else {
+        has_v6.then_some(StackChoice {
+            role: StackRole::V6,
+            mapped: false,
+        })
+    };
+    DispatchPlan {
+        primary,
+        fallback: None,
+    }
+}
+
 #[allow(dead_code)]
 impl DualStackNetworkNode<P2pLinkTransport> {
     /// Set the target peer ID for a hole-punch attempt to a specific address.
@@ -1173,49 +1268,61 @@ impl DualStackNetworkNode<P2pLinkTransport> {
     /// Send to peer using P2pEndpoint's optimized send method.
     ///
     /// Uses P2pEndpoint::send() which corresponds with recv() for proper
-    /// bidirectional communication. Tries IPv6 first, then IPv4.
+    /// bidirectional communication.
     ///
-    /// In dual-stack mode, converts plain IPv4 addresses to the mapped form
-    /// expected by the v6 transport before sending.
+    /// Dispatch (see [`Self::pick_stacks_for`]):
+    /// - **Dual-stack** (`is_dual_stack=true`, single v6 socket handling both
+    ///   families via kernel mapping): the v6 socket is used; plain IPv4
+    ///   targets are rewritten to `[::ffff:x.x.x.x]` before the wire write.
+    /// - **Split-stack** (`is_dual_stack=false`, family-specific sockets —
+    ///   typical on Windows): route by target family so v4 targets go to
+    ///   the v4 socket and v6 targets go to the v6 socket. No mapped
+    ///   addresses are synthesised.
+    ///
+    /// Mapped-v4 targets (`[::ffff:x.x.x.x]`) arriving here — e.g. via a
+    /// DHT record learned from a dual-stack peer — are un-mapped at the
+    /// dispatch boundary, so they are routed by their true family.
+    ///
+    /// On failure, the returned error preserves the underlying transport
+    /// cause instead of a generic "failed on both stacks" message.
     pub async fn send_to_peer_optimized(&self, addr: &SocketAddr, data: &[u8]) -> Result<()> {
-        // Preserve the underlying error(s) from the v6 and v4 stacks so the
-        // caller can surface them at WARN level. The previous implementation
-        // dropped both errors and returned a hardcoded
-        // "send_to_peer_optimized failed on both stacks" which made every
-        // transport failure look identical in the logs.
-        let mut v6_err: Option<anyhow::Error> = None;
-        let mut v4_err: Option<anyhow::Error> = None;
+        // Preserve the underlying error(s) so the caller can surface them at
+        // WARN level. The previous implementation returned a hardcoded
+        // "failed on both stacks" which made every transport failure look
+        // identical in the logs.
+        let (primary, fallback) = self.pick_stacks_for(addr);
+        let mut primary_err: Option<anyhow::Error> = None;
+        let mut fallback_err: Option<anyhow::Error> = None;
 
-        if let Some(v6) = &self.v6 {
-            let wire_addr = self.to_mapped_if_needed(addr);
-            match v6.send_to_peer_optimized(&wire_addr, data).await {
+        if let Some((node, wire_addr)) = primary {
+            match node.send_to_peer_optimized(&wire_addr, data).await {
                 Ok(()) => return Ok(()),
                 Err(e) => {
-                    warn!("[DUAL SEND] IPv6 send to {} failed: {:#}", addr, e);
-                    v6_err = Some(e);
+                    let family = if wire_addr.is_ipv6() { "IPv6" } else { "IPv4" };
+                    warn!("[DUAL SEND] {family} send to {} failed: {:#}", addr, e);
+                    primary_err = Some(e);
                 }
             }
         }
-        if let Some(v4) = &self.v4 {
-            match v4.send_to_peer_optimized(addr, data).await {
+        if let Some((node, wire_addr)) = fallback {
+            match node.send_to_peer_optimized(&wire_addr, data).await {
                 Ok(()) => return Ok(()),
                 Err(e) => {
-                    warn!("[DUAL SEND] IPv4 send to {} failed: {:#}", addr, e);
-                    v4_err = Some(e);
+                    let family = if wire_addr.is_ipv6() { "IPv6" } else { "IPv4" };
+                    warn!("[DUAL SEND] {family} send to {} failed: {:#}", addr, e);
+                    fallback_err = Some(e);
                 }
             }
         }
 
-        // Inline the actual error cause so callers using `{}` (not `{:#}`)
-        // see the real failure reason, not just which IP stack was tried.
-        let err = match (v6_err, v4_err) {
-            (Some(v6), Some(v4)) => anyhow::anyhow!(
-                "send_to_peer_optimized to {addr} failed on both stacks — v6: {v6}, v4: {v4}"
+        let err = match (primary_err, fallback_err) {
+            (Some(p), Some(f)) => anyhow::anyhow!(
+                "send_to_peer_optimized to {addr} failed on both stacks — primary: {p}, fallback: {f}"
             ),
-            (Some(v6), None) => anyhow::anyhow!("send_to_peer_optimized to {addr} failed: {v6}"),
-            (None, Some(v4)) => anyhow::anyhow!("send_to_peer_optimized to {addr} failed: {v4}"),
+            (Some(p), None) => anyhow::anyhow!("send_to_peer_optimized to {addr} failed: {p}"),
+            (None, Some(f)) => anyhow::anyhow!("send_to_peer_optimized to {addr} failed: {f}"),
             (None, None) => anyhow::anyhow!(
-                "send_to_peer_optimized to {addr}: neither v6 nor v4 stack available"
+                "send_to_peer_optimized to {addr}: no stack available for this address family"
             ),
         };
         Err(err)
@@ -1223,15 +1330,19 @@ impl DualStackNetworkNode<P2pLinkTransport> {
 
     /// Disconnect a peer, closing the underlying QUIC connection.
     ///
-    /// Tries both IPv6 and IPv4 stacks. In dual-stack mode, converts
-    /// plain IPv4 to mapped form for the v6 transport.
+    /// Delegates to [`Self::pick_stacks_for`] so the stack carrying the
+    /// peer is targeted in split-stack mode, and the single v6 socket
+    /// (with mapping for v4 targets) is targeted in dual-stack mode.
+    /// Issuing a disconnect to the wrong stack is wasted — on Windows it
+    /// actively triggers WSAEADDRNOTAVAIL against a v6-only socket with a
+    /// v4 target.
     pub async fn disconnect_peer_by_addr(&self, addr: &SocketAddr) {
-        if let Some(ref v6) = self.v6 {
-            let wire_addr = self.to_mapped_if_needed(addr);
-            v6.disconnect_peer_quic(&wire_addr).await;
+        let (primary, fallback) = self.pick_stacks_for(addr);
+        if let Some((node, wire_addr)) = primary {
+            node.disconnect_peer_quic(&wire_addr).await;
         }
-        if let Some(ref v4) = self.v4 {
-            v4.disconnect_peer_quic(addr).await;
+        if let Some((node, wire_addr)) = fallback {
+            node.disconnect_peer_quic(&wire_addr).await;
         }
     }
 
@@ -1313,6 +1424,63 @@ impl<T: LinkTransport + Send + Sync + 'static> DualStackNetworkNode<T> {
             return SocketAddr::V6(SocketAddrV6::new(v4.ip().to_ipv6_mapped(), v4.port(), 0, 0));
         }
         *addr
+    }
+
+    /// Pick the primary and fallback nodes for sending to `addr`, plus the
+    /// wire-format address to use for each.
+    ///
+    /// The decision matrix lives in [`decide_dispatch`]; this method resolves
+    /// the chosen [`StackChoice`] slots against `self.v6` / `self.v4` and
+    /// constructs the appropriate wire address.
+    ///
+    /// ### Normalisation at the boundary
+    ///
+    /// A mapped-v4 target (`[::ffff:x.x.x.x]`) arriving here is un-mapped
+    /// before the family-based dispatch. Without this, a mapped-v4 learned
+    /// from a DHT record or forwarded from the v6 socket's events would
+    /// reach the v6 socket in split-stack mode and trip `WSAEADDRNOTAVAIL`
+    /// on Windows — the same bug family the dispatcher exists to solve.
+    ///
+    /// ### Modes
+    ///
+    /// - **Dual-stack** (`is_dual_stack=true`, Linux default): the v6 socket
+    ///   handles both families via kernel mapping. v4 targets are rewritten
+    ///   to `[::ffff:x.x.x.x]` at the wire.
+    /// - **Split-stack** (`is_dual_stack=false`, typically Windows):
+    ///   dispatch by the target's true family. `v6.is_some()`/`v4.is_some()`
+    ///   can be any combination — by construction at least one must be Some
+    ///   for the caller to reach here usefully.
+    fn pick_stacks_for<'a>(&'a self, addr: &SocketAddr) -> PickedStacks<'a, T> {
+        let addr = saorsa_transport::shared::normalize_socket_addr(*addr);
+
+        let plan = decide_dispatch(
+            self.is_dual_stack,
+            self.v6.is_some(),
+            self.v4.is_some(),
+            addr.is_ipv4(),
+        );
+
+        let resolve = |choice: StackChoice| -> Option<(&'a P2PNetworkNode<T>, SocketAddr)> {
+            let node = match choice.role {
+                StackRole::V4 => self.v4.as_ref()?,
+                StackRole::V6 => self.v6.as_ref()?,
+            };
+            let wire = if choice.mapped {
+                if let SocketAddr::V4(v4) = addr {
+                    SocketAddr::V6(SocketAddrV6::new(v4.ip().to_ipv6_mapped(), v4.port(), 0, 0))
+                } else {
+                    addr
+                }
+            } else {
+                addr
+            };
+            Some((node, wire))
+        };
+
+        (
+            plan.primary.and_then(resolve),
+            plan.fallback.and_then(resolve),
+        )
     }
 
     /// Happy Eyeballs connect: race IPv6 and IPv4 attempts.
@@ -1468,21 +1636,26 @@ impl<T: LinkTransport + Send + Sync + 'static> DualStackNetworkNode<T> {
         out
     }
 
-    /// Send to peer by address; tries IPv6 first, then IPv4.
-    /// In dual-stack mode, converts plain IPv4 to mapped form for v6.
+    /// Send to peer by address. In dual-stack mode the v6 socket handles
+    /// both families (with v4 rewritten to mapped form). In split-stack
+    /// mode, dispatch by target family so v4 targets go to the v4 socket
+    /// directly — avoids WSAEADDRNOTAVAIL on Windows where the v6 socket
+    /// is v6-only.
     pub async fn send_to_peer_raw(&self, addr: &SocketAddr, data: &[u8]) -> Result<()> {
-        if let Some(v6) = &self.v6 {
-            let wire_addr = self.to_mapped_if_needed(addr);
-            if v6.send_to_peer_raw(&wire_addr, data).await.is_ok() {
-                return Ok(());
-            }
-        }
-        if let Some(v4) = &self.v4
-            && v4.send_to_peer_raw(addr, data).await.is_ok()
+        let (primary, fallback) = self.pick_stacks_for(addr);
+        if let Some((node, wire_addr)) = primary
+            && node.send_to_peer_raw(&wire_addr, data).await.is_ok()
         {
             return Ok(());
         }
-        Err(anyhow::anyhow!("send_to_peer_raw failed on both stacks"))
+        if let Some((node, wire_addr)) = fallback
+            && node.send_to_peer_raw(&wire_addr, data).await.is_ok()
+        {
+            return Ok(());
+        }
+        Err(anyhow::anyhow!(
+            "send_to_peer_raw to {addr} failed on all available stacks"
+        ))
     }
 
     /// Send to peer by address.
@@ -1625,6 +1798,8 @@ fn normalize_connection_event(event: ConnectionEvent) -> ConnectionEvent {
 
 #[cfg(test)]
 mod tests {
+    use super::{DispatchPlan, StackChoice, StackRole, decide_dispatch};
+
     /// Test TDD: verify no duplicate peer registration
     ///
     /// Fixed: Event forwarder no longer tracks peers, only broadcasts events.
@@ -1636,5 +1811,153 @@ mod tests {
         // The fix is verified by:
         // - test_send_to_peer_string: Exercises connect_to_peer with add_peer call
         // Integration tests verify the ConnectionEvent broadcasts work correctly.
+    }
+
+    // ------------------------------------------------------------------
+    // `decide_dispatch`: exhaustive dispatch matrix.
+    //
+    // The constructor invariant is `is_dual_stack ⟺ (has_v6 && !has_v4)`.
+    // These tests cover every reachable combination plus the defensive
+    // paths the function still handles cleanly if the invariant is ever
+    // loosened.
+    // ------------------------------------------------------------------
+
+    const V6: StackChoice = StackChoice {
+        role: StackRole::V6,
+        mapped: false,
+    };
+    const V6_MAPPED: StackChoice = StackChoice {
+        role: StackRole::V6,
+        mapped: true,
+    };
+    const V4: StackChoice = StackChoice {
+        role: StackRole::V4,
+        mapped: false,
+    };
+
+    #[test]
+    fn decide_dispatch_dual_stack_v4_target_maps_onto_v6() {
+        // Linux default: v6 socket handles both families; v4 target gets
+        // rewritten to `[::ffff:x.x.x.x]` form at the wire.
+        assert_eq!(
+            decide_dispatch(true, true, false, true),
+            DispatchPlan {
+                primary: Some(V6_MAPPED),
+                fallback: None,
+            }
+        );
+    }
+
+    #[test]
+    fn decide_dispatch_dual_stack_v6_target_no_mapping() {
+        assert_eq!(
+            decide_dispatch(true, true, false, false),
+            DispatchPlan {
+                primary: Some(V6),
+                fallback: None,
+            }
+        );
+    }
+
+    #[test]
+    fn decide_dispatch_split_stack_both_sockets_v4_target_uses_v4() {
+        // Windows split-stack: v4 target goes to the v4 socket directly.
+        // No mapping, no attempt on the v6 socket (which is v6-only).
+        assert_eq!(
+            decide_dispatch(false, true, true, true),
+            DispatchPlan {
+                primary: Some(V4),
+                fallback: None,
+            }
+        );
+    }
+
+    #[test]
+    fn decide_dispatch_split_stack_both_sockets_v6_target_uses_v6() {
+        assert_eq!(
+            decide_dispatch(false, true, true, false),
+            DispatchPlan {
+                primary: Some(V6),
+                fallback: None,
+            }
+        );
+    }
+
+    #[test]
+    fn decide_dispatch_split_stack_v4_only_v4_target() {
+        assert_eq!(
+            decide_dispatch(false, false, true, true),
+            DispatchPlan {
+                primary: Some(V4),
+                fallback: None,
+            }
+        );
+    }
+
+    #[test]
+    fn decide_dispatch_split_stack_v4_only_v6_target_is_unroutable() {
+        // A v6 target with only a v4 socket bound can't be reached. Plan
+        // must be empty — callers surface this as
+        // `no stack available for this address family`.
+        assert_eq!(
+            decide_dispatch(false, false, true, false),
+            DispatchPlan::default()
+        );
+    }
+
+    #[test]
+    fn decide_dispatch_split_stack_v6_only_v6_target() {
+        assert_eq!(
+            decide_dispatch(false, true, false, false),
+            DispatchPlan {
+                primary: Some(V6),
+                fallback: None,
+            }
+        );
+    }
+
+    #[test]
+    fn decide_dispatch_split_stack_v6_only_v4_target_is_unroutable() {
+        // Reachable only if the invariant is loosened (today
+        // `v6.is_some() && !v4.is_some()` forces `is_dual_stack=true`),
+        // but the function must still return a well-defined plan. No
+        // mapping onto a v6-only socket — that's the WSAEADDRNOTAVAIL
+        // bug the dispatcher exists to avoid.
+        assert_eq!(
+            decide_dispatch(false, true, false, true),
+            DispatchPlan::default()
+        );
+    }
+
+    #[test]
+    fn decide_dispatch_no_stacks() {
+        for addr_is_v4 in [true, false] {
+            assert_eq!(
+                decide_dispatch(false, false, false, addr_is_v4),
+                DispatchPlan::default()
+            );
+        }
+    }
+
+    #[test]
+    fn decide_dispatch_dual_stack_with_defensive_v4_fallback() {
+        // Defensive: if a caller hand-builds a node with both sockets
+        // AND `is_dual_stack=true`, the fallback slot is populated so
+        // the dual-stack path still has a second attempt available.
+        // This combination is unreachable via the public constructors.
+        assert_eq!(
+            decide_dispatch(true, true, true, true),
+            DispatchPlan {
+                primary: Some(V6_MAPPED),
+                fallback: Some(V4),
+            }
+        );
+        assert_eq!(
+            decide_dispatch(true, true, true, false),
+            DispatchPlan {
+                primary: Some(V6),
+                fallback: Some(V4),
+            }
+        );
     }
 }
