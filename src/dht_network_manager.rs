@@ -107,6 +107,35 @@ const HINT_REPUBLISH_INTERVAL_MAX: Duration = Duration::from_secs(150); // 2.5 m
 /// Routing table size below which automatic re-bootstrap is triggered.
 const AUTO_REBOOTSTRAP_THRESHOLD: usize = 3;
 
+/// Trust score below which a peer is considered unreachable and skipped by
+/// iterative lookups' candidate selection.
+///
+/// The trust engine starts every peer at [`DEFAULT_NEUTRAL_TRUST`] = 0.5.
+/// With the failure weights below, crossing this bar takes approximately:
+///   - 1 response-timeout (weight 2.0) → score ≈ 0.38
+///   - 1 transport-dial failure (weight 3.0) → score ≈ 0.34
+/// so a single conclusive failure is enough to exclude a peer from the
+/// next iterative lookup.
+///
+/// Time-decay (λ = 1.394e-5/s, half-life ≈ 14 h) naturally re-admits
+/// peers that come back online — a once-failed peer decays back above
+/// the bar in roughly 1–2 hours, so genuinely recovered peers are
+/// re-tried without needing a restart.
+const LOOKUP_SKIP_TRUST_THRESHOLD: f64 = 0.4;
+
+/// Default failure weight for DHT-level failures (response timeouts,
+/// channel closures — peer accepted our dial but didn't reply). Heavier
+/// than the original unit weight so one timeout is enough to start
+/// deprioritising the peer.
+const RPC_FAILURE_WEIGHT: f64 = 2.0;
+
+/// Weighted failure boost applied when a transport-level dial fails
+/// ("peer not reachable at any address"). A dial failure is the most
+/// conclusive signal — the peer isn't online at ANY of its advertised
+/// addresses — so we amplify its effect on the trust score even more
+/// than an RPC-level failure.
+const DIAL_FAILURE_WEIGHT: f64 = 3.0;
+
 /// Minimum time between consecutive auto re-bootstrap attempts.
 const REBOOTSTRAP_COOLDOWN: Duration = Duration::from_secs(300); // 5 minutes
 
@@ -1150,7 +1179,7 @@ impl DhtNetworkManager {
         key: &Key,
         count: usize,
     ) -> Result<Vec<DHTNode>> {
-        const MAX_ITERATIONS: usize = 20;
+        const MAX_ITERATIONS: usize = 8;
         const ALPHA: usize = 3; // Parallel queries per iteration
 
         debug!(
@@ -1181,13 +1210,27 @@ impl DhtNetworkManager {
         // share the same distance.
         let mut candidates: BTreeMap<(Key, PeerId), DHTNode> = BTreeMap::new();
 
-        // Start with local knowledge
+        // Start with local knowledge. Skip peers whose recent-failure trust
+        // has fallen below the lookup exclusion bar — dialing them wastes
+        // a full request timeout per dead peer per iteration.
         let initial = self.find_closest_nodes_local(key, count).await;
+        let mut skipped_seed = 0usize;
         for node in initial {
-            if !queried_nodes.contains(&node.peer_id) {
-                let dist = node.peer_id.distance(&target_key);
-                candidates.entry((dist, node.peer_id)).or_insert(node);
+            if queried_nodes.contains(&node.peer_id) {
+                continue;
             }
+            if self.should_skip_for_lookup(&node.peer_id) {
+                skipped_seed += 1;
+                continue;
+            }
+            let dist = node.peer_id.distance(&target_key);
+            candidates.entry((dist, node.peer_id)).or_insert(node);
+        }
+        if skipped_seed > 0 {
+            debug!(
+                "[NETWORK] Skipped {} low-trust seed peer(s) from candidate set",
+                skipped_seed
+            );
         }
 
         // Snapshot of the top-K peer IDs from the previous iteration.
@@ -1300,6 +1343,14 @@ impl DhtNetworkManager {
                             if queried_nodes.contains(&node.peer_id)
                                 || self.is_local_peer_id(&node.peer_id)
                             {
+                                continue;
+                            }
+                            // Honour the trust bar on newly-discovered
+                            // peers too — otherwise a FindNode response
+                            // from a healthy peer can repopulate the
+                            // candidate set with previously-failed peers
+                            // we just excluded from the seed.
+                            if self.should_skip_for_lookup(&node.peer_id) {
                                 continue;
                             }
                             // Record the referrer (first referrer wins)
@@ -1725,10 +1776,40 @@ impl DhtNetworkManager {
     }
 
     async fn record_peer_failure(&self, peer_id: &PeerId) {
+        self.record_peer_failure_weighted(peer_id, RPC_FAILURE_WEIGHT);
+    }
+
+    /// Returns `true` if the peer's trust score is below
+    /// [`LOOKUP_SKIP_TRUST_THRESHOLD`] and iterative lookups should skip
+    /// it as a candidate.
+    ///
+    /// With no trust engine configured (e.g. unit tests) this returns
+    /// `false` so behaviour is unchanged.
+    fn should_skip_for_lookup(&self, peer_id: &PeerId) -> bool {
+        match self.trust_engine {
+            Some(ref engine) => engine.score(peer_id) < LOOKUP_SKIP_TRUST_THRESHOLD,
+            None => false,
+        }
+    }
+
+    /// Record a peer failure with an explicit weight.
+    ///
+    /// Use a heavier weight (e.g. [`DIAL_FAILURE_WEIGHT`]) for conclusive
+    /// transport-level failures where the peer is unreachable at every
+    /// advertised address — those are stronger signals than a response
+    /// timeout (which might just be a slow peer). Unit-weight is the
+    /// default for ambiguous failures.
+    fn record_peer_failure_weighted(&self, peer_id: &PeerId, weight: f64) {
         if let Some(ref engine) = self.trust_engine {
-            engine.update_node_stats(
+            engine.update_node_stats_weighted(
                 peer_id,
                 crate::adaptive::NodeStatisticsUpdate::FailedResponse,
+                weight,
+            );
+            debug!(
+                "[TRUST] peer {} failed (weight={weight}), score now {:.3}",
+                hex::encode(&peer_id.to_bytes()[..8]),
+                engine.score(peer_id),
             );
         }
     }
@@ -1922,7 +2003,16 @@ impl DhtNetworkManager {
                 if let Ok(mut ops) = self.active_operations.lock() {
                     ops.remove(&message_id);
                 }
-                self.record_peer_failure(peer_id).await;
+                // Weighted trust penalty — but do NOT evict from the
+                // routing table. Many "unreachable" peers are actually
+                // alive behind symmetric NAT and have moved to a new
+                // ephemeral port; evicting them loses the chance to
+                // rediscover them on their next re-announcement. The
+                // trust score decays naturally, so if the peer really
+                // is dead it'll stop being picked; if it comes back
+                // at a new address the routing table gets refreshed
+                // from peer_info without needing eviction.
+                self.record_peer_failure_weighted(peer_id, DIAL_FAILURE_WEIGHT);
                 return Err(P2PError::Network(NetworkError::PeerNotFound(
                     format!(
                         "failed to dial {} at any of {} candidate address(es)",
@@ -1934,7 +2024,11 @@ impl DhtNetworkManager {
             }
         }
 
-        let result = match self
+        // Track whether the failure was transport-level (send failed = peer
+        // is unreachable on the wire) vs response-level (send ok but no
+        // reply = peer is slow or partitioned). Transport failures get
+        // a heavier trust penalty because they're conclusive.
+        let (result, transport_failed) = match self
             .transport
             .send_message(peer_id, "/dht/1.0.0", message_data)
             .await
@@ -1961,14 +2055,14 @@ impl DhtNetworkManager {
                         local_hex, peer_hex, e
                     ),
                 }
-                result
+                (result, false)
             }
             Err(e) => {
                 warn!(
                     "[STEP 1 FAILED] Failed to send DHT request to {}: {}",
                     peer_hex, e
                 );
-                Err(e)
+                (Err(e), true)
             }
         };
 
@@ -1979,8 +2073,18 @@ impl DhtNetworkManager {
 
         // Record trust failure at the RPC level so every failed request
         // (send error, response timeout, etc.) is counted exactly once.
+        // We do NOT evict the peer from the routing table — many "dead"
+        // peers are actually alive behind symmetric NAT (new ephemeral
+        // port on each re-announcement); evicting them just forces
+        // rediscovery while losing useful metadata. Trust decay handles
+        // genuinely dead peers over time.
         if result.is_err() {
-            self.record_peer_failure(peer_id).await;
+            let weight = if transport_failed {
+                DIAL_FAILURE_WEIGHT
+            } else {
+                RPC_FAILURE_WEIGHT
+            };
+            self.record_peer_failure_weighted(peer_id, weight);
         }
 
         result
@@ -2072,10 +2176,19 @@ impl DhtNetworkManager {
                 .await;
         }
 
+        // Cap the per-address dial at DHT_DIAL_TIMEOUT — the global
+        // `connection_timeout` (15s default) is sized for user-initiated
+        // connection attempts where latency matters less than success
+        // probability. For a DHT lookup, α=3 parallel dials against NAT-d
+        // peers with stale ephemeral-port bindings would otherwise burn
+        // the full 15s per peer before the iteration can proceed. 3s is
+        // enough for a handshake to a reachable peer and short enough
+        // that one slow peer doesn't dominate the iteration.
         let dial_timeout = self
             .transport
             .connection_timeout()
-            .min(self.config.request_timeout);
+            .min(self.config.request_timeout)
+            .min(DHT_DIAL_TIMEOUT);
         match tokio::time::timeout(dial_timeout, self.transport.connect_peer(address)).await {
             Ok(Ok(channel_id)) => {
                 debug!(
@@ -3181,7 +3294,16 @@ const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 15;
 /// a second, so this leaves ample slack for legitimate stragglers while
 /// letting us abandon dial cascades that are almost certainly going to
 /// fail anyway.
-const ITERATION_GRACE_TIMEOUT_SECS: u64 = 5;
+const ITERATION_GRACE_TIMEOUT_SECS: u64 = 2;
+
+/// Per-address dial timeout for DHT iterative lookups.
+///
+/// Reaches a reachable peer's QUIC handshake in well under a second on
+/// a healthy network. Set short enough that a stale NAT binding (the
+/// peer has moved to a new ephemeral port) fails fast and the iteration
+/// can proceed — without this cap, each α=3 parallel dial batch can burn
+/// the full 15s `connection_timeout` before the first response arrives.
+const DHT_DIAL_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Default maximum concurrent DHT operations
 const DEFAULT_MAX_CONCURRENT_OPS: usize = 100;
