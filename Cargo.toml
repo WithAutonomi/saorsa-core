@@ -76,6 +76,22 @@ tokio-util = { version = "0.7", features = ["rt"] }
 # Fix wyz 0.5.0 compatibility issue with tap 1.0 (CI build failure)
 wyz = "=0.5.1"
 
+# Diagnostic-only: pulled in by `probe-bin` feature to give the
+# closeness_probe binary access to tracing-subscriber. Optional so library
+# consumers don't pay the dependency cost.
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
+
+
+[features]
+# Builds the `closeness_probe` binary. Off by default — diagnostic only.
+probe-bin = ["dep:tracing-subscriber"]
+
+
+[[bin]]
+name = "closeness_probe"
+path = "src/bin/closeness_probe.rs"
+required-features = ["probe-bin"]
+
 
 [dev-dependencies]
 tempfile = "3.17"
