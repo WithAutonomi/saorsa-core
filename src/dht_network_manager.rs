@@ -1644,6 +1644,7 @@ impl DhtNetworkManager {
         let mut previous_top_k: Vec<PeerId> = Vec::new();
 
         for iteration in 0..MAX_ITERATIONS {
+            let iteration_started = std::time::Instant::now();
             if candidates.is_empty() {
                 debug!(
                     "[NETWORK] No more candidates after {} iterations",
@@ -1846,6 +1847,16 @@ impl DhtNetworkManager {
             best_nodes.dedup_by_key(|n| n.peer_id);
             best_nodes.truncate(count);
 
+            info!(
+                "[ITER-PROGRESS] iter={} elapsed_ms={} best_nodes={}/{} candidates_queued={} batch_size={}",
+                iteration,
+                iteration_started.elapsed().as_millis(),
+                best_nodes.len(),
+                count,
+                candidates.len(),
+                batch.len(),
+            );
+
             // Stagnation: compare the entire top-K set, not just closest distance.
             let current_top_k: Vec<PeerId> = best_nodes.iter().map(|n| n.peer_id).collect();
             if current_top_k == previous_top_k {
@@ -1915,24 +1926,40 @@ impl DhtNetworkManager {
         S: futures::Stream<Item = (PeerId, Result<DhtNetworkResult>)> + Unpin,
     {
         let mut results = Vec::new();
+        let started = std::time::Instant::now();
 
         // Block for the first response — if nothing arrives the iteration
         // has no new information to work with, so we do need to wait here.
         let Some(first) = stream.next().await else {
+            info!("[ITER-TIMING] no responses (stream empty)");
             return results;
         };
+        let first_response_ms = started.elapsed().as_millis();
         results.push(first);
 
         // Bounded drain: accept whichever stragglers finish within the
         // grace window, then move on. `timeout` cancels the inner future
         // on expiry, which drops the remaining query futures.
         let grace = Duration::from_secs(ITERATION_GRACE_TIMEOUT_SECS);
-        let _ = tokio::time::timeout(grace, async {
+        let drain_started = std::time::Instant::now();
+        let drain_outcome = tokio::time::timeout(grace, async {
             while let Some(next) = stream.next().await {
                 results.push(next);
             }
         })
         .await;
+        let drain_ms = drain_started.elapsed().as_millis();
+        let total_ms = started.elapsed().as_millis();
+        let drained_to_completion = drain_outcome.is_ok();
+
+        info!(
+            "[ITER-TIMING] first_response_ms={} drain_ms={} total_ms={} responses={} drain_to_completion={}",
+            first_response_ms,
+            drain_ms,
+            total_ms,
+            results.len(),
+            drained_to_completion,
+        );
 
         results
     }
@@ -3955,11 +3982,14 @@ const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 15;
 /// proceed. Once the first response is in, we have new candidates for the
 /// next iteration and can safely cap the wait on the stragglers.
 ///
-/// Sized at 2s: a peer with an already-open channel replies in well under
-/// a second, so this leaves ample slack for legitimate stragglers while
-/// letting us abandon dial cascades that are almost certainly going to
-/// fail anyway.
-const ITERATION_GRACE_TIMEOUT_SECS: u64 = 2;
+/// Sized at 5s: STG-01 measurements showed thousands of `[STEP 5a FAILED]
+/// Response channel closed (receiver timed out)` warnings under the previous
+/// 2s value — peers were genuinely answering FindNode but the responses
+/// were arriving past the grace window and being discarded, starving the
+/// next iteration of seeds and pushing 60s `verify_merkle_candidate_closeness`
+/// timeouts. 5s reverts to the pre-PR-#102 setting while we measure
+/// per-iteration timing.
+const ITERATION_GRACE_TIMEOUT_SECS: u64 = 5;
 
 /// Default maximum concurrent DHT operations
 const DEFAULT_MAX_CONCURRENT_OPS: usize = 100;
