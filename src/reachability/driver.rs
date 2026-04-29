@@ -59,7 +59,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, trace, warn};
 
 use crate::dht::AddressType;
-use crate::dht_network_manager::{DhtNetworkEvent, DhtNetworkManager};
+use crate::dht_network_manager::{DhtNetworkEvent, DhtNetworkManager, is_lan_or_loopback_socket};
 use crate::reachability::session::{RelayAcquisitionOutcome, run_relay_acquisition};
 use crate::transport_handle::TransportHandle;
 use crate::{MultiAddr, PeerId};
@@ -220,32 +220,45 @@ impl AcquisitionDriver {
         // different representations.
         let mut seen: HashSet<SocketAddr> = HashSet::new();
 
-        if let Some(tag) = direct_tag {
-            // Prefer observed (post-NAT) addresses for the direct tier since
-            // those are what peers actually see from the outside. Fall back
-            // to locally-bound listen addresses when no observations exist.
-            if !observed.is_empty() {
-                for sa in observed {
-                    if sa.ip().is_unspecified() {
-                        continue;
-                    }
-                    let normalized = saorsa_transport::shared::normalize_socket_addr(sa);
-                    if seen.insert(normalized) {
-                        typed.push((MultiAddr::quic(normalized), tag));
-                    }
-                }
-            }
-            for addr in listen {
-                let Some(sa) = addr.dialable_socket_addr() else {
-                    continue;
-                };
+        // Prefer observed (post-NAT) addresses for the direct tier since
+        // those are what peers actually see from the outside. LAN-scoped
+        // observations and listen sockets are tagged separately and only
+        // published to peers on the same WAN by `publish_address_set_to_peers`.
+        if !observed.is_empty() {
+            for sa in observed {
                 if sa.ip().is_unspecified() {
                     continue;
                 }
                 let normalized = saorsa_transport::shared::normalize_socket_addr(sa);
-                if seen.insert(normalized) {
+                let addr_type = if is_lan_or_loopback_socket(&normalized) {
+                    Some(AddressType::Lan)
+                } else {
+                    direct_tag
+                };
+                if let Some(tag) = addr_type
+                    && seen.insert(normalized)
+                {
                     typed.push((MultiAddr::quic(normalized), tag));
                 }
+            }
+        }
+        for addr in listen {
+            let Some(sa) = addr.dialable_socket_addr() else {
+                continue;
+            };
+            if sa.ip().is_unspecified() {
+                continue;
+            }
+            let normalized = saorsa_transport::shared::normalize_socket_addr(sa);
+            let addr_type = if is_lan_or_loopback_socket(&normalized) {
+                Some(AddressType::Lan)
+            } else {
+                direct_tag
+            };
+            if let Some(tag) = addr_type
+                && seen.insert(normalized)
+            {
+                typed.push((MultiAddr::quic(normalized), tag));
             }
         }
 

@@ -27,6 +27,7 @@ use crate::{
     dht::{AdmissionResult, DhtCoreEngine, DhtKey, Key, RoutingTableEvent},
     error::{DhtError, IdentityError, NetworkError},
     network::{NodeConfig, NodeMode},
+    security::canonicalize_ip,
 };
 use anyhow::Context as _;
 use dashmap::DashMap;
@@ -34,7 +35,7 @@ use dashmap::mapref::entry::Entry as DashEntry;
 use futures::stream::{FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::{RwLock, Semaphore, broadcast, oneshot};
@@ -171,6 +172,58 @@ const REBOOTSTRAP_COOLDOWN: Duration = Duration::from_secs(300); // 5 minutes
 /// stale Unverified/Direct entries published by NATed peers.
 const DIAL_FAILURE_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
 
+pub(crate) fn is_lan_or_loopback_ip(ip: IpAddr) -> bool {
+    match canonicalize_ip(ip) {
+        IpAddr::V4(v4) => v4.is_private() || v4.is_loopback() || v4.is_link_local(),
+        IpAddr::V6(v6) => v6.is_loopback() || is_ipv6_unique_local(v6) || is_ipv6_link_local(v6),
+    }
+}
+
+/// IPv6 unique-local address range fc00::/7 (RFC 4193). The high 7 bits
+/// of the first octet are `0b1111110`, leaving the L bit free.
+fn is_ipv6_unique_local(v6: Ipv6Addr) -> bool {
+    const ULA_MASK: u8 = 0b1111_1110;
+    const ULA_PREFIX: u8 = 0b1111_1100;
+    (v6.octets()[0] & ULA_MASK) == ULA_PREFIX
+}
+
+/// IPv6 link-local address range fe80::/10 (RFC 4291). The high 10 bits
+/// are `1111111010`: full first octet `0xfe`, top 2 bits of the second
+/// octet `10`.
+fn is_ipv6_link_local(v6: Ipv6Addr) -> bool {
+    const LL_FIRST_OCTET: u8 = 0xfe;
+    const LL_SECOND_OCTET_MASK: u8 = 0b1100_0000;
+    const LL_SECOND_OCTET_PREFIX: u8 = 0b1000_0000;
+    let octets = v6.octets();
+    octets[0] == LL_FIRST_OCTET && (octets[1] & LL_SECOND_OCTET_MASK) == LL_SECOND_OCTET_PREFIX
+}
+
+pub(crate) fn is_lan_or_loopback_socket(addr: &SocketAddr) -> bool {
+    is_lan_or_loopback_ip(addr.ip())
+}
+
+pub(crate) fn is_wan_ip(ip: IpAddr) -> bool {
+    let ip = canonicalize_ip(ip);
+    if is_lan_or_loopback_ip(ip) || ip.is_unspecified() {
+        return false;
+    }
+    match ip {
+        IpAddr::V4(v4) => !v4.is_multicast(),
+        IpAddr::V6(v6) => !v6.is_multicast(),
+    }
+}
+
+pub(crate) fn socket_ip_in_set(addr: &SocketAddr, ips: &HashSet<IpAddr>) -> bool {
+    ips.contains(&canonicalize_ip(addr.ip()))
+}
+
+pub(crate) fn loopback_for_ip(ip: IpAddr) -> IpAddr {
+    match canonicalize_ip(ip) {
+        IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::LOCALHOST),
+    }
+}
+
 /// DHT node representation for network operations.
 ///
 /// The `addresses` field stores one or more typed [`MultiAddr`] values.
@@ -211,7 +264,7 @@ impl DHTNode {
     /// stand in for a verified `Direct` tag.
     ///
     /// The returned vec preserves the storage order from `addresses`;
-    /// callers that need Relay-first ordering should pass the result to
+    /// callers that need priority ordering should pass the result to
     /// [`DhtNetworkManager::dialable_addresses_typed`] or use
     /// [`Self::addresses_by_priority`] for a pre-sorted `Vec<MultiAddr>`.
     pub fn typed_addresses(&self) -> Vec<(MultiAddr, AddressType)> {
@@ -229,8 +282,8 @@ impl DHTNode {
             .collect()
     }
 
-    /// Addresses sorted by [`AddressType`] priority: Relay first, then
-    /// Direct, then NATted.  Within each tier the original insertion
+    /// Addresses sorted by [`AddressType`] priority: LAN first, then Relay,
+    /// Direct, Unverified, and NATted. Within each tier the original insertion
     /// order is preserved (stable sort).
     ///
     /// Use this instead of raw `addresses` whenever the caller needs to
@@ -895,7 +948,18 @@ impl DhtNetworkManager {
         );
 
         let candidate_nodes = self.find_closest_nodes_local(key, self.k_value()).await;
-        let closer_nodes = Self::filter_response_nodes(candidate_nodes, requester);
+        let own_wan_ips = self.own_direct_wan_ips();
+        let mut closer_nodes = Vec::new();
+        for mut node in Self::filter_response_nodes(candidate_nodes, requester) {
+            let filtered = self
+                .filter_address_set_for_peer_id(&node.typed_addresses(), requester, &own_wan_ips)
+                .await;
+            node.addresses = filtered.iter().map(|(addr, _)| addr.clone()).collect();
+            node.address_types = filtered.iter().map(|(_, ty)| *ty).collect();
+            if !node.addresses.is_empty() {
+                closer_nodes.push(node);
+            }
+        }
 
         // Log addresses being returned in FIND_NODE response
         for node in &closer_nodes {
@@ -1902,7 +1966,15 @@ impl DhtNetworkManager {
     /// closes the "NAT-through-NAT relay chain" failure mode where a
     /// node's observed-but-unverified ephemeral port would be treated as
     /// a dialable Direct candidate.
+    #[cfg(test)]
     pub(crate) fn first_direct_dialable(node: &DHTNode) -> Option<MultiAddr> {
+        Self::first_direct_dialable_excluding_wan(node, &HashSet::new())
+    }
+
+    pub(crate) fn first_direct_dialable_excluding_wan(
+        node: &DHTNode,
+        excluded_wan_ips: &HashSet<IpAddr>,
+    ) -> Option<MultiAddr> {
         for (i, addr) in node.addresses.iter().enumerate() {
             let addr_type = node
                 .address_types
@@ -1916,6 +1988,9 @@ impl DhtNetworkManager {
                 continue;
             };
             if sa.ip().is_unspecified() {
+                continue;
+            }
+            if socket_ip_in_set(&sa, excluded_wan_ips) {
                 continue;
             }
             return Some(addr.clone());
@@ -1944,6 +2019,312 @@ impl DhtNetworkManager {
             trace!("Accepting loopback address (local/test): {addr}");
         }
         true
+    }
+
+    pub(crate) fn own_direct_wan_ips_from_transport(
+        transport: &crate::transport_handle::TransportHandle,
+    ) -> HashSet<IpAddr> {
+        transport
+            .direct_external_addresses()
+            .into_iter()
+            .map(|addr| canonicalize_ip(addr.ip()))
+            .filter(|ip| is_wan_ip(*ip))
+            .collect()
+    }
+
+    fn own_direct_wan_ips(&self) -> HashSet<IpAddr> {
+        Self::own_direct_wan_ips_from_transport(&self.transport)
+    }
+
+    async fn own_lan_ips_from_transport(
+        transport: &crate::transport_handle::TransportHandle,
+    ) -> HashSet<IpAddr> {
+        transport
+            .listen_addrs()
+            .await
+            .into_iter()
+            .filter_map(|addr| addr.dialable_socket_addr())
+            .map(|addr| canonicalize_ip(addr.ip()))
+            .filter(|ip| is_lan_or_loopback_ip(*ip))
+            .collect()
+    }
+
+    pub(crate) async fn maybe_swap_same_lan_ip_to_loopback(
+        transport: &crate::transport_handle::TransportHandle,
+        addr: SocketAddr,
+    ) -> SocketAddr {
+        if !is_lan_or_loopback_socket(&addr) || addr.ip().is_loopback() {
+            return addr;
+        }
+
+        let local_ips = Self::own_lan_ips_from_transport(transport).await;
+        if local_ips.contains(&canonicalize_ip(addr.ip())) {
+            return SocketAddr::new(loopback_for_ip(addr.ip()), addr.port());
+        }
+
+        addr
+    }
+
+    fn collect_lan_ips<I>(addresses: I) -> impl Iterator<Item = IpAddr>
+    where
+        I: IntoIterator<Item = MultiAddr>,
+    {
+        addresses
+            .into_iter()
+            .filter_map(|addr| addr.dialable_socket_addr())
+            .filter(is_lan_or_loopback_socket)
+            .map(|addr| canonicalize_ip(addr.ip()))
+    }
+
+    async fn peer_lan_ips(&self, peer: &DHTNode) -> HashSet<IpAddr> {
+        let mut ips: HashSet<IpAddr> =
+            Self::collect_lan_ips(peer.addresses.iter().cloned()).collect();
+
+        if let Some(info) = self.transport.peer_info(&peer.peer_id).await {
+            ips.extend(Self::collect_lan_ips(info.addresses));
+        }
+
+        ips
+    }
+
+    async fn peer_id_lan_ips(&self, peer_id: &PeerId) -> HashSet<IpAddr> {
+        let mut ips = HashSet::new();
+
+        if let Some(info) = self.transport.peer_info(peer_id).await {
+            ips.extend(Self::collect_lan_ips(info.addresses));
+        }
+
+        let typed = self
+            .dht
+            .read()
+            .await
+            .get_node_addresses_typed(peer_id)
+            .await;
+        ips.extend(Self::collect_lan_ips(
+            typed.into_iter().map(|(addr, _)| addr),
+        ));
+
+        ips
+    }
+
+    /// True when the socket's IP is one of our own observed WAN IPs (and
+    /// is itself a public WAN address) — i.e., the peer is behind the
+    /// same NAT as us. Used as same-WAN evidence on routing-table records,
+    /// which may have been authored by us and so cannot count as LAN
+    /// evidence.
+    fn socket_is_same_wan(socket: &SocketAddr, own_wan_ips: &HashSet<IpAddr>) -> bool {
+        !own_wan_ips.is_empty() && is_wan_ip(socket.ip()) && socket_ip_in_set(socket, own_wan_ips)
+    }
+
+    /// True when the socket's IP shows the peer can receive LAN-scoped
+    /// addresses from us — either it is itself LAN/loopback, or it is on
+    /// our same WAN. Used on transport-level evidence (live connections),
+    /// where a LAN-scoped peer address is genuine.
+    fn socket_indicates_same_lan_or_wan(
+        socket: &SocketAddr,
+        own_wan_ips: &HashSet<IpAddr>,
+    ) -> bool {
+        is_lan_or_loopback_socket(socket) || Self::socket_is_same_wan(socket, own_wan_ips)
+    }
+
+    fn transport_addresses_indicate_same_lan_or_wan<I>(
+        addresses: I,
+        own_wan_ips: &HashSet<IpAddr>,
+    ) -> bool
+    where
+        I: IntoIterator<Item = MultiAddr>,
+    {
+        addresses
+            .into_iter()
+            .filter_map(|addr| addr.dialable_socket_addr())
+            .any(|socket| Self::socket_indicates_same_lan_or_wan(&socket, own_wan_ips))
+    }
+
+    fn routing_addresses_indicate_same_wan<I>(addresses: I, own_wan_ips: &HashSet<IpAddr>) -> bool
+    where
+        I: IntoIterator<Item = MultiAddr>,
+    {
+        addresses
+            .into_iter()
+            .filter_map(|addr| addr.dialable_socket_addr())
+            .any(|socket| Self::socket_is_same_wan(&socket, own_wan_ips))
+    }
+
+    async fn peer_can_receive_lan_addresses(
+        &self,
+        peer: &DHTNode,
+        own_wan_ips: &HashSet<IpAddr>,
+    ) -> bool {
+        if Self::routing_addresses_indicate_same_wan(peer.addresses.iter().cloned(), own_wan_ips) {
+            return true;
+        }
+
+        if let Some(info) = self.transport.peer_info(&peer.peer_id).await
+            && Self::transport_addresses_indicate_same_lan_or_wan(info.addresses, own_wan_ips)
+        {
+            return true;
+        }
+
+        false
+    }
+
+    async fn peer_id_can_receive_lan_addresses(
+        &self,
+        peer_id: &PeerId,
+        own_wan_ips: &HashSet<IpAddr>,
+    ) -> bool {
+        if let Some(info) = self.transport.peer_info(peer_id).await
+            && Self::transport_addresses_indicate_same_lan_or_wan(info.addresses, own_wan_ips)
+        {
+            return true;
+        }
+
+        let typed = self
+            .dht
+            .read()
+            .await
+            .get_node_addresses_typed(peer_id)
+            .await;
+        Self::routing_addresses_indicate_same_wan(
+            typed.into_iter().map(|(addr, _)| addr),
+            own_wan_ips,
+        )
+    }
+
+    fn address_set_has_same_wan_non_relay(
+        addresses: &[(MultiAddr, AddressType)],
+        own_wan_ips: &HashSet<IpAddr>,
+    ) -> bool {
+        !own_wan_ips.is_empty()
+            && addresses.iter().any(|(addr, addr_type)| {
+                *addr_type != AddressType::Relay
+                    && addr.dialable_socket_addr().is_some_and(|socket| {
+                        is_wan_ip(socket.ip()) && socket_ip_in_set(&socket, own_wan_ips)
+                    })
+            })
+    }
+
+    async fn filter_address_set_for_local_use(
+        &self,
+        peer_id: &PeerId,
+        addresses: &[(MultiAddr, AddressType)],
+        own_wan_ips: &HashSet<IpAddr>,
+    ) -> Vec<(MultiAddr, AddressType)> {
+        let allow_lan = Self::address_set_has_same_wan_non_relay(addresses, own_wan_ips)
+            || self
+                .peer_id_can_receive_lan_addresses(peer_id, own_wan_ips)
+                .await;
+
+        let mut out = Vec::with_capacity(addresses.len());
+        for (addr, addr_type) in addresses {
+            let Some(socket) = addr.dialable_socket_addr() else {
+                out.push((addr.clone(), *addr_type));
+                continue;
+            };
+
+            if (*addr_type == AddressType::Lan || is_lan_or_loopback_socket(&socket)) && !allow_lan
+            {
+                continue;
+            }
+
+            if *addr_type == AddressType::Relay && socket_ip_in_set(&socket, own_wan_ips) {
+                continue;
+            }
+
+            let socket = if *addr_type == AddressType::Lan {
+                Self::maybe_swap_same_lan_ip_to_loopback(&self.transport, socket).await
+            } else {
+                socket
+            };
+
+            out.push((MultiAddr::quic(socket), *addr_type));
+        }
+
+        out
+    }
+
+    async fn filter_address_set_for_peer(
+        &self,
+        addresses: &[(MultiAddr, AddressType)],
+        peer: &DHTNode,
+        own_wan_ips: &HashSet<IpAddr>,
+    ) -> Vec<(MultiAddr, AddressType)> {
+        let allow_lan = self.peer_can_receive_lan_addresses(peer, own_wan_ips).await;
+        let peer_lan_ips = if allow_lan {
+            self.peer_lan_ips(peer).await
+        } else {
+            HashSet::new()
+        };
+
+        Self::filter_address_set_for_receiver(addresses, allow_lan, &peer_lan_ips, own_wan_ips)
+    }
+
+    async fn filter_address_set_for_peer_id(
+        &self,
+        addresses: &[(MultiAddr, AddressType)],
+        peer_id: &PeerId,
+        own_wan_ips: &HashSet<IpAddr>,
+    ) -> Vec<(MultiAddr, AddressType)> {
+        let allow_lan = self
+            .peer_id_can_receive_lan_addresses(peer_id, own_wan_ips)
+            .await;
+        let peer_lan_ips = if allow_lan {
+            self.peer_id_lan_ips(peer_id).await
+        } else {
+            HashSet::new()
+        };
+
+        Self::filter_address_set_for_receiver(addresses, allow_lan, &peer_lan_ips, own_wan_ips)
+    }
+
+    fn filter_address_set_for_receiver(
+        addresses: &[(MultiAddr, AddressType)],
+        allow_lan: bool,
+        peer_lan_ips: &HashSet<IpAddr>,
+        own_wan_ips: &HashSet<IpAddr>,
+    ) -> Vec<(MultiAddr, AddressType)> {
+        addresses
+            .iter()
+            .filter_map(|(addr, addr_type)| {
+                let socket = addr.dialable_socket_addr();
+                let local_scoped = socket.as_ref().is_some_and(is_lan_or_loopback_socket);
+                if (*addr_type == AddressType::Lan || local_scoped) && !allow_lan {
+                    return None;
+                }
+
+                if *addr_type == AddressType::Relay
+                    && socket
+                        .as_ref()
+                        .is_some_and(|socket| socket_ip_in_set(socket, own_wan_ips))
+                {
+                    return None;
+                }
+
+                let mut out = addr.clone();
+                if *addr_type == AddressType::Lan
+                    && let Some(socket) = socket
+                    && !socket.ip().is_loopback()
+                    && peer_lan_ips.contains(&canonicalize_ip(socket.ip()))
+                {
+                    out = MultiAddr::quic(SocketAddr::new(
+                        loopback_for_ip(socket.ip()),
+                        socket.port(),
+                    ));
+                }
+
+                Some((out, *addr_type))
+            })
+            .collect()
+    }
+
+    async fn filter_published_address_set_from_sender(
+        &self,
+        sender: &PeerId,
+        addresses: &[(MultiAddr, AddressType)],
+    ) -> Vec<(MultiAddr, AddressType)> {
+        let own_wan_ips = self.own_direct_wan_ips();
+        self.filter_address_set_for_local_use(sender, addresses, &own_wan_ips)
+            .await
     }
 
     /// Try dialing at most two addresses from `typed_addresses`, chosen by
@@ -1979,7 +2360,11 @@ impl DhtNetworkManager {
             );
             return None;
         }
-        let plan = Self::select_dial_candidates(typed_addresses);
+        let own_wan_ips = self.own_direct_wan_ips();
+        let filtered = self
+            .filter_address_set_for_local_use(peer_id, typed_addresses, &own_wan_ips)
+            .await;
+        let plan = Self::select_dial_candidates_with_own_wan(&filtered, &own_wan_ips);
         if plan.is_empty() {
             debug!(
                 "dial_addresses: no dialable addresses for {}",
@@ -2499,7 +2884,7 @@ impl DhtNetworkManager {
     /// Thin wrapper over [`Self::peer_addresses_for_dial_typed`] for
     /// callers that don't need the per-address type tag (e.g.,
     /// `network.rs::first_dialable_peer_address`). Internally always
-    /// goes through the typed path so the Relay-first sort invariant
+    /// goes through the typed path so the address-priority invariant
     /// holds for both consumer styles.
     pub(crate) async fn peer_addresses_for_dial(&self, peer_id: &PeerId) -> Vec<MultiAddr> {
         self.peer_addresses_for_dial_typed(peer_id)
@@ -2516,23 +2901,28 @@ impl DhtNetworkManager {
     /// peers. Returns an empty vec when the peer is unknown or has no
     /// dialable addresses.
     ///
-    /// Result is sorted by [`AddressType`] priority — Relay first
-    /// (known-good relay endpoint), then Direct, then NATted — so the
-    /// dialer tries the fastest path first.
+    /// Result is filtered for the local node's LAN/WAN relationship with the
+    /// peer, then sorted by [`AddressType`] priority — LAN first when
+    /// eligible, then Relay, Direct, Unverified, and NATted — so the dialer
+    /// tries the fastest safe path first.
     pub(crate) async fn peer_addresses_for_dial_typed(
         &self,
         peer_id: &PeerId,
     ) -> Vec<(MultiAddr, AddressType)> {
-        // 1. Routing table — filter to dialable QUIC addresses and sort
-        //    by AddressType priority (Relay first).
+        // 1. Routing table — filter to safe dialable QUIC addresses and sort
+        //    by AddressType priority.
         let typed = self
             .dht
             .read()
             .await
             .get_node_addresses_typed(peer_id)
             .await;
+        let own_wan_ips = self.own_direct_wan_ips();
         if !typed.is_empty() {
-            return Self::dialable_addresses_typed(&typed);
+            let filtered = self
+                .filter_address_set_for_local_use(peer_id, &typed, &own_wan_ips)
+                .await;
+            return Self::dialable_addresses_typed(&filtered);
         }
 
         // 2. Transport layer — for connected peers not yet in the
@@ -2557,9 +2947,9 @@ impl DhtNetworkManager {
 
     /// Filter and sort typed addresses by [`AddressType::priority`].
     ///
-    /// Relay first, Direct second, NATted last. Stable sort within each
-    /// tier preserves the input order, so callers that hand in addresses
-    /// in a meaningful sub-order (e.g., IPv6 before IPv4) keep that
+    /// LAN first, then Relay, Direct, Unverified, and NATted. Stable sort
+    /// within each tier preserves the input order, so callers that hand in
+    /// addresses in a meaningful sub-order (e.g., IPv6 before IPv4) keep that
     /// order within the type tier.
     fn dialable_addresses_typed(
         typed: &[(MultiAddr, AddressType)],
@@ -2579,10 +2969,12 @@ impl DhtNetworkManager {
     /// cold-start policy documented on [`Self::dial_addresses`].
     ///
     /// Rules:
-    /// - If a Relay is published, dial the Relay and (when present) one
-    ///   Direct address. Relay paths are the reliable fallback, so we do
-    ///   not burn a second attempt on an Unverified guess.
-    /// - If no Relay is published but a Direct is, dial the Direct and
+    /// - If a LAN address is usable, dial it first and skip Relay; same-LAN
+    ///   peers should not hairpin through a relay.
+    /// - If a Relay is published and not on our own WAN IP, dial the Relay and
+    ///   (when present) one Direct address. Relay paths are the reliable
+    ///   fallback, so we do not burn a second attempt on an Unverified guess.
+    /// - If no usable Relay is published but a Direct is, dial the Direct and
     ///   (when present) a single Unverified/NATted address as backup.
     /// - If only Unverified/NATted addresses exist, dial one of them and
     ///   stop. A second attempt from the same bucket is rarely more
@@ -2594,16 +2986,33 @@ impl DhtNetworkManager {
     /// when the top choice is unreachable. Capping at two keeps the
     /// worst case to a single retry while still covering the expected
     /// relay→direct and direct→unverified handoffs.
+    #[cfg(test)]
     fn select_dial_candidates(typed: &[(MultiAddr, AddressType)]) -> Vec<(MultiAddr, AddressType)> {
+        Self::select_dial_candidates_with_own_wan(typed, &HashSet::new())
+    }
+
+    fn select_dial_candidates_with_own_wan(
+        typed: &[(MultiAddr, AddressType)],
+        own_wan_ips: &HashSet<IpAddr>,
+    ) -> Vec<(MultiAddr, AddressType)> {
         let dialable: Vec<(MultiAddr, AddressType)> = typed
             .iter()
             .filter(|pair| Self::is_dialable(&pair.0))
             .cloned()
             .collect();
 
+        let lan = dialable
+            .iter()
+            .find(|(_, t)| *t == AddressType::Lan)
+            .cloned();
         let relay = dialable
             .iter()
-            .find(|(_, t)| *t == AddressType::Relay)
+            .find(|(addr, t)| {
+                *t == AddressType::Relay
+                    && addr
+                        .dialable_socket_addr()
+                        .is_none_or(|socket| !socket_ip_in_set(&socket, own_wan_ips))
+            })
             .cloned();
         let direct = dialable
             .iter()
@@ -2611,17 +3020,25 @@ impl DhtNetworkManager {
             .cloned();
         let other = dialable
             .iter()
-            .filter(|(_, t)| !matches!(*t, AddressType::Relay | AddressType::Direct))
+            .filter(|(_, t)| {
+                !matches!(
+                    *t,
+                    AddressType::Lan | AddressType::Relay | AddressType::Direct
+                )
+            })
             .min_by_key(|(_, t)| t.priority())
             .cloned();
 
-        match (relay, direct, other) {
-            (Some(r), Some(d), _) => vec![r, d],
-            (Some(r), None, _) => vec![r],
-            (None, Some(d), Some(o)) => vec![d, o],
-            (None, Some(d), None) => vec![d],
-            (None, None, Some(o)) => vec![o],
-            (None, None, None) => Vec::new(),
+        match (lan, relay, direct, other) {
+            (Some(l), _, Some(d), _) => vec![l, d],
+            (Some(l), _, None, Some(o)) => vec![l, o],
+            (Some(l), _, None, None) => vec![l],
+            (None, Some(r), Some(d), _) => vec![r, d],
+            (None, Some(r), None, _) => vec![r],
+            (None, None, Some(d), Some(o)) => vec![d, o],
+            (None, None, Some(d), None) => vec![d],
+            (None, None, None, Some(o)) => vec![o],
+            (None, None, None, None) => Vec::new(),
         }
     }
 
@@ -2782,8 +3199,18 @@ impl DhtNetworkManager {
                     seq,
                     addresses.len()
                 );
+                let filtered = self
+                    .filter_published_address_set_from_sender(authenticated_sender, addresses)
+                    .await;
+                if filtered.is_empty() {
+                    debug!(
+                        "Ignoring PUBLISH_ADDRESS_SET from {} after address filtering",
+                        authenticated_sender
+                    );
+                    return Ok(DhtNetworkResult::PublishAddressAck);
+                }
                 let dht = self.dht.read().await;
-                dht.replace_node_addresses(authenticated_sender, addresses.clone(), *seq)
+                dht.replace_node_addresses(authenticated_sender, filtered, *seq)
                     .await;
                 Ok(DhtNetworkResult::PublishAddressAck)
             }
@@ -3561,8 +3988,12 @@ impl DhtNetworkManager {
     /// nodes whose identity exchange always times out) as long as some
     /// authenticated neighbour keeps mentioning them.
     pub async fn merge_gossiped_typed_addresses(&self, node: &DHTNode) {
+        let own_wan_ips = self.own_direct_wan_ips();
+        let filtered = self
+            .filter_address_set_for_local_use(&node.peer_id, &node.typed_addresses(), &own_wan_ips)
+            .await;
         let dht = self.dht.read().await;
-        for (addr, ty) in node.typed_addresses() {
+        for (addr, ty) in filtered {
             dht.merge_typed_address_upgrade_only(&node.peer_id, &addr, ty)
                 .await;
         }
@@ -3660,14 +4091,24 @@ impl DhtNetworkManager {
         peers: &[DHTNode],
     ) {
         let seq = Self::next_publish_seq();
-        let op = DhtNetworkOperation::PublishAddressSet {
-            seq,
-            addresses: typed_addresses.clone(),
-        };
+        let own_wan_ips = self.own_direct_wan_ips();
         for peer in peers {
             if peer.peer_id == self.config.peer_id {
                 continue; // Skip self
             }
+            let addresses = self
+                .filter_address_set_for_peer(&typed_addresses, peer, &own_wan_ips)
+                .await;
+            if addresses.is_empty() {
+                debug!(
+                    peer = %peer.peer_id.to_hex(),
+                    seq,
+                    "skipping address-set publish after per-peer address filtering",
+                );
+                continue;
+            }
+            let address_count = addresses.len();
+            let op = DhtNetworkOperation::PublishAddressSet { seq, addresses };
             // Pass the peer's typed addresses through directly so
             // send_dht_request avoids a redundant routing-table read for
             // a peer we already have in hand.
@@ -3679,7 +4120,7 @@ impl DhtNetworkManager {
                 Ok(_) => {
                     debug!(
                         peer = %peer.peer_id.to_hex(),
-                        addrs = typed_addresses.len(),
+                        addrs = address_count,
                         seq,
                         "published address set to peer",
                     );
@@ -4321,6 +4762,145 @@ mod tests {
         assert_eq!(picks.len(), 2);
         assert_eq!(picks[0].1, AddressType::Direct);
         assert_eq!(picks[1].1, AddressType::Unverified);
+    }
+
+    #[test]
+    fn select_dial_candidates_prefers_lan_and_skips_relay() {
+        let addrs = typed(vec![
+            ("/ip4/198.51.100.1/udp/9000/quic", AddressType::Relay),
+            ("/ip4/10.0.0.7/udp/9001/quic", AddressType::Lan),
+            ("/ip4/203.0.113.7/udp/9002/quic", AddressType::Direct),
+        ]);
+        let picks = DhtNetworkManager::select_dial_candidates(&addrs);
+        assert_eq!(picks.len(), 2);
+        assert_eq!(picks[0].1, AddressType::Lan);
+        assert_eq!(picks[1].1, AddressType::Direct);
+    }
+
+    #[test]
+    fn select_dial_candidates_lan_plus_unverified_does_not_duplicate_lan() {
+        let addrs = typed(vec![
+            ("/ip4/10.0.0.7/udp/9001/quic", AddressType::Lan),
+            ("/ip4/192.0.2.9/udp/9002/quic", AddressType::Unverified),
+        ]);
+        let picks = DhtNetworkManager::select_dial_candidates(&addrs);
+        assert_eq!(picks.len(), 2);
+        assert_eq!(picks[0].1, AddressType::Lan);
+        assert_eq!(picks[1].1, AddressType::Unverified);
+    }
+
+    #[test]
+    fn select_dial_candidates_skips_relay_on_our_wan_ip() {
+        let addrs = typed(vec![
+            ("/ip4/82.151.167.27/udp/9000/quic", AddressType::Relay),
+            ("/ip4/203.0.113.7/udp/9001/quic", AddressType::Direct),
+            ("/ip4/192.0.2.9/udp/9002/quic", AddressType::Unverified),
+        ]);
+        let own_wan_ips = HashSet::from([IpAddr::V4(Ipv4Addr::new(82, 151, 167, 27))]);
+        let picks = DhtNetworkManager::select_dial_candidates_with_own_wan(&addrs, &own_wan_ips);
+        assert_eq!(picks.len(), 2);
+        assert_eq!(picks[0].1, AddressType::Direct);
+        assert_eq!(picks[1].1, AddressType::Unverified);
+    }
+
+    #[test]
+    fn filter_address_set_drops_lan_when_receiver_is_not_same_wan() {
+        let addrs = typed(vec![
+            ("/ip4/10.0.0.7/udp/9000/quic", AddressType::Lan),
+            ("/ip4/203.0.113.7/udp/9001/quic", AddressType::Direct),
+        ]);
+        let filtered = DhtNetworkManager::filter_address_set_for_receiver(
+            &addrs,
+            false,
+            &HashSet::new(),
+            &HashSet::new(),
+        );
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].1, AddressType::Direct);
+    }
+
+    #[test]
+    fn same_wan_evidence_ignores_lan_and_relay_addresses() {
+        let own_wan_ips = HashSet::from([IpAddr::V4(Ipv4Addr::new(82, 151, 167, 27))]);
+        let lan_only = typed(vec![("/ip4/10.0.0.7/udp/9000/quic", AddressType::Lan)]);
+        let same_wan_relay = typed(vec![(
+            "/ip4/82.151.167.27/udp/9000/quic",
+            AddressType::Relay,
+        )]);
+        let same_wan_direct = typed(vec![(
+            "/ip4/82.151.167.27/udp/9001/quic",
+            AddressType::Direct,
+        )]);
+
+        assert!(!DhtNetworkManager::address_set_has_same_wan_non_relay(
+            &lan_only,
+            &own_wan_ips
+        ));
+        assert!(!DhtNetworkManager::address_set_has_same_wan_non_relay(
+            &same_wan_relay,
+            &own_wan_ips
+        ));
+        assert!(DhtNetworkManager::address_set_has_same_wan_non_relay(
+            &same_wan_direct,
+            &own_wan_ips
+        ));
+    }
+
+    #[test]
+    fn filter_address_set_drops_relay_on_our_wan_ip() {
+        let addrs = typed(vec![
+            ("/ip4/82.151.167.27/udp/9000/quic", AddressType::Relay),
+            ("/ip4/203.0.113.7/udp/9001/quic", AddressType::Direct),
+        ]);
+        let own_wan_ips = HashSet::from([IpAddr::V4(Ipv4Addr::new(82, 151, 167, 27))]);
+        let filtered = DhtNetworkManager::filter_address_set_for_receiver(
+            &addrs,
+            true,
+            &HashSet::new(),
+            &own_wan_ips,
+        );
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].1, AddressType::Direct);
+    }
+
+    #[test]
+    fn filter_address_set_swaps_same_lan_ip_to_loopback_for_receiver() {
+        let addrs = typed(vec![("/ip4/10.0.0.7/udp/9000/quic", AddressType::Lan)]);
+        let peer_lan_ips = HashSet::from([IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7))]);
+        let filtered = DhtNetworkManager::filter_address_set_for_receiver(
+            &addrs,
+            true,
+            &peer_lan_ips,
+            &HashSet::new(),
+        );
+
+        assert_eq!(
+            filtered[0].0,
+            "/ip4/127.0.0.1/udp/9000/quic".parse::<MultiAddr>().unwrap()
+        );
+        assert_eq!(filtered[0].1, AddressType::Lan);
+    }
+
+    #[test]
+    fn first_direct_dialable_excluding_wan_skips_same_wan_candidate() {
+        let node = dht_node(
+            1,
+            vec![
+                ("/ip4/82.151.167.27/udp/9000/quic", AddressType::Direct),
+                ("/ip4/203.0.113.7/udp/9001/quic", AddressType::Direct),
+            ],
+        );
+        let own_wan_ips = HashSet::from([IpAddr::V4(Ipv4Addr::new(82, 151, 167, 27))]);
+        let picked =
+            DhtNetworkManager::first_direct_dialable_excluding_wan(&node, &own_wan_ips).unwrap();
+        assert_eq!(
+            picked,
+            "/ip4/203.0.113.7/udp/9001/quic"
+                .parse::<MultiAddr>()
+                .unwrap()
+        );
     }
 
     fn sock(s: &str) -> SocketAddr {

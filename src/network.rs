@@ -21,7 +21,11 @@ use crate::adaptive::trust::{TrustRecord, TrustSnapshot};
 use crate::adaptive::{AdaptiveDHT, AdaptiveDhtConfig, TrustEngine, TrustEvent};
 use crate::bootstrap::cache::{CachedCloseGroupPeer, CloseGroupCache};
 use crate::bootstrap::{BootstrapConfig, BootstrapManager};
-use crate::dht_network_manager::{DhtNetworkConfig, DhtNetworkEvent, DhtNetworkManager};
+use crate::dht::AddressType;
+use crate::dht_network_manager::{
+    DhtNetworkConfig, DhtNetworkEvent, DhtNetworkManager, is_lan_or_loopback_socket,
+    socket_ip_in_set,
+};
 use crate::error::{IdentityError, NetworkError, P2PError, P2pResult as Result};
 use crate::reachability::spawn_acquisition_driver;
 
@@ -1267,13 +1271,6 @@ impl P2PNode {
                                 advertised_addr,
                                 peer_addr.ip() == advertised_addr.ip()
                             );
-                            // Only update DHT when the advertised IP differs
-                            // from the peer's connection IP. Same-IP updates
-                            // are just different NATted ports (useless for
-                            // symmetric NAT); different-IP means a relay.
-                            if peer_addr.ip() == advertised_addr.ip() {
-                                continue;
-                            }
                             // Look up peer ID by address (tries both IPv4 and
                             // IPv4-mapped IPv6 forms via dual_stack_alternate).
                             // For symmetric NAT, this may fail because the
@@ -1281,15 +1278,68 @@ impl P2PNode {
                             if let Some(peer_id) = transport.peer_id_for_addr(&peer_addr).await {
                                 let normalized_adv =
                                     saorsa_transport::shared::normalize_socket_addr(advertised_addr);
-                                let multi_addr = crate::MultiAddr::quic(normalized_adv);
+                                let own_wan_ips =
+                                    DhtNetworkManager::own_direct_wan_ips_from_transport(&transport);
+                                let advertised_is_lan = is_lan_or_loopback_socket(&normalized_adv);
+                                let peer_is_lan = is_lan_or_loopback_socket(&peer_addr);
+                                let peer_same_wan = socket_ip_in_set(&peer_addr, &own_wan_ips);
+
+                                if advertised_is_lan {
+                                    if !(peer_is_lan || peer_same_wan) {
+                                        debug!(
+                                            "Ignoring LAN address {} from peer {} over different WAN {}",
+                                            normalized_adv, peer_id, peer_addr
+                                        );
+                                        continue;
+                                    }
+
+                                    let lan_addr =
+                                        DhtNetworkManager::maybe_swap_same_lan_ip_to_loopback(
+                                            &transport,
+                                            normalized_adv,
+                                        )
+                                        .await;
+                                    let multi_addr = MultiAddr::quic(lan_addr);
+                                    info!(
+                                        "Updating DHT: peer {} LAN address {} (connection was {})",
+                                        peer_id, lan_addr, peer_addr
+                                    );
+                                    dht.touch_node_typed(
+                                        &peer_id,
+                                        Some(&multi_addr),
+                                        AddressType::Lan,
+                                    )
+                                    .await;
+                                    continue;
+                                }
+
+                                // Same-IP non-LAN updates are just different
+                                // NATted ports (useless for symmetric NAT).
+                                if peer_addr.ip() == normalized_adv.ip() {
+                                    continue;
+                                }
+
+                                // A relay address on our own observed WAN IP is
+                                // a same-NAT hairpin candidate. Keep it out of
+                                // the routing record so dialers try the peer's
+                                // direct or unverified path instead.
+                                if socket_ip_in_set(&normalized_adv, &own_wan_ips) {
+                                    debug!(
+                                        "Ignoring relay address {} for peer {} because it is on our WAN",
+                                        normalized_adv, peer_id
+                                    );
+                                    continue;
+                                }
+
+                                let multi_addr = MultiAddr::quic(normalized_adv);
                                 info!(
                                     "Updating DHT: peer {} relay address {} (connection was {})",
-                                    peer_id, advertised_addr, peer_addr
+                                    peer_id, normalized_adv, peer_addr
                                 );
                                 dht.touch_node_typed(
                                     &peer_id,
                                     Some(&multi_addr),
-                                    crate::dht::AddressType::Relay,
+                                    AddressType::Relay,
                                 )
                                 .await;
                             }

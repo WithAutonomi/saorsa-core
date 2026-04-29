@@ -94,11 +94,13 @@ pub(crate) async fn run_relay_acquisition(
 
     let own_key = *dht.peer_id().to_bytes();
     let closest = dht.find_closest_nodes_local(&own_key, dht.k_value()).await;
+    let own_wan_ips = DhtNetworkManager::own_direct_wan_ips_from_transport(transport);
 
     let candidates: Vec<RelayCandidate> = closest
         .iter()
         .filter_map(|node| {
-            let direct = DhtNetworkManager::first_direct_dialable(node)?;
+            let direct =
+                DhtNetworkManager::first_direct_dialable_excluding_wan(node, &own_wan_ips)?;
             Some(RelayCandidate::new(node.peer_id, direct))
         })
         .collect();
