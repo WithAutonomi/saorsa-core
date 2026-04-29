@@ -62,8 +62,9 @@ pub(crate) struct WireMessage {
     pub(crate) timestamp: u64,
     /// User agent string identifying the sender's software.
     ///
-    /// Convention: `"node/<version>"` for full DHT participants,
-    /// `"client/<version>"` or `"<app>/<version>"` for ephemeral clients.
+    /// Convention: `"node/<version> [capability...]"` for full DHT
+    /// participants, `"client/<version> [capability...]"` or
+    /// `"<app>/<version> [capability...]"` for ephemeral clients.
     /// Included in the signed bytes — tamper-proof.
     #[serde(default)]
     pub(crate) user_agent: String,
@@ -98,21 +99,43 @@ enum ListenMode {
     Local,
 }
 
+/// User-agent capability token for peers that can deserialize
+/// `AddressType::Lan`.
+///
+/// Nodes that do not advertise this token must not receive `AddressType::Lan`,
+/// because older 0.24.0 binaries cannot deserialize that enum variant.
+/// TODO(0.26): remove this backwards-compatibility capability gate once all
+/// supported live nodes can decode `AddressType::Lan`.
+pub const LAN_ADDRESS_CAPABILITY: &str = "lanaddr/1";
+
 /// Returns the default user agent string for the given mode.
 ///
-/// - `Node` → `"node/<saorsa-core-version>"`
-/// - `Client` → `"client/<saorsa-core-version>"`
+/// - `Node` → `"node/<saorsa-core-version> lanaddr/1"`
+/// - `Client` → `"client/<saorsa-core-version> lanaddr/1"`
 pub fn user_agent_for_mode(mode: NodeMode) -> String {
     let prefix = match mode {
         NodeMode::Node => "node",
         NodeMode::Client => "client",
     };
-    format!("{prefix}/{}", env!("CARGO_PKG_VERSION"))
+    format!(
+        "{prefix}/{} {}",
+        env!("CARGO_PKG_VERSION"),
+        LAN_ADDRESS_CAPABILITY
+    )
 }
 
 /// Returns `true` if the user agent identifies a full DHT participant (prefix `"node/"`).
 pub fn is_dht_participant(user_agent: &str) -> bool {
     user_agent.starts_with("node/")
+}
+
+/// Returns `true` when a peer explicitly supports the LAN address wire
+/// variant. Old live nodes advertise `node/0.24.0` without this token, so they
+/// are treated as legacy even if they are on the same NAT.
+pub fn supports_lan_address_type(user_agent: &str) -> bool {
+    user_agent
+        .split(|c: char| c.is_whitespace() || c == ',' || c == ';')
+        .any(|token| token == LAN_ADDRESS_CAPABILITY)
 }
 
 /// Capacity of the internal channel used by the message receiving system.
@@ -227,8 +250,8 @@ pub struct NodeConfig {
     /// Operating mode of this node.
     ///
     /// Determines the default user agent and DHT participation:
-    /// - `Node` → user agent `"node/<version>"`, added to DHT routing tables.
-    /// - `Client` → user agent `"client/<version>"`, treated as ephemeral.
+    /// - `Node` → user agent `"node/<version> lanaddr/1"`, added to DHT routing tables.
+    /// - `Client` → user agent `"client/<version> lanaddr/1"`, treated as ephemeral.
     #[serde(default)]
     pub mode: NodeMode,
 
@@ -698,7 +721,8 @@ pub enum P2PEvent {
         data: Vec<u8>,
     },
     /// An authenticated peer has connected (first signed message verified on any channel).
-    /// The `user_agent` identifies the remote software (e.g. `"node/0.12.1"`, `"client/1.0"`).
+    /// The `user_agent` identifies the remote software and capabilities
+    /// (e.g. `"node/0.24.1 lanaddr/1"`, `"client/1.0"`).
     PeerConnected(PeerId, String),
     /// An authenticated peer has fully disconnected (all channels closed).
     PeerDisconnected(PeerId),
@@ -2464,6 +2488,20 @@ mod tests {
         assert_eq!(config.k_value, 20);
         assert_eq!(config.alpha_value, 3);
         assert_eq!(config.refresh_interval, Duration::from_secs(600));
+    }
+
+    #[test]
+    fn default_user_agent_advertises_lan_address_capability() {
+        let user_agent = user_agent_for_mode(NodeMode::Node);
+
+        assert!(user_agent.starts_with("node/"));
+        assert!(supports_lan_address_type(&user_agent));
+    }
+
+    #[test]
+    fn old_live_user_agent_is_legacy_for_lan_address_wire_type() {
+        assert!(!supports_lan_address_type("node/0.24.0"));
+        assert!(supports_lan_address_type("node/0.24.0 lanaddr/1"));
     }
 
     #[test]

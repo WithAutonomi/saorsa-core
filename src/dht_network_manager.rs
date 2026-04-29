@@ -2191,6 +2191,14 @@ impl DhtNetworkManager {
         )
     }
 
+    async fn peer_supports_lan_address_type(&self, peer_id: &PeerId) -> bool {
+        self.transport
+            .peer_user_agent(peer_id)
+            .await
+            .as_deref()
+            .is_some_and(crate::network::supports_lan_address_type)
+    }
+
     fn address_set_has_same_wan_non_relay(
         addresses: &[(MultiAddr, AddressType)],
         own_wan_ips: &HashSet<IpAddr>,
@@ -2250,13 +2258,20 @@ impl DhtNetworkManager {
         own_wan_ips: &HashSet<IpAddr>,
     ) -> Vec<(MultiAddr, AddressType)> {
         let allow_lan = self.peer_can_receive_lan_addresses(peer, own_wan_ips).await;
+        let supports_lan_wire = self.peer_supports_lan_address_type(&peer.peer_id).await;
         let peer_lan_ips = if allow_lan {
             self.peer_lan_ips(peer).await
         } else {
             HashSet::new()
         };
 
-        Self::filter_address_set_for_receiver(addresses, allow_lan, &peer_lan_ips, own_wan_ips)
+        Self::filter_address_set_for_receiver(
+            addresses,
+            allow_lan,
+            supports_lan_wire,
+            &peer_lan_ips,
+            own_wan_ips,
+        )
     }
 
     async fn filter_address_set_for_peer_id(
@@ -2265,6 +2280,7 @@ impl DhtNetworkManager {
         peer_id: &PeerId,
         own_wan_ips: &HashSet<IpAddr>,
     ) -> Vec<(MultiAddr, AddressType)> {
+        let supports_lan_wire = self.peer_supports_lan_address_type(peer_id).await;
         let allow_lan = self
             .peer_id_can_receive_lan_addresses(peer_id, own_wan_ips)
             .await;
@@ -2274,12 +2290,19 @@ impl DhtNetworkManager {
             HashSet::new()
         };
 
-        Self::filter_address_set_for_receiver(addresses, allow_lan, &peer_lan_ips, own_wan_ips)
+        Self::filter_address_set_for_receiver(
+            addresses,
+            allow_lan,
+            supports_lan_wire,
+            &peer_lan_ips,
+            own_wan_ips,
+        )
     }
 
     fn filter_address_set_for_receiver(
         addresses: &[(MultiAddr, AddressType)],
         allow_lan: bool,
+        supports_lan_wire: bool,
         peer_lan_ips: &HashSet<IpAddr>,
         own_wan_ips: &HashSet<IpAddr>,
     ) -> Vec<(MultiAddr, AddressType)> {
@@ -2288,7 +2311,9 @@ impl DhtNetworkManager {
             .filter_map(|(addr, addr_type)| {
                 let socket = addr.dialable_socket_addr();
                 let local_scoped = socket.as_ref().is_some_and(is_lan_or_loopback_socket);
-                if (*addr_type == AddressType::Lan || local_scoped) && !allow_lan {
+                if (*addr_type == AddressType::Lan || local_scoped)
+                    && (!allow_lan || !supports_lan_wire)
+                {
                     return None;
                 }
 
@@ -2312,9 +2337,76 @@ impl DhtNetworkManager {
                     ));
                 }
 
-                Some((out, *addr_type))
+                let out_type = if local_scoped {
+                    AddressType::Lan
+                } else {
+                    *addr_type
+                };
+
+                Some((out, out_type))
             })
             .collect()
+    }
+
+    fn strip_lan_wire_addresses_for_legacy(
+        addresses: Vec<(MultiAddr, AddressType)>,
+    ) -> Vec<(MultiAddr, AddressType)> {
+        // TODO(0.26): remove this backwards-compatible legacy stripping once
+        // all supported peers can deserialize `AddressType::Lan`.
+        addresses
+            .into_iter()
+            .filter(|(addr, addr_type)| {
+                *addr_type != AddressType::Lan
+                    && !addr
+                        .dialable_socket_addr()
+                        .is_some_and(|socket| is_lan_or_loopback_socket(&socket))
+            })
+            .collect()
+    }
+
+    fn strip_lan_node_for_legacy(node: &mut DHTNode) {
+        let filtered = Self::strip_lan_wire_addresses_for_legacy(node.typed_addresses());
+        node.addresses = filtered.iter().map(|(addr, _)| addr.clone()).collect();
+        node.address_types = filtered.iter().map(|(_, ty)| *ty).collect();
+    }
+
+    fn strip_lan_result_for_legacy(result: DhtNetworkResult) -> DhtNetworkResult {
+        match result {
+            DhtNetworkResult::NodesFound { key, mut nodes } => {
+                for node in &mut nodes {
+                    Self::strip_lan_node_for_legacy(node);
+                }
+                nodes.retain(|node| !node.addresses.is_empty());
+                DhtNetworkResult::NodesFound { key, nodes }
+            }
+            other => other,
+        }
+    }
+
+    fn strip_lan_operation_for_legacy(operation: DhtNetworkOperation) -> DhtNetworkOperation {
+        match operation {
+            DhtNetworkOperation::PublishAddressSet { seq, addresses } => {
+                DhtNetworkOperation::PublishAddressSet {
+                    seq,
+                    addresses: Self::strip_lan_wire_addresses_for_legacy(addresses),
+                }
+            }
+            other => other,
+        }
+    }
+
+    async fn sanitize_operation_for_peer(
+        &self,
+        peer_id: &PeerId,
+        operation: DhtNetworkOperation,
+    ) -> DhtNetworkOperation {
+        // TODO(0.26): remove this compatibility branch and send the operation
+        // unchanged once live 0.24.0 nodes are no longer supported.
+        if self.peer_supports_lan_address_type(peer_id).await {
+            operation
+        } else {
+            Self::strip_lan_operation_for_legacy(operation)
+        }
     }
 
     async fn filter_published_address_set_from_sender(
@@ -2659,6 +2751,7 @@ impl DhtNetworkManager {
         self.sweep_expired_operations();
 
         let message_id = Uuid::new_v4().to_string();
+        let operation = self.sanitize_operation_for_peer(peer_id, operation).await;
 
         let message = DhtNetworkMessage {
             message_id: message_id.clone(),
@@ -3127,7 +3220,9 @@ impl DhtNetworkManager {
                     sender,
                     message.message_id
                 );
-                let response = self.create_response_message(&message, result)?;
+                let response = self
+                    .create_response_message(&message, result, sender)
+                    .await?;
                 Ok(Some(postcard::to_stdvec(&response).map_err(|e| {
                     P2PError::Serialization(e.to_string().into())
                 })?))
@@ -3330,14 +3425,22 @@ impl DhtNetworkManager {
     }
 
     /// Create response message
-    fn create_response_message(
+    async fn create_response_message(
         &self,
         request: &DhtNetworkMessage,
         result: DhtNetworkResult,
+        response_peer: &PeerId,
     ) -> Result<DhtNetworkMessage> {
+        let supports_lan_wire = self.peer_supports_lan_address_type(response_peer).await;
+        let result = if supports_lan_wire {
+            result
+        } else {
+            Self::strip_lan_result_for_legacy(result)
+        };
+
         // Create a minimal payload that echoes the original operation type
         // Each variant explicitly extracts its key to avoid silent fallbacks
-        let payload = match &result {
+        let mut payload = match &result {
             DhtNetworkResult::NodesFound { key, .. } => DhtNetworkOperation::FindNode { key: *key },
             DhtNetworkResult::PongReceived { .. } => DhtNetworkOperation::Ping,
             DhtNetworkResult::JoinSuccess { .. } => DhtNetworkOperation::Join,
@@ -3352,6 +3455,9 @@ impl DhtNetworkManager {
                 )));
             }
         };
+        if !supports_lan_wire {
+            payload = Self::strip_lan_operation_for_legacy(payload);
+        }
 
         Ok(DhtNetworkMessage {
             message_id: request.message_id.clone(),
@@ -4649,6 +4755,99 @@ mod tests {
             .collect()
     }
 
+    #[allow(dead_code)]
+    #[derive(Debug, serde::Deserialize)]
+    enum LegacyAddressType {
+        Relay,
+        Direct,
+        Unverified,
+        NATted,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug, serde::Deserialize)]
+    struct LegacyDhtNode {
+        peer_id: PeerId,
+        addresses: Vec<MultiAddr>,
+        address_types: Vec<LegacyAddressType>,
+        distance: Option<Vec<u8>>,
+        reliability: f64,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug, serde::Deserialize)]
+    enum LegacyDhtNetworkOperation {
+        FindNode {
+            key: Key,
+        },
+        Ping,
+        Join,
+        Leave,
+        PublishAddressSet {
+            seq: u64,
+            addresses: Vec<(MultiAddr, LegacyAddressType)>,
+        },
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug, serde::Deserialize)]
+    enum LegacyDhtNetworkResult {
+        NodesFound {
+            key: Key,
+            nodes: Vec<LegacyDhtNode>,
+        },
+        PongReceived {
+            responder: PeerId,
+            latency: Duration,
+        },
+        JoinSuccess {
+            assigned_key: Key,
+            bootstrap_peers: usize,
+        },
+        LeaveSuccess,
+        PeerRejected,
+        PublishAddressAck,
+        Error {
+            operation: String,
+            error: String,
+        },
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug, serde::Deserialize)]
+    struct LegacyDhtNetworkMessage {
+        message_id: String,
+        source: PeerId,
+        target: Option<PeerId>,
+        message_type: DhtMessageType,
+        payload: LegacyDhtNetworkOperation,
+        result: Option<LegacyDhtNetworkResult>,
+        timestamp: u64,
+        ttl: u8,
+        hop_count: u8,
+    }
+
+    fn test_wire_message(
+        payload: DhtNetworkOperation,
+        result: Option<DhtNetworkResult>,
+    ) -> DhtNetworkMessage {
+        DhtNetworkMessage {
+            message_id: "compat-test".to_string(),
+            source: PeerId::from_bytes([1u8; 32]),
+            target: Some(PeerId::from_bytes([2u8; 32])),
+            message_type: if result.is_some() {
+                DhtMessageType::Response
+            } else {
+                DhtMessageType::Request
+            },
+            payload,
+            result,
+            timestamp: 1,
+            ttl: 10,
+            hop_count: 0,
+        }
+    }
+
     #[test]
     fn select_dial_candidates_returns_empty_for_empty_input() {
         let picks = DhtNetworkManager::select_dial_candidates(&[]);
@@ -4812,6 +5011,7 @@ mod tests {
         let filtered = DhtNetworkManager::filter_address_set_for_receiver(
             &addrs,
             false,
+            true,
             &HashSet::new(),
             &HashSet::new(),
         );
@@ -4857,6 +5057,7 @@ mod tests {
         let filtered = DhtNetworkManager::filter_address_set_for_receiver(
             &addrs,
             true,
+            true,
             &HashSet::new(),
             &own_wan_ips,
         );
@@ -4872,6 +5073,7 @@ mod tests {
         let filtered = DhtNetworkManager::filter_address_set_for_receiver(
             &addrs,
             true,
+            true,
             &peer_lan_ips,
             &HashSet::new(),
         );
@@ -4881,6 +5083,117 @@ mod tests {
             "/ip4/127.0.0.1/udp/9000/quic".parse::<MultiAddr>().unwrap()
         );
         assert_eq!(filtered[0].1, AddressType::Lan);
+    }
+
+    #[test]
+    fn filter_address_set_drops_lan_when_receiver_is_legacy() {
+        let addrs = typed(vec![
+            ("/ip4/10.0.0.7/udp/9000/quic", AddressType::Lan),
+            ("/ip4/203.0.113.7/udp/9001/quic", AddressType::Direct),
+        ]);
+        let peer_lan_ips = HashSet::from([IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7))]);
+        let filtered = DhtNetworkManager::filter_address_set_for_receiver(
+            &addrs,
+            true,
+            false,
+            &peer_lan_ips,
+            &HashSet::new(),
+        );
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].1, AddressType::Direct);
+    }
+
+    #[test]
+    fn strip_lan_wire_addresses_for_legacy_removes_lan_and_local_scoped() {
+        let addrs = typed(vec![
+            ("/ip4/10.0.0.7/udp/9000/quic", AddressType::Lan),
+            ("/ip4/127.0.0.1/udp/9001/quic", AddressType::Unverified),
+            ("/ip4/203.0.113.7/udp/9002/quic", AddressType::Direct),
+        ]);
+
+        let filtered = DhtNetworkManager::strip_lan_wire_addresses_for_legacy(addrs);
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].1, AddressType::Direct);
+    }
+
+    #[test]
+    fn legacy_wire_decoder_rejects_unsanitized_lan_publish_address_set() {
+        let message = test_wire_message(
+            DhtNetworkOperation::PublishAddressSet {
+                seq: 1,
+                addresses: typed(vec![("/ip4/10.0.0.7/udp/9000/quic", AddressType::Lan)]),
+            },
+            None,
+        );
+        let bytes = postcard::to_stdvec(&message).expect("serialize current wire message");
+
+        let legacy = postcard::from_bytes::<LegacyDhtNetworkMessage>(&bytes);
+
+        assert!(
+            legacy.is_err(),
+            "legacy 0.24.0-shaped decoder must reject unsanitized AddressType::Lan"
+        );
+    }
+
+    #[test]
+    fn legacy_wire_decoder_accepts_sanitized_publish_address_set() {
+        let payload = DhtNetworkManager::strip_lan_operation_for_legacy(
+            DhtNetworkOperation::PublishAddressSet {
+                seq: 1,
+                addresses: typed(vec![
+                    ("/ip4/10.0.0.7/udp/9000/quic", AddressType::Lan),
+                    ("/ip4/203.0.113.7/udp/9001/quic", AddressType::Direct),
+                ]),
+            },
+        );
+        let message = test_wire_message(payload, None);
+        let bytes = postcard::to_stdvec(&message).expect("serialize sanitized wire message");
+
+        let legacy =
+            postcard::from_bytes::<LegacyDhtNetworkMessage>(&bytes).expect("legacy decode");
+
+        match legacy.payload {
+            LegacyDhtNetworkOperation::PublishAddressSet { addresses, .. } => {
+                assert_eq!(addresses.len(), 1);
+                assert!(matches!(addresses[0].1, LegacyAddressType::Direct));
+            }
+            other => panic!("expected legacy PublishAddressSet, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn legacy_wire_decoder_accepts_sanitized_nodes_found_response() {
+        let key = [9u8; 32];
+        let mut result = DhtNetworkResult::NodesFound {
+            key,
+            nodes: vec![dht_node(
+                7,
+                vec![
+                    ("/ip4/10.0.0.7/udp/9000/quic", AddressType::Lan),
+                    ("/ip4/203.0.113.7/udp/9001/quic", AddressType::Direct),
+                ],
+            )],
+        };
+        result = DhtNetworkManager::strip_lan_result_for_legacy(result);
+        let message = test_wire_message(DhtNetworkOperation::FindNode { key }, Some(result));
+        let bytes = postcard::to_stdvec(&message).expect("serialize sanitized response");
+
+        let legacy =
+            postcard::from_bytes::<LegacyDhtNetworkMessage>(&bytes).expect("legacy decode");
+
+        match legacy.result {
+            Some(LegacyDhtNetworkResult::NodesFound { nodes, .. }) => {
+                assert_eq!(nodes.len(), 1);
+                assert_eq!(nodes[0].addresses.len(), 1);
+                assert!(matches!(
+                    nodes[0].address_types[0],
+                    LegacyAddressType::Direct
+                ));
+            }
+            other => panic!("expected legacy NodesFound result, got {other:?}"),
+        }
     }
 
     #[test]
