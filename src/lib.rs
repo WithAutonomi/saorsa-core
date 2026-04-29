@@ -65,8 +65,7 @@ pub use network::{NodeConfig, NodeMode, P2PEvent, P2PNode};
 pub use dht::Key;
 pub use dht_network_manager::{DHTNode, DhtNetworkEvent};
 
-// Bootstrap
-pub use bootstrap::{BootstrapConfig, BootstrapManager, BootstrapStats};
+// Close-group cache
 pub use bootstrap::{CachedCloseGroupPeer, CloseGroupCache};
 
 // Trust & Adaptive DHT
