@@ -213,6 +213,15 @@ impl AcquisitionDriver {
             None
         };
 
+        debug!(
+            relay = ?relay,
+            direct_verified,
+            direct_tag = ?direct_tag,
+            observed = ?observed,
+            listen = ?listen,
+            "driver: preparing typed self address set"
+        );
+
         let mut typed: Vec<(MultiAddr, AddressType)> = Vec::new();
         // Normalize addresses before dedup so IPv4-mapped IPv6
         // (::ffff:a.b.c.d) and plain IPv4 (a.b.c.d) are treated as
@@ -227,30 +236,76 @@ impl AcquisitionDriver {
             if !observed.is_empty() {
                 for sa in observed {
                     if sa.ip().is_unspecified() {
+                        debug!(
+                            address = %sa,
+                            "driver: skipping unspecified observed self address"
+                        );
                         continue;
                     }
                     let normalized = saorsa_transport::shared::normalize_socket_addr(sa);
                     if seen.insert(normalized) {
+                        debug!(
+                            address = %normalized,
+                            tag = ?tag,
+                            "driver: adding observed self address to publish set"
+                        );
                         typed.push((MultiAddr::quic(normalized), tag));
+                    } else {
+                        trace!(
+                            address = %normalized,
+                            tag = ?tag,
+                            "driver: deduped observed self address"
+                        );
                     }
                 }
             }
             for addr in listen {
                 let Some(sa) = addr.dialable_socket_addr() else {
+                    trace!(
+                        address = %addr,
+                        "driver: skipping non-dialable listen address"
+                    );
                     continue;
                 };
                 if sa.ip().is_unspecified() {
+                    debug!(
+                        address = %sa,
+                        "driver: skipping unspecified listen address"
+                    );
                     continue;
                 }
                 let normalized = saorsa_transport::shared::normalize_socket_addr(sa);
                 if seen.insert(normalized) {
+                    debug!(
+                        address = %normalized,
+                        tag = ?tag,
+                        "driver: adding listen self address to publish set"
+                    );
                     typed.push((MultiAddr::quic(normalized), tag));
+                } else {
+                    trace!(
+                        address = %normalized,
+                        tag = ?tag,
+                        "driver: deduped listen self address"
+                    );
                 }
             }
+        } else {
+            debug!(
+                relay = ?relay,
+                direct_verified,
+                observed_count = observed.len(),
+                listen_count = listen.len(),
+                "driver: suppressing unverified direct addresses while relay is held"
+            );
         }
 
         if let Some(relay_addr) = relay {
             let normalized = saorsa_transport::shared::normalize_socket_addr(relay_addr);
+            debug!(
+                address = %normalized,
+                "driver: adding relay self address to publish set"
+            );
             typed.push((MultiAddr::quic(normalized), AddressType::Relay));
         }
 
@@ -264,6 +319,12 @@ impl AcquisitionDriver {
             .dht
             .find_closest_nodes_local(&own_key, self.dht.k_value())
             .await;
+        debug!(
+            peers = all_peers.len(),
+            typed_addresses = ?typed,
+            relay = ?relay,
+            "driver: publishing typed self address set"
+        );
         trace!(
             peers = all_peers.len(),
             addrs = typed.len(),

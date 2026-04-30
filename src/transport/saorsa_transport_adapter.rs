@@ -1297,23 +1297,40 @@ impl DualStackNetworkNode<P2pLinkTransport> {
                         }) => {
                             if flag.load(Ordering::Relaxed) {
                                 // Already proven; nothing more to learn here.
+                                tracing::trace!(
+                                    remote = %addr,
+                                    "classifier: direct reachability already observed; ignoring inbound handshake"
+                                );
                                 continue;
                             }
                             let Some(socket_addr) = addr.as_socket_addr() else {
+                                tracing::trace!(
+                                    remote = %addr,
+                                    "classifier: ignoring inbound handshake from non-socket transport"
+                                );
                                 continue;
                             };
                             let normalized =
                                 saorsa_transport::shared::normalize_socket_addr(socket_addr);
                             if dialed.contains(&normalized) {
                                 // Simultaneous-open reply to our own dial; not proof.
+                                tracing::debug!(
+                                    remote = %normalized,
+                                    dialed_targets = dialed.len(),
+                                    "classifier: ignoring inbound handshake for an address we dialed"
+                                );
                                 continue;
                             }
                             let remote_ip = canonicalize_ip(normalized.ip());
-                            let is_own_external_ip = external
-                                .lock()
-                                .direct_addresses()
-                                .into_iter()
+                            let pinned_direct = external.lock().direct_addresses();
+                            let is_own_external_ip = pinned_direct
+                                .iter()
                                 .any(|sa| canonicalize_ip(sa.ip()) == remote_ip);
+                            tracing::debug!(
+                                remote = %normalized,
+                                pinned_direct = ?pinned_direct,
+                                "classifier: inbound server-side handshake is being evaluated"
+                            );
                             if is_own_external_ip {
                                 tracing::trace!(
                                     remote = %normalized,
