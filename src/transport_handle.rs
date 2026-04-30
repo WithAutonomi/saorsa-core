@@ -20,6 +20,7 @@
 use crate::MultiAddr;
 use crate::PeerId;
 use crate::bgp_geo_provider::BgpGeoProvider;
+use crate::dht::core_engine::AddressType;
 use crate::error::{NetworkError, P2PError, P2pResult as Result};
 use crate::identity::node_identity::NodeIdentity;
 use crate::network::{
@@ -86,6 +87,20 @@ pub(crate) fn external_meets_proof_threshold(
         .get(&normalized)
         .map(|set| set.len() >= MIN_DISTINCT_OBSERVERS_FOR_DIRECT)
         .unwrap_or(false)
+}
+
+/// Stable label for an address-type tag, used as a structured `kind`
+/// field on the `connect_peer` success/failure logs. `None` is rendered
+/// as `"unknown"` for callers that don't carry a tag (e.g., the public
+/// `connect_peer` entry point used by tests).
+fn address_kind_label(kind: Option<AddressType>) -> &'static str {
+    match kind {
+        Some(AddressType::Relay) => "Relay",
+        Some(AddressType::Direct) => "Direct",
+        Some(AddressType::Unverified) => "Unverified",
+        Some(AddressType::NATted) => "NATted",
+        None => "unknown",
+    }
 }
 
 /// Internal protocol for automatic identity announcement on connect.
@@ -912,7 +927,37 @@ impl TransportHandle {
     ///
     /// Only QUIC [`MultiAddr`] values are accepted. Non-QUIC transports
     /// return [`NetworkError::InvalidAddress`].
+    ///
+    /// Callers that already know how the address was classified (Direct,
+    /// Relay, Unverified, NATted) should prefer
+    /// [`Self::connect_peer_typed`] so the success/failure logs include
+    /// the address kind. This entry point is preserved for callers
+    /// (tests, public API consumers) that don't have type metadata.
     pub async fn connect_peer(&self, address: &MultiAddr) -> Result<String> {
+        self.connect_peer_inner(address, None).await
+    }
+
+    /// Connect to a peer at the given typed address.
+    ///
+    /// Same as [`Self::connect_peer`] but additionally records the
+    /// [`AddressType`] tag in the success/failure logs so an operator
+    /// can tell, after the fact, whether a failed dial was against a
+    /// `Direct`, `Relay`, `Unverified`, or `NATted` address.
+    pub async fn connect_peer_typed(
+        &self,
+        address: &MultiAddr,
+        kind: AddressType,
+    ) -> Result<String> {
+        self.connect_peer_inner(address, Some(kind)).await
+    }
+
+    async fn connect_peer_inner(
+        &self,
+        address: &MultiAddr,
+        kind: Option<AddressType>,
+    ) -> Result<String> {
+        let kind_label = address_kind_label(kind);
+
         // Require a dialable (QUIC) transport.
         let socket_addr = address.dialable_socket_addr().ok_or_else(|| {
             P2PError::Network(NetworkError::InvalidAddress(
@@ -961,8 +1006,10 @@ impl TransportHandle {
                 };
                 if is_self {
                     warn!(
-                        "Detected self-connection to own address {} (channel_id: {}), rejecting",
-                        address, connected_peer_id
+                        kind = kind_label,
+                        %address,
+                        channel_id = %connected_peer_id,
+                        "Detected self-connection to own address, rejecting"
                     );
                     self.dual_node.disconnect_peer_by_addr(&addr).await;
                     return Err(P2PError::Network(NetworkError::InvalidAddress(
@@ -970,11 +1017,21 @@ impl TransportHandle {
                     )));
                 }
 
-                info!("Successfully connected to channel: {}", connected_peer_id);
+                info!(
+                    kind = kind_label,
+                    %address,
+                    channel_id = %connected_peer_id,
+                    "Successfully connected to channel"
+                );
                 connected_peer_id
             }
             Ok(Err(e)) => {
-                warn!("connect_happy_eyeballs failed for {}: {}", address, e);
+                warn!(
+                    kind = kind_label,
+                    %address,
+                    error = %e,
+                    "connect_happy_eyeballs failed"
+                );
                 return Err(P2PError::Transport(
                     crate::error::TransportError::ConnectionFailed {
                         addr: normalized_addr,
@@ -984,8 +1041,10 @@ impl TransportHandle {
             }
             Err(_) => {
                 warn!(
-                    "connect_happy_eyeballs timed out for {} after {:?}",
-                    address, self.connection_timeout
+                    kind = kind_label,
+                    %address,
+                    timeout = ?self.connection_timeout,
+                    "connect_happy_eyeballs timed out"
                 );
                 return Err(P2PError::Timeout(self.connection_timeout));
             }
