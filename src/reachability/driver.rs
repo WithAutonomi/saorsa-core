@@ -175,19 +175,28 @@ impl AcquisitionDriver {
 
     /// Publish this node's current typed address set to K-closest peers.
     ///
-    /// The direct tier's [`AddressType`] depends on the passive
-    /// reachability classifier (see
-    /// [`TransportHandle::direct_reachability_observed`]): when at least
-    /// one unsolicited inbound handshake has completed, observed external
-    /// addresses are tagged [`AddressType::Direct`]; otherwise they are
-    /// tagged [`AddressType::Unverified`] so dialers know they may time
-    /// out. When `relay` is `Some`, the relay-allocated socket is appended
+    /// Each address's [`AddressType`] is computed independently from the
+    /// passive per-address reachability proof (see
+    /// [`TransportHandle::is_external_proven`]): an address is tagged
+    /// [`AddressType::Direct`] only after at least
+    /// `MIN_DISTINCT_OBSERVERS_FOR_DIRECT` source-disjoint inbounds have
+    /// been attributed to it; otherwise it is tagged
+    /// [`AddressType::Unverified`] (so dialers know they may time out)
+    /// or — when a relay is held — suppressed entirely (the relay is the
+    /// authoritative contact and publishing undialable direct entries
+    /// alongside it just adds timeout cost for dialers).
+    ///
+    /// When `relay` is `Some`, the relay-allocated socket is appended
     /// tagged [`AddressType::Relay`].
     ///
-    /// When a relay has been acquired, unverified-only addresses are
-    /// suppressed — the relay address is the authoritative contact and
-    /// publishing undialable direct entries alongside it just adds
-    /// timeout cost for dialers.
+    /// Per-address (not global) tagging matters for two cases the previous
+    /// global-flag approach got wrong:
+    ///
+    /// 1. A v4 inbound proves nothing about a v6 external; the classifier
+    ///    only credits same-family externals, and the tag is computed
+    ///    per address from that per-address proof.
+    /// 2. On a multi-NAT host, one external being proven Direct does not
+    ///    promote unrelated externals.
     ///
     /// Quietly drops the publish when there are no dialable addresses to
     /// advertise — a fully wildcard-bound node cannot meaningfully tell
@@ -195,28 +204,10 @@ impl AcquisitionDriver {
     async fn publish_typed_set(&self, relay: Option<SocketAddr>) {
         let listen = self.transport.listen_addrs().await;
         let observed = self.transport.direct_external_addresses();
-        let direct_verified = self.transport.direct_reachability_observed();
-
-        // Choose the tag for observed/listen addresses:
-        //   - classifier has proven reachability → Direct
-        //   - no proof yet, no relay either      → Unverified (cold-start;
-        //                                          dialers eat the risk)
-        //   - no proof yet, but relay is held    → suppress (relay is
-        //                                          authoritative; don't
-        //                                          waste dialers on
-        //                                          unverified direct)
-        let direct_tag: Option<AddressType> = if direct_verified {
-            Some(AddressType::Direct)
-        } else if relay.is_none() {
-            Some(AddressType::Unverified)
-        } else {
-            None
-        };
+        let relay_held = relay.is_some();
 
         debug!(
             relay = ?relay,
-            direct_verified,
-            direct_tag = ?direct_tag,
             observed = ?observed,
             listen = ?listen,
             "driver: preparing typed self address set"
@@ -229,75 +220,91 @@ impl AcquisitionDriver {
         // different representations.
         let mut seen: HashSet<SocketAddr> = HashSet::new();
 
-        if let Some(tag) = direct_tag {
-            // Prefer observed (post-NAT) addresses for the direct tier since
-            // those are what peers actually see from the outside. Fall back
-            // to locally-bound listen addresses when no observations exist.
-            if !observed.is_empty() {
-                for sa in observed {
-                    if sa.ip().is_unspecified() {
-                        debug!(
-                            address = %sa,
-                            "driver: skipping unspecified observed self address"
-                        );
-                        continue;
-                    }
-                    let normalized = saorsa_transport::shared::normalize_socket_addr(sa);
-                    if seen.insert(normalized) {
-                        debug!(
-                            address = %normalized,
-                            tag = ?tag,
-                            "driver: adding observed self address to publish set"
-                        );
-                        typed.push((MultiAddr::quic(normalized), tag));
-                    } else {
-                        trace!(
-                            address = %normalized,
-                            tag = ?tag,
-                            "driver: deduped observed self address"
-                        );
-                    }
-                }
+        // Resolve the publish tag for one external address:
+        //   - per-address classifier proof          → Direct
+        //   - no proof yet, no relay held           → Unverified
+        //   - no proof yet, relay held              → suppress (None)
+        let tag_for = |sa: SocketAddr| -> Option<AddressType> {
+            if self.transport.is_external_proven(sa) {
+                Some(AddressType::Direct)
+            } else if !relay_held {
+                Some(AddressType::Unverified)
+            } else {
+                None
             }
-            for addr in listen {
-                let Some(sa) = addr.dialable_socket_addr() else {
-                    trace!(
-                        address = %addr,
-                        "driver: skipping non-dialable listen address"
-                    );
-                    continue;
-                };
-                if sa.ip().is_unspecified() {
-                    debug!(
-                        address = %sa,
-                        "driver: skipping unspecified listen address"
-                    );
-                    continue;
-                }
-                let normalized = saorsa_transport::shared::normalize_socket_addr(sa);
-                if seen.insert(normalized) {
-                    debug!(
-                        address = %normalized,
-                        tag = ?tag,
-                        "driver: adding listen self address to publish set"
-                    );
-                    typed.push((MultiAddr::quic(normalized), tag));
-                } else {
-                    trace!(
-                        address = %normalized,
-                        tag = ?tag,
-                        "driver: deduped listen self address"
-                    );
-                }
+        };
+
+        // Prefer observed (post-NAT) addresses for the direct tier since
+        // those are what peers actually see from the outside. Listen
+        // addresses are emitted alongside them — same per-address tagging.
+        for sa in observed {
+            if sa.ip().is_unspecified() {
+                debug!(
+                    address = %sa,
+                    "driver: skipping unspecified observed self address"
+                );
+                continue;
             }
-        } else {
-            debug!(
-                relay = ?relay,
-                direct_verified,
-                observed_count = observed.len(),
-                listen_count = listen.len(),
-                "driver: suppressing unverified direct addresses while relay is held"
-            );
+            let normalized = saorsa_transport::shared::normalize_socket_addr(sa);
+            let Some(tag) = tag_for(normalized) else {
+                trace!(
+                    address = %normalized,
+                    "driver: suppressing unverified observed address while relay is held"
+                );
+                continue;
+            };
+            if seen.insert(normalized) {
+                debug!(
+                    address = %normalized,
+                    tag = ?tag,
+                    "driver: adding observed self address to publish set"
+                );
+                typed.push((MultiAddr::quic(normalized), tag));
+            } else {
+                trace!(
+                    address = %normalized,
+                    tag = ?tag,
+                    "driver: deduped observed self address"
+                );
+            }
+        }
+        for addr in listen {
+            let Some(sa) = addr.dialable_socket_addr() else {
+                trace!(
+                    address = %addr,
+                    "driver: skipping non-dialable listen address"
+                );
+                continue;
+            };
+            if sa.ip().is_unspecified() {
+                debug!(
+                    address = %sa,
+                    "driver: skipping unspecified listen address"
+                );
+                continue;
+            }
+            let normalized = saorsa_transport::shared::normalize_socket_addr(sa);
+            let Some(tag) = tag_for(normalized) else {
+                trace!(
+                    address = %normalized,
+                    "driver: suppressing unverified listen address while relay is held"
+                );
+                continue;
+            };
+            if seen.insert(normalized) {
+                debug!(
+                    address = %normalized,
+                    tag = ?tag,
+                    "driver: adding listen self address to publish set"
+                );
+                typed.push((MultiAddr::quic(normalized), tag));
+            } else {
+                trace!(
+                    address = %normalized,
+                    tag = ?tag,
+                    "driver: deduped listen self address"
+                );
+            }
         }
 
         if let Some(relay_addr) = relay {

@@ -42,11 +42,11 @@ use crate::error::{GeoRejectionError, GeographicConfig};
 use crate::security::canonicalize_ip;
 use crate::transport::external_addresses::ExternalAddresses;
 use anyhow::{Context, Result};
-use dashmap::DashSet;
-use std::collections::HashMap;
+use dashmap::{DashMap, DashSet};
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr, SocketAddrV6};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::{RwLock, broadcast};
 use tokio::time::sleep;
@@ -1254,96 +1254,195 @@ impl DualStackNetworkNode<P2pLinkTransport> {
         (rx, relay_rx, relay_lost_rx)
     }
 
-    /// Spawn a background task per stack that watches `P2pEvent::PeerConnected`
-    /// and sets `flag` the first time an unsolicited inbound handshake
-    /// completes — i.e. a connection accepted from a remote address that is
+    /// Spawn one background task per bound stack (v4, v6) to classify
+    /// inbound connections and accumulate per-pinned-external proof sets.
+    ///
+    /// ## What this proves
+    ///
+    /// `Side::Server` alone is not proof of cold-dialability — it only
+    /// proves "a packet landed at our listener," which on a NAT'd host
+    /// can be a redial through a NAT pinhole that the inbound peer
+    /// already knew about. The classifier records an inbound as proof
+    /// of cold-dialability for an external `E` iff **all** hold:
+    ///
+    /// 1. `Side::Server` (someone connected to us, we did not initiate).
+    /// 2. The remote socket is not in `dialed_addrs` — guards
+    ///    simultaneous-open replies. Pre-populated at every dial site
+    ///    (`TransportHandle::connect_peer`).
+    /// 3. The remote IP is not in `known_peer_ips` at the moment of the
+    ///    event — i.e. not a peer we have ever dialed or accepted from
+    ///    before. Closes the bootstrap-redial / pinhole-self-fulfillment
+    ///    case where a peer we previously connected to opens a fresh
+    ///    QUIC connection through their pre-existing NAT binding.
+    /// 4. The remote IP is not equal to any of our own pinned external
+    ///    IPs — sibling-hairpin filter (multiple nodes behind one shared
+    ///    NAT see each other's traffic as "inbound from our public IP"
+    ///    after MASQUERADE; this never left the LAN).
+    /// 5. The inbound's stack family (v4 vs v6) matches `E`'s family —
+    ///    a v4 inbound proves nothing about a v6 external.
+    ///
+    /// When all conditions hold, the remote IP is added to every matching
+    /// external's observer set in `proven_externals`. Once any external
+    /// reaches `MIN_DISTINCT_OBSERVERS_FOR_DIRECT` distinct observer IPs
+    /// it is considered cold-dialable, and
+    /// [`TransportHandle::is_external_proven`] returns `true` for it.
+    ///
+    /// ## What this also does
+    ///
+    /// On every `PeerConnected` event (any `Side`), the remote IP is
+    /// recorded in `known_peer_ips`. This means the very first inbound
+    /// from a stranger IP can contribute proof, but every subsequent
+    /// inbound from that same IP is recognised as not source-disjoint
+    /// and skipped — preventing one chatty peer from inflating its own
+    /// proof beyond the single observer slot it deserves.
+    ///
+    /// `Side::Client` events also write `known_peer_ips`, ensuring that
+    /// a peer we dial first cannot later "appear unsolicited" via a
+    /// pinhole redial — even if their NAT has remapped them to a port
     /// not in `dialed_addrs`.
-    ///
-    /// This is the passive NAT-reachability classifier: one confirmed
-    /// inbound from a peer we never dialed proves that our listener is
-    /// cold-dialable, which is what [`AcquisitionDriver::publish_typed_set`]
-    /// needs to decide whether to publish addresses tagged `Direct` or
-    /// `Unverified`.
-    ///
-    /// `dialed_addrs` is expected to be populated at the dial site
-    /// (`TransportHandle::connect_peer`) *before* the dial starts so that a
-    /// simultaneous-open race cannot mis-classify a reply as unsolicited.
-    ///
-    /// `external_addresses` is consulted to reject sibling-hairpin
-    /// handshakes: on a NAT droplet that hosts multiple nodes behind a
-    /// shared public IP, a sibling node opening a connection to us appears
-    /// as inbound from our own external IP after MASQUERADE. That traffic
-    /// is NOT evidence of public reachability — it never left the droplet.
-    /// Without this filter, sibling hairpins flip the flag true on NAT'd
-    /// hosts and defeat the whole Direct/Unverified distinction.
     pub fn spawn_direct_reachability_classifier(
         &self,
         dialed_addrs: Arc<DashSet<SocketAddr>>,
-        flag: Arc<AtomicBool>,
+        known_peer_ips: Arc<DashSet<IpAddr>>,
+        proven_externals: Arc<DashMap<SocketAddr, HashSet<IpAddr>>>,
         external_addresses: Arc<parking_lot::Mutex<ExternalAddresses>>,
     ) {
         for node in [&self.v6, &self.v4].into_iter().flatten() {
             let mut p2p_rx = node.transport.endpoint().subscribe();
             let dialed = Arc::clone(&dialed_addrs);
-            let flag = Arc::clone(&flag);
+            let known = Arc::clone(&known_peer_ips);
+            let proven = Arc::clone(&proven_externals);
             let external = Arc::clone(&external_addresses);
             tokio::spawn(async move {
                 loop {
                     match p2p_rx.recv().await {
-                        Ok(saorsa_transport::P2pEvent::PeerConnected {
-                            addr,
-                            side: Side::Server,
-                            ..
-                        }) => {
-                            if flag.load(Ordering::Relaxed) {
-                                // Already proven; nothing more to learn here.
-                                tracing::trace!(
-                                    remote = %addr,
-                                    "classifier: direct reachability already observed; ignoring inbound handshake"
-                                );
-                                continue;
-                            }
+                        Ok(saorsa_transport::P2pEvent::PeerConnected { addr, side, .. }) => {
+                            // Drop non-socket transports (BLE, LoRa) — proof
+                            // is tied to QUIC NAT mappings.
                             let Some(socket_addr) = addr.as_socket_addr() else {
                                 tracing::trace!(
                                     remote = %addr,
-                                    "classifier: ignoring inbound handshake from non-socket transport"
+                                    "classifier: ignoring non-socket transport handshake"
                                 );
                                 continue;
                             };
                             let normalized =
                                 saorsa_transport::shared::normalize_socket_addr(socket_addr);
-                            if dialed.contains(&normalized) {
-                                // Simultaneous-open reply to our own dial; not proof.
-                                tracing::debug!(
+                            let remote_ip = canonicalize_ip(normalized.ip());
+
+                            // Snapshot whether this IP was already known
+                            // BEFORE we record the event. Source-disjointness
+                            // is evaluated against the prior state — recording
+                            // first would lose the signal.
+                            let was_known_before =
+                                known.contains(&remote_ip) || dialed.contains(&normalized);
+
+                            // Always record so future inbounds from the same
+                            // IP are correctly recognised as not
+                            // source-disjoint.
+                            known.insert(remote_ip);
+
+                            // Only Side::Server inbounds are candidates for
+                            // proof. Side::Client (we initiated) only updates
+                            // `known_peer_ips`.
+                            if !matches!(side, Side::Server) {
+                                tracing::trace!(
                                     remote = %normalized,
-                                    dialed_targets = dialed.len(),
-                                    "classifier: ignoring inbound handshake for an address we dialed"
+                                    side = ?side,
+                                    "classifier: recorded outbound peer; not a proof candidate"
                                 );
                                 continue;
                             }
-                            let remote_ip = canonicalize_ip(normalized.ip());
+
+                            if was_known_before {
+                                tracing::debug!(
+                                    remote = %normalized,
+                                    "classifier: ignoring inbound from previously-known peer \
+                                     (not source-disjoint; possible pinhole redial)"
+                                );
+                                continue;
+                            }
+
+                            // Sibling-hairpin filter: source IP equals one of
+                            // our pinned externals → traffic that never left
+                            // the shared NAT.
                             let pinned_direct = external.lock().direct_addresses();
                             let is_own_external_ip = pinned_direct
                                 .iter()
                                 .any(|sa| canonicalize_ip(sa.ip()) == remote_ip);
-                            tracing::debug!(
-                                remote = %normalized,
-                                pinned_direct = ?pinned_direct,
-                                "classifier: inbound server-side handshake is being evaluated"
-                            );
                             if is_own_external_ip {
                                 tracing::trace!(
                                     remote = %normalized,
-                                    "classifier: ignoring sibling-hairpin handshake from own external IP"
+                                    "classifier: ignoring sibling-hairpin handshake from \
+                                     own external IP"
                                 );
                                 continue;
                             }
-                            tracing::info!(
-                                remote = %normalized,
-                                "direct reachability observed: unsolicited inbound handshake \
-                                 from peer not in dialed set"
-                            );
-                            flag.store(true, Ordering::Release);
+
+                            // Per-family attribution by the inbound's family
+                            // (not the bind family of the receiving stack):
+                            // a dual-stack v6 socket bound to `[::]:port`
+                            // accepts both v4 and v6 traffic, so we cannot
+                            // assume "v6 stack receives only v6 inbounds."
+                            // After `normalize_socket_addr`, IPv4-mapped-v6
+                            // addresses (`::ffff:a.b.c.d`) are flattened to
+                            // plain v4, so the inbound's `is_ipv6()` is the
+                            // canonical family. A v4 inbound only credits
+                            // v4 externals; same for v6.
+                            //
+                            // For a host with no externals of the matching
+                            // family yet pinned, the proof is dropped
+                            // silently — nothing to attribute it to. The
+                            // next inbound after pinning lands will start
+                            // accumulating proof.
+                            let inbound_is_v6 = normalized.is_ipv6();
+                            let attributable: Vec<SocketAddr> = pinned_direct
+                                .iter()
+                                .filter(|sa| sa.is_ipv6() == inbound_is_v6)
+                                .copied()
+                                .collect();
+
+                            if attributable.is_empty() {
+                                tracing::trace!(
+                                    remote = %normalized,
+                                    inbound_is_v6,
+                                    "classifier: no pinned externals of matching family; \
+                                     proof deferred until address pin"
+                                );
+                                continue;
+                            }
+
+                            for ext in attributable {
+                                let normalized_ext =
+                                    saorsa_transport::shared::normalize_socket_addr(ext);
+                                let mut entry = proven.entry(normalized_ext).or_default();
+                                let inserted = entry.insert(remote_ip);
+                                let count = entry.len();
+                                drop(entry);
+                                if inserted {
+                                    if count >= crate::transport_handle::MIN_DISTINCT_OBSERVERS_FOR_DIRECT {
+                                        tracing::info!(
+                                            external = %normalized_ext,
+                                            observers = count,
+                                            threshold =
+                                                crate::transport_handle::MIN_DISTINCT_OBSERVERS_FOR_DIRECT,
+                                            new_observer = %remote_ip,
+                                            "classifier: external promoted to Direct \
+                                             (source-disjoint quorum reached)"
+                                        );
+                                    } else {
+                                        tracing::debug!(
+                                            external = %normalized_ext,
+                                            observers = count,
+                                            threshold =
+                                                crate::transport_handle::MIN_DISTINCT_OBSERVERS_FOR_DIRECT,
+                                            new_observer = %remote_ip,
+                                            "classifier: source-disjoint observer recorded; \
+                                             below threshold"
+                                        );
+                                    }
+                                }
+                            }
                         }
                         Err(broadcast::error::RecvError::Closed) => break,
                         Err(broadcast::error::RecvError::Lagged(_)) => continue,

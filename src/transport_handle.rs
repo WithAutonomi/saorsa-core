@@ -38,9 +38,9 @@ use dashmap::{DashMap, DashSet};
 use std::collections::HashSet;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::{RwLock, broadcast};
 use tokio::task::JoinHandle;
@@ -54,6 +54,39 @@ const TEST_MAX_REQUESTS: u32 = 100;
 const TEST_BURST_SIZE: u32 = 100;
 const TEST_RATE_LIMIT_WINDOW_SECS: u64 = 1;
 const TEST_CONNECTION_TIMEOUT_SECS: u64 = 30;
+
+/// Minimum distinct source-disjoint observers required before an external
+/// address is considered cold-dialable.
+///
+/// "Source-disjoint" means the observer IP was not already in this node's
+/// known-peer set at the time of the inbound — i.e. not a peer we had ever
+/// dialed or seen connect to us. Two such observers eliminates the
+/// pinhole-self-fulfillment case (one already-known peer redialing through
+/// their pre-existing NAT binding) while still allowing prompt promotion
+/// in healthy clusters where multiple bootstraps independently reach the
+/// node within the first connect window.
+///
+/// Matches `MIN_OBSERVERS_FOR_QUORUM` in saorsa-transport's address-pinning
+/// path (`nat_traversal_api.rs`) — same statistical argument.
+pub(crate) const MIN_DISTINCT_OBSERVERS_FOR_DIRECT: usize = 2;
+
+/// Return `true` iff `external` has cleared the per-address proof
+/// threshold in `proven_externals`.
+///
+/// Free function so the threshold semantics — and the address
+/// normalisation that backs lookups — can be exercised in unit tests
+/// without constructing a full [`TransportHandle`] (which performs real
+/// network binds).
+pub(crate) fn external_meets_proof_threshold(
+    external: SocketAddr,
+    proven_externals: &DashMap<SocketAddr, HashSet<IpAddr>>,
+) -> bool {
+    let normalized = saorsa_transport::shared::normalize_socket_addr(external);
+    proven_externals
+        .get(&normalized)
+        .map(|set| set.len() >= MIN_DISTINCT_OBSERVERS_FOR_DIRECT)
+        .unwrap_or(false)
+}
 
 /// Internal protocol for automatic identity announcement on connect.
 /// Filtered from P2PEvent::Message emission — not visible to applications.
@@ -192,15 +225,30 @@ pub struct TransportHandle {
     /// entries are never removed for the lifetime of the handle because the
     /// classifier only cares about "did we ever dial this remote?".
     dialed_addrs: Arc<DashSet<SocketAddr>>,
-    /// Becomes `true` the first time an unsolicited inbound handshake
-    /// completes (an accepted connection from a remote address that is not
-    /// in `dialed_addrs`). Once set, the flag latches — reachability does
-    /// not "un-prove" itself within a single process lifetime. Consumed by
-    /// [`crate::reachability::driver::AcquisitionDriver::publish_typed_set`]
-    /// to decide between publishing `AddressType::Direct` and
-    /// `AddressType::Unverified` for the local node's observed external
-    /// addresses.
-    direct_reachability_observed: Arc<AtomicBool>,
+    /// IPs of every peer this handle has ever interacted with. Populated by
+    /// [`Self::connect_peer`] (alongside `dialed_addrs`) and by the passive
+    /// reachability classifier on every `PeerConnected` event (both sides).
+    /// Used as the source-disjointness exclusion set for the per-address
+    /// proof: an inbound from an IP already in this set does not prove
+    /// cold-dialability — that peer already had reason to know our address
+    /// (we dialed them, or they connected to us before) and could therefore
+    /// reach us through a pre-existing NAT pinhole. Per-IP (not per
+    /// SocketAddr) because NAT remappings between sessions change the port
+    /// while the IP — and therefore the pinhole — is what matters.
+    known_peer_ips: Arc<DashSet<IpAddr>>,
+    /// Distinct source-disjoint observer IPs per pinned external address.
+    ///
+    /// An entry is added when a `Side::Server` inbound arrives whose remote
+    /// IP is not in `known_peer_ips` and not equal to any pinned external
+    /// IP (sibling-hairpin filter). The inbound's stack-family (v4 vs v6)
+    /// determines which pinned externals receive the credit.
+    ///
+    /// An external is considered cold-dialable
+    /// ([`AddressType::Direct`](crate::dht::AddressType::Direct)) once its
+    /// observer set reaches [`MIN_DISTINCT_OBSERVERS_FOR_DIRECT`].
+    /// Per-address — never globally — so one external's proof does not
+    /// promote unrelated externals.
+    proven_externals: Arc<DashMap<SocketAddr, HashSet<IpAddr>>>,
 }
 
 // ============================================================================
@@ -270,17 +318,21 @@ impl TransportHandle {
             dual_node.spawn_peer_address_update_forwarder(Arc::clone(&external_addresses));
 
         // Passive direct-reachability classifier: subscribe to
-        // `P2pEvent::PeerConnected` and flip `direct_reachability_observed`
-        // the first time an inbound (`Side::Server`) handshake completes
-        // from a remote we did not dial first. Consumed by
-        // `AcquisitionDriver::publish_typed_set` to pick between
-        // `AddressType::Direct` and `AddressType::Unverified` for the
-        // self-record's observed external addresses.
+        // `P2pEvent::PeerConnected` and accumulate per-pinned-external proof
+        // sets keyed on source-disjoint remote IPs. Consumed by
+        // `AcquisitionDriver::publish_typed_set` (via
+        // `Self::is_external_proven`) to tag each address as
+        // `AddressType::Direct` only once that address itself has cleared
+        // the observer threshold. The classifier also writes into
+        // `known_peer_ips` on every `PeerConnected` event so subsequent
+        // inbounds from the same IP do not count as fresh proof.
         let dialed_addrs: Arc<DashSet<SocketAddr>> = Arc::new(DashSet::new());
-        let direct_reachability_observed: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+        let known_peer_ips: Arc<DashSet<IpAddr>> = Arc::new(DashSet::new());
+        let proven_externals: Arc<DashMap<SocketAddr, HashSet<IpAddr>>> = Arc::new(DashMap::new());
         dual_node.spawn_direct_reachability_classifier(
             Arc::clone(&dialed_addrs),
-            Arc::clone(&direct_reachability_observed),
+            Arc::clone(&known_peer_ips),
+            Arc::clone(&proven_externals),
             Arc::clone(&external_addresses),
         );
 
@@ -349,7 +401,8 @@ impl TransportHandle {
             channel_to_peers,
             peer_user_agents,
             dialed_addrs,
-            direct_reachability_observed,
+            known_peer_ips,
+            proven_externals,
         })
     }
 
@@ -431,7 +484,8 @@ impl TransportHandle {
             channel_to_peers: Arc::new(DashMap::new()),
             peer_user_agents: Arc::new(DashMap::new()),
             dialed_addrs: Arc::new(DashSet::new()),
-            direct_reachability_observed: Arc::new(AtomicBool::new(false)),
+            known_peer_ips: Arc::new(DashSet::new()),
+            proven_externals: Arc::new(DashMap::new()),
         })
     }
 }
@@ -451,22 +505,28 @@ impl TransportHandle {
         &self.node_identity
     }
 
-    /// Whether the local listener is known to be cold-dialable.
+    /// Whether the named external address has been proven cold-dialable.
     ///
-    /// Set by the passive reachability classifier (see
-    /// [`crate::transport::saorsa_transport_adapter::DualStackNetworkNode::spawn_direct_reachability_classifier`])
-    /// the first time a `Side::Server` handshake completes from a remote
-    /// address we had not previously dialed. Once set, the flag latches —
-    /// reachability is not considered to have "un-proven" itself for the
-    /// lifetime of this `TransportHandle`.
+    /// Returns `true` iff at least
+    /// [`MIN_DISTINCT_OBSERVERS_FOR_DIRECT`] distinct source-disjoint peers
+    /// have made unsolicited inbound connections that the classifier
+    /// attributed to this external. "Source-disjoint" means the observer
+    /// IP was not in `known_peer_ips` at the time of the inbound — i.e.
+    /// not a peer this handle had any prior reason to know about.
     ///
-    /// Consumed by [`crate::reachability::driver::AcquisitionDriver::publish_typed_set`]
-    /// to decide whether this node's observed external addresses are
-    /// published as [`crate::dht::AddressType::Direct`] (flag set) or
-    /// [`crate::dht::AddressType::Unverified`] (flag unset, and no relay
-    /// available).
-    pub fn direct_reachability_observed(&self) -> bool {
-        self.direct_reachability_observed.load(Ordering::Acquire)
+    /// Per-address: one external's proof never promotes another. An
+    /// inbound on the v4 stack only credits v4 externals, and an inbound
+    /// from a peer behind the same NAT (sibling-hairpin) is rejected.
+    ///
+    /// Consumed by
+    /// [`crate::reachability::driver::AcquisitionDriver::publish_typed_set`]
+    /// to tag each address as
+    /// [`AddressType::Direct`](crate::dht::AddressType::Direct) (proven)
+    /// or [`AddressType::Unverified`](crate::dht::AddressType::Unverified)
+    /// (not yet proven, no relay held) — or to suppress unverified entries
+    /// entirely when a relay is held.
+    pub fn is_external_proven(&self, addr: SocketAddr) -> bool {
+        external_meets_proof_threshold(addr, &self.proven_externals)
     }
 
     /// Get the first listen address as a string.
@@ -496,17 +556,15 @@ impl TransportHandle {
     /// (preferred), then pinned direct addresses from bootstrap
     /// OBSERVED_ADDRESS frames.
     ///
-    /// If no addresses have been pinned yet (the brief ~1s window after
-    /// bootstrap connection before the first `ExternalAddressDiscovered`
-    /// event), falls back to the live observation from active connections.
+    /// Returns an empty vec if nothing has been pinned yet — the
+    /// `ExternalAddressDiscovered` events that drive pinning are
+    /// quorum-gated in saorsa-transport (≥ 2 distinct observers per
+    /// address), so any caller that wants to publish or otherwise act on
+    /// these addresses gets only the quorum-cleared set. There is no
+    /// live-observation fallback: a single peer's unconfirmed
+    /// `OBSERVED_ADDRESS` is not strong enough evidence to advertise.
     pub fn observed_external_addresses(&self) -> Vec<SocketAddr> {
-        let pinned = self.external_addresses.lock().all_addresses();
-        if !pinned.is_empty() {
-            return pinned;
-        }
-        // Brief-window fallback: before the forwarder has pinned any
-        // address, try the live query on active connections.
-        self.dual_node.get_observed_external_addresses()
+        self.external_addresses.lock().all_addresses()
     }
 
     /// Return only the pinned **direct** external addresses (no relay).
@@ -514,12 +572,12 @@ impl TransportHandle {
     /// Used by callers that tag addresses by type (e.g. the relay driver's
     /// `publish_typed_set`) to avoid double-tagging the relay address as
     /// both Direct and Relay.
+    ///
+    /// Same quorum guarantee as
+    /// [`Self::observed_external_addresses`]: only addresses cleared by
+    /// saorsa-transport's `MIN_OBSERVERS_FOR_QUORUM` gate are returned.
     pub fn direct_external_addresses(&self) -> Vec<SocketAddr> {
-        let pinned = self.external_addresses.lock().direct_addresses();
-        if !pinned.is_empty() {
-            return pinned;
-        }
-        self.dual_node.get_observed_external_addresses()
+        self.external_addresses.lock().direct_addresses()
     }
 
     /// Store the relay-allocated address so it is included (first) in
@@ -874,10 +932,17 @@ impl TransportHandle {
         // passive reachability classifier can distinguish simultaneous-open
         // replies from genuinely unsolicited inbounds. The set is
         // monotonic; we do not remove entries on disconnect.
-        self.dialed_addrs
-            .insert(saorsa_transport::shared::normalize_socket_addr(
-                normalized_addr,
-            ));
+        let dial_target_normalized =
+            saorsa_transport::shared::normalize_socket_addr(normalized_addr);
+        self.dialed_addrs.insert(dial_target_normalized);
+        // Also record the dial target's IP in `known_peer_ips` so that an
+        // inbound from this peer through a NAT-remapped source port — same
+        // IP, different port, missed by the SocketAddr-keyed `dialed_addrs`
+        // — is correctly recognised as not source-disjoint by the
+        // reachability classifier.
+        self.known_peer_ips.insert(crate::security::canonicalize_ip(
+            dial_target_normalized.ip(),
+        ));
 
         let peer_id = match tokio::time::timeout(
             self.connection_timeout,
@@ -2339,5 +2404,115 @@ impl RelaySessionEstablisher for Arc<TransportHandle> {
         relay_addr: SocketAddr,
     ) -> std::result::Result<SocketAddr, RelaySessionEstablishError> {
         self.setup_proactive_relay_session(relay_addr).await
+    }
+}
+
+#[cfg(test)]
+mod proven_externals_tests {
+    use super::*;
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().expect("test IP")
+    }
+
+    fn sa(s: &str) -> SocketAddr {
+        s.parse().expect("test socket addr")
+    }
+
+    fn seed_observer(
+        proven: &DashMap<SocketAddr, HashSet<IpAddr>>,
+        external: SocketAddr,
+        observer: IpAddr,
+    ) {
+        let normalized = saorsa_transport::shared::normalize_socket_addr(external);
+        proven.entry(normalized).or_default().insert(observer);
+    }
+
+    #[test]
+    fn external_with_no_observers_is_not_proven() {
+        let proven = DashMap::new();
+        assert!(!external_meets_proof_threshold(
+            sa("198.51.100.1:10000"),
+            &proven
+        ));
+    }
+
+    #[test]
+    fn external_with_one_observer_is_not_proven() {
+        let proven = DashMap::new();
+        let ext = sa("198.51.100.1:10000");
+        seed_observer(&proven, ext, ip("203.0.113.1"));
+        assert!(!external_meets_proof_threshold(ext, &proven));
+    }
+
+    #[test]
+    fn external_with_two_distinct_observers_is_proven() {
+        let proven = DashMap::new();
+        let ext = sa("198.51.100.1:10000");
+        seed_observer(&proven, ext, ip("203.0.113.1"));
+        seed_observer(&proven, ext, ip("203.0.113.2"));
+        assert!(external_meets_proof_threshold(ext, &proven));
+    }
+
+    #[test]
+    fn duplicate_observer_does_not_count_twice() {
+        let proven = DashMap::new();
+        let ext = sa("198.51.100.1:10000");
+        seed_observer(&proven, ext, ip("203.0.113.1"));
+        seed_observer(&proven, ext, ip("203.0.113.1"));
+        assert!(
+            !external_meets_proof_threshold(ext, &proven),
+            "the same observer reporting twice must not satisfy the distinct-observer quorum"
+        );
+    }
+
+    #[test]
+    fn one_externals_proof_does_not_promote_another() {
+        let proven = DashMap::new();
+        let ext_a = sa("198.51.100.1:10000");
+        let ext_b = sa("198.51.100.2:10000");
+        seed_observer(&proven, ext_a, ip("203.0.113.1"));
+        seed_observer(&proven, ext_a, ip("203.0.113.2"));
+        assert!(external_meets_proof_threshold(ext_a, &proven));
+        assert!(
+            !external_meets_proof_threshold(ext_b, &proven),
+            "B has no observers; A's proof must not leak across externals"
+        );
+    }
+
+    #[test]
+    fn v4_external_proof_does_not_promote_v6_external() {
+        let proven = DashMap::new();
+        let v4 = sa("198.51.100.1:10000");
+        let v6 = sa("[2001:db8::1]:10000");
+        seed_observer(&proven, v4, ip("203.0.113.1"));
+        seed_observer(&proven, v4, ip("203.0.113.2"));
+        assert!(external_meets_proof_threshold(v4, &proven));
+        assert!(
+            !external_meets_proof_threshold(v6, &proven),
+            "different family: v4 proof must not leak to a v6 external"
+        );
+    }
+
+    #[test]
+    fn lookup_normalises_v4_mapped_v6() {
+        // External pinned in plain v4 form; caller queries via
+        // IPv4-mapped IPv6 (`::ffff:198.51.100.1`). Both must hit the
+        // same entry after normalisation; otherwise the publisher's
+        // per-address tag computation can disagree with what the
+        // classifier wrote, and an address would be tagged Unverified
+        // despite having reached its observer quorum.
+        let proven = DashMap::new();
+        let v4 = sa("198.51.100.1:10000");
+        seed_observer(&proven, v4, ip("203.0.113.1"));
+        seed_observer(&proven, v4, ip("203.0.113.2"));
+
+        let mapped: SocketAddr = "[::ffff:198.51.100.1]:10000"
+            .parse()
+            .expect("test mapped addr");
+        assert!(
+            external_meets_proof_threshold(mapped, &proven),
+            "lookup via IPv4-mapped IPv6 must normalize to the v4 entry"
+        );
     }
 }
