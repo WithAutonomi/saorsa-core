@@ -1273,7 +1273,7 @@ impl DhtCoreEngine {
 
     /// Get a peer's addresses paired with their [`AddressType`] tags.
     ///
-    /// Used by [`crate::dht_network_manager::DhtNetworkManager::peer_addresses_for_dial`]
+    /// Used by [`crate::dht_network_manager::DhtNetworkManager::peer_addresses_for_dial_typed`]
     /// to sort candidates by type priority (Relay first) per ADR-014.
     pub async fn get_node_addresses_typed(
         &self,

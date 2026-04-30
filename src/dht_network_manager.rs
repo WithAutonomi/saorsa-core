@@ -2129,7 +2129,7 @@ impl DhtNetworkManager {
         }
         let mut attempted = 0usize;
         let mut skipped_cached = 0usize;
-        for (addr, _ty) in &plan {
+        for (addr, ty) in &plan {
             attempted += 1;
             let Some(socket_addr) = addr.dialable_socket_addr() else {
                 continue;
@@ -2137,13 +2137,14 @@ impl DhtNetworkManager {
             if self.dial_failure_cache.is_failed(&socket_addr) {
                 skipped_cached += 1;
                 trace!(
-                    "dial_addresses: skipping recently failed address {} for {}",
+                    "dial_addresses: skipping recently failed address {} ({:?}) for {}",
                     addr,
+                    ty,
                     peer_id.to_hex()
                 );
                 continue;
             }
-            match self.dial_candidate(peer_id, addr).await {
+            match self.dial_candidate(peer_id, addr, *ty).await {
                 Some(channel_id) => {
                     self.dial_failure_cache.clear(&socket_addr);
                     return Some(channel_id);
@@ -2647,14 +2648,19 @@ impl DhtNetworkManager {
     /// [`TransportHandle::wait_for_peer_identity`] before sending, because
     /// the app-level `peer_to_channel` mapping is only populated after the
     /// asynchronous identity-exchange handshake completes.
-    async fn dial_candidate(&self, peer_id: &PeerId, address: &MultiAddr) -> Option<String> {
+    async fn dial_candidate(
+        &self,
+        peer_id: &PeerId,
+        address: &MultiAddr,
+        kind: AddressType,
+    ) -> Option<String> {
         let peer_hex = peer_id.to_hex();
 
         // Reject unspecified addresses before attempting the connection.
         if address.ip().is_some_and(|ip| ip.is_unspecified()) {
             debug!(
-                "dial_candidate: rejecting unspecified address for {}: {}",
-                peer_hex, address
+                "dial_candidate: rejecting unspecified address for {}: {} ({:?})",
+                peer_hex, address, kind
             );
             return None;
         }
@@ -2663,44 +2669,34 @@ impl DhtNetworkManager {
             .transport
             .connection_timeout()
             .min(self.config.request_timeout);
-        match tokio::time::timeout(dial_timeout, self.transport.connect_peer(address)).await {
+        match tokio::time::timeout(
+            dial_timeout,
+            self.transport.connect_peer_typed(address, kind),
+        )
+        .await
+        {
             Ok(Ok(channel_id)) => {
                 debug!(
-                    "dial_candidate: connected to {} at {} (channel {})",
-                    peer_hex, address, channel_id
+                    "dial_candidate: connected to {} at {} ({:?}) (channel {})",
+                    peer_hex, address, kind, channel_id
                 );
                 Some(channel_id)
             }
             Ok(Err(e)) => {
                 debug!(
-                    "dial_candidate: failed to connect to {} at {}: {}",
-                    peer_hex, address, e
+                    "dial_candidate: failed to connect to {} at {} ({:?}): {}",
+                    peer_hex, address, kind, e
                 );
                 None
             }
             Err(_) => {
                 debug!(
-                    "dial_candidate: timeout connecting to {} at {} (>{:?})",
-                    peer_hex, address, dial_timeout
+                    "dial_candidate: timeout connecting to {} at {} ({:?}) (>{:?})",
+                    peer_hex, address, kind, dial_timeout
                 );
                 None
             }
         }
-    }
-
-    /// Look up connectable addresses for `peer_id` as bare `MultiAddr`s.
-    ///
-    /// Thin wrapper over [`Self::peer_addresses_for_dial_typed`] for
-    /// callers that don't need the per-address type tag (e.g.,
-    /// `network.rs::first_dialable_peer_address`). Internally always
-    /// goes through the typed path so the Relay-first sort invariant
-    /// holds for both consumer styles.
-    pub(crate) async fn peer_addresses_for_dial(&self, peer_id: &PeerId) -> Vec<MultiAddr> {
-        self.peer_addresses_for_dial_typed(peer_id)
-            .await
-            .into_iter()
-            .map(|(addr, _ty)| addr)
-            .collect()
     }
 
     /// Look up connectable typed addresses for `peer_id`.

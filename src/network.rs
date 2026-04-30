@@ -21,6 +21,7 @@ use crate::adaptive::trust::{TrustRecord, TrustSnapshot};
 use crate::adaptive::{AdaptiveDHT, AdaptiveDhtConfig, TrustEngine, TrustEvent};
 use crate::bootstrap::cache::{CachedCloseGroupPeer, CloseGroupCache};
 use crate::bootstrap::{BootstrapConfig, BootstrapManager};
+use crate::dht::core_engine::AddressType;
 use crate::dht_network_manager::{
     DhtNetworkConfig, DhtNetworkEvent, DhtNetworkManager, IDENTITY_EXCHANGE_TIMEOUT,
 };
@@ -1428,8 +1429,26 @@ impl P2PNode {
     /// the authenticated peer identity, call
     /// [`wait_for_peer_identity`](Self::wait_for_peer_identity) with the
     /// returned channel ID.
+    ///
+    /// Callers that already know how the address was classified should
+    /// prefer [`Self::connect_peer_typed`] so the resulting log line
+    /// carries an accurate `kind` field instead of `unknown`.
     pub async fn connect_peer(&self, address: &MultiAddr) -> Result<String> {
         self.transport.connect_peer(address).await
+    }
+
+    /// Connect to a peer at the given typed address.
+    ///
+    /// Same as [`Self::connect_peer`] but threads the [`AddressType`]
+    /// through to the transport-level dial log so an operator can tell,
+    /// after the fact, whether a failed dial was against a `Direct`,
+    /// `Relay`, `Unverified`, or `NATted` address.
+    pub async fn connect_peer_typed(
+        &self,
+        address: &MultiAddr,
+        kind: AddressType,
+    ) -> Result<String> {
+        self.transport.connect_peer_typed(address, kind).await
     }
 
     /// Wait for the identity exchange on `channel_id` to complete, returning
@@ -1567,7 +1586,7 @@ impl P2PNode {
         stale_channels: &[String],
     ) -> Result<()> {
         // Resolve a dial address: caller-provided > saved > DHT.
-        let address = self
+        let (address, kind) = self
             .resolve_dial_address(peer_id, addrs, saved_addrs)
             .await
             .ok_or_else(|| {
@@ -1587,7 +1606,7 @@ impl P2PNode {
         }
 
         // Dial and wait for identity exchange.
-        let channel_id = self.transport.connect_peer(&address).await?;
+        let channel_id = self.transport.connect_peer_typed(&address, kind).await?;
         let authenticated = match self
             .transport
             .wait_for_peer_identity(&channel_id, IDENTITY_EXCHANGE_TIMEOUT)
@@ -1617,28 +1636,53 @@ impl P2PNode {
     /// Resolve a dial address for `peer_id`, preferring caller-provided
     /// addresses over cached/DHT sources.
     ///
-    /// Returns the first dialable (QUIC, non-unspecified) address found, or
-    /// `None` when no address is available.
+    /// Returns the first dialable (QUIC, non-unspecified) address found,
+    /// paired with the [`AddressType`] the DHT routing table believes
+    /// for that address. Caller-provided / saved addresses that don't
+    /// appear in the routing table fall back to
+    /// [`AddressType::Unverified`] — the same default the routing table
+    /// applies to legacy peers that never asserted reachability.
+    /// Returns `None` when no dialable address is available.
     async fn resolve_dial_address(
         &self,
         peer_id: &PeerId,
         caller_addrs: &[MultiAddr],
         saved_addrs: &[MultiAddr],
-    ) -> Option<MultiAddr> {
+    ) -> Option<(MultiAddr, AddressType)> {
+        // Pull the typed DHT view once so we can both prefer it as a
+        // fallback source and use it to look up the kind for caller- /
+        // saved-supplied addresses.
+        let dht_typed = self
+            .adaptive_dht
+            .peer_addresses_for_dial_typed(peer_id)
+            .await;
+        let lookup_kind = |addr: &MultiAddr| -> AddressType {
+            dht_typed
+                .iter()
+                .find(|(a, _)| a == addr)
+                .map(|(_, ty)| *ty)
+                .unwrap_or(AddressType::Unverified)
+        };
+
         // 1. Caller-provided addresses (highest priority).
         if let Some(addr) = Self::first_dialable(caller_addrs) {
-            return Some(addr);
+            let kind = lookup_kind(&addr);
+            return Some((addr, kind));
         }
 
         // 2. Addresses snapshotted from the transport layer before the send
         //    attempt cleaned them up.
         if let Some(addr) = Self::first_dialable(saved_addrs) {
-            return Some(addr);
+            let kind = lookup_kind(&addr);
+            return Some((addr, kind));
         }
 
-        // 3. DHT routing table — apply the same dialability filter.
-        let dht_addrs = self.adaptive_dht.peer_addresses_for_dial(peer_id).await;
-        Self::first_dialable(&dht_addrs)
+        // 3. DHT routing table — apply the same dialability filter and
+        //    keep the type tag the routing table provided.
+        dht_typed.into_iter().find(|(a, _)| {
+            a.dialable_socket_addr()
+                .is_some_and(|sa| !sa.ip().is_unspecified())
+        })
     }
 
     /// Return the first dialable QUIC address from a slice, skipping
@@ -2224,7 +2268,15 @@ impl P2PNode {
         identity_timeout: Duration,
     ) -> Option<PeerId> {
         for addr in addrs {
-            match self.connect_peer(addr).await {
+            // Bootstrap addresses come from operator-supplied seeds (CLI
+            // flags, config file, bootstrap cache). The local reachability
+            // classifier hasn't proven them yet, so log them as
+            // `Unverified` rather than `unknown`.
+            match self
+                .transport
+                .connect_peer_typed(addr, AddressType::Unverified)
+                .await
+            {
                 Ok(channel_id) => match self
                     .transport
                     .wait_for_peer_identity(&channel_id, identity_timeout)

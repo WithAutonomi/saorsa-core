@@ -21,6 +21,7 @@
 //! trust signals through [`AdaptiveDHT::report_trust_event`].
 
 use crate::adaptive::trust::{NodeStatisticsUpdate, TrustEngine};
+use crate::dht::core_engine::AddressType;
 use crate::dht_network_manager::{DhtNetworkConfig, DhtNetworkManager};
 use crate::{MultiAddr, PeerId};
 
@@ -247,13 +248,20 @@ impl AdaptiveDHT {
         self.dht_manager.trigger_self_lookup().await
     }
 
-    /// Look up connectable addresses for a peer.
+    /// Look up connectable typed addresses for a peer.
     ///
-    /// Checks the DHT routing table first, then falls back to the transport
-    /// layer. Returns an empty vec when the peer is unknown or has no dialable
-    /// addresses.
-    pub(crate) async fn peer_addresses_for_dial(&self, peer_id: &PeerId) -> Vec<MultiAddr> {
-        self.dht_manager.peer_addresses_for_dial(peer_id).await
+    /// Checks the DHT routing table first, then falls back to the
+    /// transport layer. Returns an empty vec when the peer is unknown
+    /// or has no dialable addresses. The per-address [`AddressType`]
+    /// tag is preserved so the dial path can log the kind on
+    /// success/failure.
+    pub(crate) async fn peer_addresses_for_dial_typed(
+        &self,
+        peer_id: &PeerId,
+    ) -> Vec<(MultiAddr, AddressType)> {
+        self.dht_manager
+            .peer_addresses_for_dial_typed(peer_id)
+            .await
     }
 }
 
