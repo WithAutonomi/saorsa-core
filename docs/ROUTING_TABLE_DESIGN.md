@@ -60,7 +60,7 @@ All parameters are configurable. Values below are a reference profile used for l
 | `EMA_ALPHA` | EMA smoothing factor — weight of each new observation (higher = faster response) | `0.3` |
 | `DECAY_LAMBDA` | Per-second exponential decay rate toward neutral (0.5) | `4.198e-6` |
 | `SELF_LOOKUP_INTERVAL` | Periodic self-lookup cadence (maintenance phase only; bootstrap self-lookups run back-to-back with no interval) | random in `[5 min, 10 min]` |
-| `BUCKET_REFRESH_INTERVAL` | Periodic refresh cadence for stale k-buckets | `10 min` |
+| `BUCKET_REFRESH_INTERVAL` | Periodic refresh cadence for stale k-buckets, randomised per cycle to break startup-lockstep across the network | random in `[7.5 min, 12.5 min]` |
 | `STALE_BUCKET_THRESHOLD` | Duration after which a bucket without activity is considered stale | `1 hour` |
 | `LIVE_THRESHOLD` | Duration of no contact after which a peer is considered stale for revalidation and loses trust protection | `15 min` |
 | `STALE_REVALIDATION_TIMEOUT` | Maximum time to wait for a stale peer's ping response during admission contention | `1s` |

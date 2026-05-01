@@ -150,8 +150,14 @@ const SELF_LOOKUP_INTERVAL_MIN: Duration = Duration::from_secs(300); // 5 minute
 /// Maximum self-lookup interval.
 const SELF_LOOKUP_INTERVAL_MAX: Duration = Duration::from_secs(600); // 10 minutes
 
-/// Periodic refresh cadence for stale k-buckets.
-const BUCKET_REFRESH_INTERVAL: Duration = Duration::from_secs(600); // 10 minutes
+/// Minimum periodic refresh cadence for stale k-buckets (randomized between
+/// min and max). Jittering this interval prevents 1000s of nodes that started
+/// in lockstep from all firing their bucket-refresh FIND_NODEs in the same
+/// second once their distant buckets cross [`STALE_BUCKET_THRESHOLD`].
+const BUCKET_REFRESH_INTERVAL_MIN: Duration = Duration::from_secs(450); // 7.5 minutes
+
+/// Maximum periodic refresh cadence for stale k-buckets.
+const BUCKET_REFRESH_INTERVAL_MAX: Duration = Duration::from_secs(750); // 12.5 minutes
 
 /// Routing table size below which automatic re-bootstrap is triggered.
 const AUTO_REBOOTSTRAP_THRESHOLD: usize = 3;
@@ -1149,7 +1155,8 @@ impl DhtNetworkManager {
 
     /// Spawn the periodic bucket refresh background task.
     ///
-    /// Every [`BUCKET_REFRESH_INTERVAL`], finds stale buckets (not refreshed
+    /// At a randomised interval between [`BUCKET_REFRESH_INTERVAL_MIN`] and
+    /// [`BUCKET_REFRESH_INTERVAL_MAX`], finds stale buckets (not refreshed
     /// within [`STALE_BUCKET_THRESHOLD`]) and performs a FIND_NODE lookup for
     /// a random key in each stale bucket's range. This populates stale buckets
     /// with fresh peers.
@@ -1160,8 +1167,13 @@ impl DhtNetworkManager {
 
         let handle = tokio::spawn(async move {
             loop {
+                let interval = Self::randomised_interval(
+                    BUCKET_REFRESH_INTERVAL_MIN,
+                    BUCKET_REFRESH_INTERVAL_MAX,
+                );
+
                 tokio::select! {
-                    () = tokio::time::sleep(BUCKET_REFRESH_INTERVAL) => {}
+                    () = tokio::time::sleep(interval) => {}
                     () = shutdown.cancelled() => break,
                 }
 
