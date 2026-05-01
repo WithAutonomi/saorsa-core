@@ -71,6 +71,19 @@ const TEST_CONNECTION_TIMEOUT_SECS: u64 = 30;
 /// path (`nat_traversal_api.rs`) — same statistical argument.
 pub(crate) const MIN_DISTINCT_OBSERVERS_FOR_DIRECT: usize = 2;
 
+/// Cap on the number of distinct externals a single peer's IP may
+/// have on record in `peer_observations` before further reports are
+/// dropped.
+///
+/// A well-behaved peer observes us at exactly one external per family
+/// (the one their packets reached us through). The cap protects against
+/// a hostile peer flooding many fake `OBSERVED_ADDRESS` entries to bloat
+/// memory or to "vote" for arbitrary externals — that vote still requires
+/// a separate Side::Server inbound from the same peer to count, but the
+/// table itself should not grow without bound under attack. 8 is well
+/// above the realistic 1–2 needed for v4+v6 and dual-NAT setups.
+pub(crate) const MAX_OBSERVATIONS_PER_PEER: usize = 8;
+
 /// Return `true` iff `external` has cleared the per-address proof
 /// threshold in `proven_externals`.
 ///
@@ -253,17 +266,55 @@ pub struct TransportHandle {
     known_peer_ips: Arc<DashSet<IpAddr>>,
     /// Distinct source-disjoint observer IPs per pinned external address.
     ///
-    /// An entry is added when a `Side::Server` inbound arrives whose remote
-    /// IP is not in `known_peer_ips` and not equal to any pinned external
-    /// IP (sibling-hairpin filter). The inbound's stack-family (v4 vs v6)
-    /// determines which pinned externals receive the credit.
+    /// An entry is added when a peer that passed the source-disjoint /
+    /// sibling-hairpin / Side::Server filter reports — via a QUIC
+    /// `OBSERVED_ADDRESS` frame — that they observe us at the named
+    /// external. The peer's own report is the per-address attribution
+    /// signal: an inbound from peer P on local v4 stack only credits the
+    /// externals P actually told us about, never any other same-family
+    /// pinned external.
     ///
     /// An external is considered cold-dialable
     /// ([`AddressType::Direct`](crate::dht::AddressType::Direct)) once its
     /// observer set reaches [`MIN_DISTINCT_OBSERVERS_FOR_DIRECT`].
     /// Per-address — never globally — so one external's proof does not
-    /// promote unrelated externals.
+    /// promote unrelated externals, even on multi-WAN hosts with several
+    /// concurrently-pinned same-family externals.
     proven_externals: Arc<DashMap<SocketAddr, HashSet<IpAddr>>>,
+    /// Per-peer-IP set of externals each peer has reported observing us
+    /// at, derived from `P2pEvent::PeerObservedExternal`.
+    ///
+    /// Used by the classifier to do per-address attribution: when peer P
+    /// makes a source-disjoint Side::Server inbound, only the externals
+    /// P has told us about (intersected with currently pinned externals)
+    /// are credited with P's IP. A peer reporting external `E` is the
+    /// peer's own statement that they reached us at `E` — there is no
+    /// stronger per-address signal available at this layer.
+    ///
+    /// Capped at [`MAX_OBSERVATIONS_PER_PEER`] entries per peer to bound
+    /// memory under hostile reporting. Per-IP (not per-SocketAddr)
+    /// because NAT remappings rotate the port between sessions while the
+    /// IP — and therefore the proof identity — is what matters.
+    ///
+    /// Held to keep the `Arc` alive for the classifier and forwarder
+    /// tasks that captured clones — `self`-side accesses go through the
+    /// background tasks, not through this field directly.
+    #[allow(dead_code)]
+    peer_observations: Arc<DashMap<IpAddr, HashSet<SocketAddr>>>,
+    /// IPs of source-disjoint Side::Server inbounds that passed the
+    /// classifier's filters and are therefore eligible to contribute proof.
+    ///
+    /// An observation from a peer not in this set is recorded in
+    /// `peer_observations` but does not credit `proven_externals`.
+    /// Membership is monotonic: once a peer's IP is added (i.e. they
+    /// arrived as a stranger), their observations remain attributable
+    /// for the lifetime of the handle.
+    ///
+    /// Held to keep the `Arc` alive for the classifier and forwarder
+    /// tasks that captured clones — `self`-side accesses go through the
+    /// background tasks, not through this field directly.
+    #[allow(dead_code)]
+    proof_eligible_peers: Arc<DashSet<IpAddr>>,
 }
 
 // ============================================================================
@@ -324,17 +375,10 @@ impl TransportHandle {
         // address is pinned it is retained for the process lifetime.
         let external_addresses = Arc::new(parking_lot::Mutex::new(ExternalAddresses::new()));
 
-        // Subscribe to address-related P2pEvents from the transport layer:
-        //   - PeerAddressUpdated → mpsc, drained by the DHT bridge
-        //   - RelayEstablished → mpsc, drained by the DHT bridge
-        //   - RelayLost → mpsc, drained by the reachability driver
-        //   - ExternalAddressDiscovered → pinned into external_addresses
-        let (peer_addr_update_rx, relay_established_rx, relay_lost_rx) =
-            dual_node.spawn_peer_address_update_forwarder(Arc::clone(&external_addresses));
-
         // Passive direct-reachability classifier: subscribe to
-        // `P2pEvent::PeerConnected` and accumulate per-pinned-external proof
-        // sets keyed on source-disjoint remote IPs. Consumed by
+        // `P2pEvent::PeerConnected` and `P2pEvent::PeerObservedExternal`,
+        // attribute proof per-address using each peer's own
+        // `OBSERVED_ADDRESS` reports. Consumed by
         // `AcquisitionDriver::publish_typed_set` (via
         // `Self::is_external_proven`) to tag each address as
         // `AddressType::Direct` only once that address itself has cleared
@@ -344,11 +388,31 @@ impl TransportHandle {
         let dialed_addrs: Arc<DashSet<SocketAddr>> = Arc::new(DashSet::new());
         let known_peer_ips: Arc<DashSet<IpAddr>> = Arc::new(DashSet::new());
         let proven_externals: Arc<DashMap<SocketAddr, HashSet<IpAddr>>> = Arc::new(DashMap::new());
+        let peer_observations: Arc<DashMap<IpAddr, HashSet<SocketAddr>>> = Arc::new(DashMap::new());
+        let proof_eligible_peers: Arc<DashSet<IpAddr>> = Arc::new(DashSet::new());
+
+        // Subscribe to address-related P2pEvents from the transport layer:
+        //   - PeerAddressUpdated → mpsc, drained by the DHT bridge
+        //   - RelayEstablished → mpsc, drained by the DHT bridge
+        //   - RelayLost → mpsc, drained by the reachability driver
+        //   - ExternalAddressDiscovered → pinned into external_addresses
+        //     and triggers a back-fill of any earlier observations now
+        //     that the address is known.
+        let (peer_addr_update_rx, relay_established_rx, relay_lost_rx) = dual_node
+            .spawn_peer_address_update_forwarder(
+                Arc::clone(&external_addresses),
+                Arc::clone(&peer_observations),
+                Arc::clone(&proof_eligible_peers),
+                Arc::clone(&proven_externals),
+            );
+
         dual_node.spawn_direct_reachability_classifier(
             Arc::clone(&dialed_addrs),
             Arc::clone(&known_peer_ips),
             Arc::clone(&proven_externals),
             Arc::clone(&external_addresses),
+            Arc::clone(&peer_observations),
+            Arc::clone(&proof_eligible_peers),
         );
 
         // Subscribe to connection events BEFORE spawning the monitor task
@@ -418,6 +482,8 @@ impl TransportHandle {
             dialed_addrs,
             known_peer_ips,
             proven_externals,
+            peer_observations,
+            proof_eligible_peers,
         })
     }
 
@@ -501,6 +567,8 @@ impl TransportHandle {
             dialed_addrs: Arc::new(DashSet::new()),
             known_peer_ips: Arc::new(DashSet::new()),
             proven_externals: Arc::new(DashMap::new()),
+            peer_observations: Arc::new(DashMap::new()),
+            proof_eligible_peers: Arc::new(DashSet::new()),
         })
     }
 }
