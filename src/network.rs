@@ -131,9 +131,10 @@ const DEFAULT_MAX_CONNECTIONS: usize = 10_000;
 
 /// Default connection timeout in seconds.
 ///
-/// Derived from the sum of connection strategy stages: direct (2s) +
-/// 2 × hole-punch rounds (3s + 1s retry each) + relay (10s) = ~20s.
-/// 25s provides margin for handshake jitter.
+/// The transport adapter keeps each direct Happy Eyeballs attempt short so
+/// DHT lookups can move past offline peers quickly. 25s leaves room for
+/// multi-stage connection strategies and identity exchange while preserving
+/// the historical API default.
 const DEFAULT_CONNECTION_TIMEOUT_SECS: u64 = 25;
 
 /// Number of cached bootstrap peers to retrieve.
@@ -1272,27 +1273,33 @@ impl P2PNode {
                         _ = shutdown.cancelled() => break,
                         update = transport.recv_peer_address_update() => {
                             let Some((peer_addr, advertised_addr)) = update else { break };
-                            info!(
-                                "DHT_BRIDGE: processing update peer={} addr={} same_ip={}",
-                                peer_addr,
-                                advertised_addr,
-                                peer_addr.ip() == advertised_addr.ip()
-                            );
+                            let normalized_peer =
+                                saorsa_transport::shared::normalize_socket_addr(peer_addr);
+                            let normalized_adv =
+                                saorsa_transport::shared::normalize_socket_addr(advertised_addr);
                             // Only update DHT when the advertised IP differs
                             // from the peer's connection IP. Same-IP updates
                             // are just different NATted ports (useless for
                             // symmetric NAT); different-IP means a relay.
-                            if peer_addr.ip() == advertised_addr.ip() {
+                            if normalized_peer.ip() == normalized_adv.ip() {
+                                debug!(
+                                    "DHT_BRIDGE: dropping same-IP update peer={} addr={}",
+                                    normalized_peer,
+                                    normalized_adv
+                                );
                                 continue;
                             }
+                            info!(
+                                "DHT_BRIDGE: processing relay update peer={} addr={}",
+                                normalized_peer,
+                                normalized_adv
+                            );
                             // Look up peer ID by address (tries both IPv4 and
                             // IPv4-mapped IPv6 forms via dual_stack_alternate).
                             // For symmetric NAT, this may fail because the
                             // connection's channel key uses a different NATted port.
-                            if let Some(peer_id) = transport.peer_id_for_addr(&peer_addr).await {
-                                let normalized_adv =
-                                    saorsa_transport::shared::normalize_socket_addr(advertised_addr);
-                                let multi_addr = crate::MultiAddr::quic(normalized_adv);
+                            if let Some(peer_id) = transport.peer_id_for_addr(&normalized_peer).await {
+                                let multi_addr = MultiAddr::quic(normalized_adv);
                                 info!(
                                     "Updating DHT: peer {} relay address {} (connection was {})",
                                     peer_id, advertised_addr, peer_addr
@@ -1300,7 +1307,7 @@ impl P2PNode {
                                 dht.touch_node_typed(
                                     &peer_id,
                                     Some(&multi_addr),
-                                    crate::dht::AddressType::Relay,
+                                    AddressType::Relay,
                                 )
                                 .await;
                             }

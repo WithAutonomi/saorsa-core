@@ -810,8 +810,8 @@ impl TransportHandle {
 
     /// Look up the peer ID for a given connection address.
     pub async fn peer_id_for_addr(&self, addr: &SocketAddr) -> Option<PeerId> {
-        // Try the exact stringified address first.
-        let channel_id = addr.to_string();
+        let normalized = saorsa_transport::shared::normalize_socket_addr(*addr);
+        let channel_id = normalized.to_string();
         if let Some(peer_id) = self
             .channel_to_peers
             .get(&channel_id)
@@ -820,9 +820,9 @@ impl TransportHandle {
             return Some(peer_id);
         }
 
-        // The channel key may be stored as IPv4-mapped IPv6 (e.g., "[::ffff:1.2.3.4]:PORT")
-        // while the lookup address was normalized to IPv4 ("1.2.3.4:PORT"), or vice versa.
-        let alt_addr = saorsa_transport::shared::dual_stack_alternate(addr)?;
+        // Defensive lookup against the IPv4-mapped IPv6 alternate form in case
+        // any code path inserts via a non-canonical key.
+        let alt_addr = saorsa_transport::shared::dual_stack_alternate(&normalized)?;
         let alt_channel_id = alt_addr.to_string();
         self.channel_to_peers
             .get(&alt_channel_id)
@@ -1064,7 +1064,7 @@ impl TransportHandle {
         .await
         {
             Ok(Ok(addr)) => {
-                let connected_peer_id = addr.to_string();
+                let connected_peer_id = canonical_channel_id(addr);
 
                 // Prevent self-connections by comparing against all listen
                 // addresses (dual-stack nodes may have both IPv4 and IPv6).
@@ -1896,7 +1896,7 @@ impl TransportHandle {
                     continue;
                 }
 
-                let channel_id = remote_sock.to_string();
+                let channel_id = canonical_channel_id(remote_sock);
                 let remote_addr = MultiAddr::quic(remote_sock);
                 // PeerConnected is emitted later when the peer's identity is
                 // authenticated via a signed message — not at transport level.
@@ -2074,7 +2074,7 @@ impl TransportHandle {
     ) {
         info!("Message dispatch shard {shard_idx} started");
         while let Some((from_addr, bytes)) = shard_rx.recv().await {
-            let channel_id = from_addr.to_string();
+            let channel_id = canonical_channel_id(from_addr);
             trace!(
                 shard = shard_idx,
                 "Received {} bytes from channel {}",
@@ -2095,6 +2095,10 @@ impl TransportHandle {
                     if let Some(ref app_id) = authenticated_node_id
                         && *app_id != self_peer_id
                     {
+                        let already_mapped = peer_to_channel
+                            .get(app_id)
+                            .is_some_and(|channels| channels.value().contains(&channel_id));
+
                         // Register peer ID at the low-level transport
                         // endpoint BEFORE inserting into peer_to_channel so
                         // any concurrent reader who observes the app-level
@@ -2104,9 +2108,11 @@ impl TransportHandle {
                         // await; under sharded `DashMap` we can't hold a
                         // shard guard across an await, so we rely on
                         // happens-before via operation ordering instead.
-                        dual_node_for_peer_reg
-                            .register_connection_peer_id(from_addr, *app_id.to_bytes())
-                            .await;
+                        if !already_mapped {
+                            dual_node_for_peer_reg
+                                .register_connection_peer_id(from_addr, *app_id.to_bytes())
+                                .await;
+                        }
 
                         // Atomically determine whether this is the peer's
                         // first channel. Using `entry` per-shard avoids the
@@ -2257,6 +2263,10 @@ fn shard_index_for_addr(addr: &SocketAddr) -> usize {
     (hasher.finish() as usize) % MESSAGE_DISPATCH_SHARDS
 }
 
+fn canonical_channel_id(addr: SocketAddr) -> String {
+    saorsa_transport::shared::normalize_socket_addr(addr).to_string()
+}
+
 // ============================================================================
 // Shutdown
 // ============================================================================
@@ -2347,7 +2357,7 @@ impl TransportHandle {
                             ConnectionEvent::Established {
                                 remote_address, ..
                             } => {
-                                let channel_id = remote_address.to_string();
+                                let channel_id = canonical_channel_id(remote_address);
                                 debug!(
                                     "Connection established: channel={}, addr={}",
                                     channel_id, remote_address
@@ -2411,7 +2421,7 @@ impl TransportHandle {
                             }
                             ConnectionEvent::Lost { remote_address, reason }
                             | ConnectionEvent::Failed { remote_address, reason } => {
-                                let channel_id = remote_address.to_string();
+                                let channel_id = canonical_channel_id(remote_address);
                                 debug!("Connection lost/failed: channel={channel_id}, reason={reason}");
 
                                 active_connections.remove(&channel_id);

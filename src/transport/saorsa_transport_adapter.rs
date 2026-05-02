@@ -156,13 +156,8 @@ const HAPPY_EYEBALLS_V4_STAGGER: Duration = Duration::from_millis(50);
 
 /// Per-attempt direct-connect timeout used by the Happy Eyeballs race.
 ///
-/// saorsa-transport's `StrategyConfig` default is 3 s, sized for relay
-/// handshakes that add one extra RTT. With the dial planner now capping
-/// attempts at two addresses per peer (see
-/// [`crate::dht_network_manager::DhtNetworkManager::select_dial_candidates`]),
-/// a tighter 2 s budget matches the direct / relay-transport RTT we see
-/// in practice and shaves a full second off worst-case cold-start
-/// latency when the first address is unreachable.
+/// Keep this short because DHT lookups expect to encounter unreachable
+/// candidates on live networks and should move on quickly.
 const DIRECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Increment the drop counter and log periodically when the address-event
@@ -1232,15 +1227,18 @@ impl DualStackNetworkNode<P2pLinkTransport> {
     /// Register a peer ID at the low-level transport endpoint for PUNCH_ME_NOW
     /// relay routing. Called when identity exchange completes on a connection.
     pub async fn register_connection_peer_id(&self, addr: SocketAddr, peer_id: [u8; 32]) {
+        let normalized = saorsa_transport::shared::normalize_socket_addr(addr);
         for node in [&self.v6, &self.v4].into_iter().flatten() {
             let endpoint = node.transport.endpoint();
-            endpoint.register_connection_peer_id(addr, peer_id);
-            // Also register the dual-stack alternate form (IPv4 ↔ IPv4-mapped IPv6)
-            // so peer ID routing works regardless of which form the connection uses.
-            if let Some(alt) = saorsa_transport::shared::dual_stack_alternate(&addr) {
-                endpoint.register_connection_peer_id(alt, peer_id);
+            if endpoint.has_active_connection(&normalized) {
+                endpoint.register_connection_peer_id(normalized, peer_id);
+                return;
             }
         }
+        debug!(
+            "No active transport endpoint found while registering peer ID for {}",
+            normalized
+        );
     }
 
     /// Check if a peer has a live QUIC connection via either stack.
