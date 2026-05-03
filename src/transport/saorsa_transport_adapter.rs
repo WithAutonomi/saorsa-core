@@ -154,11 +154,14 @@ const ADDRESS_EVENT_DROP_LOG_INTERVAL: u64 = 32;
 /// IPv4 take over quickly when the v6 attempt is failing or stalled.
 const HAPPY_EYEBALLS_V4_STAGGER: Duration = Duration::from_millis(50);
 
-/// Per-attempt direct-connect timeout used by the Happy Eyeballs race.
+/// Per-attempt direct-connect progress timeout used by the Happy Eyeballs race.
 ///
 /// Keep this short because DHT lookups expect to encounter unreachable
 /// candidates on live networks and should move on quickly.
-const DIRECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+const DIRECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Per-attempt direct handshake timeout after connection progress is observed.
+const DIRECT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(4);
 
 /// Increment the drop counter and log periodically when the address-event
 /// forwarder fails to push into a bounded channel.
@@ -470,7 +473,8 @@ impl P2PNetworkNode<P2pLinkTransport> {
             .with_default_strategy(
                 StrategyConfig::direct_only()
                     .with_ipv4_timeout(DIRECT_CONNECT_TIMEOUT)
-                    .with_ipv6_timeout(DIRECT_CONNECT_TIMEOUT),
+                    .with_ipv6_timeout(DIRECT_CONNECT_TIMEOUT)
+                    .with_direct_handshake_timeout(DIRECT_HANDSHAKE_TIMEOUT),
             );
 
         // Get the actual bound address from the endpoint (important for port 0 bindings)
@@ -491,7 +495,8 @@ impl P2PNetworkNode<P2pLinkTransport> {
             .with_default_strategy(
                 StrategyConfig::direct_only()
                     .with_ipv4_timeout(DIRECT_CONNECT_TIMEOUT)
-                    .with_ipv6_timeout(DIRECT_CONNECT_TIMEOUT),
+                    .with_ipv6_timeout(DIRECT_CONNECT_TIMEOUT)
+                    .with_direct_handshake_timeout(DIRECT_HANDSHAKE_TIMEOUT),
             );
 
         // Get the actual bound address from the endpoint
@@ -754,9 +759,9 @@ impl<T: LinkTransport + Send + Sync + 'static> P2PNetworkNode<T> {
         //
         // The transport's default StrategyConfig::direct_only() disables
         // hole-punching and the in-cascade relay fallback, so this dial
-        // is single-shot. 5 s covers a QUIC handshake (1 RTT) + ML-DSA
-        // verification + margin for network jitter.
-        const DIAL_TIMEOUT: Duration = Duration::from_secs(5);
+        // is single-shot. 6 s covers the transport's 1 s progress timeout
+        // plus 4 s handshake timeout, with margin for task scheduling.
+        const DIAL_TIMEOUT: Duration = Duration::from_secs(6);
 
         let conn = tokio::time::timeout(
             DIAL_TIMEOUT,
