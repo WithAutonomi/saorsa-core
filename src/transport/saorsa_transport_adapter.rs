@@ -154,7 +154,7 @@ const ADDRESS_EVENT_DROP_LOG_INTERVAL: u64 = 32;
 /// IPv4 take over quickly when the v6 attempt is failing or stalled.
 const HAPPY_EYEBALLS_V4_STAGGER: Duration = Duration::from_millis(50);
 
-/// Per-attempt direct-connect progress timeout used by the Happy Eyeballs race.
+/// Per-attempt direct connect timeout used by the Happy Eyeballs race.
 ///
 /// Keep this short because DHT lookups expect to encounter unreachable
 /// candidates on live networks and should move on quickly.
@@ -472,8 +472,7 @@ impl P2PNetworkNode<P2pLinkTransport> {
             .context("Failed to create transport")?
             .with_default_strategy(
                 StrategyConfig::direct_only()
-                    .with_ipv4_timeout(DIRECT_CONNECT_TIMEOUT)
-                    .with_ipv6_timeout(DIRECT_CONNECT_TIMEOUT)
+                    .with_direct_connect_timeout(DIRECT_CONNECT_TIMEOUT)
                     .with_direct_handshake_timeout(DIRECT_HANDSHAKE_TIMEOUT),
             );
 
@@ -494,8 +493,7 @@ impl P2PNetworkNode<P2pLinkTransport> {
             .map_err(|e| anyhow::anyhow!("Failed to create transport: {}", e))?
             .with_default_strategy(
                 StrategyConfig::direct_only()
-                    .with_ipv4_timeout(DIRECT_CONNECT_TIMEOUT)
-                    .with_ipv6_timeout(DIRECT_CONNECT_TIMEOUT)
+                    .with_direct_connect_timeout(DIRECT_CONNECT_TIMEOUT)
                     .with_direct_handshake_timeout(DIRECT_HANDSHAKE_TIMEOUT),
             );
 
