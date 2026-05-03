@@ -87,6 +87,7 @@
 //! ```
 
 use std::borrow::Cow;
+use std::fmt;
 use std::io;
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -371,6 +372,50 @@ pub enum StateError {
     CorruptionDetected(Cow<'static, str>),
 }
 
+/// Categories of send failure used by reconnect policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendFailureKind {
+    /// The mapped channel was already gone before any stream bytes were written.
+    StaleChannel,
+    /// Opening a stream made no progress within the progress timeout.
+    OpenStreamProgressTimeout,
+    /// A stream write made no progress within the progress timeout.
+    WriteProgressTimeout,
+    /// The stream write failed after a stream had been opened.
+    StreamWrite,
+    /// The stream could not be finished after bytes were queued.
+    StreamFinish,
+    /// The remote peer explicitly stopped the stream.
+    PeerStopped,
+    /// The send failed while observing acknowledgement/stop state.
+    Acknowledgement,
+    /// The lower layer did not provide a more specific classification.
+    Other,
+}
+
+impl SendFailureKind {
+    /// Whether this failure is safe to treat as a stale channel and reconnect.
+    pub fn is_stale_channel(self) -> bool {
+        matches!(self, Self::StaleChannel)
+    }
+}
+
+impl fmt::Display for SendFailureKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let label = match self {
+            Self::StaleChannel => "stale_channel",
+            Self::OpenStreamProgressTimeout => "open_stream_progress_timeout",
+            Self::WriteProgressTimeout => "write_progress_timeout",
+            Self::StreamWrite => "stream_write",
+            Self::StreamFinish => "stream_finish",
+            Self::PeerStopped => "peer_stopped",
+            Self::Acknowledgement => "acknowledgement",
+            Self::Other => "other",
+        };
+        f.write_str(label)
+    }
+}
+
 /// Transport-related errors
 #[derive(Debug, Error)]
 pub enum TransportError {
@@ -388,6 +433,14 @@ pub enum TransportError {
 
     #[error("Stream error: {0}")]
     StreamError(Cow<'static, str>),
+
+    #[error("Send failed ({kind}): {reason}")]
+    SendFailed {
+        /// Failure kind used by retry/reconnect policy.
+        kind: SendFailureKind,
+        /// Human-readable failure reason.
+        reason: Cow<'static, str>,
+    },
 
     #[error("Certificate error: {0}")]
     CertificateError(Cow<'static, str>),
@@ -539,6 +592,15 @@ impl P2PError {
     pub fn internal(msg: impl Into<Cow<'static, str>>) -> Self {
         P2PError::Internal(msg.into())
     }
+
+    /// Whether retrying this send by reconnecting is safe.
+    pub(crate) fn is_stale_channel_send_failure(&self) -> bool {
+        match self {
+            P2PError::Network(NetworkError::PeerNotFound(_)) => true,
+            P2PError::Transport(TransportError::SendFailed { kind, .. }) => kind.is_stale_channel(),
+            _ => false,
+        }
+    }
 }
 
 /// Logging integration for errors
@@ -644,5 +706,29 @@ mod tests {
             err.to_string(),
             "Cryptography error: Invalid key length: expected 32, got 16"
         );
+    }
+
+    #[test]
+    fn test_send_failure_reconnect_classification() {
+        let stale = P2PError::Transport(TransportError::SendFailed {
+            kind: SendFailureKind::StaleChannel,
+            reason: "closed before stream open".into(),
+        });
+        assert!(stale.is_stale_channel_send_failure());
+
+        let progress_timeout = P2PError::Transport(TransportError::SendFailed {
+            kind: SendFailureKind::WriteProgressTimeout,
+            reason: "no write progress".into(),
+        });
+        assert!(!progress_timeout.is_stale_channel_send_failure());
+
+        let open_timeout = P2PError::Transport(TransportError::SendFailed {
+            kind: SendFailureKind::OpenStreamProgressTimeout,
+            reason: "no stream-open progress".into(),
+        });
+        assert!(!open_timeout.is_stale_channel_send_failure());
+
+        let missing = P2PError::Network(NetworkError::PeerNotFound("peer".into()));
+        assert!(missing.is_stale_channel_send_failure());
     }
 }

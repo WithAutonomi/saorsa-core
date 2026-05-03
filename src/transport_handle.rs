@@ -21,7 +21,7 @@ use crate::MultiAddr;
 use crate::PeerId;
 use crate::bgp_geo_provider::BgpGeoProvider;
 use crate::dht::core_engine::AddressType;
-use crate::error::{NetworkError, P2PError, P2pResult as Result};
+use crate::error::{NetworkError, P2PError, P2pResult as Result, SendFailureKind, TransportError};
 use crate::identity::node_identity::NodeIdentity;
 use crate::network::{
     ConnectionStatus, MAX_ACTIVE_REQUESTS, MAX_REQUEST_TIMEOUT, MESSAGE_RECV_CHANNEL_CAPACITY,
@@ -116,6 +116,38 @@ fn address_kind_label(kind: Option<AddressType>) -> &'static str {
     }
 }
 
+fn classify_send_error(error: &anyhow::Error) -> SendFailureKind {
+    for cause in error.chain() {
+        if let Some(endpoint_error) = cause.downcast_ref::<saorsa_transport::EndpointError>() {
+            return match endpoint_error {
+                saorsa_transport::EndpointError::PeerNotFound(_) => SendFailureKind::StaleChannel,
+                saorsa_transport::EndpointError::SendFailed { stage, .. } => {
+                    classify_transport_send_stage(*stage)
+                }
+                _ => SendFailureKind::Other,
+            };
+        }
+    }
+
+    SendFailureKind::Other
+}
+
+fn classify_transport_send_stage(stage: saorsa_transport::SendFailureStage) -> SendFailureKind {
+    match stage {
+        saorsa_transport::SendFailureStage::OpenStream => SendFailureKind::StaleChannel,
+        saorsa_transport::SendFailureStage::OpenStreamProgressTimeout => {
+            SendFailureKind::OpenStreamProgressTimeout
+        }
+        saorsa_transport::SendFailureStage::WriteProgressTimeout => {
+            SendFailureKind::WriteProgressTimeout
+        }
+        saorsa_transport::SendFailureStage::Write => SendFailureKind::StreamWrite,
+        saorsa_transport::SendFailureStage::Finish => SendFailureKind::StreamFinish,
+        saorsa_transport::SendFailureStage::Stopped => SendFailureKind::PeerStopped,
+        saorsa_transport::SendFailureStage::Acknowledgement => SendFailureKind::Acknowledgement,
+    }
+}
+
 /// Internal protocol for automatic identity announcement on connect.
 /// Filtered from P2PEvent::Message emission — not visible to applications.
 const IDENTITY_ANNOUNCE_PROTOCOL: &str = "/saorsa/identity/1.0";
@@ -125,7 +157,7 @@ pub struct TransportConfig {
     /// Addresses to bind on. The transport partitions these into at most
     /// one IPv4 and one IPv6 QUIC endpoint.
     pub listen_addrs: Vec<MultiAddr>,
-    /// Connection timeout for outbound dials and sends.
+    /// Connection timeout for outbound dials and request waits.
     pub connection_timeout: Duration,
     /// Maximum concurrent connections.
     pub max_connections: usize,
@@ -1297,8 +1329,9 @@ impl TransportHandle {
     /// Send a message to an authenticated peer (raw, no trust reporting).
     ///
     /// Resolves the app-level [`PeerId`] to transport channels via the
-    /// `peer_to_channel` mapping and tries each channel until one succeeds.
-    /// Dead channels are pruned during the attempt loop.
+    /// `peer_to_channel` mapping. Stale channels are pruned and skipped, but
+    /// active send failures are returned without trying another channel so
+    /// large/partial writes are not duplicated.
     pub async fn send_message(
         &self,
         peer_id: &PeerId,
@@ -1326,14 +1359,26 @@ impl TransportHandle {
             {
                 Ok(()) => return Ok(()),
                 Err(e) => {
+                    if e.is_stale_channel_send_failure() {
+                        warn!(
+                            peer = %peer_hex,
+                            channel = %channel_id,
+                            error = %e,
+                            "Stale channel send failed, removing and trying next",
+                        );
+                        self.remove_channel(channel_id).await;
+                        last_err = Some(e);
+                        continue;
+                    }
+
                     warn!(
                         peer = %peer_hex,
                         channel = %channel_id,
                         error = %e,
-                        "Channel send failed, removing and trying next",
+                        "Channel send failed during active send, removing without retry",
                     );
                     self.remove_channel(channel_id).await;
-                    last_err = Some(e);
+                    return Err(e);
                 }
             }
         }
@@ -1419,18 +1464,16 @@ impl TransportHandle {
                 format!("Invalid channel ID address: {e}").into(),
             ))
         })?;
-        let send_fut = self.dual_node.send_to_peer_optimized(&addr, &message_data);
-        let result = tokio::time::timeout(self.connection_timeout, send_fut)
+        let result = self
+            .dual_node
+            .send_to_peer_optimized(&addr, &message_data)
             .await
-            .map_err(|_| {
-                P2PError::Transport(crate::error::TransportError::StreamError(
-                    "Timed out sending message".into(),
-                ))
-            })?
             .map_err(|e| {
-                P2PError::Transport(crate::error::TransportError::StreamError(
-                    e.to_string().into(),
-                ))
+                let kind = classify_send_error(&e);
+                P2PError::Transport(TransportError::SendFailed {
+                    kind,
+                    reason: e.to_string().into(),
+                })
             });
 
         if result.is_ok() {

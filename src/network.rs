@@ -1536,18 +1536,27 @@ impl P2PNode {
             .map(|info| info.addresses)
             .unwrap_or_default();
 
-        // Clone data for retry — transport.send_message consumes the Vec,
-        // so we need a copy if the first attempt fails.
+        // Clone data for retry — only stale-channel failures are retried, but
+        // transport.send_message consumes the Vec.
         let retry_data = data.clone();
 
         // Fast path: try existing connection.
         match self.transport.send_message(peer_id, protocol, data).await {
             Ok(()) => return Ok(()),
             Err(e) => {
+                if !e.is_stale_channel_send_failure() {
+                    debug!(
+                        peer = %peer_id.to_hex(),
+                        error = %e,
+                        "send failed during active channel use, not reconnecting",
+                    );
+                    return Err(e);
+                }
+
                 debug!(
                     peer = %peer_id.to_hex(),
                     error = %e,
-                    "send failed, attempting reconnect",
+                    "stale channel send failed, attempting reconnect",
                 );
             }
         }
