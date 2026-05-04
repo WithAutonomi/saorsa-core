@@ -143,8 +143,6 @@ fn classify_transport_send_stage(stage: saorsa_transport::SendFailureStage) -> S
         }
         saorsa_transport::SendFailureStage::Write => SendFailureKind::StreamWrite,
         saorsa_transport::SendFailureStage::Finish => SendFailureKind::StreamFinish,
-        saorsa_transport::SendFailureStage::Stopped => SendFailureKind::PeerStopped,
-        saorsa_transport::SendFailureStage::Acknowledgement => SendFailureKind::Acknowledgement,
     }
 }
 

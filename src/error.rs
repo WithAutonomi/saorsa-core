@@ -385,10 +385,6 @@ pub enum SendFailureKind {
     StreamWrite,
     /// The stream could not be finished after bytes were queued.
     StreamFinish,
-    /// The remote peer explicitly stopped the stream.
-    PeerStopped,
-    /// The send failed while observing acknowledgement/stop state.
-    Acknowledgement,
     /// The lower layer did not provide a more specific classification.
     Other,
 }
@@ -408,8 +404,6 @@ impl fmt::Display for SendFailureKind {
             Self::WriteProgressTimeout => "write_progress_timeout",
             Self::StreamWrite => "stream_write",
             Self::StreamFinish => "stream_finish",
-            Self::PeerStopped => "peer_stopped",
-            Self::Acknowledgement => "acknowledgement",
             Self::Other => "other",
         };
         f.write_str(label)
