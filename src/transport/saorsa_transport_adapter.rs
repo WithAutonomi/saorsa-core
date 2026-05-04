@@ -48,7 +48,7 @@ use std::net::{IpAddr, SocketAddr, SocketAddrV6};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-use tokio::sync::{RwLock, broadcast};
+use tokio::sync::{RwLock, broadcast, watch};
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, trace};
@@ -192,23 +192,33 @@ fn handle_address_event_drop<T>(
     }
 }
 
-fn emit_direct_promotion(
-    tx: &tokio::sync::mpsc::Sender<SocketAddr>,
-    drops: &AtomicU64,
-    promoted: SocketAddr,
-) {
-    if let Err(err) = tx.try_send(promoted) {
-        handle_address_event_drop(drops, "DirectAddressPromoted", &err);
-    }
+/// Paired address-event outputs: an mpsc work queue for the reachability
+/// driver and a watch-backed latest-value stream for observers/tests.
+#[derive(Clone)]
+pub(crate) struct AddressEventPublisher {
+    tx: tokio::sync::mpsc::Sender<SocketAddr>,
+    latest_tx: watch::Sender<Option<SocketAddr>>,
+    event_kind: &'static str,
 }
 
-fn emit_self_address_update(
-    tx: &tokio::sync::mpsc::Sender<SocketAddr>,
-    drops: &AtomicU64,
-    address: SocketAddr,
-) {
-    if let Err(err) = tx.try_send(address) {
-        handle_address_event_drop(drops, "SelfAddressUpdated", &err);
+impl AddressEventPublisher {
+    pub(crate) fn new(
+        event_kind: &'static str,
+        tx: tokio::sync::mpsc::Sender<SocketAddr>,
+        latest_tx: watch::Sender<Option<SocketAddr>>,
+    ) -> Self {
+        Self {
+            tx,
+            latest_tx,
+            event_kind,
+        }
+    }
+
+    fn emit(&self, drops: &AtomicU64, address: SocketAddr) {
+        let _ = self.latest_tx.send_replace(Some(address));
+        if let Err(err) = self.tx.try_send(address) {
+            handle_address_event_drop(drops, self.event_kind, &err);
+        }
     }
 }
 
@@ -1451,8 +1461,8 @@ impl DualStackNetworkNode<P2pLinkTransport> {
         peer_observations: Arc<DashMap<IpAddr, HashSet<SocketAddr>>>,
         proof_eligible_peers: Arc<DashSet<IpAddr>>,
         proven_externals: Arc<DashMap<SocketAddr, HashSet<IpAddr>>>,
-        direct_promoted_tx: tokio::sync::mpsc::Sender<SocketAddr>,
-        self_address_updated_tx: tokio::sync::mpsc::Sender<SocketAddr>,
+        direct_promoted_events: AddressEventPublisher,
+        self_address_updated_events: AddressEventPublisher,
     ) -> (
         tokio::sync::mpsc::Receiver<(SocketAddr, SocketAddr)>,
         tokio::sync::mpsc::Receiver<SocketAddr>,
@@ -1472,8 +1482,8 @@ impl DualStackNetworkNode<P2pLinkTransport> {
             let observations_clone = Arc::clone(&peer_observations);
             let eligible_clone = Arc::clone(&proof_eligible_peers);
             let proven_clone = Arc::clone(&proven_externals);
-            let direct_promoted_tx_clone = direct_promoted_tx.clone();
-            let self_address_updated_tx_clone = self_address_updated_tx.clone();
+            let direct_promoted_events_clone = direct_promoted_events.clone();
+            let self_address_updated_events_clone = self_address_updated_events.clone();
             let drops = Arc::clone(&drop_counter);
             let local_bind = node.local_address();
             tokio::spawn(async move {
@@ -1550,18 +1560,10 @@ impl DualStackNetworkNode<P2pLinkTransport> {
                                         &proven_clone,
                                     ) {
                                         promoted_any = true;
-                                        emit_direct_promotion(
-                                            &direct_promoted_tx_clone,
-                                            &drops,
-                                            promoted,
-                                        );
+                                        direct_promoted_events_clone.emit(&drops, promoted);
                                     }
                                     if !promoted_any {
-                                        emit_self_address_update(
-                                            &self_address_updated_tx_clone,
-                                            &drops,
-                                            normalized,
-                                        );
+                                        self_address_updated_events_clone.emit(&drops, normalized);
                                     }
                                 } else {
                                     tracing::trace!(
@@ -1668,8 +1670,8 @@ impl DualStackNetworkNode<P2pLinkTransport> {
         external_addresses: Arc<parking_lot::Mutex<ExternalAddresses>>,
         peer_observations: Arc<DashMap<IpAddr, HashSet<SocketAddr>>>,
         proof_eligible_peers: Arc<DashSet<IpAddr>>,
-        direct_promoted_tx: tokio::sync::mpsc::Sender<SocketAddr>,
-        self_address_updated_tx: tokio::sync::mpsc::Sender<SocketAddr>,
+        direct_promoted_events: AddressEventPublisher,
+        self_address_updated_events: AddressEventPublisher,
     ) {
         let drop_counter = Arc::new(AtomicU64::new(0));
         for node in [&self.v6, &self.v4].into_iter().flatten() {
@@ -1680,8 +1682,8 @@ impl DualStackNetworkNode<P2pLinkTransport> {
             let external = Arc::clone(&external_addresses);
             let observations = Arc::clone(&peer_observations);
             let eligible = Arc::clone(&proof_eligible_peers);
-            let promoted_tx = direct_promoted_tx.clone();
-            let self_address_tx = self_address_updated_tx.clone();
+            let promoted_events = direct_promoted_events.clone();
+            let self_address_events = self_address_updated_events.clone();
             let drops = Arc::clone(&drop_counter);
             tokio::spawn(async move {
                 loop {
@@ -1697,7 +1699,7 @@ impl DualStackNetworkNode<P2pLinkTransport> {
                                 &eligible,
                                 &proven,
                             ) {
-                                emit_direct_promotion(&promoted_tx, &drops, promoted);
+                                promoted_events.emit(&drops, promoted);
                             }
                         }
                         Ok(saorsa_transport::P2pEvent::PeerObservedExternal {
@@ -1713,10 +1715,10 @@ impl DualStackNetworkNode<P2pLinkTransport> {
                                 &proven,
                             );
                             if let Some(address) = outcome.publishable_added {
-                                emit_self_address_update(&self_address_tx, &drops, address);
+                                self_address_events.emit(&drops, address);
                             }
                             if let Some(promoted) = outcome.promoted {
-                                emit_direct_promotion(&promoted_tx, &drops, promoted);
+                                promoted_events.emit(&drops, promoted);
                             }
                         }
                         Err(broadcast::error::RecvError::Closed) => break,

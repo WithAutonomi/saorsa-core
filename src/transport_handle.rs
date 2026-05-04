@@ -31,7 +31,9 @@ use crate::network::{
 };
 use crate::reachability::{RelaySessionEstablishError, RelaySessionEstablisher};
 use crate::transport::external_addresses::ExternalAddresses;
-use crate::transport::saorsa_transport_adapter::{ConnectionEvent, DualStackNetworkNode};
+use crate::transport::saorsa_transport_adapter::{
+    AddressEventPublisher, ConnectionEvent, DualStackNetworkNode,
+};
 use crate::validation::{RateLimitConfig, RateLimiter};
 
 use dashmap::mapref::entry::Entry as DashEntry;
@@ -43,7 +45,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-use tokio::sync::{RwLock, broadcast};
+use tokio::sync::{RwLock, broadcast, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -260,6 +262,12 @@ pub struct TransportHandle {
     /// Bounded mpsc with the same drop semantics as
     /// `peer_address_update_rx`.
     direct_address_promoted_rx: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<SocketAddr>>,
+    /// Latest direct-address promotion for observers/tests. This is
+    /// separate from the driver's single-consumer mpsc receiver so callers
+    /// can observe state changes without contending with the driver's
+    /// `recv().await`.
+    direct_address_promoted_watch_tx: watch::Sender<Option<SocketAddr>>,
+    direct_address_promoted_watch_rx: parking_lot::Mutex<watch::Receiver<Option<SocketAddr>>>,
     /// Self-address update events — received when a newly observed
     /// external address becomes publishable as Unverified or is pinned as
     /// Direct without crossing the Direct proof threshold. Drained by the
@@ -269,6 +277,11 @@ pub struct TransportHandle {
     /// Bounded mpsc with the same drop semantics as
     /// `peer_address_update_rx`.
     self_address_updated_rx: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<SocketAddr>>,
+    /// Latest self-address update for observers/tests. Separate from the
+    /// driver's single-consumer mpsc receiver for the same reason as
+    /// `direct_address_promoted_watch_rx`.
+    self_address_updated_watch_tx: watch::Sender<Option<SocketAddr>>,
+    self_address_updated_watch_rx: parking_lot::Mutex<watch::Receiver<Option<SocketAddr>>>,
     /// External addresses: direct addresses pinned from transport quorum,
     /// unverified candidates from QUIC `OBSERVED_ADDRESS` frames, plus the
     /// relay-allocated address when a MASQUE relay is held. Populated by
@@ -458,14 +471,27 @@ impl TransportHandle {
         let (self_address_updated_tx, self_address_updated_rx) = tokio::sync::mpsc::channel(
             crate::transport::saorsa_transport_adapter::ADDRESS_EVENT_CHANNEL_CAPACITY,
         );
+        let (direct_address_promoted_watch_tx, direct_address_promoted_watch_rx) =
+            watch::channel(None);
+        let (self_address_updated_watch_tx, self_address_updated_watch_rx) = watch::channel(None);
+        let direct_promoted_events = AddressEventPublisher::new(
+            "DirectAddressPromoted",
+            direct_promoted_tx,
+            direct_address_promoted_watch_tx.clone(),
+        );
+        let self_address_updated_events = AddressEventPublisher::new(
+            "SelfAddressUpdated",
+            self_address_updated_tx,
+            self_address_updated_watch_tx.clone(),
+        );
         let (peer_addr_update_rx, relay_established_rx, relay_lost_rx) = dual_node
             .spawn_peer_address_update_forwarder(
                 Arc::clone(&external_addresses),
                 Arc::clone(&peer_observations),
                 Arc::clone(&proof_eligible_peers),
                 Arc::clone(&proven_externals),
-                direct_promoted_tx.clone(),
-                self_address_updated_tx.clone(),
+                direct_promoted_events.clone(),
+                self_address_updated_events.clone(),
             );
 
         dual_node.spawn_direct_reachability_classifier(
@@ -475,8 +501,8 @@ impl TransportHandle {
             Arc::clone(&external_addresses),
             Arc::clone(&peer_observations),
             Arc::clone(&proof_eligible_peers),
-            direct_promoted_tx,
-            self_address_updated_tx,
+            direct_promoted_events,
+            self_address_updated_events,
         );
 
         // Subscribe to connection events BEFORE spawning the monitor task
@@ -534,7 +560,13 @@ impl TransportHandle {
             relay_established_rx: tokio::sync::Mutex::new(relay_established_rx),
             relay_lost_rx: tokio::sync::Mutex::new(relay_lost_rx),
             direct_address_promoted_rx: tokio::sync::Mutex::new(direct_address_promoted_rx),
+            direct_address_promoted_watch_tx,
+            direct_address_promoted_watch_rx: parking_lot::Mutex::new(
+                direct_address_promoted_watch_rx,
+            ),
             self_address_updated_rx: tokio::sync::Mutex::new(self_address_updated_rx),
+            self_address_updated_watch_tx,
+            self_address_updated_watch_rx: parking_lot::Mutex::new(self_address_updated_watch_rx),
             external_addresses,
             connection_timeout: config.connection_timeout,
             connection_monitor_handle,
@@ -586,6 +618,9 @@ impl TransportHandle {
             };
             Arc::new(dual)
         };
+        let (direct_address_promoted_watch_tx, direct_address_promoted_watch_rx) =
+            watch::channel(None);
+        let (self_address_updated_watch_tx, self_address_updated_watch_rx) = watch::channel(None);
 
         Ok(Self {
             dual_node,
@@ -626,12 +661,18 @@ impl TransportHandle {
                 );
                 tokio::sync::Mutex::new(rx)
             },
+            direct_address_promoted_watch_tx,
+            direct_address_promoted_watch_rx: parking_lot::Mutex::new(
+                direct_address_promoted_watch_rx,
+            ),
             self_address_updated_rx: {
                 let (_tx, rx) = tokio::sync::mpsc::channel(
                     crate::transport::saorsa_transport_adapter::ADDRESS_EVENT_CHANNEL_CAPACITY,
                 );
                 tokio::sync::Mutex::new(rx)
             },
+            self_address_updated_watch_tx,
+            self_address_updated_watch_rx: parking_lot::Mutex::new(self_address_updated_watch_rx),
             external_addresses: Arc::new(parking_lot::Mutex::new(ExternalAddresses::new())),
             connection_timeout: Duration::from_secs(TEST_CONNECTION_TIMEOUT_SECS),
             connection_monitor_handle: Arc::new(RwLock::new(None)),
@@ -962,18 +1003,54 @@ impl TransportHandle {
         rx.try_recv().ok()
     }
 
-    /// Drain any direct-address promotion events. Returns the address that
-    /// just crossed the proof threshold, if one is queued.
-    pub async fn drain_direct_address_promoted(&self) -> Option<SocketAddr> {
-        let mut rx = self.direct_address_promoted_rx.lock().await;
-        rx.try_recv().ok()
+    fn drain_latest_socket_event(
+        rx: &parking_lot::Mutex<watch::Receiver<Option<SocketAddr>>>,
+    ) -> Option<SocketAddr> {
+        let mut rx = rx.lock();
+        if rx.has_changed().ok()? {
+            *rx.borrow_and_update()
+        } else {
+            None
+        }
     }
 
-    /// Drain any self-address update events. Returns the address that
-    /// newly became publishable, if one is queued.
+    /// Drain the latest direct-address promotion notification, if one has
+    /// arrived since the previous drain.
+    ///
+    /// This is watch-backed and never waits on the reachability driver's
+    /// single-consumer mpsc receiver. Multiple raw promotion events may
+    /// coalesce to the latest address.
+    pub async fn drain_direct_address_promoted(&self) -> Option<SocketAddr> {
+        Self::drain_latest_socket_event(&self.direct_address_promoted_watch_rx)
+    }
+
+    /// Drain the latest self-address update notification, if one has
+    /// arrived since the previous drain.
+    ///
+    /// This is watch-backed and never waits on the reachability driver's
+    /// single-consumer mpsc receiver. Multiple raw update events may
+    /// coalesce to the latest address.
     pub async fn drain_self_address_updated(&self) -> Option<SocketAddr> {
-        let mut rx = self.self_address_updated_rx.lock().await;
-        rx.try_recv().ok()
+        Self::drain_latest_socket_event(&self.self_address_updated_watch_rx)
+    }
+
+    /// Subscribe to direct-address promotion notifications.
+    ///
+    /// The returned watch receiver retains only the latest promoted
+    /// address. Its initial value is `None`; after `changed().await`,
+    /// read the current value with `borrow_and_update()`.
+    pub fn subscribe_direct_address_promoted(&self) -> watch::Receiver<Option<SocketAddr>> {
+        self.direct_address_promoted_watch_tx.subscribe()
+    }
+
+    /// Subscribe to self-address update notifications.
+    ///
+    /// The returned watch receiver retains only the latest publishable
+    /// address update. Its initial value is `None`; after
+    /// `changed().await`, read the current value with
+    /// `borrow_and_update()`.
+    pub fn subscribe_self_address_updated(&self) -> watch::Receiver<Option<SocketAddr>> {
+        self.self_address_updated_watch_tx.subscribe()
     }
 
     /// Wait for the next relay-lost event.
@@ -2667,6 +2744,30 @@ impl RelaySessionEstablisher for Arc<TransportHandle> {
         relay_addr: SocketAddr,
     ) -> std::result::Result<SocketAddr, RelaySessionEstablishError> {
         self.setup_proactive_relay_session(relay_addr).await
+    }
+}
+
+#[cfg(test)]
+mod address_event_observer_tests {
+    use super::*;
+
+    #[test]
+    fn watch_drain_returns_latest_event_once() {
+        let (tx, rx) = watch::channel(None);
+        let rx = parking_lot::Mutex::new(rx);
+        let first: SocketAddr = "198.51.100.1:10000".parse().expect("test addr");
+        let second: SocketAddr = "198.51.100.2:10000".parse().expect("test addr");
+
+        assert_eq!(TransportHandle::drain_latest_socket_event(&rx), None);
+
+        let _ = tx.send_replace(Some(first));
+        let _ = tx.send_replace(Some(second));
+
+        assert_eq!(
+            TransportHandle::drain_latest_socket_event(&rx),
+            Some(second)
+        );
+        assert_eq!(TransportHandle::drain_latest_socket_event(&rx), None);
     }
 }
 
