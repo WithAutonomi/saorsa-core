@@ -64,7 +64,7 @@ once_cell = "1.21"
 dashmap = "6"
 
 # Networking
-saorsa-transport = "0.33.0"
+saorsa-transport = { git = "https://github.com/saorsa-labs/saorsa-transport.git", branch = "rc-2026.4.4" }
 
 # Core-specific dependencies
 dirs = "6.0"
