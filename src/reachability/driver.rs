@@ -204,7 +204,7 @@ impl AcquisitionDriver {
     /// peers how to reach it.
     async fn publish_typed_set(&self, relay: Option<SocketAddr>) {
         let listen = self.transport.listen_addrs().await;
-        let observed = self.transport.direct_external_addresses();
+        let observed = self.transport.non_relay_external_addresses();
 
         debug!(
             relay = ?relay,
@@ -300,6 +300,23 @@ impl AcquisitionDriver {
                         }
                     }
                 }
+                updated = self.transport.recv_self_address_updated() => {
+                    match updated {
+                        Some(addr) => {
+                            let relay = *self.relay_address.read().await;
+                            info!(
+                                address = %addr,
+                                relay = ?relay,
+                                "driver: self address updated, republishing typed self address set"
+                            );
+                            self.publish_typed_set(relay).await;
+                        }
+                        None => {
+                            // Channel closed — transport is shutting down.
+                            return true;
+                        }
+                    }
+                }
                 event = events.recv() => {
                     match event {
                         Ok(DhtNetworkEvent::KClosestPeersChanged { ref new, .. }) => {
@@ -372,6 +389,21 @@ impl AcquisitionDriver {
                             info!(
                                 address = %addr,
                                 "driver: direct address promoted during relay backoff, republishing typed self address set"
+                            );
+                            self.publish_typed_set(None).await;
+                        }
+                        None => {
+                            // Channel closed — transport is shutting down.
+                            return true;
+                        }
+                    }
+                }
+                updated = self.transport.recv_self_address_updated() => {
+                    match updated {
+                        Some(addr) => {
+                            info!(
+                                address = %addr,
+                                "driver: self address updated during relay backoff, republishing typed self address set"
                             );
                             self.publish_typed_set(None).await;
                         }

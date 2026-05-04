@@ -260,10 +260,20 @@ pub struct TransportHandle {
     /// Bounded mpsc with the same drop semantics as
     /// `peer_address_update_rx`.
     direct_address_promoted_rx: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<SocketAddr>>,
-    /// Pinned external addresses: direct addresses observed from QUIC
-    /// `OBSERVED_ADDRESS` frames during bootstrap, plus the relay-allocated
-    /// address when a MASQUE relay is held. Populated by the address-update
-    /// forwarder; survives connection drops; reset on process restart.
+    /// Self-address update events — received when a newly observed
+    /// external address becomes publishable as Unverified or is pinned as
+    /// Direct without crossing the Direct proof threshold. Drained by the
+    /// reachability driver so a relay-only self-record can be corrected as
+    /// soon as a non-relay fallback appears.
+    ///
+    /// Bounded mpsc with the same drop semantics as
+    /// `peer_address_update_rx`.
+    self_address_updated_rx: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<SocketAddr>>,
+    /// External addresses: direct addresses pinned from transport quorum,
+    /// unverified candidates from QUIC `OBSERVED_ADDRESS` frames, plus the
+    /// relay-allocated address when a MASQUE relay is held. Populated by
+    /// the address-update forwarder and reachability classifier; survives
+    /// connection drops; reset on process restart.
     external_addresses: Arc<parking_lot::Mutex<ExternalAddresses>>,
     connection_timeout: Duration,
     connection_monitor_handle: Arc<RwLock<Option<JoinHandle<()>>>>,
@@ -409,9 +419,11 @@ impl TransportHandle {
 
         let shutdown = CancellationToken::new();
 
-        // Pinned external addresses. The forwarder spawned below feeds
-        // this from `P2pEvent::ExternalAddressDiscovered` events; once an
-        // address is pinned it is retained for the process lifetime.
+        // External addresses. The forwarder and classifier below feed this
+        // from `ExternalAddressDiscovered` and `PeerObservedExternal`
+        // events; pinned direct addresses are retained for the process
+        // lifetime and single-observer reports are retained as Unverified
+        // publish candidates.
         let external_addresses = Arc::new(parking_lot::Mutex::new(ExternalAddresses::new()));
 
         // Passive direct-reachability classifier: subscribe to
@@ -435,10 +447,15 @@ impl TransportHandle {
         //   - RelayEstablished → mpsc, drained by the DHT bridge
         //   - RelayLost → mpsc, drained by the reachability driver
         //   - DirectAddressPromoted → mpsc, drained by the reachability driver
+        //   - SelfAddressUpdated → mpsc, drained by the reachability driver
         //   - ExternalAddressDiscovered → pinned into external_addresses
         //     and triggers a back-fill of any earlier observations now
-        //     that the address is known.
+        //     that the address is known. PeerObservedExternal is consumed
+        //     by the classifier and retained as an Unverified candidate.
         let (direct_promoted_tx, direct_address_promoted_rx) = tokio::sync::mpsc::channel(
+            crate::transport::saorsa_transport_adapter::ADDRESS_EVENT_CHANNEL_CAPACITY,
+        );
+        let (self_address_updated_tx, self_address_updated_rx) = tokio::sync::mpsc::channel(
             crate::transport::saorsa_transport_adapter::ADDRESS_EVENT_CHANNEL_CAPACITY,
         );
         let (peer_addr_update_rx, relay_established_rx, relay_lost_rx) = dual_node
@@ -448,6 +465,7 @@ impl TransportHandle {
                 Arc::clone(&proof_eligible_peers),
                 Arc::clone(&proven_externals),
                 direct_promoted_tx.clone(),
+                self_address_updated_tx.clone(),
             );
 
         dual_node.spawn_direct_reachability_classifier(
@@ -458,6 +476,7 @@ impl TransportHandle {
             Arc::clone(&peer_observations),
             Arc::clone(&proof_eligible_peers),
             direct_promoted_tx,
+            self_address_updated_tx,
         );
 
         // Subscribe to connection events BEFORE spawning the monitor task
@@ -515,6 +534,7 @@ impl TransportHandle {
             relay_established_rx: tokio::sync::Mutex::new(relay_established_rx),
             relay_lost_rx: tokio::sync::Mutex::new(relay_lost_rx),
             direct_address_promoted_rx: tokio::sync::Mutex::new(direct_address_promoted_rx),
+            self_address_updated_rx: tokio::sync::Mutex::new(self_address_updated_rx),
             external_addresses,
             connection_timeout: config.connection_timeout,
             connection_monitor_handle,
@@ -606,6 +626,12 @@ impl TransportHandle {
                 );
                 tokio::sync::Mutex::new(rx)
             },
+            self_address_updated_rx: {
+                let (_tx, rx) = tokio::sync::mpsc::channel(
+                    crate::transport::saorsa_transport_adapter::ADDRESS_EVENT_CHANNEL_CAPACITY,
+                );
+                tokio::sync::Mutex::new(rx)
+            },
             external_addresses: Arc::new(parking_lot::Mutex::new(ExternalAddresses::new())),
             connection_timeout: Duration::from_secs(TEST_CONNECTION_TIMEOUT_SECS),
             connection_monitor_handle: Arc::new(RwLock::new(None)),
@@ -687,31 +713,34 @@ impl TransportHandle {
     }
 
     /// Return **all** external addresses for this node: relay first
-    /// (preferred), then pinned direct addresses from bootstrap
-    /// OBSERVED_ADDRESS frames.
+    /// (preferred), then pinned direct addresses, then observed-but-
+    /// unverified external candidates from QUIC `OBSERVED_ADDRESS` frames.
     ///
-    /// Returns an empty vec if nothing has been pinned yet — the
-    /// `ExternalAddressDiscovered` events that drive pinning are
-    /// quorum-gated in saorsa-transport (≥ 2 distinct observers per
-    /// address), so any caller that wants to publish or otherwise act on
-    /// these addresses gets only the quorum-cleared set. There is no
-    /// live-observation fallback: a single peer's unconfirmed
-    /// `OBSERVED_ADDRESS` is not strong enough evidence to advertise.
+    /// Callers should still use [`Self::is_external_proven`] to decide
+    /// whether a non-relay address is Direct or Unverified. A single
+    /// observation is publishable as Unverified so dialers can try it
+    /// after the relay, but it is not treated as proven Direct until it
+    /// crosses the passive proof threshold.
     pub fn observed_external_addresses(&self) -> Vec<SocketAddr> {
         self.external_addresses.lock().all_addresses()
     }
 
-    /// Return only the pinned **direct** external addresses (no relay).
+    /// Return only the pinned **direct** external addresses (no relay, no
+    /// unverified candidates).
+    pub fn direct_external_addresses(&self) -> Vec<SocketAddr> {
+        self.external_addresses.lock().direct_addresses()
+    }
+
+    /// Return all non-relay external addresses that should be considered
+    /// for typed self-publication.
     ///
     /// Used by callers that tag addresses by type (e.g. the relay driver's
     /// `publish_typed_set`) to avoid double-tagging the relay address as
-    /// both Direct and Relay.
-    ///
-    /// Same quorum guarantee as
-    /// [`Self::observed_external_addresses`]: only addresses cleared by
-    /// saorsa-transport's `MIN_OBSERVERS_FOR_QUORUM` gate are returned.
-    pub fn direct_external_addresses(&self) -> Vec<SocketAddr> {
-        self.external_addresses.lock().direct_addresses()
+    /// both Direct and Relay. Returned addresses may be Direct or
+    /// Unverified; call [`Self::is_external_proven`] per address to tag
+    /// them correctly.
+    pub fn non_relay_external_addresses(&self) -> Vec<SocketAddr> {
+        self.external_addresses.lock().non_relay_addresses()
     }
 
     /// Store the relay-allocated address so it is included (first) in
@@ -940,6 +969,13 @@ impl TransportHandle {
         rx.try_recv().ok()
     }
 
+    /// Drain any self-address update events. Returns the address that
+    /// newly became publishable, if one is queued.
+    pub async fn drain_self_address_updated(&self) -> Option<SocketAddr> {
+        let mut rx = self.self_address_updated_rx.lock().await;
+        rx.try_recv().ok()
+    }
+
     /// Wait for the next relay-lost event.
     ///
     /// Resolves when a previously-advertised MASQUE relay address has
@@ -964,6 +1000,16 @@ impl TransportHandle {
     /// if the underlying channel has closed.
     pub async fn recv_direct_address_promoted(&self) -> Option<SocketAddr> {
         let mut rx = self.direct_address_promoted_rx.lock().await;
+        rx.recv().await
+    }
+
+    /// Wait for the next self-address update event.
+    ///
+    /// Resolves when a non-relay external address newly becomes
+    /// publishable as Unverified or is pinned as Direct without crossing
+    /// the Direct proof threshold, or `None` if the channel has closed.
+    pub async fn recv_self_address_updated(&self) -> Option<SocketAddr> {
+        let mut rx = self.self_address_updated_rx.lock().await;
         rx.recv().await
     }
 

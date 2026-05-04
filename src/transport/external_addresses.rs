@@ -11,17 +11,18 @@
 // distributed under these licenses is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 
-//! Pinned external addresses for this node.
+//! External addresses for this node.
 //!
 //! ## Why this exists
 //!
 //! A node behind NAT discovers its external (post-NAT) address from QUIC
-//! `OBSERVED_ADDRESS` frames sent by bootstrap peers during the initial
-//! connection phase. These addresses are **pinned** — once observed, they
-//! are retained for the lifetime of the process.
+//! `OBSERVED_ADDRESS` frames. A single report is retained as an
+//! unverified candidate so peers can attempt it after the relay. Once the
+//! transport emits `ExternalAddressDiscovered`, the address is **pinned**
+//! as direct and retained for the lifetime of the process.
 //!
 //! When the node acquires a MASQUE relay, the relay-allocated address is
-//! stored alongside the pinned direct addresses. The relay address is
+//! stored alongside the non-relay addresses. The relay address is
 //! considered the **preferred** address and is returned first by
 //! [`ExternalAddresses::all_addresses`].
 //!
@@ -32,6 +33,9 @@
 //! refresh the cache, and the direct address ages out. Pinning eliminates
 //! this problem: the address observed at bootstrap is valid for as long as
 //! the NAT mapping holds, and the relay provides reachability regardless.
+//! Unverified candidates are still retained because a relay-only self
+//! record gives dialers no chance to try a NAT mapping that peers have
+//! already observed.
 
 use std::net::SocketAddr;
 
@@ -45,10 +49,18 @@ use std::net::SocketAddr;
 /// published to K-closest peers.
 const MAX_DIRECT_ADDRESSES: usize = 16;
 
-/// Pinned external addresses observed from QUIC peers and the relay layer.
+/// Maximum number of observed-but-unproven addresses retained.
+///
+/// Kept separate from [`MAX_DIRECT_ADDRESSES`] so a stream of unverified
+/// NAT rebinding reports cannot evict addresses already pinned as direct.
+const MAX_UNVERIFIED_ADDRESSES: usize = 16;
+
+/// External addresses observed from QUIC peers and the relay layer.
 ///
 /// Direct addresses are pinned on first observation and evicted
-/// oldest-first when [`MAX_DIRECT_ADDRESSES`] is reached.
+/// oldest-first when [`MAX_DIRECT_ADDRESSES`] is reached. Unverified
+/// addresses are single-peer observations that have not been promoted to
+/// direct yet; they are also insertion-ordered and capped.
 /// The relay address is set/cleared by the relay acquisition driver.
 #[derive(Debug, Default)]
 pub(crate) struct ExternalAddresses {
@@ -56,6 +68,9 @@ pub(crate) struct ExternalAddresses {
     /// received during bootstrap. Insertion-ordered, deduplicated, capped
     /// at [`MAX_DIRECT_ADDRESSES`].
     direct: Vec<SocketAddr>,
+    /// Observed external addresses that are publishable as Unverified but
+    /// have not been promoted/pinned as Direct.
+    unverified: Vec<SocketAddr>,
     /// Relay-allocated address. `Some` when a MASQUE relay is held, `None`
     /// otherwise.
     relay: Option<SocketAddr>,
@@ -76,6 +91,7 @@ impl ExternalAddresses {
         if Some(addr) == self.relay || self.direct.contains(&addr) {
             return false;
         }
+        self.unverified.retain(|unverified| *unverified != addr);
         if self.direct.len() >= MAX_DIRECT_ADDRESSES {
             self.direct.remove(0);
         }
@@ -83,10 +99,37 @@ impl ExternalAddresses {
         true
     }
 
+    /// Retain an observed external address as an unverified publish
+    /// candidate.
+    ///
+    /// Returns `true` only when this changes the publishable address set.
+    /// Relay and already-pinned direct addresses are ignored.
+    pub(crate) fn record_unverified(&mut self, addr: SocketAddr) -> bool {
+        let addr = saorsa_transport::shared::normalize_socket_addr(addr);
+        if Some(addr) == self.relay || self.direct.contains(&addr) {
+            return false;
+        }
+        if let Some(pos) = self
+            .unverified
+            .iter()
+            .position(|unverified| *unverified == addr)
+        {
+            let existing = self.unverified.remove(pos);
+            self.unverified.push(existing);
+            return false;
+        }
+        if self.unverified.len() >= MAX_UNVERIFIED_ADDRESSES {
+            self.unverified.remove(0);
+        }
+        self.unverified.push(addr);
+        true
+    }
+
     /// Set the relay-allocated address.
     pub(crate) fn set_relay(&mut self, addr: SocketAddr) {
         let addr = saorsa_transport::shared::normalize_socket_addr(addr);
         self.direct.retain(|direct| *direct != addr);
+        self.unverified.retain(|unverified| *unverified != addr);
         self.relay = Some(addr);
     }
 
@@ -96,15 +139,20 @@ impl ExternalAddresses {
     }
 
     /// All external addresses, **relay first** (preferred), then pinned
-    /// direct addresses. If the relay address also appears in the direct
-    /// set, it is not duplicated.
+    /// direct addresses, then unverified observed addresses. If the relay
+    /// address also appears in either non-relay set, it is not duplicated.
     pub(crate) fn all_addresses(&self) -> Vec<SocketAddr> {
-        let mut out = Vec::with_capacity(self.direct.len() + 1);
+        let mut out = Vec::with_capacity(self.direct.len() + self.unverified.len() + 1);
         if let Some(relay) = self.relay {
             out.push(relay);
         }
         for &addr in &self.direct {
             if Some(addr) != self.relay {
+                out.push(addr);
+            }
+        }
+        for &addr in &self.unverified {
+            if Some(addr) != self.relay && !self.direct.contains(&addr) {
                 out.push(addr);
             }
         }
@@ -114,6 +162,19 @@ impl ExternalAddresses {
     /// Only the pinned direct addresses (no relay).
     pub(crate) fn direct_addresses(&self) -> Vec<SocketAddr> {
         self.direct.clone()
+    }
+
+    /// All non-relay addresses that should be considered for typed
+    /// self-publication.
+    pub(crate) fn non_relay_addresses(&self) -> Vec<SocketAddr> {
+        let mut out = Vec::with_capacity(self.direct.len() + self.unverified.len());
+        out.extend(self.direct.iter().copied());
+        for &addr in &self.unverified {
+            if !self.direct.contains(&addr) {
+                out.push(addr);
+            }
+        }
+        out
     }
 
     /// The relay address, if any.
@@ -160,6 +221,44 @@ mod tests {
         ext.set_relay(relay);
         assert_eq!(ext.all_addresses(), vec![relay, direct]);
         assert_eq!(ext.relay_address(), Some(relay));
+    }
+
+    #[test]
+    fn all_addresses_includes_unverified_after_relay() {
+        let mut ext = ExternalAddresses::new();
+        let relay = addr(1, 9000);
+        let unverified = addr(2, 9000);
+
+        ext.set_relay(relay);
+        assert!(ext.record_unverified(unverified));
+
+        assert_eq!(ext.all_addresses(), vec![relay, unverified]);
+        assert_eq!(ext.non_relay_addresses(), vec![unverified]);
+    }
+
+    #[test]
+    fn pin_direct_removes_matching_unverified() {
+        let mut ext = ExternalAddresses::new();
+        let direct = addr(1, 9000);
+
+        assert!(ext.record_unverified(direct));
+        assert!(ext.pin_direct(direct));
+
+        assert_eq!(ext.direct_addresses(), vec![direct]);
+        assert_eq!(ext.non_relay_addresses(), vec![direct]);
+        assert_eq!(ext.all_addresses(), vec![direct]);
+    }
+
+    #[test]
+    fn set_relay_removes_matching_unverified() {
+        let mut ext = ExternalAddresses::new();
+        let relay = addr(1, 9000);
+
+        assert!(ext.record_unverified(relay));
+        ext.set_relay(relay);
+
+        assert_eq!(ext.all_addresses(), vec![relay]);
+        assert!(ext.non_relay_addresses().is_empty());
     }
 
     #[test]
