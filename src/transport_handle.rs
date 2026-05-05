@@ -720,9 +720,7 @@ impl TransportHandle {
     /// inbound on the v4 stack only credits v4 externals, and an inbound
     /// from a peer behind the same NAT (sibling-hairpin) is rejected.
     ///
-    /// Consumed by
-    /// [`crate::reachability::driver::AcquisitionDriver::publish_typed_set`]
-    /// to tag each address as
+    /// Consumed by the shared self-address builder to tag each address as
     /// [`AddressType::Direct`](crate::dht::AddressType::Direct) (proven)
     /// or [`AddressType::Unverified`](crate::dht::AddressType::Unverified)
     /// (not yet proven).
@@ -782,6 +780,12 @@ impl TransportHandle {
     /// them correctly.
     pub fn non_relay_external_addresses(&self) -> Vec<SocketAddr> {
         self.external_addresses.lock().non_relay_addresses()
+    }
+
+    /// Return the relay-allocated external address, if a relay is currently
+    /// held.
+    pub(crate) fn relay_external_address(&self) -> Option<SocketAddr> {
+        self.external_addresses.lock().relay_address()
     }
 
     /// Store the relay-allocated address so it is included (first) in

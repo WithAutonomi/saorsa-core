@@ -27,6 +27,7 @@ use crate::{
     dht::{AdmissionResult, DhtCoreEngine, DhtKey, Key, RoutingTableEvent},
     error::{DhtError, IdentityError, NetworkError},
     network::{NodeConfig, NodeMode},
+    self_address::build_typed_self_address_set,
 };
 use anyhow::Context as _;
 use dashmap::DashMap;
@@ -1975,63 +1976,31 @@ impl DhtNetworkManager {
     /// K-closest results. The local node always participates in distance
     /// ranking but is never queried over the network.
     ///
-    /// The published address list is sourced from:
-    ///
-    /// 1. The transport's externally-observed reflexive address (set by
-    ///    OBSERVED_ADDRESS frames received from peers). This is the only
-    ///    authoritative source for a NAT'd node — it is the actual post-NAT
-    ///    address that remote peers see the connection arrive from.
-    /// 2. The transport's runtime-bound `listen_addrs`, but **only when the
-    ///    bind address has a specific (non-wildcard) IP**. Wildcard binds
-    ///    (`0.0.0.0` / `[::]`) are bind-side concepts meaning "any interface"
-    ///    and are not dialable, so we skip them entirely and rely on (1).
+    /// The published address list uses the same shared self-address
+    /// invariants as the reachability driver's `PublishAddressSet` fan-out:
+    /// relay first when present, then at most one best non-relay address per
+    /// IP family, each tagged as Direct only when the passive classifier has
+    /// proven that exact external socket. Wildcard and zero-port listen
+    /// addresses are dropped rather than published as undialable placeholders.
     ///
     /// If neither source produces an address, the returned `DHTNode` has an
-    /// empty `addresses` vec. This is the right answer at the publish layer:
-    /// it tells consumers "I don't know how to be reached yet" rather than
-    /// lying with a bind-side wildcard or a guessed LAN IP that won't work
-    /// from the public internet. The empty window closes naturally once the
-    /// first peer connects to us and OBSERVED_ADDRESS flows.
+    /// empty `addresses` vec. That is intentional: it tells consumers "I
+    /// don't know how to be reached yet" rather than guessing a LAN or
+    /// bind-side wildcard address that internet peers cannot route to.
     async fn local_dht_node(&self) -> DHTNode {
-        let mut addresses: Vec<MultiAddr> = Vec::new();
-
-        // 1. Non-relay external addresses — pinned Direct (post-NAT
-        //    addresses peers observed via QUIC OBSERVED_ADDRESS during
-        //    bootstrap, quorum-cleared by the source-disjoint classifier)
-        //    plus single-peer Unverified candidates retained as a
-        //    fallback. Mirrors what the typed-publish path advertises so
-        //    a node behind NAT remains reachable via the OBSERVED_ADDRESS
-        //    hint before it crosses the Direct proof threshold. Empty
-        //    until at least one peer has observed us. Excludes the relay
-        //    address, which is advertised via the typed-set path in the
-        //    relay driver.
-        for observed in self.transport.non_relay_external_addresses() {
-            let resolved = MultiAddr::quic(observed);
-            if !addresses.contains(&resolved) {
-                addresses.push(resolved);
-            }
-        }
-
-        // 2. Runtime-bound listen addresses with specific IPs only. Wildcards
-        //    and zero ports are pre-bind placeholders or all-interface
-        //    bindings — neither is dialable.
-        for la in self.transport.listen_addrs().await {
-            let Some(sa) = la.dialable_socket_addr() else {
-                continue;
-            };
-            if sa.port() == 0 || sa.ip().is_unspecified() {
-                continue;
-            }
-            let resolved = MultiAddr::quic(sa);
-            if !addresses.contains(&resolved) {
-                addresses.push(resolved);
-            }
-        }
+        let observed = self.transport.non_relay_external_addresses();
+        let listen = self.transport.listen_addrs().await;
+        let relay = self.transport.relay_external_address();
+        let typed = build_typed_self_address_set(observed, listen, relay, |sa| {
+            self.transport.is_external_proven(sa)
+        });
+        let (addresses, address_types): (Vec<MultiAddr>, Vec<AddressType>) =
+            typed.into_iter().unzip();
 
         DHTNode {
             peer_id: self.config.peer_id,
             addresses,
-            address_types: Vec::new(), // Self-addresses are untagged; the classifier decides.
+            address_types,
             distance: None,
             reliability: SELF_RELIABILITY_SCORE,
         }

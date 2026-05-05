@@ -13,44 +13,47 @@
 
 //! Regression tests for the addresses a node publishes about itself in the DHT.
 //!
-//! These tests pin the contract that `DhtNetworkManager::local_dht_node()` is
-//! the only place where a node decides what addresses to advertise about
-//! itself, and that those addresses must always survive a receiving peer's
-//! `dialable_addresses()` filter.
+//! These tests pin the contract for the DHT self-entry built by
+//! `DhtNetworkManager::local_dht_node()`. It must follow the same
+//! self-address invariants as the reachability driver's typed
+//! `PublishAddressSet` fan-out, and every address it emits must survive a
+//! receiving peer's `dialable_addresses()` filter.
 //!
-//! The production failure mode this guards against is a node telling other
-//! peers "you can reach me at <unspecified-or-zero-port>", which is silently
-//! filtered out by every consumer's `dialable_addresses()` check and makes
-//! the node invisible to DHT-based peer discovery.
+//! The production failure mode this guards against is a self-inclusive DHT
+//! result saying "you can reach me at <unspecified-or-zero-port>", which is
+//! silently filtered out by every consumer's `dialable_addresses()` check and
+//! makes the self-entry unusable for local responsibility and lookup results.
 //!
 //! Concretely, the production path is:
 //!
-//! 1. Peer A queries the DHT for peer B.
-//! 2. The DHT response contains B's self-entry, built by
+//! 1. A local self-inclusive lookup includes the self-entry built by
 //!    `DhtNetworkManager::local_dht_node()`.
-//! 3. A's `dialable_addresses()` filter rejects any unspecified IP
-//!    (`0.0.0.0`, `[::]`) and any non-QUIC entry. Port 0 is also undialable.
-//! 4. If every address in B's self-entry is filtered out, A cannot reach B
-//!    via the DHT — it can only reach B via static bootstrap config or a
-//!    pre-existing in-memory connection.
+//! 2. Consumers pass the entry through `dialable_addresses()`, which rejects
+//!    unspecified IPs (`0.0.0.0`, `[::]`), non-QUIC entries, and port 0.
+//! 3. If every address in the self-entry is filtered out, the local node
+//!    participates in distance ranking but has no usable address attached.
 //!
-//! These tests assert (3) succeeds against (2) using the public
-//! `find_closest_nodes_local_with_self()` API, which is the same code path the
-//! DHT response handler invokes.
+//! These tests assert the dialability filter succeeds against the public
+//! `find_closest_nodes_local_with_self()` API, which exercises the same
+//! self-entry builder used to seed iterative lookups.
 //!
 //! ## Address sources
 //!
-//! `local_dht_node()` has exactly two sources:
+//! `local_dht_node()` uses the same shared self-address builder as the typed
+//! publish path. Its inputs are:
 //!
+//! - **Relay allocation**: when a MASQUE relay is held, its allocated public
+//!   address is published first and tagged Relay.
 //! - **Loopback / specific-IP listen binds**: when the transport is bound to
 //!   a non-wildcard address (e.g. `127.0.0.1:<port>` from `local: true`
-//!   mode), the bound address is published directly. This path is exercised
-//!   by the single-node `local_mode_*` tests below.
+//!   mode), the bound address participates in the same per-family Direct vs
+//!   Unverified selection as observed addresses. This path is exercised by
+//!   the single-node `local_mode_*` tests below.
 //! - **OBSERVED_ADDRESS frames**: when the transport is bound to a wildcard
 //!   (`0.0.0.0` / `[::]`), the bound address is *not* published. Instead the
 //!   node waits until at least one peer connects and reports back via QUIC's
-//!   OBSERVED_ADDRESS extension. This path is exercised by the two-node
-//!   `wildcard_*` tests below.
+//!   OBSERVED_ADDRESS extension. Observed addresses are tagged Direct only
+//!   after the passive classifier proves that exact external socket.
 //!
 //! ## Why we don't substitute wildcards with `primary_local_ip()`
 //!
