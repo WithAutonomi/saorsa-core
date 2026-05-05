@@ -145,6 +145,8 @@ fn classify_transport_send_stage(stage: saorsa_transport::SendFailureStage) -> S
         }
         saorsa_transport::SendFailureStage::Write => SendFailureKind::StreamWrite,
         saorsa_transport::SendFailureStage::Finish => SendFailureKind::StreamFinish,
+        saorsa_transport::SendFailureStage::DeliveryAck
+        | saorsa_transport::SendFailureStage::DeliveryAckTimeout => SendFailureKind::StreamFinish,
     }
 }
 
@@ -1502,6 +1504,28 @@ impl TransportHandle {
         protocol: &str,
         data: Vec<u8>,
     ) -> Result<()> {
+        self.send_message_inner(peer_id, protocol, data, false)
+            .await
+    }
+
+    /// Send a message to an authenticated peer, waiting until QUIC confirms
+    /// the remote endpoint received the full stream before returning.
+    pub async fn send_message_with_delivery_ack(
+        &self,
+        peer_id: &PeerId,
+        protocol: &str,
+        data: Vec<u8>,
+    ) -> Result<()> {
+        self.send_message_inner(peer_id, protocol, data, true).await
+    }
+
+    async fn send_message_inner(
+        &self,
+        peer_id: &PeerId,
+        protocol: &str,
+        data: Vec<u8>,
+        wait_for_delivery_ack: bool,
+    ) -> Result<()> {
         let peer_hex = peer_id.to_hex();
         let channels: Vec<String> = self
             .peer_to_channel
@@ -1518,7 +1542,7 @@ impl TransportHandle {
         let mut last_err = None;
         for channel_id in &channels {
             match self
-                .send_on_channel(channel_id, protocol, data.clone())
+                .send_on_channel_inner(channel_id, protocol, data.clone(), wait_for_delivery_ack)
                 .await
             {
                 Ok(()) => return Ok(()),
@@ -1562,6 +1586,17 @@ impl TransportHandle {
         channel_id: &str,
         protocol: &str,
         data: Vec<u8>,
+    ) -> Result<()> {
+        self.send_on_channel_inner(channel_id, protocol, data, false)
+            .await
+    }
+
+    async fn send_on_channel_inner(
+        &self,
+        channel_id: &str,
+        protocol: &str,
+        data: Vec<u8>,
+        wait_for_delivery_ack: bool,
     ) -> Result<()> {
         debug!(
             "Sending message to channel {} on protocol {}",
@@ -1616,11 +1651,12 @@ impl TransportHandle {
         let raw_data_len = data.len();
         let message_data = self.create_protocol_message(protocol, data)?;
         debug!(
-            "Sending {} bytes to channel {} on protocol {} (raw data: {} bytes)",
+            "Sending {} bytes to channel {} on protocol {} (raw data: {} bytes, wait_for_delivery_ack={})",
             message_data.len(),
             channel_id,
             protocol,
-            raw_data_len
+            raw_data_len,
+            wait_for_delivery_ack
         );
 
         let addr: SocketAddr = channel_id.parse().map_err(|e: std::net::AddrParseError| {
@@ -1628,17 +1664,22 @@ impl TransportHandle {
                 format!("Invalid channel ID address: {e}").into(),
             ))
         })?;
-        let result = self
-            .dual_node
-            .send_to_peer_optimized(&addr, &message_data)
-            .await
-            .map_err(|e| {
-                let kind = classify_send_error(&e);
-                P2PError::Transport(TransportError::SendFailed {
-                    kind,
-                    reason: e.to_string().into(),
-                })
-            });
+        let send_result = if wait_for_delivery_ack {
+            self.dual_node
+                .send_to_peer_optimized_with_delivery_ack(&addr, &message_data)
+                .await
+        } else {
+            self.dual_node
+                .send_to_peer_optimized(&addr, &message_data)
+                .await
+        };
+        let result = send_result.map_err(|e| {
+            let kind = classify_send_error(&e);
+            P2PError::Transport(TransportError::SendFailed {
+                kind,
+                reason: e.to_string().into(),
+            })
+        });
 
         if result.is_ok() {
             debug!(
