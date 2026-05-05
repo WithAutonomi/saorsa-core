@@ -178,7 +178,6 @@ impl ExternalAddresses {
     }
 
     /// The relay address, if any.
-    #[cfg(test)]
     pub(crate) fn relay_address(&self) -> Option<SocketAddr> {
         self.relay
     }

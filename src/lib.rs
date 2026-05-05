@@ -46,6 +46,7 @@ pub(crate) mod quantum_crypto;
 pub(crate) mod rate_limit;
 pub(crate) mod reachability;
 pub(crate) mod security;
+pub(crate) mod self_address;
 pub(crate) mod transport;
 pub(crate) mod transport_handle;
 pub(crate) mod validation;
