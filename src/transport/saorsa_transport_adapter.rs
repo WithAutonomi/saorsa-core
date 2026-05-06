@@ -578,8 +578,8 @@ impl P2PNetworkNode<P2pLinkTransport> {
     /// Send data to a peer using P2pEndpoint's send method
     ///
     /// This method is specialized for P2pLinkTransport and uses the underlying
-    /// P2pEndpoint's send() method which corresponds with recv() for proper
-    /// bidirectional communication.
+    /// P2pEndpoint's send() method, which waits for QUIC to confirm peer
+    /// receipt of the full stream.
     ///
     /// On failure the underlying transport error is preserved via
     /// `anyhow::Context` so callers can inspect the cause (e.g. QUIC
@@ -595,30 +595,6 @@ impl P2PNetworkNode<P2pLinkTransport> {
             .send(addr, data)
             .await
             .with_context(|| format!("QUIC send to {} ({} bytes) failed", addr, data.len()))
-    }
-
-    /// Send data to a peer and wait for QUIC to acknowledge peer receipt of the full stream.
-    pub async fn send_to_peer_optimized_with_delivery_ack(
-        &self,
-        addr: &SocketAddr,
-        data: &[u8],
-    ) -> Result<()> {
-        trace!(
-            "[QUIC SEND] endpoint().send_with_delivery_ack() to {} ({} bytes)",
-            addr,
-            data.len()
-        );
-        self.transport
-            .endpoint()
-            .send_with_delivery_ack(addr, data)
-            .await
-            .with_context(|| {
-                format!(
-                    "QUIC delivery-ack send to {} ({} bytes) failed",
-                    addr,
-                    data.len()
-                )
-            })
     }
 
     /// Disconnect a specific peer, closing the underlying QUIC connection.
@@ -1931,43 +1907,6 @@ impl DualStackNetworkNode<P2pLinkTransport> {
         // correctly-configured dual-stack node but guarded for safety.
         Err(anyhow::anyhow!(
             "send_to_peer_optimized to {}: no compatible stack bound (v4={}, v6={})",
-            addr,
-            self.v4.is_some(),
-            self.v6.is_some()
-        ))
-    }
-
-    /// Send to peer using P2pEndpoint's optimized send method, waiting until
-    /// QUIC confirms the peer received the full stream.
-    pub async fn send_to_peer_optimized_with_delivery_ack(
-        &self,
-        addr: &SocketAddr,
-        data: &[u8],
-    ) -> Result<()> {
-        if addr.is_ipv4()
-            && let Some(v4) = &self.v4
-        {
-            return v4
-                .send_to_peer_optimized_with_delivery_ack(addr, data)
-                .await
-                .map_err(|e| e.context(format!("IPv4 delivery-ack send to {} failed", addr)));
-        }
-
-        if let Some(v6) = &self.v6 {
-            let wire_addr = self.to_mapped_if_needed(addr);
-            return v6
-                .send_to_peer_optimized_with_delivery_ack(&wire_addr, data)
-                .await
-                .map_err(|e| {
-                    e.context(format!(
-                        "IPv6 delivery-ack send to {} (wire {}) failed",
-                        addr, wire_addr
-                    ))
-                });
-        }
-
-        Err(anyhow::anyhow!(
-            "send_to_peer_optimized_with_delivery_ack to {}: no compatible stack bound (v4={}, v6={})",
             addr,
             self.v4.is_some(),
             self.v6.is_some()

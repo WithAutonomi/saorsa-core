@@ -1505,31 +1505,6 @@ impl P2PNode {
         data: Vec<u8>,
         addrs: &[MultiAddr],
     ) -> Result<()> {
-        self.send_message_inner(peer_id, protocol, data, addrs, false)
-            .await
-    }
-
-    /// Send a message to an authenticated peer and wait until QUIC confirms
-    /// the remote endpoint received the full stream before returning.
-    pub async fn send_message_with_delivery_ack(
-        &self,
-        peer_id: &PeerId,
-        protocol: &str,
-        data: Vec<u8>,
-        addrs: &[MultiAddr],
-    ) -> Result<()> {
-        self.send_message_inner(peer_id, protocol, data, addrs, true)
-            .await
-    }
-
-    async fn send_message_inner(
-        &self,
-        peer_id: &PeerId,
-        protocol: &str,
-        data: Vec<u8>,
-        addrs: &[MultiAddr],
-        wait_for_delivery_ack: bool,
-    ) -> Result<()> {
         // Snapshot channel IDs before the send attempt — transport.send_message
         // prunes dead channels from bookkeeping but does NOT close the
         // underlying QUIC connection.  We need the original IDs for
@@ -1544,21 +1519,11 @@ impl P2PNode {
 
             // Another sender may have connected while we waited for the lock.
             if self.transport.is_peer_connected(peer_id).await {
-                return self
-                    .transport_send_message(peer_id, protocol, data, wait_for_delivery_ack)
-                    .await;
+                return self.transport.send_message(peer_id, protocol, data).await;
             }
 
             return self
-                .reconnect_and_send(
-                    peer_id,
-                    protocol,
-                    data,
-                    addrs,
-                    &[],
-                    &[],
-                    wait_for_delivery_ack,
-                )
+                .reconnect_and_send(peer_id, protocol, data, addrs, &[], &[])
                 .await;
         }
 
@@ -1576,9 +1541,7 @@ impl P2PNode {
         let retry_data = data.clone();
 
         // Fast path: try existing connection.
-        let send_result = self
-            .transport_send_message(peer_id, protocol, data, wait_for_delivery_ack)
-            .await;
+        let send_result = self.transport.send_message(peer_id, protocol, data).await;
         match send_result {
             Ok(()) => return Ok(()),
             Err(e) => {
@@ -1613,7 +1576,8 @@ impl P2PNode {
                 self.transport.disconnect_channel(channel_id).await;
             }
             return self
-                .transport_send_message(peer_id, protocol, retry_data, wait_for_delivery_ack)
+                .transport
+                .send_message(peer_id, protocol, retry_data)
                 .await;
         }
 
@@ -1624,7 +1588,6 @@ impl P2PNode {
             addrs,
             &saved_addrs,
             &existing_channels,
-            wait_for_delivery_ack,
         )
         .await
     }
@@ -1638,7 +1601,6 @@ impl P2PNode {
         addrs: &[MultiAddr],
         saved_addrs: &[MultiAddr],
         stale_channels: &[String],
-        wait_for_delivery_ack: bool,
     ) -> Result<()> {
         // Resolve a dial address: caller-provided > saved > DHT.
         let (address, kind) = self
@@ -1685,24 +1647,7 @@ impl P2PNode {
         }
 
         // Send on the fresh connection.
-        self.transport_send_message(peer_id, protocol, data, wait_for_delivery_ack)
-            .await
-    }
-
-    async fn transport_send_message(
-        &self,
-        peer_id: &PeerId,
-        protocol: &str,
-        data: Vec<u8>,
-        wait_for_delivery_ack: bool,
-    ) -> Result<()> {
-        if wait_for_delivery_ack {
-            self.transport
-                .send_message_with_delivery_ack(peer_id, protocol, data)
-                .await
-        } else {
-            self.transport.send_message(peer_id, protocol, data).await
-        }
+        self.transport.send_message(peer_id, protocol, data).await
     }
 
     /// Resolve a dial address for `peer_id`, preferring caller-provided
