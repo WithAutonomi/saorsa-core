@@ -27,7 +27,7 @@ use crate::{
     dht::{AdmissionResult, DhtCoreEngine, DhtKey, Key, RoutingTableEvent},
     error::{DhtError, IdentityError, NetworkError},
     network::{NodeConfig, NodeMode},
-    self_address::build_typed_self_address_set,
+    self_address::build_self_address_set,
 };
 use anyhow::Context as _;
 use dashmap::DashMap;
@@ -1991,11 +1991,10 @@ impl DhtNetworkManager {
         let observed = self.transport.non_relay_external_addresses();
         let listen = self.transport.listen_addrs().await;
         let relay = self.transport.relay_external_address();
-        let typed = build_typed_self_address_set(observed, listen, relay, |sa| {
+        let (addresses, address_types) = build_self_address_set(observed, listen, relay, |sa| {
             self.transport.is_external_proven(sa)
-        });
-        let (addresses, address_types): (Vec<MultiAddr>, Vec<AddressType>) =
-            typed.into_iter().unzip();
+        })
+        .into_parallel_vecs();
 
         DHTNode {
             peer_id: self.config.peer_id,

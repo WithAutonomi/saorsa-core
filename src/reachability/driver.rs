@@ -64,7 +64,7 @@ use tracing::{debug, info, trace, warn};
 use crate::dht::AddressType;
 use crate::dht_network_manager::{DhtNetworkEvent, DhtNetworkManager};
 use crate::reachability::session::{RelayAcquisitionOutcome, run_relay_acquisition};
-use crate::self_address::build_typed_self_address_set;
+use crate::self_address::build_self_address_set;
 use crate::transport_handle::TransportHandle;
 use crate::{MultiAddr, PeerId};
 
@@ -229,14 +229,16 @@ impl AcquisitionDriver {
             "driver: preparing typed self address set"
         );
 
-        let typed = build_typed_self_address_set(observed, listen, relay, |sa| {
+        let self_addresses = build_self_address_set(observed, listen, relay, |sa| {
             self.transport.is_external_proven(sa)
         });
 
-        if typed.is_empty() {
+        if self_addresses.is_empty() {
             debug!("driver: publish skipped, no dialable self addresses");
             return;
         }
+
+        let typed = self_addresses.into_typed_vec();
 
         let own_key = *self.dht.peer_id().to_bytes();
         let all_peers = self
