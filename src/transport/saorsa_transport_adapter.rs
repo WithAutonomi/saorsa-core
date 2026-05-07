@@ -45,9 +45,12 @@ use anyhow::{Context, Result};
 use dashmap::{DashMap, DashSet};
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr, SocketAddrV6};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
+use tokio::io::{AsyncRead, ReadBuf};
 use tokio::sync::{RwLock, broadcast, watch};
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
@@ -55,8 +58,8 @@ use tracing::{debug, info, trace};
 
 // Import saorsa-transport types using the new LinkTransport API (0.14+)
 use saorsa_transport::{
-    LinkConn, LinkEvent, LinkTransport, NatConfig, P2pConfig, P2pLinkTransport, ProtocolId, Side,
-    StrategyConfig,
+    InboundStream, LinkConn, LinkEvent, LinkTransport, NatConfig, P2pConfig, P2pLinkTransport,
+    ProtocolId, Side, StrategyConfig,
 };
 
 // Import saorsa-transport types for SharedTransport integration
@@ -69,6 +72,54 @@ use saorsa_transport::link_transport::StreamType;
 /// This protocol identifier is used for multiplexing saorsa's DHT traffic
 /// over the QUIC transport. Other protocols can be registered for different services.
 pub const SAORSA_DHT_PROTOCOL: ProtocolId = ProtocolId::from_static(b"saorsa-dht/1.0.0");
+
+/// Live inbound bulk payload stream from saorsa-transport.
+///
+/// This type deliberately does not expose the body as `Vec<u8>`. Callers should
+/// copy/hash/store it incrementally through the [`AsyncRead`] implementation.
+pub struct InboundBulkStream {
+    addr: SocketAddr,
+    inner: InboundStream,
+}
+
+impl InboundBulkStream {
+    fn from_transport(inner: InboundStream) -> Self {
+        let addr = inner.addr();
+        Self { addr, inner }
+    }
+
+    fn with_addr(mut self, addr: SocketAddr) -> Self {
+        self.addr = addr;
+        self
+    }
+
+    /// Normalized remote transport address for this stream.
+    pub fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    /// Declared payload length, if the sender knew it up front.
+    pub fn length(&self) -> Option<u64> {
+        self.inner.length()
+    }
+
+    /// Stop the stream if the application rejects or no longer needs it.
+    pub fn stop(&mut self, error_code: saorsa_transport::VarInt) -> Result<()> {
+        self.inner
+            .stop(error_code)
+            .map_err(|e| anyhow::anyhow!("Failed to stop inbound bulk stream: {e}"))
+    }
+}
+
+impl AsyncRead for InboundBulkStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
 
 /// Connection lifecycle events from saorsa-transport
 #[derive(Debug, Clone)]
@@ -595,6 +646,41 @@ impl P2PNetworkNode<P2pLinkTransport> {
             .send(addr, data)
             .await
             .with_context(|| format!("QUIC send to {} ({} bytes) failed", addr, data.len()))
+    }
+
+    /// Stream a bulk payload to a peer without materializing it as a `Vec<u8>`.
+    ///
+    /// This uses saorsa-transport's bulk stream frame path. The receive side
+    /// obtains the live stream via [`Self::recv_bulk_stream`] instead of the
+    /// small-message `recv()` channel.
+    pub async fn send_stream_to_peer_optimized<R>(
+        &self,
+        addr: &SocketAddr,
+        reader: R,
+        length: Option<u64>,
+    ) -> Result<u64>
+    where
+        R: AsyncRead + Unpin,
+    {
+        trace!(
+            "[QUIC BULK SEND] endpoint().send_stream() to {} (declared length {:?})",
+            addr, length
+        );
+        self.transport
+            .endpoint()
+            .send_stream(addr, reader, length)
+            .await
+            .with_context(|| format!("QUIC bulk stream to {addr} failed"))
+    }
+
+    /// Receive the next inbound bulk stream without buffering its body.
+    pub async fn recv_bulk_stream(&self) -> Result<InboundBulkStream> {
+        self.transport
+            .endpoint()
+            .recv_stream()
+            .await
+            .map(InboundBulkStream::from_transport)
+            .context("Failed to receive inbound bulk stream")
     }
 
     /// Disconnect a specific peer, closing the underlying QUIC connection.
@@ -1911,6 +1997,74 @@ impl DualStackNetworkNode<P2pLinkTransport> {
             self.v4.is_some(),
             self.v6.is_some()
         ))
+    }
+
+    /// Stream a bulk payload to a peer by address.
+    ///
+    /// Bulk streams are not retried across address families because the reader
+    /// may have been partially consumed by the first attempt. Callers that want
+    /// retry semantics should provide a fresh reader for each retry.
+    pub async fn send_stream_to_peer_optimized<R>(
+        &self,
+        addr: &SocketAddr,
+        reader: R,
+        length: Option<u64>,
+    ) -> Result<u64>
+    where
+        R: AsyncRead + Unpin,
+    {
+        if addr.is_ipv4()
+            && let Some(v4) = &self.v4
+        {
+            return v4
+                .send_stream_to_peer_optimized(addr, reader, length)
+                .await
+                .map_err(|e| e.context(format!("IPv4 bulk stream to {} failed", addr)));
+        }
+
+        if let Some(v6) = &self.v6 {
+            let wire_addr = self.to_mapped_if_needed(addr);
+            return v6
+                .send_stream_to_peer_optimized(&wire_addr, reader, length)
+                .await
+                .map_err(|e| {
+                    e.context(format!(
+                        "IPv6 bulk stream to {} (wire {}) failed",
+                        addr, wire_addr
+                    ))
+                });
+        }
+
+        Err(anyhow::anyhow!(
+            "send_stream_to_peer_optimized to {}: no compatible stack bound (v4={}, v6={})",
+            addr,
+            self.v4.is_some(),
+            self.v6.is_some()
+        ))
+    }
+
+    /// Receive the next inbound bulk stream from any active stack.
+    pub async fn recv_bulk_stream(&self) -> Result<InboundBulkStream> {
+        let raw = match (&self.v6, &self.v4) {
+            (Some(v6), Some(v4)) => {
+                tokio::select! {
+                    res = v6.recv_bulk_stream() => res,
+                    res = v4.recv_bulk_stream() => res,
+                }
+            }
+            (Some(v6), None) => v6.recv_bulk_stream().await,
+            (None, Some(v4)) => v4.recv_bulk_stream().await,
+            (None, None) => Err(anyhow::anyhow!(
+                "no active transport stack for bulk receive"
+            )),
+        }?;
+
+        if self.is_dual_stack {
+            let normalized = saorsa_transport::shared::normalize_socket_addr(raw.addr());
+            Ok(raw.with_addr(normalized))
+        } else {
+            Ok(raw)
+        }
     }
 
     /// Disconnect a peer, closing the underlying QUIC connection.

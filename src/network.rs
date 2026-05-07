@@ -41,6 +41,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::io::AsyncRead;
 use tokio::sync::{Mutex as TokioMutex, RwLock, broadcast};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -1590,6 +1591,116 @@ impl P2PNode {
             &existing_channels,
         )
         .await
+    }
+
+    /// Stream a bulk payload to an authenticated peer without buffering it as
+    /// a `Vec<u8>` in saorsa-core.
+    ///
+    /// Use this for chunk/file bodies. Small control messages should continue
+    /// using [`Self::send_message`], which preserves protocol routing,
+    /// signatures, and request/response correlation. This method only ensures a
+    /// live authenticated channel exists before handing `reader` to the
+    /// transport; it does not retry after streaming begins because the reader
+    /// may have been partially consumed.
+    pub async fn send_bulk_stream<R>(
+        &self,
+        peer_id: &PeerId,
+        reader: R,
+        length: Option<u64>,
+        addrs: &[MultiAddr],
+    ) -> Result<u64>
+    where
+        R: AsyncRead + Unpin,
+    {
+        self.ensure_bulk_stream_channel(peer_id, addrs).await?;
+        self.transport
+            .send_bulk_stream(peer_id, reader, length)
+            .await
+    }
+
+    /// Receive the next inbound bulk stream.
+    ///
+    /// The returned stream implements [`AsyncRead`]. Callers should copy/hash
+    /// directly from it into their storage pipeline and avoid collecting the
+    /// body into memory.
+    pub async fn recv_bulk_stream(
+        &self,
+    ) -> Result<crate::transport::saorsa_transport_adapter::InboundBulkStream> {
+        self.transport.recv_bulk_stream().await
+    }
+
+    /// Ensure `peer_id` has an active authenticated channel before moving a
+    /// non-retryable bulk reader into the transport.
+    async fn ensure_bulk_stream_channel(
+        &self,
+        peer_id: &PeerId,
+        addrs: &[MultiAddr],
+    ) -> Result<()> {
+        if self
+            .transport
+            .active_channel_for_peer(peer_id)
+            .await
+            .is_some()
+        {
+            return Ok(());
+        }
+
+        let lock = self.reconnect_lock_for(peer_id);
+        let _guard = lock.lock().await;
+
+        if self
+            .transport
+            .active_channel_for_peer(peer_id)
+            .await
+            .is_some()
+        {
+            return Ok(());
+        }
+
+        let stale_channels = self.transport.channels_for_peer(peer_id).await;
+        let saved_addrs: Vec<MultiAddr> = self
+            .transport
+            .peer_info(peer_id)
+            .await
+            .map(|info| info.addresses)
+            .unwrap_or_default();
+
+        let (address, kind) = self
+            .resolve_dial_address(peer_id, addrs, &saved_addrs)
+            .await
+            .ok_or_else(|| {
+                P2PError::Network(NetworkError::PeerNotFound(peer_id.to_hex().into()))
+            })?;
+
+        if !stale_channels.is_empty() {
+            for channel_id in &stale_channels {
+                self.transport.disconnect_channel(channel_id).await;
+            }
+            tokio::time::sleep(QUIC_TEARDOWN_GRACE).await;
+        }
+
+        let channel_id = self.transport.connect_peer_typed(&address, kind).await?;
+        let authenticated = match self
+            .transport
+            .wait_for_peer_identity(&channel_id, IDENTITY_EXCHANGE_TIMEOUT)
+            .await
+        {
+            Ok(peer) => peer,
+            Err(e) => {
+                self.transport.disconnect_channel(&channel_id).await;
+                return Err(e);
+            }
+        };
+
+        if &authenticated != peer_id {
+            self.transport.disconnect_channel(&channel_id).await;
+            return Err(P2PError::Identity(IdentityError::IdentityMismatch {
+                expected: peer_id.to_hex().into(),
+                actual: authenticated.to_hex().into(),
+            }));
+        }
+
+        Ok(())
     }
 
     /// Tear down stale channels, reconnect to a peer, and send a message.

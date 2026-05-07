@@ -32,7 +32,7 @@ use crate::network::{
 use crate::reachability::{RelaySessionEstablishError, RelaySessionEstablisher};
 use crate::transport::external_addresses::ExternalAddresses;
 use crate::transport::saorsa_transport_adapter::{
-    AddressEventPublisher, ConnectionEvent, DualStackNetworkNode,
+    AddressEventPublisher, ConnectionEvent, DualStackNetworkNode, InboundBulkStream,
 };
 use crate::validation::{RateLimitConfig, RateLimiter};
 
@@ -45,6 +45,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+use tokio::io::AsyncRead;
 use tokio::sync::{RwLock, broadcast, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
@@ -1663,6 +1664,63 @@ impl TransportHandle {
             .get(app_peer_id)
             .map(|channels| channels.value().iter().cloned().collect())
             .unwrap_or_default()
+    }
+
+    /// Return one active channel ID for an app-level peer, if any.
+    pub async fn active_channel_for_peer(&self, app_peer_id: &PeerId) -> Option<String> {
+        for channel_id in self.channels_for_peer(app_peer_id).await {
+            if self.is_connection_active(&channel_id).await {
+                return Some(channel_id);
+            }
+        }
+        None
+    }
+
+    /// Stream a bulk payload to an authenticated peer over an active channel.
+    ///
+    /// This bypasses the small-message `WireMessage`/dispatcher path so large
+    /// files and chunks are not copied into `Vec<u8>` at the transport boundary.
+    /// No automatic retry is attempted after the stream starts, because the
+    /// source reader may have been partially consumed.
+    pub async fn send_bulk_stream<R>(
+        &self,
+        peer_id: &PeerId,
+        reader: R,
+        length: Option<u64>,
+    ) -> Result<u64>
+    where
+        R: AsyncRead + Unpin,
+    {
+        let channel_id = self.active_channel_for_peer(peer_id).await.ok_or_else(|| {
+            P2PError::Network(NetworkError::PeerNotFound(peer_id.to_hex().into()))
+        })?;
+        let addr: SocketAddr = channel_id.parse().map_err(|e: std::net::AddrParseError| {
+            P2PError::Network(NetworkError::PeerNotFound(
+                format!("Invalid channel ID address: {e}").into(),
+            ))
+        })?;
+
+        self.dual_node
+            .send_stream_to_peer_optimized(&addr, reader, length)
+            .await
+            .map_err(|e| {
+                let kind = classify_send_error(&e);
+                P2PError::Transport(TransportError::SendFailed {
+                    kind,
+                    reason: e.to_string().into(),
+                })
+            })
+    }
+
+    /// Receive the next inbound bulk stream.
+    ///
+    /// The returned stream body is still live on the QUIC stream. Callers must
+    /// drain, copy, hash, or explicitly stop it.
+    pub async fn recv_bulk_stream(&self) -> Result<InboundBulkStream> {
+        self.dual_node
+            .recv_bulk_stream()
+            .await
+            .map_err(|e| P2PError::Transport(TransportError::StreamError(e.to_string().into())))
     }
 
     /// Get all authenticated app-level peer IDs communicating over a channel.
