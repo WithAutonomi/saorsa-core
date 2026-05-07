@@ -998,6 +998,26 @@ impl P2PNode {
         self.adaptive_dht.report_trust_event(peer_id, event).await;
     }
 
+    /// Report a consumer-level application failure for a peer without
+    /// requiring the caller to import [`TrustEvent`].
+    ///
+    /// This is the recommended entry point for downstream crates (ant-client,
+    /// ant-node) that need to downscore a peer after a verifiable misbehaviour
+    /// (e.g. a quote whose `pub_key` does not BLAKE3-hash to its claimed
+    /// `PeerId`) but which do not — and should not — depend directly on
+    /// `saorsa-core`'s adaptive trust types.
+    ///
+    /// `weight` is clamped to the same `MAX_CONSUMER_WEIGHT` cap as
+    /// [`Self::report_trust_event`]. A weight of `5.0` (the cap) is enough
+    /// to drop a peer from neutral 0.5 to below the production swap-out
+    /// threshold in a single event — the intended setting for "the storer
+    /// would have rejected this proof"-class evidence.
+    pub async fn report_application_failure(&self, peer_id: &PeerId, weight: f64) {
+        self.adaptive_dht
+            .report_trust_event(peer_id, TrustEvent::ApplicationFailure(weight))
+            .await;
+    }
+
     /// Get the current trust score for a peer (0.0 to 1.0).
     ///
     /// Returns 0.5 (neutral) for unknown peers.

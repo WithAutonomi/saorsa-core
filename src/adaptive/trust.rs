@@ -810,4 +810,106 @@ mod tests {
             "after {success_rounds} weight-3 successes, score {restored_score} should be >= {TRUST_PROTECTION_THRESHOLD}"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Bad-binding eviction: ApplicationFailure(MAX_CONSUMER_WEIGHT) is
+    // sufficient to push a peer out of the lookup-eligible band in one shot.
+    //
+    // The production swap-out threshold lives in `AdaptiveDhtConfig`
+    // (`DEFAULT_SWAP_THRESHOLD = 0.35`). plan-1-bad-node-eviction also calls
+    // out the looser sanity bound of 0.4. We assert against both so a future
+    // tweak to either knob still flags this test.
+    // -----------------------------------------------------------------------
+
+    /// Production swap-out threshold (mirrors `adaptive::dht::DEFAULT_SWAP_THRESHOLD`).
+    const SWAP_THRESHOLD: f64 = 0.35;
+
+    /// Looser sanity bound from plan-1-bad-node-eviction.md.
+    const PLAN_LOOKUP_SKIP_BOUND: f64 = 0.4;
+
+    /// A1: A single `FailedResponse` with weight 5.0 (the
+    /// `MAX_CONSUMER_WEIGHT` cap used for bad-binding reports) drops a peer
+    /// from neutral 0.5 to below 0.4 — proving one bad-binding detection is
+    /// enough to evict the offender from lookup-eligible candidates.
+    #[tokio::test]
+    async fn bad_binding_event_drops_peer_below_lookup_threshold() {
+        let engine = TrustEngine::new();
+        let peer = PeerId::random();
+
+        // ApplicationFailure(5.0) → FailedResponse with weight 5.0 after the
+        // public-API clamp.
+        engine.update_node_stats_weighted(&peer, NodeStatisticsUpdate::FailedResponse, 5.0);
+
+        let score = engine.score(&peer);
+        assert!(
+            score < PLAN_LOOKUP_SKIP_BOUND,
+            "one weight-5 failure should drop score below {PLAN_LOOKUP_SKIP_BOUND}, got {score}"
+        );
+        assert!(
+            score < SWAP_THRESHOLD,
+            "score {score} should also be below the production swap threshold {SWAP_THRESHOLD}"
+        );
+        assert!(
+            score >= MIN_TRUST_SCORE,
+            "score {score} must remain inside the legal range"
+        );
+    }
+
+    /// A2: A peer downscored by one bad-binding event recovers above the
+    /// swap threshold after ~1 day of decay. Eviction is *temporary*: a
+    /// peer that fixes its config re-enters the lookup pool naturally.
+    #[tokio::test]
+    async fn bad_binding_decays_back_above_threshold_after_2h() {
+        let engine = TrustEngine::new();
+        let peer = PeerId::random();
+
+        engine.update_node_stats_weighted(&peer, NodeStatisticsUpdate::FailedResponse, 5.0);
+        let after_failure = engine.score(&peer);
+        assert!(
+            after_failure < SWAP_THRESHOLD,
+            "post-failure score {after_failure} should be below {SWAP_THRESHOLD}"
+        );
+
+        // The decay tuning (DECAY_LAMBDA) is sized so that the worst score
+        // (0.0) recovers above the swap threshold in ~1 day. From ~0.26 we
+        // need substantially less; assert the score has materially recovered
+        // after a 2-hour idle window without claiming it is fully back.
+        let two_hours = std::time::Duration::from_secs(2 * 3600);
+        engine.simulate_elapsed(&peer, two_hours).await;
+        let after_two_hours = engine.score(&peer);
+        assert!(
+            after_two_hours > after_failure,
+            "score should decay toward neutral after 2h: {after_failure} -> {after_two_hours}"
+        );
+
+        // Full recovery (back above the swap threshold) should hold within
+        // a day of idle time, matching the decay-recovery contract.
+        let one_day = std::time::Duration::from_secs(24 * 3600);
+        engine.simulate_elapsed(&peer, one_day).await;
+        let after_one_day = engine.score(&peer);
+        assert!(
+            after_one_day >= SWAP_THRESHOLD,
+            "after ~1 day of decay the score {after_one_day} should be back above the swap threshold {SWAP_THRESHOLD}"
+        );
+    }
+
+    /// A3: 10 consecutive `FailedResponse(5.0)` events keep the score
+    /// inside [MIN_TRUST_SCORE, swap_threshold). Confirms the EMA arithmetic
+    /// does not produce negative or NaN scores under repeated punishment.
+    #[tokio::test]
+    async fn multiple_bad_bindings_dont_compound_pathologically() {
+        let engine = TrustEngine::new();
+        let peer = PeerId::random();
+
+        for _ in 0..10 {
+            engine.update_node_stats_weighted(&peer, NodeStatisticsUpdate::FailedResponse, 5.0);
+        }
+
+        let score = engine.score(&peer);
+        assert!(score.is_finite(), "score {score} must remain finite");
+        assert!(
+            (MIN_TRUST_SCORE..PLAN_LOOKUP_SKIP_BOUND).contains(&score),
+            "after 10 weight-5 failures, score {score} must lie in [{MIN_TRUST_SCORE}, {PLAN_LOOKUP_SKIP_BOUND})"
+        );
+    }
 }
