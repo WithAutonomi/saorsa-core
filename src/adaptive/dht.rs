@@ -29,12 +29,18 @@ use crate::error::P2pResult as Result;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-/// Default trust score threshold below which a peer is eligible for swap-out
-const DEFAULT_SWAP_THRESHOLD: f64 = 0.35;
+/// Default trust score threshold below which a peer is eligible for swap-out.
+///
+/// Exposed `pub(crate)` so sibling tests in `adaptive::trust` can assert
+/// against the canonical value rather than duplicating the literal.
+pub(crate) const DEFAULT_SWAP_THRESHOLD: f64 = 0.35;
 
 /// Maximum weight multiplier per single consumer-reported event.
 /// Caps the influence of any single consumer event on the EMA.
-const MAX_CONSUMER_WEIGHT: f64 = 5.0;
+///
+/// Exposed `pub(crate)` so sibling tests can drive the public
+/// `AdaptiveDHT::report_trust_event` path with the documented cap.
+pub(crate) const MAX_CONSUMER_WEIGHT: f64 = 5.0;
 
 /// Configuration for the AdaptiveDHT layer
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -110,6 +116,34 @@ impl TrustEvent {
             | TrustEvent::ApplicationFailure(_) => NodeStatisticsUpdate::FailedResponse,
         }
     }
+
+    /// Pure function that mirrors the clamping + zero-weight gate applied by
+    /// [`AdaptiveDHT::report_trust_event`].
+    ///
+    /// Returns `Some((stats_update, effective_weight))` when the event would
+    /// be applied to the trust engine, or `None` when the consumer-reported
+    /// weight is non-positive / non-finite (silent no-op). For internal
+    /// events (`ConnectionFailed`, `ConnectionTimeout`) the effective weight
+    /// is `1.0`. For consumer events the weight is clamped to
+    /// [`MAX_CONSUMER_WEIGHT`].
+    ///
+    /// Exists as a separate function so tests can assert the clamping/gating
+    /// behaviour of the public entry point without constructing the full
+    /// [`AdaptiveDHT`] (which requires a real `TransportHandle`).
+    pub(crate) fn clamped_update(self) -> Option<(NodeStatisticsUpdate, f64)> {
+        match self {
+            TrustEvent::ApplicationSuccess(weight) | TrustEvent::ApplicationFailure(weight) => {
+                if weight.is_finite() && weight > 0.0 {
+                    Some((self.to_stats_update(), weight.min(MAX_CONSUMER_WEIGHT)))
+                } else {
+                    None
+                }
+            }
+            TrustEvent::ConnectionFailed | TrustEvent::ConnectionTimeout => {
+                Some((self.to_stats_update(), 1.0))
+            }
+        }
+    }
 }
 
 /// AdaptiveDHT — the trust boundary for all DHT operations.
@@ -178,22 +212,9 @@ impl AdaptiveDHT {
     /// evicted — they remain in the routing table until a better candidate
     /// arrives and triggers a swap-out.
     pub async fn report_trust_event(&self, peer_id: &PeerId, event: TrustEvent) {
-        match event {
-            TrustEvent::ApplicationSuccess(weight) | TrustEvent::ApplicationFailure(weight) => {
-                if weight > 0.0 {
-                    let clamped_weight = weight.min(MAX_CONSUMER_WEIGHT);
-                    self.trust_engine.update_node_stats_weighted(
-                        peer_id,
-                        event.to_stats_update(),
-                        clamped_weight,
-                    );
-                }
-            }
-            _ => {
-                // Internal events: unit weight
-                self.trust_engine
-                    .update_node_stats(peer_id, event.to_stats_update());
-            }
+        if let Some((stats_update, weight)) = event.clamped_update() {
+            self.trust_engine
+                .update_node_stats_weighted(peer_id, stats_update, weight);
         }
     }
 
