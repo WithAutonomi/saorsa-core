@@ -1717,10 +1717,20 @@ impl TransportHandle {
     /// The returned stream body is still live on the QUIC stream. Callers must
     /// drain, copy, hash, or explicitly stop it.
     pub async fn recv_bulk_stream(&self) -> Result<InboundBulkStream> {
-        self.dual_node
-            .recv_bulk_stream()
-            .await
-            .map_err(|e| P2PError::Transport(TransportError::StreamError(e.to_string().into())))
+        let stream =
+            self.dual_node.recv_bulk_stream().await.map_err(|e| {
+                P2PError::Transport(TransportError::StreamError(e.to_string().into()))
+            })?;
+
+        let channel_id = canonical_channel_id(stream.addr());
+        let peers = self.peers_on_channel(&channel_id).await;
+        let source = if peers.len() == 1 {
+            peers.first().copied()
+        } else {
+            None
+        };
+
+        Ok(stream.with_source(source))
     }
 
     /// Get all authenticated app-level peer IDs communicating over a channel.

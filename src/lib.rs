@@ -61,6 +61,7 @@ pub mod identity;
 // Networking
 pub use address::MultiAddr;
 pub use network::{NodeConfig, NodeMode, P2PEvent, P2PNode};
+pub use transport::saorsa_transport_adapter::InboundBulkStream;
 
 // DHT types — peer discovery, routing, and network events
 pub use dht::Key;

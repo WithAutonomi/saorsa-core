@@ -39,6 +39,7 @@
 //! automatically enables saorsa-transport's prometheus metrics collection.
 
 use crate::error::{GeoRejectionError, GeographicConfig};
+use crate::identity::PeerId;
 use crate::security::canonicalize_ip;
 use crate::transport::external_addresses::ExternalAddresses;
 use anyhow::{Context, Result};
@@ -79,13 +80,18 @@ pub const SAORSA_DHT_PROTOCOL: ProtocolId = ProtocolId::from_static(b"saorsa-dht
 /// copy/hash/store it incrementally through the [`AsyncRead`] implementation.
 pub struct InboundBulkStream {
     addr: SocketAddr,
+    source: Option<PeerId>,
     inner: InboundStream,
 }
 
 impl InboundBulkStream {
     fn from_transport(inner: InboundStream) -> Self {
         let addr = inner.addr();
-        Self { addr, inner }
+        Self {
+            addr,
+            source: None,
+            inner,
+        }
     }
 
     fn with_addr(mut self, addr: SocketAddr) -> Self {
@@ -93,9 +99,19 @@ impl InboundBulkStream {
         self
     }
 
+    pub(crate) fn with_source(mut self, source: Option<PeerId>) -> Self {
+        self.source = source;
+        self
+    }
+
     /// Normalized remote transport address for this stream.
     pub fn addr(&self) -> SocketAddr {
         self.addr
+    }
+
+    /// Authenticated app-level peer that opened this stream, if known.
+    pub fn source(&self) -> Option<PeerId> {
+        self.source
     }
 
     /// Declared payload length, if the sender knew it up front.
