@@ -1787,6 +1787,10 @@ impl DhtNetworkManager {
         let initial = self.find_closest_nodes_local(key, count).await;
         for node in initial {
             if peer_states.is_contactable(&node.peer_id) {
+                if self.lookup_candidate_dial_plan_is_exhausted(&node).await {
+                    peer_states.mark_failed(node.peer_id);
+                    continue;
+                }
                 let dist = node.peer_id.distance(&target_key);
                 candidates.entry((dist, node.peer_id)).or_insert(node);
             }
@@ -1816,6 +1820,14 @@ impl DhtNetworkManager {
                 };
                 let node = entry.remove();
                 if !peer_states.is_contactable(&node.peer_id) {
+                    continue;
+                }
+                if self.lookup_candidate_dial_plan_is_exhausted(&node).await {
+                    peer_states.mark_failed(node.peer_id);
+                    trace!(
+                        "[NETWORK] Skipping {}: all FIND_NODE dial candidates are in the failure cache",
+                        node.peer_id.to_hex()
+                    );
                     continue;
                 }
                 peer_states.mark_waiting(node.peer_id);
@@ -1898,6 +1910,14 @@ impl DhtNetworkManager {
                             if !peer_states.is_contactable(&node.peer_id)
                                 || self.is_local_peer_id(&node.peer_id)
                             {
+                                continue;
+                            }
+                            if self.lookup_candidate_dial_plan_is_exhausted(&node).await {
+                                peer_states.mark_failed(node.peer_id);
+                                trace!(
+                                    "[NETWORK] Skipping gossiped {}: all FIND_NODE dial candidates are in the failure cache",
+                                    node.peer_id.to_hex()
+                                );
                                 continue;
                             }
                             // Ingest the responder's typed view into our
@@ -2362,6 +2382,34 @@ impl DhtNetworkManager {
             skipped_cached
         );
         None
+    }
+
+    /// Return true when a FIND_NODE candidate has no useful dial attempt left
+    /// right now because every address in the dial plan is cooling down in the
+    /// shared failed-address cache.
+    ///
+    /// Already-connected peers are still queryable even if their advertised
+    /// addresses are cached as failed, because the request path can reuse the
+    /// open channel without dialing.
+    async fn lookup_candidate_dial_plan_is_exhausted(&self, node: &DHTNode) -> bool {
+        let typed = node.typed_addresses();
+        if !Self::dial_plan_fully_failed_in_cache(self.dial_failure_cache.as_ref(), &typed) {
+            return false;
+        }
+
+        !self.transport.is_peer_connected(&node.peer_id).await
+    }
+
+    fn dial_plan_fully_failed_in_cache(
+        cache: &DialFailureCache,
+        typed_addresses: &[(MultiAddr, AddressType)],
+    ) -> bool {
+        let plan = Self::select_dial_candidates(typed_addresses);
+        !plan.is_empty()
+            && plan.iter().all(|(addr, _)| {
+                addr.dialable_socket_addr()
+                    .is_some_and(|socket_addr| cache.is_failed(&socket_addr))
+            })
     }
 
     async fn record_peer_failure(&self, peer_id: &PeerId) {
@@ -4939,6 +4987,42 @@ mod tests {
         assert_eq!(picks.len(), 2);
         assert_eq!(picks[0].1, AddressType::Direct);
         assert_eq!(picks[1].1, AddressType::Unverified);
+    }
+
+    #[test]
+    fn dial_plan_fully_failed_in_cache_requires_every_planned_address() {
+        let cache = DialFailureCache::new();
+        let addrs = typed(vec![
+            ("/ip4/198.51.100.1/udp/9000/quic", AddressType::Relay),
+            ("/ip4/203.0.113.7/udp/9001/quic", AddressType::Direct),
+        ]);
+        let plan = DhtNetworkManager::select_dial_candidates(&addrs);
+
+        assert!(!DhtNetworkManager::dial_plan_fully_failed_in_cache(
+            &cache, &addrs
+        ));
+
+        cache.record_failure(plan[0].0.dialable_socket_addr().unwrap());
+        assert!(
+            !DhtNetworkManager::dial_plan_fully_failed_in_cache(&cache, &addrs),
+            "one available planned address should keep the candidate queryable"
+        );
+
+        cache.record_failure(plan[1].0.dialable_socket_addr().unwrap());
+        assert!(
+            DhtNetworkManager::dial_plan_fully_failed_in_cache(&cache, &addrs),
+            "all planned dial addresses in the failure cache should suppress the candidate"
+        );
+    }
+
+    #[test]
+    fn dial_plan_fully_failed_in_cache_empty_plan_is_not_exhausted() {
+        let cache = DialFailureCache::new();
+
+        assert!(!DhtNetworkManager::dial_plan_fully_failed_in_cache(
+            &cache,
+            &[]
+        ));
     }
 
     fn sock(s: &str) -> SocketAddr {
