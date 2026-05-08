@@ -259,6 +259,9 @@ pub struct DHTNode {
     /// peers returned by `find_closest_nodes_local()`.
     #[serde(default)]
     pub address_types: Vec<AddressType>,
+    /// Optional per-record metadata. In current DHT responses this may carry
+    /// a marker-encoded `PublishAddressSet` sequence so newer nodes can prefer
+    /// fresher address records without changing the wire shape for older nodes.
     pub distance: Option<Vec<u8>>,
     pub reliability: f64,
 }
@@ -360,7 +363,37 @@ impl DHTNode {
         if other.reliability > self.reliability {
             self.reliability = other.reliability;
         }
+        let publish_seq = dht_node_publish_seq(self).max(dht_node_publish_seq(&other));
+        if publish_seq != 0 {
+            self.distance = encode_publish_seq_distance(publish_seq);
+        }
     }
+}
+
+const PUBLISH_SEQ_DISTANCE_MARKER: &[u8; 8] = b"PUBSEQ01";
+
+fn encode_publish_seq_distance(seq: u64) -> Option<Vec<u8>> {
+    if seq == 0 {
+        return None;
+    }
+    let mut encoded = Vec::with_capacity(PUBLISH_SEQ_DISTANCE_MARKER.len() + 8);
+    encoded.extend_from_slice(PUBLISH_SEQ_DISTANCE_MARKER);
+    encoded.extend_from_slice(&seq.to_be_bytes());
+    Some(encoded)
+}
+
+fn dht_node_publish_seq(node: &DHTNode) -> u64 {
+    let Some(distance) = node.distance.as_deref() else {
+        return 0;
+    };
+    if distance.len() != PUBLISH_SEQ_DISTANCE_MARKER.len() + 8
+        || &distance[..PUBLISH_SEQ_DISTANCE_MARKER.len()] != PUBLISH_SEQ_DISTANCE_MARKER
+    {
+        return 0;
+    }
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&distance[PUBLISH_SEQ_DISTANCE_MARKER.len()..]);
+    u64::from_be_bytes(bytes)
 }
 
 /// Alias for serialization compatibility
@@ -990,12 +1023,16 @@ fn report_signature(node: &DHTNode) -> Vec<(MultiAddr, u8)> {
 ///
 ///   1. **Self-report** — if the subject peer itself responded, its
 ///      report is authoritative.
-///   2. **Quorum** — among the top `QUORUM_TOP_N` closest-XOR
+///   2. **Newest publish** — any report carrying the highest non-zero
+///      `PublishAddressSet` sequence wins. That sequence originated from
+///      the subject peer's authenticated publish path and lets a newer
+///      direct-only or re-relayed record displace stale relay gossip.
+///   3. **Quorum** — among the top `QUORUM_TOP_N` closest-XOR
 ///      responders, if `QUORUM_THRESHOLD`+ agree on the address set
 ///      (same [`report_signature`]), their consensus wins. One close
 ///      adversary cannot poison the result when 2+ honest neighbours
 ///      agree.
-///   3. **Fallback** — the closest-XOR responder wins. On an XOR tie
+///   4. **Fallback** — the closest-XOR responder wins. On an XOR tie
 ///      the one whose best tag tier is stronger breaks it.
 ///
 /// Returns `None` only when `reports` is empty.
@@ -1027,7 +1064,23 @@ fn compute_winner<'a>(
         .collect();
     by_dist.sort_by(|a, b| a.2.cmp(&b.2).then(a.3.cmp(&b.3)));
 
-    // Rule 2: quorum among top-N.
+    // Rule 2: newest authoritative publish sequence wins. This keeps stale
+    // third-party relay records from beating a newer direct-only or re-relayed
+    // self-record during an iterative lookup.
+    if let Some((rid, node, _, _)) = by_dist
+        .iter()
+        .filter(|(_, node, _, _)| dht_node_publish_seq(node) != 0)
+        .max_by(|a, b| {
+            dht_node_publish_seq(a.1)
+                .cmp(&dht_node_publish_seq(b.1))
+                .then_with(|| b.2.cmp(&a.2))
+                .then_with(|| b.3.cmp(&a.3))
+        })
+    {
+        return Some((*rid, *node));
+    }
+
+    // Rule 3: quorum among top-N.
     let top_n = &by_dist[..by_dist.len().min(QUORUM_TOP_N)];
     if top_n.len() >= QUORUM_THRESHOLD {
         let mut buckets: HashMap<Vec<(MultiAddr, u8)>, Vec<PeerId>> = HashMap::new();
@@ -1051,7 +1104,7 @@ fn compute_winner<'a>(
         }
     }
 
-    // Rule 3: fallback — closest-XOR (then strongest-tier) responder.
+    // Rule 4: fallback — closest-XOR (then strongest-tier) responder.
     let (rid, node, _, _) = by_dist.first()?;
     Some((*rid, *node))
 }
@@ -1632,15 +1685,18 @@ impl DhtNetworkManager {
         );
 
         let dht_guard = self.dht.read().await;
-        match dht_guard.find_nodes(&DhtKey::from_bytes(*key), count).await {
+        match dht_guard
+            .find_nodes_with_publish_seq(&DhtKey::from_bytes(*key), count)
+            .await
+        {
             Ok(nodes) => nodes
                 .into_iter()
-                .filter(|node| !self.is_local_peer_id(&node.id))
-                .map(|node| DHTNode {
+                .filter(|(node, _)| !self.is_local_peer_id(&node.id))
+                .map(|(node, publish_seq)| DHTNode {
                     peer_id: node.id,
                     address_types: node.address_types,
                     addresses: node.addresses,
-                    distance: None,
+                    distance: encode_publish_seq_distance(publish_seq),
                     reliability: SELF_RELIABILITY_SCORE,
                 })
                 .collect(),
@@ -3924,15 +3980,20 @@ impl DhtNetworkManager {
     }
 
     /// Ingest a peer's typed address set from a FIND_NODE gossip response
-    /// into the local routing table, upgrading tags only.
+    /// into the local routing table.
     ///
-    /// For each `(addr, ty)` pair in `node`, if the peer is already in the
-    /// routing table, either add the new address or promote the existing
-    /// entry — but never demote a higher-priority tag already held (which
-    /// typically came from the peer's own `PublishAddressSet` or from our
-    /// own classifier). Peers absent from the routing table are left alone;
-    /// we don't accept *new* peer identities from untrusted gossip, only
-    /// additional information about peers we already know.
+    /// If the report carries a marker-encoded publish sequence in its existing
+    /// `distance` metadata slot, it is a propagated `PublishAddressSet` view
+    /// and the sequence guard decides whether to replace our local record
+    /// wholesale. Older sequence-bearing reports are ignored instead of being
+    /// merged, which prevents stale relay addresses from being reintroduced
+    /// after the publisher has republished a newer direct-only or re-relayed
+    /// set. Legacy reports without a sequence keep the old upgrade-only
+    /// behavior: add a new address or promote the existing entry, but never
+    /// demote a higher-priority tag already held. Peers absent from the routing
+    /// table are left alone; we don't accept *new* peer identities from
+    /// untrusted gossip, only additional information about peers we already
+    /// know.
     ///
     /// This closes the hole where a NAT'd peer XOR-far from every open
     /// node could never land in anyone's K-closest for `PublishAddressSet`
@@ -3951,6 +4012,17 @@ impl DhtNetworkManager {
     /// authenticated neighbour keeps mentioning them.
     pub async fn merge_gossiped_typed_addresses(&self, node: &DHTNode) {
         let dht = self.dht.read().await;
+        let publish_seq = dht_node_publish_seq(node);
+        if publish_seq != 0 {
+            let _ = dht
+                .replace_node_addresses_from_gossip(
+                    &node.peer_id,
+                    node.typed_addresses(),
+                    publish_seq,
+                )
+                .await;
+            return;
+        }
         for (addr, ty) in node.typed_addresses() {
             dht.merge_typed_address_upgrade_only(&node.peer_id, &addr, ty)
                 .await;
@@ -4007,11 +4079,11 @@ impl DhtNetworkManager {
     /// collecting them is inexpensive.
     pub async fn routing_table_peers(&self) -> Vec<DHTNode> {
         let dht_guard = self.dht.read().await;
-        let nodes = dht_guard.all_nodes().await;
+        let nodes = dht_guard.all_nodes_with_publish_seq().await;
         drop(dht_guard);
         nodes
             .into_iter()
-            .map(|node| {
+            .map(|(node, publish_seq)| {
                 let reliability = self
                     .trust_engine
                     .as_ref()
@@ -4021,7 +4093,7 @@ impl DhtNetworkManager {
                     peer_id: node.id,
                     address_types: node.address_types,
                     addresses: node.addresses,
-                    distance: None,
+                    distance: encode_publish_seq_distance(publish_seq),
                     reliability,
                 }
             })
@@ -4368,8 +4440,8 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // FIND_NODE aggregator selection rule — closest-XOR-responder wins with
-    // self-report lock-in and tier tie-break.
+    // FIND_NODE aggregator selection rule — self-report and publish-sequence
+    // freshness win before quorum / closest-XOR fallback.
     // -----------------------------------------------------------------------
 
     /// Build a synthetic PeerId with `byte` in position 0 and zeros
@@ -4383,11 +4455,20 @@ mod tests {
 
     /// Minimal synthetic `DHTNode` with a single address at the given tier.
     fn report(subject_byte: u8, addr_str: &str, ty: AddressType) -> DHTNode {
+        report_with_seq(subject_byte, addr_str, ty, 0)
+    }
+
+    fn report_with_seq(
+        subject_byte: u8,
+        addr_str: &str,
+        ty: AddressType,
+        publish_seq: u64,
+    ) -> DHTNode {
         DHTNode {
             peer_id: peer_with_leading(subject_byte),
             addresses: vec![addr_str.parse().unwrap()],
             address_types: vec![ty],
-            distance: None,
+            distance: encode_publish_seq_distance(publish_seq),
             reliability: 1.0,
         }
     }
@@ -4460,6 +4541,36 @@ mod tests {
         assert_eq!(
             winner_node.addresses[0],
             consensus_addr.parse::<MultiAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn winner_newer_publish_seq_beats_closer_stale_report() {
+        // The stale relay report is XOR-closer to the subject, but a newer
+        // PublishAddressSet sequence must win so lookups stop dialing dead
+        // relay allocations after the publisher republishes/rebinds.
+        let subject = peer_with_leading(0xF0);
+        let stale_responder = peer_with_leading(0xF1);
+        let fresh_responder = peer_with_leading(0xFA);
+
+        let stale_relay = "/ip4/198.51.100.7/udp/46973/quic";
+        let fresh_relay = "/ip4/203.0.113.9/udp/60488/quic";
+
+        let mut reports = SubjectReports::new();
+        reports.insert(
+            stale_responder,
+            report_with_seq(0xF0, stale_relay, AddressType::Relay, 10),
+        );
+        reports.insert(
+            fresh_responder,
+            report_with_seq(0xF0, fresh_relay, AddressType::Relay, 20),
+        );
+
+        let (winner_rid, winner_node) = compute_winner(&subject, &reports).unwrap();
+        assert_eq!(winner_rid, fresh_responder);
+        assert_eq!(
+            winner_node.addresses[0],
+            fresh_relay.parse::<MultiAddr>().unwrap()
         );
     }
 

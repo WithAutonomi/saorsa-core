@@ -422,6 +422,23 @@ struct KBucket {
     last_refreshed: Instant,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum AddressReplaceMode {
+    /// The subject peer sent the address set over an authenticated channel.
+    /// This proves liveness, so the peer and bucket recency are refreshed.
+    AuthenticatedSelfPublish,
+    /// A third party repeated a sequence-bearing address set in FIND_NODE
+    /// gossip. The record may be fresh, but it is not evidence that the
+    /// subject peer is alive from our point of view.
+    GossipedRecord,
+}
+
+impl AddressReplaceMode {
+    const fn refreshes_liveness(self) -> bool {
+        matches!(self, Self::AuthenticatedSelfPublish)
+    }
+}
+
 impl KBucket {
     fn new(max_size: usize) -> Self {
         Self {
@@ -662,6 +679,33 @@ impl KBucket {
         node_id: &PeerId,
         typed_addresses: Vec<(MultiAddr, AddressType)>,
     ) -> bool {
+        self.replace_node_addresses_with_mode(
+            node_id,
+            typed_addresses,
+            AddressReplaceMode::AuthenticatedSelfPublish,
+        )
+    }
+
+    /// Overwrite a peer's address list from a sequence-bearing FIND_NODE
+    /// gossip record without updating peer liveness or bucket recency.
+    fn replace_node_addresses_from_gossip(
+        &mut self,
+        node_id: &PeerId,
+        typed_addresses: Vec<(MultiAddr, AddressType)>,
+    ) -> bool {
+        self.replace_node_addresses_with_mode(
+            node_id,
+            typed_addresses,
+            AddressReplaceMode::GossipedRecord,
+        )
+    }
+
+    fn replace_node_addresses_with_mode(
+        &mut self,
+        node_id: &PeerId,
+        typed_addresses: Vec<(MultiAddr, AddressType)>,
+        mode: AddressReplaceMode,
+    ) -> bool {
         let Some(pos) = self.nodes.iter().position(|n| &n.id == node_id) else {
             return false;
         };
@@ -681,13 +725,16 @@ impl KBucket {
             // per family, but a misbehaving sender could try to exceed
             // that. The cap enforces the invariant regardless.
             node.enforce_per_ip_family_cap();
-            node.last_seen.store_now();
         }
 
-        // Move to tail (most recently seen).
-        let node = self.nodes.remove(pos);
-        self.nodes.push(node);
-        self.last_refreshed = Instant::now();
+        if mode.refreshes_liveness() {
+            self.nodes[pos].last_seen.store_now();
+            // Move to tail (most recently seen).
+            let node = self.nodes.remove(pos);
+            self.nodes.push(node);
+            self.last_refreshed = Instant::now();
+        }
+
         true
     }
 }
@@ -733,6 +780,10 @@ impl KademliaRoutingTable {
         self.last_publish_seqs.remove(node_id);
     }
 
+    fn publish_seq_for(&self, node_id: &PeerId) -> u64 {
+        self.last_publish_seqs.get(node_id).copied().unwrap_or(0)
+    }
+
     /// Replace a peer's advertised address list under a monotonic sender
     /// sequence check.
     ///
@@ -752,6 +803,35 @@ impl KademliaRoutingTable {
         typed_addresses: Vec<(MultiAddr, AddressType)>,
         seq: u64,
     ) -> bool {
+        self.replace_node_addresses_with_mode(
+            node_id,
+            typed_addresses,
+            seq,
+            AddressReplaceMode::AuthenticatedSelfPublish,
+        )
+    }
+
+    fn replace_node_addresses_from_gossip(
+        &mut self,
+        node_id: &PeerId,
+        typed_addresses: Vec<(MultiAddr, AddressType)>,
+        seq: u64,
+    ) -> bool {
+        self.replace_node_addresses_with_mode(
+            node_id,
+            typed_addresses,
+            seq,
+            AddressReplaceMode::GossipedRecord,
+        )
+    }
+
+    fn replace_node_addresses_with_mode(
+        &mut self,
+        node_id: &PeerId,
+        typed_addresses: Vec<(MultiAddr, AddressType)>,
+        seq: u64,
+        mode: AddressReplaceMode,
+    ) -> bool {
         if let Some(&stored) = self.last_publish_seqs.get(node_id)
             && seq <= stored
         {
@@ -762,7 +842,13 @@ impl KademliaRoutingTable {
             return false;
         };
 
-        let applied = self.buckets[bucket_index].replace_node_addresses(node_id, typed_addresses);
+        let applied = match mode {
+            AddressReplaceMode::AuthenticatedSelfPublish => {
+                self.buckets[bucket_index].replace_node_addresses(node_id, typed_addresses)
+            }
+            AddressReplaceMode::GossipedRecord => self.buckets[bucket_index]
+                .replace_node_addresses_from_gossip(node_id, typed_addresses),
+        };
         if applied {
             self.last_publish_seqs.insert(*node_id, seq);
         }
@@ -854,6 +940,20 @@ impl KademliaRoutingTable {
             .collect()
     }
 
+    fn find_closest_nodes_with_publish_seq(
+        &self,
+        key: &DhtKey,
+        count: usize,
+    ) -> Vec<(NodeInfo, u64)> {
+        self.find_closest_nodes(key, count)
+            .into_iter()
+            .map(|node| {
+                let seq = self.publish_seq_for(&node.id);
+                (node, seq)
+            })
+            .collect()
+    }
+
     /// Returns the k-bucket index for a key, or `None` when the key equals
     /// the local node ID (XOR distance is zero — no valid bucket exists).
     fn get_bucket_index_for_key(&self, key: &DhtKey) -> Option<usize> {
@@ -891,6 +991,16 @@ impl KademliaRoutingTable {
         self.buckets
             .iter()
             .flat_map(|b| b.get_nodes().iter().cloned())
+            .collect()
+    }
+
+    fn all_nodes_with_publish_seq(&self) -> Vec<(NodeInfo, u64)> {
+        self.all_nodes()
+            .into_iter()
+            .map(|node| {
+                let seq = self.publish_seq_for(&node.id);
+                (node, seq)
+            })
             .collect()
     }
 
@@ -1225,6 +1335,17 @@ impl DhtCoreEngine {
         Ok(routing.find_closest_nodes(key, count))
     }
 
+    /// Find nodes closest to a key and include the latest authoritative
+    /// `PublishAddressSet` sequence known for each returned record.
+    pub async fn find_nodes_with_publish_seq(
+        &self,
+        key: &DhtKey,
+        count: usize,
+    ) -> Result<Vec<(NodeInfo, u64)>> {
+        let routing = self.routing_table.read().await;
+        Ok(routing.find_closest_nodes_with_publish_seq(key, count))
+    }
+
     /// Find nodes closest to a key, including self as a candidate.
     /// Used by consumers for storage responsibility determination.
     #[allow(dead_code)]
@@ -1309,8 +1430,13 @@ impl DhtCoreEngine {
     ///
     /// The routing table holds at most `256 * k_value` entries, so
     /// collecting them is inexpensive.
+    #[allow(dead_code)]
     pub async fn all_nodes(&self) -> Vec<NodeInfo> {
         self.routing_table.read().await.all_nodes()
+    }
+
+    pub async fn all_nodes_with_publish_seq(&self) -> Vec<(NodeInfo, u64)> {
+        self.routing_table.read().await.all_nodes_with_publish_seq()
     }
 
     /// Build diagnostic statistics for the routing table.
@@ -1444,9 +1570,10 @@ impl DhtCoreEngine {
     ///
     /// Implements the receive side of the `PublishAddressSet` wire op: the
     /// sender is authoritative about its own reachable addresses and the
-    /// receiver drops any address the sender omits. This is the only path
-    /// by which a stale relay entry can be removed from a peer's routing
-    /// record when the relay session dies.
+    /// receiver drops any address the sender omits. This authenticated path is
+    /// the source of fresh address records; later FIND_NODE gossip may propagate
+    /// the same replacement through [`Self::replace_node_addresses_from_gossip`]
+    /// without refreshing liveness.
     ///
     /// - Loopback entries are filtered out unless [`Self::allow_loopback`]
     ///   is set (devnets/tests), matching the loopback-injection guard in
@@ -1465,8 +1592,40 @@ impl DhtCoreEngine {
         typed_addresses: Vec<(MultiAddr, AddressType)>,
         seq: u64,
     ) -> bool {
-        if typed_addresses.is_empty() {
+        let Some(filtered) = self.filter_publish_address_set(typed_addresses) else {
             return false;
+        };
+        let mut routing = self.routing_table.write().await;
+        routing.replace_node_addresses(node_id, filtered, seq)
+    }
+
+    /// Replace a peer's advertised address list from sequence-bearing gossip
+    /// without refreshing liveness.
+    ///
+    /// Uses the same filtering and monotonic-sequence guard as
+    /// [`Self::replace_node_addresses`], but does not update `last_seen`,
+    /// bucket MRU order, or bucket refresh timestamps. A third-party
+    /// FIND_NODE response can propagate a newer address record, but only
+    /// direct authenticated traffic from the subject peer proves liveness.
+    pub(crate) async fn replace_node_addresses_from_gossip(
+        &self,
+        node_id: &PeerId,
+        typed_addresses: Vec<(MultiAddr, AddressType)>,
+        seq: u64,
+    ) -> bool {
+        let Some(filtered) = self.filter_publish_address_set(typed_addresses) else {
+            return false;
+        };
+        let mut routing = self.routing_table.write().await;
+        routing.replace_node_addresses_from_gossip(node_id, filtered, seq)
+    }
+
+    fn filter_publish_address_set(
+        &self,
+        typed_addresses: Vec<(MultiAddr, AddressType)>,
+    ) -> Option<Vec<(MultiAddr, AddressType)>> {
+        if typed_addresses.is_empty() {
+            return None;
         }
 
         let allow_loopback = self.allow_loopback;
@@ -1482,12 +1641,7 @@ impl DhtCoreEngine {
             })
             .collect();
 
-        if filtered.is_empty() {
-            return false;
-        }
-
-        let mut routing = self.routing_table.write().await;
-        routing.replace_node_addresses(node_id, filtered, seq)
+        (!filtered.is_empty()).then_some(filtered)
     }
 
     /// Add a node to the DHT with security checks.
@@ -2539,6 +2693,52 @@ mod tests {
             node.addresses,
             vec!["/ip4/3.3.3.3/udp/9000/quic".parse::<MultiAddr>().unwrap()]
         );
+    }
+
+    #[test]
+    fn replace_addresses_from_gossip_does_not_refresh_liveness() {
+        let local_id = PeerId::from_bytes([0u8; 32]);
+        let mut table = KademliaRoutingTable::new(local_id, 8);
+        let peer = PeerId::from_bytes([1u8; 32]);
+        table
+            .add_node(NodeInfo {
+                id: peer,
+                addresses: vec!["/ip4/1.1.1.1/udp/9000/quic".parse().unwrap()],
+                address_types: vec![AddressType::Direct],
+                last_seen: AtomicInstant::now(),
+            })
+            .unwrap();
+
+        let bucket_index = table.get_bucket_index(&peer).unwrap();
+        let before_last_seen = table.buckets[bucket_index]
+            .find_node(&peer)
+            .unwrap()
+            .last_seen
+            .load();
+        let before_last_refreshed = table.buckets[bucket_index].last_refreshed;
+
+        let gossiped: Vec<(MultiAddr, AddressType)> = vec![(
+            "/ip4/2.2.2.2/udp/9000/quic".parse().unwrap(),
+            AddressType::Relay,
+        )];
+        assert!(table.replace_node_addresses_from_gossip(&peer, gossiped, 10));
+
+        let node = table.buckets[bucket_index].find_node(&peer).unwrap();
+        assert_eq!(
+            node.addresses,
+            vec!["/ip4/2.2.2.2/udp/9000/quic".parse::<MultiAddr>().unwrap()]
+        );
+        assert_eq!(node.address_types, vec![AddressType::Relay]);
+        assert_eq!(
+            node.last_seen.load(),
+            before_last_seen,
+            "third-party gossip must not prove subject-peer liveness"
+        );
+        assert_eq!(
+            table.buckets[bucket_index].last_refreshed, before_last_refreshed,
+            "third-party gossip must not count as bucket discovery activity"
+        );
+        assert_eq!(table.publish_seq_for(&peer), 10);
     }
 
     #[test]
