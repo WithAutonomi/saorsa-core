@@ -4224,7 +4224,7 @@ impl DhtNetworkManager {
     /// is authoritative — the receiver replaces any prior record wholesale,
     /// which is how stale relay addresses get dropped when a session closes.
     ///
-    /// `seq` is a per-call Unix-nanosecond timestamp from
+    /// `seq` is a non-zero per-call Unix-nanosecond timestamp from
     /// [`Self::next_publish_seq`], guaranteeing monotonicity across sends
     /// from the same node.
     pub async fn publish_address_set_to_peers(
@@ -4282,12 +4282,15 @@ impl DhtNetworkManager {
     ///
     /// NTP slews of a few seconds are harmless: the worst case is briefly
     /// rejecting a valid republish, which the driver's reactive triggers
-    /// will retry in short order.
+    /// will retry in short order. Always returns a non-zero value because
+    /// receivers reserve `0` as their "no sequence observed" sentinel.
     fn next_publish_seq() -> u64 {
-        SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0)
+        match SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) {
+            Ok(duration) => u64::try_from(duration.as_nanos())
+                .unwrap_or(u64::MAX)
+                .max(1),
+            Err(_) => 1,
+        }
     }
 
     /// Get the local listen address of this node's P2P network

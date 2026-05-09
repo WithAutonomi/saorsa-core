@@ -805,16 +805,18 @@ impl KademliaRoutingTable {
     /// Replace a peer's advertised address list under a monotonic sender
     /// sequence check.
     ///
-    /// Stale republishes (`seq <= stored seq for this peer`) are discarded.
-    /// When `seq` is strictly greater than any previously observed sequence
-    /// from `node_id`, the peer's bucket entry is rewritten via
+    /// Sequence `0` is reserved as the "no sequence observed" sentinel and is
+    /// discarded. Stale republishes (`seq <= stored seq for this peer`) are
+    /// also discarded. When `seq` is strictly greater than any previously
+    /// observed sequence from `node_id`, the peer's bucket entry is rewritten via
     /// [`KBucket::replace_node_addresses`] and the stored sequence is
     /// advanced. The whole check-and-apply runs under the caller's write
     /// lock on the routing table, so concurrent republishes from the same
     /// sender are serialised.
     ///
     /// Returns `true` when addresses were replaced; `false` when the peer
-    /// is absent from the routing table or the message was stale.
+    /// is absent from the routing table or the message had an invalid/stale
+    /// sequence.
     fn replace_node_addresses(
         &mut self,
         node_id: &PeerId,
@@ -850,6 +852,10 @@ impl KademliaRoutingTable {
         seq: u64,
         mode: AddressReplaceMode,
     ) -> bool {
+        if seq == 0 {
+            return false;
+        }
+
         if let Some(&stored) = self.last_publish_seqs.get(node_id)
             && seq <= stored
         {
@@ -1614,8 +1620,9 @@ impl DhtCoreEngine {
     /// - Empty address lists (after filtering) are rejected — the sender
     ///   must have at least one valid address or the receiver would be
     ///   left with an unreachable entry.
-    /// - `seq` must strictly exceed the last sequence observed from
-    ///   `node_id`; older or duplicate sequences are ignored.
+    /// - `seq` must be non-zero and strictly exceed the last sequence
+    ///   observed from `node_id`; zero, older, or duplicate sequences are
+    ///   ignored.
     ///
     /// Returns `true` when the peer's addresses were replaced, `false`
     /// otherwise (peer absent, stale sequence, or empty filtered list).
@@ -2726,6 +2733,35 @@ mod tests {
             node.addresses,
             vec!["/ip4/3.3.3.3/udp/9000/quic".parse::<MultiAddr>().unwrap()]
         );
+    }
+
+    #[test]
+    fn replace_addresses_rejects_zero_publish_seq() {
+        let local_id = PeerId::from_bytes([0u8; 32]);
+        let mut table = KademliaRoutingTable::new(local_id, 8);
+        let peer = PeerId::from_bytes([1u8; 32]);
+        let initial_addr = "/ip4/1.1.1.1/udp/9000/quic".parse::<MultiAddr>().unwrap();
+        table
+            .add_node(NodeInfo {
+                id: peer,
+                addresses: vec![initial_addr.clone()],
+                address_types: vec![AddressType::Unverified],
+                last_seen: AtomicInstant::now(),
+            })
+            .unwrap();
+
+        let zero_publish: Vec<(MultiAddr, AddressType)> = vec![(
+            "/ip4/2.2.2.2/udp/9000/quic".parse().unwrap(),
+            AddressType::Direct,
+        )];
+        assert!(!table.replace_node_addresses(&peer, zero_publish.clone(), 0));
+        assert!(!table.replace_node_addresses_from_gossip(&peer, zero_publish, 0));
+        assert_eq!(table.publish_seq_for(&peer), 0);
+
+        let bucket_index = table.get_bucket_index(&peer).unwrap();
+        let node = table.buckets[bucket_index].find_node(&peer).unwrap();
+        assert_eq!(node.addresses, vec![initial_addr]);
+        assert_eq!(node.address_types, vec![AddressType::Unverified]);
     }
 
     #[test]
