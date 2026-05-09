@@ -784,6 +784,24 @@ impl KademliaRoutingTable {
         self.last_publish_seqs.get(node_id).copied().unwrap_or(0)
     }
 
+    /// Merge a legacy relay hint only while the peer has no authoritative
+    /// `PublishAddressSet` record.
+    ///
+    /// Once a publish sequence has been observed, the stored address list is
+    /// the owner's complete self-record for that sequence. Allowing legacy
+    /// ADD_ADDRESS hints to mutate it would let stale relay allocations
+    /// reappear after a newer direct-only publish removed them.
+    fn touch_legacy_relay_hint_if_unsequenced(
+        &mut self,
+        node_id: &PeerId,
+        address: &MultiAddr,
+    ) -> bool {
+        if self.publish_seq_for(node_id) != 0 {
+            return false;
+        }
+        self.touch_node(node_id, Some(address), AddressType::Relay)
+    }
+
     /// Replace a peer's advertised address list under a monotonic sender
     /// sequence check.
     ///
@@ -1522,6 +1540,21 @@ impl DhtCoreEngine {
         // Slow path: address merge or re-classification needed, take write lock.
         let mut routing = self.routing_table.write().await;
         routing.touch_node(node_id, address, addr_type)
+    }
+
+    /// Merge a peer-advertised relay hint only if the peer has never sent an
+    /// authoritative `PublishAddressSet`.
+    ///
+    /// Legacy ADD_ADDRESS frames remain useful for peers that predate typed
+    /// self-record publishing. After any publish sequence has been stored for
+    /// the peer, only a newer `PublishAddressSet` may change its address list.
+    pub async fn touch_legacy_relay_hint_if_unsequenced(
+        &self,
+        node_id: &PeerId,
+        address: &MultiAddr,
+    ) -> bool {
+        let mut routing = self.routing_table.write().await;
+        routing.touch_legacy_relay_hint_if_unsequenced(node_id, address)
     }
 
     /// Merge `address` (with `addr_type`) into an existing peer's record
@@ -2693,6 +2726,71 @@ mod tests {
             node.addresses,
             vec!["/ip4/3.3.3.3/udp/9000/quic".parse::<MultiAddr>().unwrap()]
         );
+    }
+
+    #[test]
+    fn legacy_relay_hint_updates_unsequenced_record() {
+        let local_id = PeerId::from_bytes([0u8; 32]);
+        let mut table = KademliaRoutingTable::new(local_id, 8);
+        let peer = PeerId::from_bytes([1u8; 32]);
+        table
+            .add_node(NodeInfo {
+                id: peer,
+                addresses: vec!["/ip4/1.1.1.1/udp/9000/quic".parse().unwrap()],
+                address_types: vec![AddressType::Unverified],
+                last_seen: AtomicInstant::now(),
+            })
+            .unwrap();
+
+        let relay = "/ip4/198.51.100.7/udp/46973/quic"
+            .parse::<MultiAddr>()
+            .unwrap();
+        assert!(table.touch_legacy_relay_hint_if_unsequenced(&peer, &relay));
+
+        let bucket_index = table.get_bucket_index(&peer).unwrap();
+        let node = table.buckets[bucket_index].find_node(&peer).unwrap();
+        assert_eq!(node.addresses[0], relay);
+        assert_eq!(node.address_types[0], AddressType::Relay);
+        assert_eq!(table.publish_seq_for(&peer), 0);
+    }
+
+    #[test]
+    fn legacy_relay_hint_does_not_mutate_sequenced_record() {
+        let local_id = PeerId::from_bytes([0u8; 32]);
+        let mut table = KademliaRoutingTable::new(local_id, 8);
+        let peer = PeerId::from_bytes([1u8; 32]);
+        table
+            .add_node(NodeInfo {
+                id: peer,
+                addresses: vec!["/ip4/1.1.1.1/udp/9000/quic".parse().unwrap()],
+                address_types: vec![AddressType::Unverified],
+                last_seen: AtomicInstant::now(),
+            })
+            .unwrap();
+
+        let direct_only: Vec<(MultiAddr, AddressType)> = vec![(
+            "/ip4/203.0.113.9/udp/60488/quic".parse().unwrap(),
+            AddressType::Direct,
+        )];
+        assert!(table.replace_node_addresses(&peer, direct_only.clone(), 20));
+
+        let stale_relay = "/ip4/198.51.100.7/udp/46973/quic"
+            .parse::<MultiAddr>()
+            .unwrap();
+        assert!(!table.touch_legacy_relay_hint_if_unsequenced(&peer, &stale_relay));
+
+        let bucket_index = table.get_bucket_index(&peer).unwrap();
+        let node = table.buckets[bucket_index].find_node(&peer).unwrap();
+        assert_eq!(
+            node.addresses,
+            vec![
+                "/ip4/203.0.113.9/udp/60488/quic"
+                    .parse::<MultiAddr>()
+                    .unwrap()
+            ]
+        );
+        assert_eq!(node.address_types, vec![AddressType::Direct]);
+        assert_eq!(table.publish_seq_for(&peer), 20);
     }
 
     #[test]

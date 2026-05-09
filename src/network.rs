@@ -1304,12 +1304,15 @@ impl P2PNode {
                                     "Updating DHT: peer {} relay address {} (connection was {})",
                                     peer_id, advertised_addr, peer_addr
                                 );
-                                dht.touch_node_typed(
-                                    &peer_id,
-                                    Some(&multi_addr),
-                                    AddressType::Relay,
-                                )
-                                .await;
+                                if !dht
+                                    .touch_legacy_relay_hint_if_unsequenced(&peer_id, &multi_addr)
+                                    .await
+                                {
+                                    debug!(
+                                        "DHT_BRIDGE: ignored legacy relay hint for sequenced peer {} addr {}",
+                                        peer_id, advertised_addr
+                                    );
+                                }
                             }
                         }
                     }

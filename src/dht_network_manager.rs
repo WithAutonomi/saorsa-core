@@ -1109,6 +1109,56 @@ fn compute_winner<'a>(
     Some((*rid, *node))
 }
 
+fn prefer_lookup_record(candidate: &DHTNode, existing: &DHTNode) -> bool {
+    let candidate_seq = dht_node_publish_seq(candidate);
+    let existing_seq = dht_node_publish_seq(existing);
+    candidate_seq > existing_seq
+        || (candidate_seq == existing_seq
+            && best_tier_priority(candidate) < best_tier_priority(existing))
+}
+
+/// Refresh final lookup results with the per-subject winners observed during
+/// the lookup.
+///
+/// `best_nodes` is built from the candidate that was queried at the time it
+/// entered an alpha batch. Later responses in the same lookup may carry a
+/// fresher sequence-bearing self-record for that same peer. Before returning
+/// results to callers, replace every returned peer with the current
+/// [`compute_winner`] output so a stale candidate copy cannot leak out to
+/// clients that discovered the peer purely through this lookup.
+fn apply_lookup_report_winners(
+    best_nodes: Vec<DHTNode>,
+    subject_reports: &HashMap<PeerId, SubjectReports>,
+    key: &Key,
+    count: usize,
+) -> Vec<DHTNode> {
+    let mut by_peer: HashMap<PeerId, DHTNode> = HashMap::new();
+
+    for node in best_nodes {
+        let node = subject_reports
+            .get(&node.peer_id)
+            .and_then(|reports| compute_winner(&node.peer_id, reports))
+            .map(|(_, winner)| winner.clone())
+            .unwrap_or(node);
+
+        match by_peer.entry(node.peer_id) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                if prefer_lookup_record(&node, entry.get()) {
+                    *entry.get_mut() = node;
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(node);
+            }
+        }
+    }
+
+    let mut refreshed: Vec<DHTNode> = by_peer.into_values().collect();
+    refreshed.sort_by(|a, b| DhtNetworkManager::compare_node_distance(a, b, key));
+    refreshed.truncate(count);
+    refreshed
+}
+
 impl DhtNetworkManager {
     fn new_from_components(
         transport: Arc<crate::transport_handle::TransportHandle>,
@@ -2048,9 +2098,7 @@ impl DhtNetworkManager {
             previous_top_k = current_top_k;
         }
 
-        best_nodes.sort_by(|a, b| Self::compare_node_distance(a, b, key));
-        best_nodes.dedup_by_key(|n| n.peer_id);
-        best_nodes.truncate(count);
+        best_nodes = apply_lookup_report_winners(best_nodes, &subject_reports, key, count);
 
         info!(
             "[NETWORK] Found {} closest nodes: {:?}",
@@ -4027,6 +4075,22 @@ impl DhtNetworkManager {
         dht.touch_node_typed(peer_id, address, addr_type).await
     }
 
+    /// Merge a legacy ADD_ADDRESS relay hint only while the peer has no
+    /// authoritative `PublishAddressSet` sequence.
+    ///
+    /// Sequence-bearing self-records are full replacements. Once we have one
+    /// for a peer, legacy relay hints must not mutate that record or they can
+    /// resurrect relay addresses the owner already removed.
+    pub async fn touch_legacy_relay_hint_if_unsequenced(
+        &self,
+        peer_id: &PeerId,
+        address: &MultiAddr,
+    ) -> bool {
+        let dht = self.dht.read().await;
+        dht.touch_legacy_relay_hint_if_unsequenced(peer_id, address)
+            .await
+    }
+
     /// Ingest a peer's typed address set from a FIND_NODE gossip response
     /// into the local routing table.
     ///
@@ -4620,6 +4684,70 @@ mod tests {
             winner_node.addresses[0],
             fresh_relay.parse::<MultiAddr>().unwrap()
         );
+    }
+
+    #[test]
+    fn winner_newer_direct_only_publish_removes_stale_relay() {
+        // A relay-lost republish is represented as a newer full address set
+        // that simply omits the old relay. The stale sequenced relay report
+        // must not survive aggregation.
+        let subject = peer_with_leading(0xF0);
+        let stale_responder = peer_with_leading(0xF1);
+        let fresh_responder = peer_with_leading(0xFA);
+
+        let stale_relay = "/ip4/198.51.100.7/udp/46973/quic";
+        let fresh_direct = "/ip4/203.0.113.9/udp/60488/quic";
+
+        let mut reports = SubjectReports::new();
+        reports.insert(
+            stale_responder,
+            report_with_seq(0xF0, stale_relay, AddressType::Relay, 10),
+        );
+        reports.insert(
+            fresh_responder,
+            report_with_seq(0xF0, fresh_direct, AddressType::Direct, 20),
+        );
+
+        let (winner_rid, winner_node) = compute_winner(&subject, &reports).unwrap();
+        assert_eq!(winner_rid, fresh_responder);
+        assert_eq!(
+            winner_node.addresses,
+            vec![fresh_direct.parse::<MultiAddr>().unwrap()]
+        );
+        assert_eq!(winner_node.address_types, vec![AddressType::Direct]);
+    }
+
+    #[test]
+    fn lookup_result_uses_per_peer_winner_not_stale_candidate_copy() {
+        // The queried candidate entered best_nodes with a stale relay record.
+        // A later response in the same lookup reported a newer direct-only
+        // publish for the same subject. The final result must be refreshed to
+        // the winner before clients receive it.
+        let subject = peer_with_leading(0xF0);
+        let stale_responder = peer_with_leading(0xF1);
+        let fresh_responder = peer_with_leading(0xFA);
+        let key = *subject.to_bytes();
+
+        let stale_relay = "/ip4/198.51.100.7/udp/46973/quic";
+        let fresh_direct = "/ip4/203.0.113.9/udp/60488/quic";
+        let stale_node = report_with_seq(0xF0, stale_relay, AddressType::Relay, 10);
+        let fresh_node = report_with_seq(0xF0, fresh_direct, AddressType::Direct, 20);
+
+        let mut reports = SubjectReports::new();
+        reports.insert(stale_responder, stale_node.clone());
+        reports.insert(fresh_responder, fresh_node);
+
+        let mut all_reports = HashMap::new();
+        all_reports.insert(subject, reports);
+
+        let results = apply_lookup_report_winners(vec![stale_node], &all_reports, &key, 1);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].peer_id, subject);
+        assert_eq!(
+            results[0].addresses,
+            vec![fresh_direct.parse::<MultiAddr>().unwrap()]
+        );
+        assert_eq!(results[0].address_types, vec![AddressType::Direct]);
     }
 
     #[test]
