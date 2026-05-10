@@ -705,6 +705,10 @@ pub enum P2PEvent {
         /// For signed messages this is the authenticated app-level [`PeerId`];
         /// `None` for unsigned messages.
         source: Option<PeerId>,
+        /// IP transport address that delivered this message, when known.
+        ///
+        /// This is provenance metadata, not an identity signal.
+        transport_source: Option<MultiAddr>,
         /// Raw message data payload
         data: Vec<u8>,
     },
@@ -1768,6 +1772,7 @@ pub(crate) struct ParsedMessage {
 
 pub(crate) fn parse_protocol_message(bytes: &[u8], source: &str) -> Option<ParsedMessage> {
     let message: WireMessage = postcard::from_bytes(bytes).ok()?;
+    let transport_source = source.parse::<SocketAddr>().ok().map(MultiAddr::quic);
 
     // Validate timestamp to prevent replay attacks
     let now = std::time::SystemTime::now()
@@ -1832,6 +1837,7 @@ pub(crate) fn parse_protocol_message(bytes: &[u8], source: &str) -> Option<Parse
         event: P2PEvent::Message {
             topic: message.protocol,
             source: authenticated_node_id,
+            transport_source,
             data: message.data,
         },
         authenticated_node_id,
@@ -3327,9 +3333,14 @@ mod tests {
             P2PEvent::Message {
                 topic,
                 source,
+                transport_source,
                 data,
             } => {
                 assert!(source.is_none(), "unsigned message source must be None");
+                assert!(
+                    transport_source.is_none(),
+                    "non-socket transport source should not produce an IP transport address"
+                );
                 assert_eq!(topic, "test/v1");
                 assert_eq!(data, vec![1u8, 2, 3]);
             }
@@ -3360,6 +3371,26 @@ mod tests {
 
         match parsed.event {
             P2PEvent::Message { data, .. } => assert!(data.is_empty()),
+            other => panic!("expected P2PEvent::Message, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_protocol_message_records_ip_transport_source() {
+        let bytes = make_wire_bytes("ping", vec![1], "sender", current_timestamp());
+
+        let parsed =
+            parse_protocol_message(&bytes, "192.168.1.2:4567").expect("valid message should parse");
+
+        match parsed.event {
+            P2PEvent::Message {
+                transport_source, ..
+            } => {
+                assert_eq!(
+                    transport_source,
+                    Some(MultiAddr::quic("192.168.1.2:4567".parse().unwrap()))
+                );
+            }
             other => panic!("expected P2PEvent::Message, got {:?}", other),
         }
     }

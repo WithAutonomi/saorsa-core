@@ -298,7 +298,7 @@ impl SaorsaNode {
 
         loop {
             match events.recv().await {
-                Ok(P2PEvent::Message { source, topic, data }) => {
+                Ok(P2PEvent::Message { source, topic, data, .. }) => {
                     match self.handle_message(&source, &topic, &data).await {
                         Ok(()) => {
                             // Message handled successfully

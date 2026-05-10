@@ -1661,15 +1661,15 @@ impl DhtCoreEngine {
     /// - Loopback entries are filtered out unless [`Self::allow_loopback`]
     ///   is set (devnets/tests), matching the loopback-injection guard in
     ///   [`KBucket::touch_node_typed`].
-    /// - Empty address lists (after filtering) are rejected — the sender
-    ///   must have at least one valid address or the receiver would be
-    ///   left with an unreachable entry.
+    /// - Empty input address lists are rejected. If filtering strips every
+    ///   supplied address, the empty set is still applied so stale addresses
+    ///   from an older publish cannot survive a newer full replacement.
     /// - `seq` must be non-zero and strictly exceed the last sequence
     ///   observed from `node_id`; zero, older, or duplicate sequences are
     ///   ignored.
     ///
     /// Returns `true` when the peer's addresses were replaced, `false`
-    /// otherwise (peer absent, stale sequence, or empty filtered list).
+    /// otherwise (peer absent, stale sequence, or empty input list).
     pub async fn replace_node_addresses(
         &self,
         node_id: &PeerId,
@@ -1729,7 +1729,7 @@ impl DhtCoreEngine {
             })
             .collect();
 
-        (!filtered.is_empty()).then_some(filtered)
+        Some(filtered)
     }
 
     /// Add a node to the DHT with security checks.
@@ -3170,6 +3170,23 @@ mod tests {
             "non-loopback should be accepted: {:?}",
             result
         );
+    }
+
+    #[tokio::test]
+    async fn replace_addresses_applies_empty_set_after_filtering_all_entries() {
+        let mut dht = DhtCoreEngine::new_for_tests(PeerId::from_bytes([0u8; 32])).unwrap();
+        let peer = PeerId::from_bytes([1u8; 32]);
+        dht.add_node_no_trust(make_node(1, "/ip4/198.51.100.1/udp/9000/quic"))
+            .await
+            .unwrap();
+
+        let loopback_only = vec![(
+            "/ip4/127.0.0.1/udp/9001/quic".parse().unwrap(),
+            AddressType::Direct,
+        )];
+
+        assert!(dht.replace_node_addresses(&peer, loopback_only, 1).await);
+        assert!(dht.get_node_addresses(&peer).await.is_empty());
     }
 
     // -----------------------------------------------------------------------

@@ -915,7 +915,7 @@ struct DhtOperationContext {
     contacted_nodes: Vec<PeerId>,
     /// Oneshot sender for delivering the response
     /// None if response already sent (channel consumed)
-    response_tx: Option<oneshot::Sender<(PeerId, DhtNetworkResult)>>,
+    response_tx: Option<oneshot::Sender<DhtResponseEnvelope>>,
 }
 
 impl std::fmt::Debug for DhtOperationContext {
@@ -929,6 +929,12 @@ impl std::fmt::Debug for DhtOperationContext {
             .field("response_tx", &self.response_tx.is_some())
             .finish()
     }
+}
+
+#[derive(Debug)]
+struct DhtResponseEnvelope {
+    result: DhtNetworkResult,
+    transport_source: Option<MultiAddr>,
 }
 
 /// DHT network events
@@ -1654,16 +1660,29 @@ impl DhtNetworkManager {
         let mut to_dial: Vec<(PeerId, Vec<(MultiAddr, AddressType)>)> = Vec::new();
         for peer_id in peers {
             let op = DhtNetworkOperation::FindNode { key };
-            match self.send_dht_request(peer_id, op, None).await {
-                Ok(DhtNetworkResult::NodesFound { nodes, .. }) => {
+            match self
+                .send_dht_request_with_response_context(peer_id, op, None)
+                .await
+            {
+                Ok(DhtResponseEnvelope {
+                    result: DhtNetworkResult::NodesFound { nodes, .. },
+                    transport_source,
+                    ..
+                }) => {
                     for node in &nodes {
-                        let typed = node.typed_addresses();
+                        let trusted_node = self
+                            .gossiped_node_with_trusted_addresses(
+                                node.clone(),
+                                transport_source.as_ref(),
+                            )
+                            .await;
+                        let typed = trusted_node.typed_addresses();
                         let dialable_count =
                             typed.iter().filter(|(a, _)| Self::is_dialable(a)).count();
                         debug!(
                             "DHT bootstrap: peer={} num_addresses={} dialable={}",
-                            node.peer_id.to_hex(),
-                            node.addresses.len(),
+                            trusted_node.peer_id.to_hex(),
+                            trusted_node.addresses.len(),
                             dialable_count
                         );
                         // Ingest the responder's typed view of this peer so
@@ -1672,9 +1691,10 @@ impl DhtNetworkManager {
                         // landing in our own K-closest PublishAddressSet
                         // fan-out. No-op when the peer isn't already in the
                         // routing table; upgrade-only on existing entries.
-                        self.merge_gossiped_typed_addresses(node).await;
-                        if seen.insert(node.peer_id) && dialable_count > 0 {
-                            to_dial.push((node.peer_id, typed));
+                        self.merge_trusted_gossiped_typed_addresses(&trusted_node)
+                            .await;
+                        if seen.insert(trusted_node.peer_id) && dialable_count > 0 {
+                            to_dial.push((trusted_node.peer_id, typed));
                         }
                     }
                 }
@@ -2059,7 +2079,11 @@ impl DhtNetworkManager {
 
             for (peer_id, result) in results {
                 match result {
-                    Ok(DhtNetworkResult::NodesFound { mut nodes, .. }) => {
+                    Ok(DhtResponseEnvelope {
+                        result: DhtNetworkResult::NodesFound { mut nodes, .. },
+                        transport_source,
+                        ..
+                    }) => {
                         peer_states.mark_succeeded(peer_id);
                         // Add successful node to best_nodes
                         if let Some(queried_node) = batch.iter().find(|n| n.peer_id == peer_id) {
@@ -2072,6 +2096,12 @@ impl DhtNetworkManager {
                         nodes.sort_by(|a, b| Self::compare_node_distance(a, b, key));
                         nodes.truncate(self.k_value());
                         for node in nodes {
+                            let node = self
+                                .gossiped_node_with_trusted_addresses(
+                                    node,
+                                    transport_source.as_ref(),
+                                )
+                                .await;
                             if !peer_states.is_contactable(&node.peer_id)
                                 || self.is_local_peer_id(&node.peer_id)
                             {
@@ -2094,7 +2124,7 @@ impl DhtNetworkManager {
                             // never learns which of its neighbours expose
                             // a dialable Direct address and fails relay
                             // acquisition.
-                            self.merge_gossiped_typed_addresses(&node).await;
+                            self.merge_trusted_gossiped_typed_addresses(&node).await;
                             let subject_id = node.peer_id;
                             let dist = subject_id.distance(&target_key);
                             let cand_key = (dist, subject_id);
@@ -2145,7 +2175,10 @@ impl DhtNetworkManager {
                             candidates.insert(cand_key, winner_node);
                         }
                     }
-                    Ok(DhtNetworkResult::PeerRejected) => {
+                    Ok(DhtResponseEnvelope {
+                        result: DhtNetworkResult::PeerRejected,
+                        ..
+                    }) => {
                         peer_states.mark_failed(peer_id);
                         // Remote peer rejected us (e.g. older node with blocking) —
                         // remove them from our routing table (no point retrying) but
@@ -2243,7 +2276,7 @@ impl DhtNetworkManager {
         typed: Vec<(MultiAddr, AddressType)>,
         key: Key,
         failure_rx: broadcast::Receiver<PeerId>,
-    ) -> (PeerId, Result<DhtNetworkResult>) {
+    ) -> (PeerId, Result<DhtResponseEnvelope>) {
         let request = async {
             // Pass the same typed candidate list to both ensure_peer_channel
             // and send_dht_request so the request path doesn't pay a redundant
@@ -2255,7 +2288,7 @@ impl DhtNetworkManager {
             // the peer-dial coordinator, so concurrent iterative lookups that
             // happen to batch the same peer join this dial rather than racing it.
             self.ensure_peer_channel(&peer_id, &typed).await?;
-            self.send_dht_request(
+            self.send_dht_request_with_response_context(
                 &peer_id,
                 DhtNetworkOperation::FindNode { key },
                 Some(&typed),
@@ -2329,9 +2362,11 @@ impl DhtNetworkManager {
     /// queries up to `ITERATION_GRACE_TIMEOUT_SECS` to finish before giving
     /// up on them and returning whatever has arrived. Any still-pending
     /// futures are dropped (and cancelled) when the stream is returned.
-    async fn collect_iteration_results<S>(mut stream: S) -> Vec<(PeerId, Result<DhtNetworkResult>)>
+    async fn collect_iteration_results<S>(
+        mut stream: S,
+    ) -> Vec<(PeerId, Result<DhtResponseEnvelope>)>
     where
-        S: futures::Stream<Item = (PeerId, Result<DhtNetworkResult>)> + Unpin,
+        S: futures::Stream<Item = (PeerId, Result<DhtResponseEnvelope>)> + Unpin,
     {
         let mut results = Vec::new();
 
@@ -2618,6 +2653,45 @@ impl DhtNetworkManager {
         let external = self.transport.non_relay_external_addresses();
         let listen = self.transport.listen_addrs().await;
         DialAddressContext::from_parts(external, listen, self.config.node_config.allow_loopback)
+    }
+
+    async fn filter_lan_addresses_for_store(
+        &self,
+        typed_addresses: Vec<(MultiAddr, AddressType)>,
+        transport_source: Option<&MultiAddr>,
+    ) -> Vec<(MultiAddr, AddressType)> {
+        let context = self.local_dial_address_context().await;
+        Self::filter_lan_addresses_for_store_with_context(
+            typed_addresses,
+            transport_source,
+            &context,
+        )
+    }
+
+    fn filter_lan_addresses_for_store_with_context(
+        typed_addresses: Vec<(MultiAddr, AddressType)>,
+        transport_source: Option<&MultiAddr>,
+        context: &DialAddressContext,
+    ) -> Vec<(MultiAddr, AddressType)> {
+        let canonical: Vec<_> = typed_addresses
+            .into_iter()
+            .map(|(addr, ty)| {
+                let ty = AddressType::for_advertised_address(&addr, ty);
+                (addr, ty)
+            })
+            .collect();
+
+        let arrived_over_lan = transport_source
+            .and_then(MultiAddr::ip)
+            .is_some_and(is_lan_ip);
+        if arrived_over_lan || context.peer_shares_wan(&canonical) {
+            return canonical;
+        }
+
+        canonical
+            .into_iter()
+            .filter(|(_, ty)| *ty != AddressType::Lan)
+            .collect()
     }
 
     async fn contextual_dial_plan(
@@ -2933,6 +3007,18 @@ impl DhtNetworkManager {
         operation: DhtNetworkOperation,
         candidates: Option<&[(MultiAddr, AddressType)]>,
     ) -> Result<DhtNetworkResult> {
+        Ok(self
+            .send_dht_request_with_response_context(peer_id, operation, candidates)
+            .await?
+            .result)
+    }
+
+    async fn send_dht_request_with_response_context(
+        &self,
+        peer_id: &PeerId,
+        operation: DhtNetworkOperation,
+        candidates: Option<&[(MultiAddr, AddressType)]>,
+    ) -> Result<DhtResponseEnvelope> {
         // Sweep stale entries left by dropped futures before adding a new one
         self.sweep_expired_operations();
 
@@ -3055,7 +3141,7 @@ impl DhtNetworkManager {
                         "[STEP 6] {} <- {}: Got response: {:?}",
                         self.config.peer_id.to_hex(),
                         peer_id.to_hex(),
-                        std::mem::discriminant(r)
+                        std::mem::discriminant(&r.result)
                     ),
                     Err(e) => warn!(
                         "[STEP 6 FAILED] {} <- {}: Response error: {}",
@@ -3366,14 +3452,14 @@ impl DhtNetworkManager {
     async fn wait_for_response(
         &self,
         _message_id: &str,
-        response_rx: oneshot::Receiver<(PeerId, DhtNetworkResult)>,
+        response_rx: oneshot::Receiver<DhtResponseEnvelope>,
         _peer_id: &PeerId,
-    ) -> Result<DhtNetworkResult> {
+    ) -> Result<DhtResponseEnvelope> {
         let response_timeout = self.config.request_timeout;
 
         // Wait for response with timeout - no polling, no TOCTOU race
         match tokio::time::timeout(response_timeout, response_rx).await {
-            Ok(Ok((_source, result))) => Ok(result),
+            Ok(Ok(response)) => Ok(response),
             Ok(Err(_recv_error)) => {
                 // Channel closed without response (sender dropped).
                 Err(P2PError::Network(NetworkError::ProtocolError(
@@ -3389,6 +3475,7 @@ impl DhtNetworkManager {
         &self,
         data: &[u8],
         sender: &PeerId,
+        transport_source: Option<&MultiAddr>,
     ) -> Result<Option<Vec<u8>>> {
         // SEC: Reject oversized messages before deserialization to prevent memory exhaustion
         if data.len() > MAX_MESSAGE_SIZE {
@@ -3428,7 +3515,9 @@ impl DhtNetworkManager {
                     message.payload,
                     sender
                 );
-                let result = self.handle_dht_request(&message, sender).await?;
+                let result = self
+                    .handle_dht_request(&message, sender, transport_source)
+                    .await?;
                 debug!(
                     "[STEP 4] {}: Sending response {:?} back to {} (msg_id: {})",
                     self.config.peer_id.to_hex(),
@@ -3448,7 +3537,8 @@ impl DhtNetworkManager {
                     sender,
                     message.message_id
                 );
-                self.handle_dht_response(&message, sender).await?;
+                self.handle_dht_response(&message, sender, transport_source)
+                    .await?;
                 Ok(None)
             }
             DhtMessageType::Broadcast => {
@@ -3471,6 +3561,7 @@ impl DhtNetworkManager {
         &self,
         message: &DhtNetworkMessage,
         authenticated_sender: &PeerId,
+        transport_source: Option<&MultiAddr>,
     ) -> Result<DhtNetworkResult> {
         match &message.payload {
             DhtNetworkOperation::FindNode { key } => {
@@ -3508,8 +3599,21 @@ impl DhtNetworkManager {
                     seq,
                     addresses.len()
                 );
+                let filtered_addresses = self
+                    .filter_lan_addresses_for_store(addresses.clone(), transport_source)
+                    .await;
+                let stripped = addresses.len().saturating_sub(filtered_addresses.len());
+                if stripped > 0 {
+                    debug!(
+                        peer = %authenticated_sender.to_hex(),
+                        seq,
+                        stripped,
+                        kept = filtered_addresses.len(),
+                        "stripped untrusted LAN address(es) from published address set",
+                    );
+                }
                 let dht = self.dht.read().await;
-                dht.replace_node_addresses(authenticated_sender, addresses.clone(), *seq)
+                dht.replace_node_addresses(authenticated_sender, filtered_addresses, *seq)
                     .await;
                 Ok(DhtNetworkResult::PublishAddressAck)
             }
@@ -3540,6 +3644,7 @@ impl DhtNetworkManager {
         &self,
         message: &DhtNetworkMessage,
         sender: &PeerId,
+        transport_source: Option<&MultiAddr>,
     ) -> Result<()> {
         let message_id = &message.message_id;
         debug!("Handling DHT response for message_id: {message_id}");
@@ -3596,9 +3701,11 @@ impl DhtNetworkManager {
                     self.config.peer_id.to_hex(),
                     message_id
                 );
-                // Send the transport-authenticated sender identity, not the
-                // self-reported message.source which could be spoofed.
-                if tx.send((sender_app_id, result)).is_err() {
+                let response = DhtResponseEnvelope {
+                    result,
+                    transport_source: transport_source.cloned(),
+                };
+                if tx.send(response).is_err() {
                     warn!(
                         "[STEP 5a FAILED] {}: Response channel closed for msg_id {} (receiver timed out)",
                         self.config.peer_id.to_hex(),
@@ -3965,6 +4072,7 @@ impl DhtNetworkManager {
                                 crate::network::P2PEvent::Message {
                                     topic,
                                     source,
+                                    transport_source,
                                     data,
                                 } => {
                                     trace!(
@@ -3997,7 +4105,11 @@ impl DhtNetworkManager {
                                             // This ensures permits are released even if a handler gets stuck
                                             match tokio::time::timeout(
                                                 REQUEST_TIMEOUT,
-                                                manager_clone.handle_dht_message(&data, &source_peer),
+                                                manager_clone.handle_dht_message(
+                                                    &data,
+                                                    &source_peer,
+                                                    transport_source.as_ref(),
+                                                ),
                                             )
                                             .await
                                             {
@@ -4372,19 +4484,46 @@ impl DhtNetworkManager {
     /// nodes whose identity exchange always times out) as long as some
     /// authenticated neighbour keeps mentioning them.
     pub async fn merge_gossiped_typed_addresses(&self, node: &DHTNode) {
+        self.merge_gossiped_typed_addresses_from_transport(node, None)
+            .await;
+    }
+
+    async fn merge_gossiped_typed_addresses_from_transport(
+        &self,
+        node: &DHTNode,
+        transport_source: Option<&MultiAddr>,
+    ) {
+        let node = self
+            .gossiped_node_with_trusted_addresses(node.clone(), transport_source)
+            .await;
+        self.merge_trusted_gossiped_typed_addresses(&node).await;
+    }
+
+    async fn gossiped_node_with_trusted_addresses(
+        &self,
+        mut node: DHTNode,
+        transport_source: Option<&MultiAddr>,
+    ) -> DHTNode {
+        let typed_addresses = self
+            .filter_lan_addresses_for_store(node.typed_addresses(), transport_source)
+            .await;
+        let (addresses, address_types): (Vec<_>, Vec<_>) = typed_addresses.into_iter().unzip();
+        node.addresses = addresses;
+        node.address_types = address_types;
+        node
+    }
+
+    async fn merge_trusted_gossiped_typed_addresses(&self, node: &DHTNode) {
+        let typed_addresses = node.typed_addresses();
         let dht = self.dht.read().await;
         let publish_seq = dht_node_publish_seq(node);
         if publish_seq != 0 {
             let _ = dht
-                .replace_node_addresses_from_gossip(
-                    &node.peer_id,
-                    node.typed_addresses(),
-                    publish_seq,
-                )
+                .replace_node_addresses_from_gossip(&node.peer_id, typed_addresses, publish_seq)
                 .await;
             return;
         }
-        for (addr, ty) in node.typed_addresses() {
+        for (addr, ty) in typed_addresses {
             dht.merge_typed_address_upgrade_only(&node.peer_id, &addr, ty)
                 .await;
         }
@@ -4775,6 +4914,125 @@ mod tests {
         let typed = node.typed_addresses();
         assert_eq!(typed.len(), 1);
         assert_eq!(typed[0].1, AddressType::Lan);
+    }
+
+    fn typed_addresses(entries: Vec<(&str, AddressType)>) -> Vec<(MultiAddr, AddressType)> {
+        entries
+            .into_iter()
+            .map(|(s, t)| (s.parse().unwrap(), t))
+            .collect()
+    }
+
+    #[test]
+    fn store_filter_strips_lan_without_lan_source_or_same_wan() {
+        let context = DialAddressContext::from_parts(
+            ["203.0.113.9:9000".parse::<SocketAddr>().unwrap()],
+            Vec::<MultiAddr>::new(),
+            false,
+        );
+        let addrs = typed_addresses(vec![
+            ("/ip4/192.168.10.179/udp/10449/quic", AddressType::Lan),
+            ("/ip4/198.51.100.8/udp/10449/quic", AddressType::Direct),
+        ]);
+
+        let filtered =
+            DhtNetworkManager::filter_lan_addresses_for_store_with_context(addrs, None, &context);
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].1, AddressType::Direct);
+        assert_eq!(
+            filtered[0].0,
+            "/ip4/198.51.100.8/udp/10449/quic"
+                .parse::<MultiAddr>()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn store_filter_canonicalizes_untrusted_private_direct_to_stripped_lan() {
+        let context = DialAddressContext::from_parts(
+            ["203.0.113.9:9000".parse::<SocketAddr>().unwrap()],
+            Vec::<MultiAddr>::new(),
+            false,
+        );
+        let addrs = typed_addresses(vec![(
+            "/ip4/192.168.10.179/udp/10449/quic",
+            AddressType::Direct,
+        )]);
+
+        let filtered =
+            DhtNetworkManager::filter_lan_addresses_for_store_with_context(addrs, None, &context);
+
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn store_filter_keeps_lan_when_advertisement_arrived_over_lan() {
+        let context = DialAddressContext::from_parts(
+            Vec::<SocketAddr>::new(),
+            Vec::<MultiAddr>::new(),
+            false,
+        );
+        let source = "/ip4/192.168.1.2/udp/9000/quic"
+            .parse::<MultiAddr>()
+            .unwrap();
+        let addrs = typed_addresses(vec![(
+            "/ip4/192.168.10.179/udp/10449/quic",
+            AddressType::Direct,
+        )]);
+
+        let filtered = DhtNetworkManager::filter_lan_addresses_for_store_with_context(
+            addrs,
+            Some(&source),
+            &context,
+        );
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].1, AddressType::Lan);
+    }
+
+    #[test]
+    fn store_filter_keeps_lan_when_subject_shares_our_wan() {
+        let context = DialAddressContext::from_parts(
+            ["203.0.113.9:9000".parse::<SocketAddr>().unwrap()],
+            Vec::<MultiAddr>::new(),
+            false,
+        );
+        let addrs = typed_addresses(vec![
+            ("/ip4/192.168.10.179/udp/10449/quic", AddressType::Lan),
+            ("/ip4/203.0.113.9/udp/10449/quic", AddressType::Unverified),
+        ]);
+
+        let filtered =
+            DhtNetworkManager::filter_lan_addresses_for_store_with_context(addrs, None, &context);
+
+        assert_eq!(filtered.len(), 2);
+        assert!(filtered.iter().any(|(_, ty)| *ty == AddressType::Lan));
+        assert!(
+            filtered
+                .iter()
+                .any(|(addr, ty)| *ty == AddressType::Unverified
+                    && addr.ip() == Some("203.0.113.9".parse().unwrap()))
+        );
+    }
+
+    #[test]
+    fn store_filter_does_not_use_relay_as_same_wan_lan_proof() {
+        let context = DialAddressContext::from_parts(
+            ["203.0.113.9:9000".parse::<SocketAddr>().unwrap()],
+            Vec::<MultiAddr>::new(),
+            false,
+        );
+        let addrs = typed_addresses(vec![
+            ("/ip4/192.168.10.179/udp/10449/quic", AddressType::Lan),
+            ("/ip4/203.0.113.9/udp/10449/quic", AddressType::Relay),
+        ]);
+
+        let filtered =
+            DhtNetworkManager::filter_lan_addresses_for_store_with_context(addrs, None, &context);
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].1, AddressType::Relay);
     }
 
     #[test]

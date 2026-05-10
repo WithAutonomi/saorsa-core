@@ -2041,6 +2041,7 @@ impl TransportHandle {
         self.send_event(P2PEvent::Message {
             topic: topic.to_string(),
             source: Some(*self.node_identity.peer_id()),
+            transport_source: None,
             data: data.to_vec(),
         });
 
