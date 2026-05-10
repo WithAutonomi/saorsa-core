@@ -5195,6 +5195,19 @@ mod tests {
     }
 
     #[test]
+    fn first_direct_dialable_canonicalizes_mapped_local_scope_direct_to_lan() {
+        let node = dht_node(
+            1,
+            vec![(
+                "/ip6/::ffff:192.168.1.10/udp/9000/quic",
+                AddressType::Direct,
+            )],
+        );
+
+        assert_eq!(DhtNetworkManager::first_direct_dialable(&node), None);
+    }
+
+    #[test]
     fn first_direct_dialable_for_relay_skips_same_wan_candidate() {
         let node = dht_node(
             1,
@@ -5479,6 +5492,30 @@ mod tests {
 
         let local_only = typed(vec![(
             "/ip4/192.168.1.10/udp/9003/quic",
+            AddressType::Unverified,
+        )]);
+        let picks = DhtNetworkManager::select_dial_candidates(&local_only);
+        assert_eq!(picks.len(), 1);
+        assert_eq!(picks[0].1, AddressType::Lan);
+    }
+
+    #[test]
+    fn select_dial_candidates_canonicalizes_mapped_local_scope_to_lan() {
+        let addrs = typed(vec![
+            ("/ip4/198.51.100.1/udp/9000/quic", AddressType::Relay),
+            ("/ip6/::ffff:127.0.0.1/udp/9001/quic", AddressType::Direct),
+            (
+                "/ip6/::ffff:100.64.0.1/udp/9002/quic",
+                AddressType::Unverified,
+            ),
+        ]);
+
+        let picks = DhtNetworkManager::select_dial_candidates(&addrs);
+        assert_eq!(picks.len(), 1);
+        assert_eq!(picks[0].1, AddressType::Relay);
+
+        let local_only = typed(vec![(
+            "/ip6/::ffff:100.64.0.1/udp/9002/quic",
             AddressType::Unverified,
         )]);
         let picks = DhtNetworkManager::select_dial_candidates(&local_only);

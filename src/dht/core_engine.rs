@@ -4573,6 +4573,37 @@ mod tests {
     }
 
     #[test]
+    fn mapped_local_scope_address_type_is_canonicalized_to_lan() {
+        let cases = [
+            (
+                "/ip6/::ffff:192.168.1.10/udp/9000/quic",
+                AddressType::Direct,
+            ),
+            (
+                "/ip6/::ffff:127.0.0.1/udp/9001/quic",
+                AddressType::Unverified,
+            ),
+            ("/ip6/::ffff:100.64.0.1/udp/9002/quic", AddressType::Relay),
+        ];
+
+        for (idx, (addr, advertised)) in cases.into_iter().enumerate() {
+            let mut node = NodeInfo {
+                id: PeerId::from_bytes([idx as u8; 32]),
+                addresses: Vec::new(),
+                address_types: Vec::new(),
+                last_seen: AtomicInstant::now(),
+            };
+            let addr: MultiAddr = addr.parse().unwrap();
+
+            node.merge_typed_address(addr.clone(), advertised);
+
+            assert_eq!(node.addresses, vec![addr], "case {idx}");
+            assert_eq!(node.address_types, vec![AddressType::Lan], "case {idx}");
+            assert_eq!(node.address_type_at(0), AddressType::Lan, "case {idx}");
+        }
+    }
+
+    #[test]
     fn merge_same_family_keeps_relay_best_wan_and_lan() {
         // Under the per-IP-family cap: at most 1 Relay + 1 WAN
         // non-Relay (Direct/Unverified) + 1 Lan per family. Direct is the
