@@ -3336,8 +3336,7 @@ impl DhtNetworkManager {
         wan.sort_by_key(|(index, _, _)| *index);
 
         let has_wan_or_relay = relay.is_some() || !wan.is_empty();
-        let lan_is_reachable = lan.iter().any(|(_, score, _, _)| *score <= 1);
-        let prefer_lan = !lan.is_empty() && (lan_is_reachable || context.peer_shares_wan(typed));
+        let prefer_lan = !lan.is_empty() && context.peer_shares_wan(typed);
 
         if prefer_lan {
             out.extend(lan.iter().map(|(_, _, addr, ty)| (addr.clone(), *ty)));
@@ -5580,7 +5579,7 @@ mod tests {
     }
 
     #[test]
-    fn select_dial_candidates_prefers_lan_for_same_lan_prefix() {
+    fn select_dial_candidates_does_not_prefer_lan_for_private_prefix_only() {
         let addrs = typed(vec![
             ("/ip4/198.51.100.1/udp/9000/quic", AddressType::Relay),
             ("/ip4/192.168.1.30/udp/9001/quic", AddressType::Lan),
@@ -5592,9 +5591,8 @@ mod tests {
         );
 
         let picks = DhtNetworkManager::select_dial_candidates_with_context(&addrs, &context);
-        assert_eq!(picks.len(), 2);
-        assert_eq!(picks[0].1, AddressType::Lan);
-        assert_eq!(picks[1].1, AddressType::Relay);
+        assert_eq!(picks.len(), 1);
+        assert_eq!(picks[0].1, AddressType::Relay);
     }
 
     #[test]
