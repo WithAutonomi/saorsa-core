@@ -246,6 +246,7 @@ async fn private_node_receives_messages_through_masque_relay() {
                     topic,
                     source,
                     data,
+                    ..
                 }) if topic == "test/relay-msg" => {
                     return (source, data);
                 }
@@ -293,6 +294,7 @@ async fn private_node_receives_messages_through_masque_relay() {
                     topic,
                     source,
                     data,
+                    ..
                 }) if topic == "test/relay-sustained" => {
                     return (source, data);
                 }

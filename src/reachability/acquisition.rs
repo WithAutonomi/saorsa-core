@@ -22,9 +22,10 @@
 //!
 //! 1. The caller supplies a pre-filtered list of [`RelayCandidate`]s sorted
 //!    by XOR distance (closest first). Filtering — selecting peers whose
-//!    own DHT record contains at least one `Direct` address — is the
-//!    caller's responsibility, not the coordinator's. See
-//!    [`DhtNetworkManager::first_direct_dialable`](crate::dht_network_manager::DhtNetworkManager::first_direct_dialable)
+//!    own DHT record contains at least one `Direct` address that is not on
+//!    the local node's WAN IP — is the caller's responsibility, not the
+//!    coordinator's. See
+//!    [`DhtNetworkManager::first_direct_dialable_for_relay`](crate::dht_network_manager::DhtNetworkManager::first_direct_dialable_for_relay)
 //!    for the canonical filter.
 //! 2. [`RelayAcquisition::acquire`] tries each candidate in order. On
 //!    `AtCapacity` or `Unreachable` it walks to the next candidate. On the

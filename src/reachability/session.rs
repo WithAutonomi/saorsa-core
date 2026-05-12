@@ -14,11 +14,13 @@
 //! Unconditional MASQUE relay acquisition.
 //!
 //! Every non-client node tries to acquire a MASQUE relay from an XOR-closest
-//! peer after bootstrap. There is no dial-back probe and no public/private
-//! classification: the "is this candidate public?" question is answered
-//! ambiently by the dial attempt itself. A candidate whose Direct address is
-//! unreachable will simply fail to accept the CONNECT-UDP request, and the
-//! walker moves to the next-closest peer.
+//! peer after bootstrap. Candidates on the same WAN as this node are filtered
+//! out because they do not provide a distinct public route. There is no
+//! dial-back probe and no broader public/private classification: the "is this
+//! candidate public?" question is answered ambiently by the dial attempt
+//! itself. A candidate whose Direct address is unreachable will simply fail to
+//! accept the CONNECT-UDP request, and the walker moves to the next-closest
+//! peer.
 //!
 //! The acquisition walk is a thin wrapper around the reusable
 //! [`RelayAcquisition`] coordinator: build a filtered candidate list from
@@ -71,10 +73,10 @@ pub(crate) enum RelayAcquisitionOutcome {
 
 /// Run a single unconditional relay-acquisition attempt.
 ///
-/// Walks the XOR-closest peers in the local routing table, filters to
-/// those advertising at least one `Direct` address, and tries each in
-/// order via the [`RelayAcquisition`] coordinator until one accepts a
-/// MASQUE CONNECT-UDP reservation.
+/// Walks the XOR-closest peers in the local routing table, filters to those
+/// advertising at least one `Direct` address that is not on this node's own
+/// WAN IP, and tries each in order via the [`RelayAcquisition`] coordinator
+/// until one accepts a MASQUE CONNECT-UDP reservation.
 ///
 /// The "is this candidate public?" check is implicit: a private candidate's
 /// Direct address is unreachable from outside its NAT, so the QUIC dial
@@ -94,6 +96,7 @@ pub(crate) async fn run_relay_acquisition(
 
     let own_key = *dht.peer_id().to_bytes();
     let closest = dht.find_closest_nodes_local(&own_key, dht.k_value()).await;
+    let local_address_context = dht.local_dial_address_context().await;
 
     debug!(
         closest_count = closest.len(),
@@ -103,7 +106,8 @@ pub(crate) async fn run_relay_acquisition(
     let mut candidates: Vec<RelayCandidate> = Vec::new();
     for node in &closest {
         let typed = node.typed_addresses();
-        let direct = DhtNetworkManager::first_direct_dialable(node);
+        let direct =
+            DhtNetworkManager::first_direct_dialable_for_relay(node, &local_address_context);
         debug!(
             peer = %node.peer_id.to_hex(),
             typed_addresses = ?typed,

@@ -157,8 +157,9 @@ const HAPPY_EYEBALLS_V4_STAGGER: Duration = Duration::from_millis(50);
 /// Per-attempt direct connect timeout used by the Happy Eyeballs race.
 ///
 /// Keep this short because DHT lookups expect to encounter unreachable
-/// candidates on live networks and should move on quickly.
-const DIRECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
+/// candidates on live networks and should move on quickly, but leave enough
+/// room for one QUIC initial-flight retransmission on slower relay paths.
+const DIRECT_CONNECT_TIMEOUT: Duration = Duration::from_millis(1250);
 
 /// Per-attempt direct handshake timeout after connection progress is observed.
 const DIRECT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(4);
@@ -578,8 +579,8 @@ impl P2PNetworkNode<P2pLinkTransport> {
     /// Send data to a peer using P2pEndpoint's send method
     ///
     /// This method is specialized for P2pLinkTransport and uses the underlying
-    /// P2pEndpoint's send() method which corresponds with recv() for proper
-    /// bidirectional communication.
+    /// P2pEndpoint's send() method, which waits for QUIC to confirm peer
+    /// receipt of the full stream.
     ///
     /// On failure the underlying transport error is preserved via
     /// `anyhow::Context` so callers can inspect the cause (e.g. QUIC

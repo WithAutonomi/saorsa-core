@@ -42,6 +42,35 @@ pub use saorsa_transport::transport::TransportAddr;
 
 use crate::identity::peer_id::PeerId;
 
+/// Return true for IP addresses that should only be advertised for local
+/// reachability.
+#[must_use]
+pub(crate) fn is_lan_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => is_lan_ipv4(ip),
+        IpAddr::V6(ip) => {
+            if let Some(ip) = ip.to_ipv4_mapped() {
+                return is_lan_ipv4(ip);
+            }
+            is_lan_ipv6(ip)
+        }
+    }
+}
+
+fn is_lan_ipv4(ip: Ipv4Addr) -> bool {
+    ip.is_loopback()
+        || ip.is_private()
+        || ip.is_link_local()
+        || (ip.octets()[0] == 100 && (ip.octets()[1] & 0b1100_0000) == 64)
+}
+
+fn is_lan_ipv6(ip: Ipv6Addr) -> bool {
+    let octets = ip.octets();
+    ip.is_loopback()
+        || (octets[0] & 0xfe) == 0xfc
+        || (octets[0] == 0xfe && (octets[1] & 0xc0) == 0x80)
+}
+
 /// Composable, self-describing network address with an optional [`PeerId`]
 /// suffix.
 ///
@@ -179,17 +208,10 @@ impl MultiAddr {
         self.ip().is_some_and(|ip| ip.is_loopback())
     }
 
-    /// `true` if this is an IP-based private/link-local address, `false`
+    /// `true` if this is an IP-based local-scope address, `false`
     /// otherwise.
     pub fn is_private(&self) -> bool {
-        match self.ip() {
-            Some(IpAddr::V4(ip)) => ip.is_private(),
-            Some(IpAddr::V6(ip)) => {
-                let octets = ip.octets();
-                (octets[0] & 0xfe) == 0xfc
-            }
-            None => false,
-        }
+        self.ip().is_some_and(is_lan_ip)
     }
 }
 
@@ -318,6 +340,28 @@ mod tests {
 
         let public_addr = MultiAddr::from_ipv4(Ipv4Addr::new(8, 8, 8, 8), 53);
         assert!(!public_addr.is_private());
+    }
+
+    #[test]
+    fn test_ipv4_mapped_lan_address_detection() {
+        let mapped_private: IpAddr = "::ffff:192.168.1.10".parse().unwrap();
+        let mapped_loopback: IpAddr = "::ffff:127.0.0.1".parse().unwrap();
+        let mapped_link_local: IpAddr = "::ffff:169.254.1.10".parse().unwrap();
+        let mapped_cgnat: IpAddr = "::ffff:100.64.0.1".parse().unwrap();
+        let mapped_public: IpAddr = "::ffff:8.8.8.8".parse().unwrap();
+
+        assert!(is_lan_ip(mapped_private));
+        assert!(is_lan_ip(mapped_loopback));
+        assert!(is_lan_ip(mapped_link_local));
+        assert!(is_lan_ip(mapped_cgnat));
+        assert!(!is_lan_ip(mapped_public));
+    }
+
+    #[test]
+    fn test_ipv4_mapped_private_multiaddr_detection() {
+        let addr: MultiAddr = "/ip6/::ffff:192.168.1.10/udp/9000/quic".parse().unwrap();
+
+        assert!(addr.is_private());
     }
 
     #[test]

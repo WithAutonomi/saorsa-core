@@ -113,7 +113,7 @@ fn address_kind_label(kind: Option<AddressType>) -> &'static str {
         Some(AddressType::Relay) => "Relay",
         Some(AddressType::Direct) => "Direct",
         Some(AddressType::Unverified) => "Unverified",
-        Some(AddressType::NATted) => "NATted",
+        Some(AddressType::Lan) => "Lan",
         None => "unknown",
     }
 }
@@ -145,6 +145,7 @@ fn classify_transport_send_stage(stage: saorsa_transport::SendFailureStage) -> S
         }
         saorsa_transport::SendFailureStage::Write => SendFailureKind::StreamWrite,
         saorsa_transport::SendFailureStage::Finish => SendFailureKind::StreamFinish,
+        saorsa_transport::SendFailureStage::DeliveryAck => SendFailureKind::StreamFinish,
     }
 }
 
@@ -1159,6 +1160,93 @@ impl TransportHandle {
             }
         }
     }
+
+    fn upsert_connected_channel_static(
+        active_connections: &DashSet<String>,
+        peers: &DashMap<String, PeerInfo>,
+        channel_id: &str,
+        remote_address: SocketAddr,
+        source: &'static str,
+        refresh_connected_at: bool,
+    ) {
+        let normalized_addr = saorsa_transport::shared::normalize_socket_addr(remote_address);
+        let address = MultiAddr::quic(normalized_addr);
+        let now = Instant::now();
+
+        active_connections.insert(channel_id.to_string());
+
+        match peers.entry(channel_id.to_string()) {
+            DashEntry::Occupied(mut entry) => {
+                let peer_info = entry.get_mut();
+                peer_info.status = ConnectionStatus::Connected;
+                if refresh_connected_at {
+                    peer_info.connected_at = now;
+                }
+                if !peer_info.addresses.contains(&address) {
+                    peer_info.addresses.push(address);
+                }
+            }
+            DashEntry::Vacant(entry) => {
+                debug!("{source}: registering connected channel {channel_id}");
+                entry.insert(PeerInfo {
+                    channel_id: channel_id.to_string(),
+                    addresses: vec![address],
+                    status: ConnectionStatus::Connected,
+                    last_seen: now,
+                    connected_at: now,
+                    protocols: Vec::new(),
+                    heartbeat_count: 0,
+                });
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn register_authenticated_peer_channel_static(
+        active_connections: &DashSet<String>,
+        peers: &DashMap<String, PeerInfo>,
+        peer_to_channel: &DashMap<PeerId, HashSet<String>>,
+        channel_to_peers: &DashMap<String, HashSet<PeerId>>,
+        peer_user_agents: &DashMap<PeerId, String>,
+        event_tx: &broadcast::Sender<P2PEvent>,
+        channel_id: &str,
+        remote_address: SocketAddr,
+        app_id: PeerId,
+        peer_user_agent: &str,
+    ) {
+        Self::upsert_connected_channel_static(
+            active_connections,
+            peers,
+            channel_id,
+            remote_address,
+            "authenticated peer registration",
+            false,
+        );
+
+        let mut is_new_peer = false;
+        let inserted = match peer_to_channel.entry(app_id) {
+            DashEntry::Occupied(mut entry) => entry.get_mut().insert(channel_id.to_string()),
+            DashEntry::Vacant(entry) => {
+                is_new_peer = true;
+                let mut set = HashSet::new();
+                set.insert(channel_id.to_string());
+                entry.insert(set);
+                true
+            }
+        };
+        if inserted {
+            channel_to_peers
+                .entry(channel_id.to_string())
+                .or_default()
+                .insert(app_id);
+        }
+
+        if is_new_peer {
+            let peer_user_agent = peer_user_agent.to_string();
+            peer_user_agents.insert(app_id, peer_user_agent.clone());
+            broadcast_event(event_tx, P2PEvent::PeerConnected(app_id, peer_user_agent));
+        }
+    }
 }
 
 // ============================================================================
@@ -1193,7 +1281,7 @@ impl TransportHandle {
     /// return [`NetworkError::InvalidAddress`].
     ///
     /// Callers that already know how the address was classified (Direct,
-    /// Relay, Unverified, NATted) should prefer
+    /// Relay, Unverified, Lan) should prefer
     /// [`Self::connect_peer_typed`] so the success/failure logs include
     /// the address kind. This entry point is preserved for callers
     /// (tests, public API consumers) that don't have type metadata.
@@ -1206,7 +1294,7 @@ impl TransportHandle {
     /// Same as [`Self::connect_peer`] but additionally records the
     /// [`AddressType`] tag in the success/failure logs so an operator
     /// can tell, after the fact, whether a failed dial was against a
-    /// `Direct`, `Relay`, `Unverified`, or `NATted` address.
+    /// `Direct`, `Relay`, `Unverified`, or `Lan` address.
     pub async fn connect_peer_typed(
         &self,
         address: &MultiAddr,
@@ -1628,17 +1716,17 @@ impl TransportHandle {
                 format!("Invalid channel ID address: {e}").into(),
             ))
         })?;
-        let result = self
+        let send_result = self
             .dual_node
             .send_to_peer_optimized(&addr, &message_data)
-            .await
-            .map_err(|e| {
-                let kind = classify_send_error(&e);
-                P2PError::Transport(TransportError::SendFailed {
-                    kind,
-                    reason: e.to_string().into(),
-                })
-            });
+            .await;
+        let result = send_result.map_err(|e| {
+            let kind = classify_send_error(&e);
+            P2PError::Transport(TransportError::SendFailed {
+                kind,
+                reason: e.to_string().into(),
+            })
+        });
 
         if result.is_ok() {
             debug!(
@@ -2040,6 +2128,7 @@ impl TransportHandle {
         self.send_event(P2PEvent::Message {
             topic: topic.to_string(),
             source: Some(*self.node_identity.peer_id()),
+            transport_source: None,
             data: data.to_vec(),
         });
 
@@ -2177,6 +2266,8 @@ impl TransportHandle {
 
             let event_tx = self.event_tx.clone();
             let active_requests = Arc::clone(&self.active_requests);
+            let active_connections = Arc::clone(&self.active_connections);
+            let peers = Arc::clone(&self.peers);
             let peer_to_channel = Arc::clone(&self.peer_to_channel);
             let channel_to_peers = Arc::clone(&self.channel_to_peers);
             let peer_user_agents = Arc::clone(&self.peer_user_agents);
@@ -2189,6 +2280,8 @@ impl TransportHandle {
                     shard_rx,
                     event_tx,
                     active_requests,
+                    active_connections,
+                    peers,
                     peer_to_channel,
                     channel_to_peers,
                     peer_user_agents,
@@ -2273,6 +2366,8 @@ impl TransportHandle {
         mut shard_rx: tokio::sync::mpsc::Receiver<(SocketAddr, Vec<u8>)>,
         event_tx: broadcast::Sender<P2PEvent>,
         active_requests: Arc<DashMap<String, PendingRequest>>,
+        active_connections: Arc<DashSet<String>>,
+        peers: Arc<DashMap<String, PeerInfo>>,
         peer_to_channel: Arc<DashMap<PeerId, HashSet<String>>>,
         channel_to_peers: Arc<DashMap<String, HashSet<PeerId>>>,
         peer_user_agents: Arc<DashMap<PeerId, String>>,
@@ -2321,39 +2416,21 @@ impl TransportHandle {
                                 .await;
                         }
 
-                        // Atomically determine whether this is the peer's
-                        // first channel. Using `entry` per-shard avoids the
-                        // contains_key/insert TOCTOU that could otherwise
-                        // double-fire `PeerConnected` when two channels for
-                        // the same peer arrive concurrently on different
-                        // dispatch shards.
-                        let mut is_new_peer = false;
-                        let inserted = match peer_to_channel.entry(*app_id) {
-                            DashEntry::Occupied(mut entry) => {
-                                entry.get_mut().insert(channel_id.clone())
-                            }
-                            DashEntry::Vacant(entry) => {
-                                is_new_peer = true;
-                                let mut set = HashSet::new();
-                                set.insert(channel_id.clone());
-                                entry.insert(set);
-                                true
-                            }
-                        };
-                        if inserted {
-                            channel_to_peers
-                                .entry(channel_id.clone())
-                                .or_default()
-                                .insert(*app_id);
-                        }
-
-                        if is_new_peer {
-                            peer_user_agents.insert(*app_id, peer_user_agent.clone());
-                            broadcast_event(
-                                &event_tx,
-                                P2PEvent::PeerConnected(*app_id, peer_user_agent.clone()),
-                            );
-                        }
+                        // This helper owns the app-level PeerConnected invariant:
+                        // `peer_info(app_id)` must be queryable before the event
+                        // is broadcast to DHT or other subscribers.
+                        Self::register_authenticated_peer_channel_static(
+                            &active_connections,
+                            &peers,
+                            &peer_to_channel,
+                            &channel_to_peers,
+                            &peer_user_agents,
+                            &event_tx,
+                            &channel_id,
+                            from_addr,
+                            *app_id,
+                            &peer_user_agent,
+                        );
                     }
 
                     // Identity announces are internal plumbing — don't
@@ -2570,26 +2647,14 @@ impl TransportHandle {
                                     channel_id, remote_address
                                 );
 
-                                active_connections.insert(channel_id.clone());
-
-                                peers
-                                    .entry(channel_id.clone())
-                                    .and_modify(|peer_info| {
-                                        peer_info.status = ConnectionStatus::Connected;
-                                        peer_info.connected_at = Instant::now();
-                                    })
-                                    .or_insert_with(|| {
-                                        debug!("Registering new incoming channel: {}", channel_id);
-                                        PeerInfo {
-                                            channel_id: channel_id.clone(),
-                                            addresses: vec![MultiAddr::quic(remote_address)],
-                                            status: ConnectionStatus::Connected,
-                                            last_seen: Instant::now(),
-                                            connected_at: Instant::now(),
-                                            protocols: Vec::new(),
-                                            heartbeat_count: 0,
-                                        }
-                                    });
+                                Self::upsert_connected_channel_static(
+                                    &active_connections,
+                                    &peers,
+                                    &channel_id,
+                                    remote_address,
+                                    "connection lifecycle",
+                                    true,
+                                );
 
                                 // Send identity announce so the remote peer can authenticate us.
                                 //
@@ -2772,6 +2837,61 @@ mod address_event_observer_tests {
             Some(second)
         );
         assert_eq!(TransportHandle::drain_latest_socket_event(&rx), None);
+    }
+}
+
+#[cfg(test)]
+mod authenticated_peer_registration_tests {
+    use super::*;
+
+    #[test]
+    fn authenticated_registration_makes_peer_info_queryable_before_event_consumers_run() {
+        let active_connections = DashSet::new();
+        let peers = DashMap::new();
+        let peer_to_channel = DashMap::new();
+        let channel_to_peers = DashMap::new();
+        let peer_user_agents = DashMap::new();
+        let (event_tx, mut event_rx) = broadcast::channel(4);
+
+        let app_id = PeerId::from_bytes([0x31; 32]);
+        let remote_addr: SocketAddr = "64.227.163.41:43782".parse().expect("test addr");
+        let channel_id = canonical_channel_id(remote_addr);
+
+        TransportHandle::register_authenticated_peer_channel_static(
+            &active_connections,
+            &peers,
+            &peer_to_channel,
+            &channel_to_peers,
+            &peer_user_agents,
+            &event_tx,
+            &channel_id,
+            remote_addr,
+            app_id,
+            "node/test",
+        );
+
+        assert!(active_connections.contains(&channel_id));
+
+        let mapped_channel = peer_to_channel
+            .get(&app_id)
+            .and_then(|channels| channels.value().iter().next().cloned())
+            .expect("app peer should be mapped to a channel");
+        let peer_info = peers
+            .get(&mapped_channel)
+            .map(|entry| entry.value().clone())
+            .expect("mapped channel should have peer info before event consumers run");
+
+        assert_eq!(peer_info.channel_id, channel_id);
+        assert_eq!(peer_info.status, ConnectionStatus::Connected);
+        assert_eq!(peer_info.addresses, vec![MultiAddr::quic(remote_addr)]);
+
+        match event_rx.try_recv().expect("peer connected event") {
+            P2PEvent::PeerConnected(peer_id, user_agent) => {
+                assert_eq!(peer_id, app_id);
+                assert_eq!(user_agent, "node/test");
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
     }
 }
 
