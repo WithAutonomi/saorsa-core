@@ -163,6 +163,33 @@ impl AddressType {
     }
 }
 
+/// Whether `addr` is worth storing in a peer's address record.
+///
+/// Filters out wildcard binds (`0.0.0.0` / `::`) and port `0` for any
+/// IP-based transport (QUIC, TCP, UDP). Such addresses are never dialable:
+/// they identify a *bind* socket on the publisher's side, not a routable
+/// destination. Older saorsa-core builds (pre-self-address filter)
+/// sometimes published their bind addresses verbatim, so receivers kept
+/// warning on every dial attempt against the stored wildcard. Dropping
+/// them at the store boundary stops the noise without changing dial logic
+/// downstream — `is_dialable` (the consumer-side check at
+/// [`DhtNetworkManager::is_dialable`]) keeps its existing rejection so an
+/// untrusted address that slips through any future store path is still
+/// caught at dial time.
+///
+/// Non-IP transports return `true` (filter does not apply) — the address
+/// type itself encodes whatever reachability semantics are appropriate.
+///
+/// Loopback is intentionally NOT filtered here: local devnets legitimately
+/// store loopback addresses, and the per-node `allow_loopback` config lives
+/// at [`DhtCoreEngine::replace_node_addresses`].
+pub(crate) fn is_storable_address(addr: &MultiAddr) -> bool {
+    let Some(sa) = addr.socket_addr() else {
+        return true;
+    };
+    !sa.ip().is_unspecified() && sa.port() != 0
+}
+
 /// Convenience alias for the internal callers that predate the method form.
 const fn type_priority(t: AddressType) -> u8 {
     t.priority()
@@ -238,6 +265,9 @@ impl NodeInfo {
     /// the "at most 1 Relay + 1 WAN non-Relay + 1 LAN per IP family"
     /// invariant holds.
     pub fn merge_typed_address(&mut self, addr: MultiAddr, addr_type: AddressType) {
+        if !is_storable_address(&addr) {
+            return;
+        }
         let addr_type = AddressType::for_advertised_address(&addr, addr_type);
 
         // Ensure address_types is in sync with addresses (legacy compat).
@@ -430,6 +460,9 @@ impl NodeInfo {
         addr: MultiAddr,
         addr_type: AddressType,
     ) -> bool {
+        if !is_storable_address(&addr) {
+            return false;
+        }
         let addr_type = AddressType::for_advertised_address(&addr, addr_type);
         if let Some(pos) = self.addresses.iter().position(|a| a == &addr) {
             let existing = self.address_type_at(pos);
@@ -478,6 +511,37 @@ impl KBucket {
     }
 
     fn add_node(&mut self, mut node: NodeInfo) -> Result<()> {
+        // Drop wildcard / port-zero addresses up front — they are never
+        // dialable destinations (they identify a *bind* socket on the
+        // publisher's side) and storing them just produces dial-time noise
+        // every time the peer is selected as a candidate.
+        let pre_filter_len = node.addresses.len();
+        let mut kept_types = Vec::with_capacity(pre_filter_len);
+        let mut kept_addrs = Vec::with_capacity(pre_filter_len);
+        for (i, addr) in node.addresses.drain(..).enumerate() {
+            if is_storable_address(&addr) {
+                let ty = node
+                    .address_types
+                    .get(i)
+                    .copied()
+                    .unwrap_or(AddressType::Unverified);
+                kept_addrs.push(addr);
+                kept_types.push(ty);
+            }
+        }
+        let stripped = pre_filter_len - kept_addrs.len();
+        let kept_count = kept_addrs.len();
+        node.addresses = kept_addrs;
+        node.address_types = kept_types;
+        if stripped > 0 {
+            tracing::debug!(
+                node_id = %node.id.to_hex(),
+                stripped,
+                kept = kept_count,
+                "stripped non-dialable address(es) from incoming NodeInfo",
+            );
+        }
+
         // Reject nodes with no addresses — a node without reachable
         // addresses is useless in the routing table and would waste a slot.
         if node.addresses.is_empty() {
@@ -753,13 +817,27 @@ impl KBucket {
             return false;
         };
 
+        let input_was_non_empty = !typed_addresses.is_empty();
         let mut typed: Vec<(MultiAddr, AddressType)> = typed_addresses
             .into_iter()
+            .filter(|(addr, _)| is_storable_address(addr))
             .map(|(addr, ty)| {
                 let ty = AddressType::for_advertised_address(&addr, ty);
                 (addr, ty)
             })
             .collect();
+
+        // If filtering emptied a non-empty input (publisher sent only
+        // wildcards or other non-storable addresses), refuse the replace
+        // entirely. The caller (KademliaRoutingTable::replace_node_addresses_with_mode)
+        // gates `last_publish_seqs` on this return value, so refusing here
+        // preserves the peer's prior good addresses AND leaves the door
+        // open for a subsequent CORRECT publish at the same sequence number
+        // to land. Without this guard we would (a) wipe a working address
+        // list and (b) lock the peer out of future republishes ≤ this seq.
+        if typed.is_empty() && input_was_non_empty {
+            return false;
+        }
         typed.sort_by_key(|(_, t)| type_priority(*t));
         typed.truncate(MAX_ADDRESSES_PER_NODE);
 
@@ -4934,5 +5012,205 @@ mod tests {
         assert!(!changed);
         assert_eq!(node.addresses.len(), 1);
         assert_eq!(node.address_type_at(0), AddressType::Direct);
+    }
+
+    // -----------------------------------------------------------------------
+    // Wildcard-address store-side filter tests (silences ~66k WARN/3.7h
+    // observed on prod where peers running older saorsa-core publish their
+    // bind-side `0.0.0.0` / `::` addresses verbatim).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn is_storable_address_rejects_wildcard_v4() {
+        let addr: MultiAddr = "/ip4/0.0.0.0/udp/9000/quic".parse().unwrap();
+        assert!(!is_storable_address(&addr));
+    }
+
+    #[test]
+    fn is_storable_address_rejects_wildcard_v6() {
+        let addr: MultiAddr = "/ip6/::/udp/9000/quic".parse().unwrap();
+        assert!(!is_storable_address(&addr));
+    }
+
+    #[test]
+    fn is_storable_address_rejects_port_zero() {
+        let addr: MultiAddr = "/ip4/192.0.2.1/udp/0/quic".parse().unwrap();
+        assert!(!is_storable_address(&addr));
+    }
+
+    #[test]
+    fn is_storable_address_accepts_routable() {
+        let addr: MultiAddr = "/ip4/203.0.113.10/udp/9000/quic".parse().unwrap();
+        assert!(is_storable_address(&addr));
+    }
+
+    #[test]
+    fn is_storable_address_accepts_loopback_for_devnet() {
+        // Loopback is intentionally accepted — local devnets need it. The
+        // per-node `allow_loopback` config gates routing-table admission
+        // separately.
+        let v4: MultiAddr = "/ip4/127.0.0.1/udp/9000/quic".parse().unwrap();
+        let v6: MultiAddr = "/ip6/::1/udp/9000/quic".parse().unwrap();
+        assert!(is_storable_address(&v4));
+        assert!(is_storable_address(&v6));
+    }
+
+    #[test]
+    fn merge_typed_address_drops_wildcard_silently() {
+        let mut node = NodeInfo {
+            id: PeerId::from_bytes([1u8; 32]),
+            addresses: vec![],
+            address_types: vec![],
+            last_seen: AtomicInstant::now(),
+        };
+        let wildcard: MultiAddr = "/ip6/::/udp/55928/quic".parse().unwrap();
+        node.merge_typed_address(wildcard, AddressType::Direct);
+        assert!(node.addresses.is_empty());
+        assert!(node.address_types.is_empty());
+    }
+
+    #[test]
+    fn merge_typed_address_upgrade_only_returns_false_on_wildcard() {
+        let mut node = NodeInfo {
+            id: PeerId::from_bytes([1u8; 32]),
+            addresses: vec![],
+            address_types: vec![],
+            last_seen: AtomicInstant::now(),
+        };
+        let wildcard: MultiAddr = "/ip4/0.0.0.0/udp/10000/quic".parse().unwrap();
+        let changed = node.merge_typed_address_upgrade_only(wildcard, AddressType::Direct);
+        assert!(!changed);
+        assert!(node.addresses.is_empty());
+    }
+
+    #[test]
+    fn replace_node_addresses_strips_wildcards_keeps_routable() {
+        let k = 8;
+        let mut bucket = KBucket::new(k);
+        bucket
+            .add_node(make_node(1, "/ip4/203.0.113.1/udp/9000/quic"))
+            .unwrap();
+
+        // Publish a mixed set: one routable + one wildcard.
+        let routable: MultiAddr = "/ip4/198.51.100.5/udp/10000/quic".parse().unwrap();
+        let wildcard: MultiAddr = "/ip4/0.0.0.0/udp/10000/quic".parse().unwrap();
+        let typed = vec![
+            (routable.clone(), AddressType::Direct),
+            (wildcard, AddressType::Direct),
+        ];
+        let applied = bucket.replace_node_addresses(&PeerId::from_bytes([1u8; 32]), typed);
+        assert!(applied);
+
+        let node = bucket.get_nodes().last().unwrap();
+        assert_eq!(node.addresses, vec![routable]);
+        assert_eq!(node.address_types, vec![AddressType::Direct]);
+    }
+
+    #[test]
+    fn add_node_strips_wildcards_from_incoming_record() {
+        let k = 8;
+        let mut bucket = KBucket::new(k);
+        let routable: MultiAddr = "/ip4/198.51.100.5/udp/10000/quic".parse().unwrap();
+        let wildcard: MultiAddr = "/ip6/::/udp/10000/quic".parse().unwrap();
+        let node = NodeInfo {
+            id: PeerId::from_bytes([42u8; 32]),
+            addresses: vec![wildcard, routable.clone()],
+            address_types: vec![AddressType::Direct, AddressType::Direct],
+            last_seen: AtomicInstant::now(),
+        };
+        bucket.add_node(node).unwrap();
+        let stored = bucket.get_nodes().last().unwrap();
+        assert_eq!(stored.addresses, vec![routable]);
+        assert_eq!(stored.address_types, vec![AddressType::Direct]);
+    }
+
+    #[test]
+    fn add_node_rejects_record_with_only_wildcard_addresses() {
+        let k = 8;
+        let mut bucket = KBucket::new(k);
+        let wildcard: MultiAddr = "/ip4/0.0.0.0/udp/10000/quic".parse().unwrap();
+        let node = NodeInfo {
+            id: PeerId::from_bytes([42u8; 32]),
+            addresses: vec![wildcard],
+            address_types: vec![AddressType::Direct],
+            last_seen: AtomicInstant::now(),
+        };
+        // After filtering, addresses is empty — add_node rejects the slot.
+        let result = bucket.add_node(node);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn is_storable_address_rejects_tcp_wildcard() {
+        // The dialable_socket_addr() helper only matches QUIC; the filter
+        // must use socket_addr() to also catch TCP / raw UDP wildcards.
+        let tcp_wildcard: MultiAddr = "/ip4/0.0.0.0/tcp/9000".parse().unwrap();
+        assert!(!is_storable_address(&tcp_wildcard));
+    }
+
+    #[test]
+    fn is_storable_address_rejects_udp_wildcard_v6() {
+        let udp_wildcard: MultiAddr = "/ip6/::/udp/9000".parse().unwrap();
+        assert!(!is_storable_address(&udp_wildcard));
+    }
+
+    #[test]
+    fn replace_node_addresses_preserves_state_when_filter_empties_input() {
+        // If a publisher sends a non-empty set that gets entirely filtered
+        // out (e.g. only wildcards), the bucket must NOT wipe the peer's
+        // existing good addresses. The caller relies on `false` to skip
+        // advancing the per-peer publish sequence.
+        let k = 8;
+        let mut bucket = KBucket::new(k);
+        let original: MultiAddr = "/ip4/203.0.113.42/udp/9000/quic".parse().unwrap();
+        bucket
+            .add_node(NodeInfo {
+                id: PeerId::from_bytes([7u8; 32]),
+                addresses: vec![original.clone()],
+                address_types: vec![AddressType::Direct],
+                last_seen: AtomicInstant::now(),
+            })
+            .unwrap();
+
+        let wildcard: MultiAddr = "/ip6/::/udp/55928/quic".parse().unwrap();
+        let typed = vec![(wildcard, AddressType::Direct)];
+        let applied = bucket.replace_node_addresses(&PeerId::from_bytes([7u8; 32]), typed);
+
+        assert!(!applied, "filter-empty publish must not be applied");
+        let node = bucket.get_nodes().last().unwrap();
+        assert_eq!(
+            node.addresses,
+            vec![original],
+            "original addresses must be preserved"
+        );
+    }
+
+    #[test]
+    fn replace_node_addresses_strips_wildcards_with_relay_and_direct() {
+        // Mixed-tier publish: Relay + Direct + wildcard. Filter drops the
+        // wildcard, type-priority sort keeps Relay first, Direct second.
+        let k = 8;
+        let mut bucket = KBucket::new(k);
+        bucket
+            .add_node(make_node(1, "/ip4/203.0.113.1/udp/9000/quic"))
+            .unwrap();
+
+        let relay: MultiAddr = "/ip4/198.51.100.1/udp/8443/quic".parse().unwrap();
+        let direct: MultiAddr = "/ip4/198.51.100.5/udp/10000/quic".parse().unwrap();
+        let wildcard: MultiAddr = "/ip4/0.0.0.0/udp/10000/quic".parse().unwrap();
+        let typed = vec![
+            (direct.clone(), AddressType::Direct),
+            (wildcard, AddressType::Direct),
+            (relay.clone(), AddressType::Relay),
+        ];
+        let applied = bucket.replace_node_addresses(&PeerId::from_bytes([1u8; 32]), typed);
+        assert!(applied);
+
+        let node = bucket.get_nodes().last().unwrap();
+        assert_eq!(node.addresses, vec![relay, direct]);
+        assert_eq!(
+            node.address_types,
+            vec![AddressType::Relay, AddressType::Direct]
+        );
     }
 }
