@@ -446,9 +446,21 @@ impl NodeInfo {
 struct KBucket {
     nodes: Vec<NodeInfo>,
     max_size: usize,
-    /// Monotonic timestamp of the last time this bucket was refreshed
-    /// (node added, updated, or touched).
-    last_refreshed: Instant,
+    /// Monotonic timestamp of the last time this bucket was refreshed by
+    /// live-peer evidence (node added, updated, or touched).
+    last_refreshed_by_live_peer: Instant,
+    /// Monotonic timestamp of the last completed refresh probe for this
+    /// bucket. This is deliberately separate from live-peer refresh so failed
+    /// or empty probes can be deprioritised without masking stale buckets.
+    last_probe_finished: Instant,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BucketRefreshCandidate {
+    pub(crate) index: usize,
+    pub(crate) refresh_debt: Duration,
+    pub(crate) live_peer_age: Duration,
+    pub(crate) probe_age: Duration,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -470,10 +482,12 @@ impl AddressReplaceMode {
 
 impl KBucket {
     fn new(max_size: usize) -> Self {
+        let now = Instant::now();
         Self {
             nodes: Vec::new(),
             max_size,
-            last_refreshed: Instant::now(),
+            last_refreshed_by_live_peer: now,
+            last_probe_finished: now,
         }
     }
 
@@ -517,7 +531,7 @@ impl KBucket {
                 existing.merge_typed_address(addr, addr_type);
             }
             self.nodes.push(existing);
-            self.last_refreshed = Instant::now();
+            self.last_refreshed_by_live_peer = Instant::now();
             return Ok(());
         }
 
@@ -528,7 +542,7 @@ impl KBucket {
             // connection handler batching advertised addresses.
             node.enforce_per_ip_family_cap();
             self.nodes.push(node);
-            self.last_refreshed = Instant::now();
+            self.last_refreshed_by_live_peer = Instant::now();
             Ok(())
         } else {
             Err(anyhow!(
@@ -572,7 +586,7 @@ impl KBucket {
             }
             let node = self.nodes.remove(pos);
             self.nodes.push(node);
-            self.last_refreshed = Instant::now();
+            self.last_refreshed_by_live_peer = Instant::now();
             true
         } else {
             false
@@ -583,9 +597,9 @@ impl KBucket {
     /// upgrade-only semantics: never demote a higher-priority tag already
     /// on the same address.
     ///
-    /// **Pure address-set update.** Does NOT bump the peer's `last_seen`,
-    /// does NOT reorder the bucket (no MRU promotion), and does NOT bump
-    /// the bucket's `last_refreshed` timestamp. Intended for FIND_NODE
+    /// **Pure address-set update.** Does NOT bump the peer's `last_seen`, does
+    /// NOT reorder the bucket (no MRU promotion), and does NOT bump the
+    /// bucket's `last_refreshed_by_live_peer` timestamp. Intended for FIND_NODE
     /// gossip ingestion, where a responder's typed view of a *third*
     /// peer is trusted enough to widen our known address set or promote
     /// `Unverified` → `Direct`/`Relay`, but is **not** evidence of:
@@ -594,13 +608,14 @@ impl KBucket {
     ///   gossip would let peers we cannot authenticate with ourselves
     ///   stay perpetually "fresh", indefinitely deferring the
     ///   [`DhtCoreEngine::stale_k_closest`] eviction worker), or
-    /// * bucket-level discovery activity (covered by `last_refreshed` —
-    ///   the bucket-refresh task uses it to decide when to run a
+    /// * bucket-level discovery activity (covered by
+    ///   `last_refreshed_by_live_peer` — the bucket-refresh task uses it to
+    ///   decide when to run a
     ///   FIND_NODE for a random key in this bucket's range, which is how
     ///   we discover *new* peers. Gossip about peers we already know is
-    ///   not discovery; bumping `last_refreshed` from gossip would mask
-    ///   genuinely-stale buckets and silently suppress discovery as long
-    ///   as some neighbour kept gossiping about a peer in that range).
+    ///   not discovery; bumping `last_refreshed_by_live_peer` from gossip would
+    ///   mask genuinely-stale buckets and silently suppress discovery as long as
+    ///   some neighbour kept gossiping about a peer in that range).
     ///
     /// Returns `true` when the merge changed the peer's address record
     /// (a new address was appended, or an existing tag was promoted to a
@@ -782,7 +797,7 @@ impl KBucket {
             // Move to tail (most recently seen).
             let node = self.nodes.remove(pos);
             self.nodes.push(node);
-            self.last_refreshed = Instant::now();
+            self.last_refreshed_by_live_peer = Instant::now();
         }
 
         true
@@ -1092,14 +1107,38 @@ impl KademliaRoutingTable {
             .collect()
     }
 
-    /// Return indices of buckets whose `last_refreshed` exceeds `threshold`.
-    fn stale_bucket_indices(&self, threshold: Duration) -> Vec<usize> {
+    /// Return refresh candidates for buckets whose live-peer refresh exceeds
+    /// `threshold`.
+    fn stale_bucket_refresh_candidates(&self, threshold: Duration) -> Vec<BucketRefreshCandidate> {
+        let now = Instant::now();
         self.buckets
             .iter()
             .enumerate()
-            .filter(|(_, b)| b.last_refreshed.elapsed() > threshold)
-            .map(|(i, _)| i)
+            .filter_map(|(index, bucket)| {
+                let live_peer_age =
+                    now.saturating_duration_since(bucket.last_refreshed_by_live_peer);
+                if live_peer_age <= threshold {
+                    return None;
+                }
+                let probe_age = now.saturating_duration_since(bucket.last_probe_finished);
+                let overdue = live_peer_age.saturating_sub(threshold);
+                let refresh_debt = overdue.min(probe_age);
+                Some(BucketRefreshCandidate {
+                    index,
+                    refresh_debt,
+                    live_peer_age,
+                    probe_age,
+                })
+            })
             .collect()
+    }
+
+    fn mark_bucket_probe_finished(&mut self, bucket_idx: usize) -> bool {
+        let Some(bucket) = self.buckets.get_mut(bucket_idx) else {
+            return false;
+        };
+        bucket.last_probe_finished = Instant::now();
+        true
     }
 }
 
@@ -1321,12 +1360,25 @@ impl DhtCoreEngine {
             .collect()
     }
 
-    /// Return bucket indices that haven't been refreshed within the given threshold.
-    pub(crate) async fn stale_bucket_indices(&self, threshold: Duration) -> Vec<usize> {
+    /// Return bucket refresh candidates that have not seen live-peer refresh
+    /// within the given threshold.
+    pub(crate) async fn stale_bucket_refresh_candidates(
+        &self,
+        threshold: Duration,
+    ) -> Vec<BucketRefreshCandidate> {
         self.routing_table
             .read()
             .await
-            .stale_bucket_indices(threshold)
+            .stale_bucket_refresh_candidates(threshold)
+    }
+
+    /// Mark a bucket refresh probe as completed without changing live-peer
+    /// freshness.
+    pub(crate) async fn mark_bucket_probe_finished(&self, bucket_idx: usize) -> bool {
+        self.routing_table
+            .write()
+            .await
+            .mark_bucket_probe_finished(bucket_idx)
     }
 
     /// Generate a random key that would fall into the specified bucket index
@@ -2137,7 +2189,7 @@ impl DhtCoreEngine {
             // Move to tail (most recently seen)
             let updated = routing.buckets[bucket_idx].nodes.remove(pos);
             routing.buckets[bucket_idx].nodes.push(updated);
-            routing.buckets[bucket_idx].last_refreshed = Instant::now();
+            routing.buckets[bucket_idx].last_refreshed_by_live_peer = Instant::now();
             return Ok(AdmissionResult::Admitted(Vec::new()));
         }
 
@@ -2648,14 +2700,14 @@ mod tests {
     }
 
     #[test]
-    fn gossip_merge_does_not_bump_last_refreshed() {
+    fn gossip_merge_does_not_bump_live_peer_refresh() {
         let k = 8;
         let mut bucket = KBucket::new(k);
         bucket
             .add_node(make_node(1, "/ip4/1.1.1.1/udp/9000/quic"))
             .unwrap();
 
-        let before = bucket.last_refreshed;
+        let before = bucket.last_refreshed_by_live_peer;
 
         let gossiped: MultiAddr = "/ip4/8.8.8.8/udp/9000/quic".parse().unwrap();
         let changed = bucket.merge_typed_address_upgrade_only(
@@ -2665,8 +2717,8 @@ mod tests {
         );
         assert!(changed);
         assert_eq!(
-            bucket.last_refreshed, before,
-            "gossip ingestion is not bucket-level discovery — last_refreshed must not advance"
+            bucket.last_refreshed_by_live_peer, before,
+            "gossip ingestion is not bucket-level discovery — live-peer refresh must not advance"
         );
     }
 
@@ -2916,7 +2968,7 @@ mod tests {
             .unwrap()
             .last_seen
             .load();
-        let before_last_refreshed = table.buckets[bucket_index].last_refreshed;
+        let before_last_refreshed = table.buckets[bucket_index].last_refreshed_by_live_peer;
 
         let gossiped: Vec<(MultiAddr, AddressType)> = vec![(
             "/ip4/2.2.2.2/udp/9000/quic".parse().unwrap(),
@@ -2936,7 +2988,7 @@ mod tests {
             "third-party gossip must not prove subject-peer liveness"
         );
         assert_eq!(
-            table.buckets[bucket_index].last_refreshed, before_last_refreshed,
+            table.buckets[bucket_index].last_refreshed_by_live_peer, before_last_refreshed,
             "third-party gossip must not count as bucket discovery activity"
         );
         assert_eq!(table.publish_seq_for(&peer), 10);
@@ -4002,13 +4054,65 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_stale_bucket_indices_returns_empty_when_fresh() {
+    async fn test_stale_bucket_refresh_candidates_returns_empty_when_fresh() {
         let dht = DhtCoreEngine::new_for_tests(PeerId::random()).unwrap();
-        let stale = dht.stale_bucket_indices(Duration::from_secs(3600)).await;
+        let stale = dht
+            .stale_bucket_refresh_candidates(Duration::from_secs(3600))
+            .await;
         assert!(
             stale.is_empty(),
             "freshly created routing table should have no stale buckets"
         );
+    }
+
+    #[tokio::test]
+    async fn stale_bucket_refresh_candidates_use_probe_debt() {
+        let dht = DhtCoreEngine::new_for_tests(PeerId::random()).unwrap();
+        let bucket_idx = 7;
+        let now = Instant::now();
+        {
+            let mut routing = dht.routing_table_for_test().write().await;
+            let bucket = &mut routing.buckets[bucket_idx];
+            bucket.last_refreshed_by_live_peer = now - Duration::from_secs(2 * 3600);
+            bucket.last_probe_finished = now - Duration::from_secs(60);
+        }
+
+        let candidates = dht
+            .stale_bucket_refresh_candidates(Duration::from_secs(3600))
+            .await;
+        let candidate = candidates
+            .into_iter()
+            .find(|candidate| candidate.index == bucket_idx)
+            .expect("stale bucket should be returned");
+
+        assert!(candidate.live_peer_age >= Duration::from_secs(2 * 3600));
+        assert!(candidate.probe_age >= Duration::from_secs(60));
+        assert!(
+            candidate.refresh_debt <= Duration::from_secs(65),
+            "recent probe should limit refresh debt: {:?}",
+            candidate.refresh_debt
+        );
+    }
+
+    #[tokio::test]
+    async fn marking_bucket_probe_finished_does_not_refresh_live_peer_timestamp() {
+        let dht = DhtCoreEngine::new_for_tests(PeerId::random()).unwrap();
+        let bucket_idx = 11;
+        let old_live = Instant::now() - Duration::from_secs(2 * 3600);
+        let old_probe = Instant::now() - Duration::from_secs(3600);
+        {
+            let mut routing = dht.routing_table_for_test().write().await;
+            let bucket = &mut routing.buckets[bucket_idx];
+            bucket.last_refreshed_by_live_peer = old_live;
+            bucket.last_probe_finished = old_probe;
+        }
+
+        assert!(dht.mark_bucket_probe_finished(bucket_idx).await);
+
+        let routing = dht.routing_table_for_test().read().await;
+        let bucket = &routing.buckets[bucket_idx];
+        assert_eq!(bucket.last_refreshed_by_live_peer, old_live);
+        assert!(bucket.last_probe_finished > old_probe);
     }
 
     #[tokio::test]
