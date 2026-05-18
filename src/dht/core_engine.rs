@@ -452,7 +452,7 @@ struct KBucket {
     /// Monotonic timestamp of the last completed refresh probe for this
     /// bucket. This is deliberately separate from live-peer refresh so failed
     /// or empty probes can be deprioritised without masking stale buckets.
-    last_probe_finished: Instant,
+    last_probe_finished: AtomicInstant,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -487,7 +487,7 @@ impl KBucket {
             nodes: Vec::new(),
             max_size,
             last_refreshed_by_live_peer: now,
-            last_probe_finished: now,
+            last_probe_finished: AtomicInstant::from_instant(now),
         }
     }
 
@@ -1120,7 +1120,7 @@ impl KademliaRoutingTable {
             .map(|(index, bucket)| {
                 let live_peer_age =
                     now.saturating_duration_since(bucket.last_refreshed_by_live_peer);
-                let probe_age = now.saturating_duration_since(bucket.last_probe_finished);
+                let probe_age = now.saturating_duration_since(bucket.last_probe_finished.load());
                 let refresh_debt = live_peer_age.min(probe_age);
                 BucketRefreshCandidate {
                     index,
@@ -1132,11 +1132,11 @@ impl KademliaRoutingTable {
             .collect()
     }
 
-    fn mark_bucket_probe_finished(&mut self, bucket_idx: usize) -> bool {
-        let Some(bucket) = self.buckets.get_mut(bucket_idx) else {
+    fn mark_bucket_probe_finished(&self, bucket_idx: usize) -> bool {
+        let Some(bucket) = self.buckets.get(bucket_idx) else {
             return false;
         };
-        bucket.last_probe_finished = Instant::now();
+        bucket.last_probe_finished.store_now();
         true
     }
 }
@@ -1368,7 +1368,7 @@ impl DhtCoreEngine {
     /// freshness.
     pub(crate) async fn mark_bucket_probe_finished(&self, bucket_idx: usize) -> bool {
         self.routing_table
-            .write()
+            .read()
             .await
             .mark_bucket_probe_finished(bucket_idx)
     }
@@ -4066,7 +4066,7 @@ mod tests {
             let mut routing = dht.routing_table_for_test().write().await;
             let bucket = &mut routing.buckets[bucket_idx];
             bucket.last_refreshed_by_live_peer = instant_ago(live_age);
-            bucket.last_probe_finished = instant_ago(probe_age);
+            bucket.last_probe_finished.store(instant_ago(probe_age));
         }
 
         let candidates = dht.bucket_refresh_candidates().await;
@@ -4094,7 +4094,7 @@ mod tests {
             let mut routing = dht.routing_table_for_test().write().await;
             let bucket = &mut routing.buckets[bucket_idx];
             bucket.last_refreshed_by_live_peer = old_live;
-            bucket.last_probe_finished = old_probe;
+            bucket.last_probe_finished.store(old_probe);
         }
 
         assert!(dht.mark_bucket_probe_finished(bucket_idx).await);
@@ -4102,7 +4102,7 @@ mod tests {
         let routing = dht.routing_table_for_test().read().await;
         let bucket = &routing.buckets[bucket_idx];
         assert_eq!(bucket.last_refreshed_by_live_peer, old_live);
-        assert!(bucket.last_probe_finished > old_probe);
+        assert!(bucket.last_probe_finished.load() > old_probe);
     }
 
     #[tokio::test]

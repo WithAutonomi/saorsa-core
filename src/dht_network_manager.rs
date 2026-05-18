@@ -1529,75 +1529,69 @@ impl DhtNetworkManager {
                 tokio::select! {
                     () = shutdown.cancelled() => break,
                     _ = async {
-                        let refresh_candidates = this
-                            .dht
-                            .read()
-                            .await
-                            .bucket_refresh_candidates()
-                            .await;
+                        match Arc::clone(&this.maintenance_lookup_semaphore).try_acquire_owned() {
+                            Ok(_maintenance_lookup_permit) => {
+                                let refresh_candidates = this
+                                    .dht
+                                    .read()
+                                    .await
+                                    .bucket_refresh_candidates()
+                                    .await;
 
-                        if refresh_candidates.is_empty() {
-                            trace!("Bucket refresh: no refresh candidates");
-                            return;
-                        }
+                                let candidate_count = refresh_candidates.len();
+                                let refresh_indices =
+                                    Self::select_bucket_refresh_indices(refresh_candidates);
+                                let refresh_count = refresh_indices.len();
+                                debug!(
+                                    "Bucket refresh: {candidate_count} candidate buckets, refreshing {refresh_count}"
+                                );
 
-                        let candidate_count = refresh_candidates.len();
-                        let refresh_indices = Self::select_bucket_refresh_indices(refresh_candidates);
-                        let refresh_count = refresh_indices.len();
-                        debug!(
-                            "Bucket refresh: {candidate_count} candidate buckets, refreshing {refresh_count}"
-                        );
+                                let k = this.k_value();
 
-                        let Ok(_maintenance_lookup_permit) = Arc::clone(
-                            &this.maintenance_lookup_semaphore,
-                        )
-                        .try_acquire_owned()
-                        else {
-                            debug!(
-                                "Bucket refresh skipped: maintenance lookup already running"
-                            );
-                            return;
-                        };
+                                for bucket_idx in refresh_indices {
+                                    if shutdown_ref.is_cancelled() {
+                                        break;
+                                    }
+                                    let random_key = {
+                                        let dht = this.dht.read().await;
+                                        dht.generate_random_key_for_bucket(bucket_idx)
+                                    };
+                                    let Some(key) = random_key else {
+                                        this.mark_bucket_probe_finished(bucket_idx).await;
+                                        continue;
+                                    };
 
-                        let k = this.k_value();
-
-                        for bucket_idx in refresh_indices {
-                            if shutdown_ref.is_cancelled() {
-                                break;
-                            }
-                            let random_key = {
-                                let dht = this.dht.read().await;
-                                dht.generate_random_key_for_bucket(bucket_idx)
-                            };
-                            let Some(key) = random_key else {
-                                let dht = this.dht.read().await;
-                                dht.mark_bucket_probe_finished(bucket_idx).await;
-                                continue;
-                            };
-
-                            let key_bytes: Key = *key.as_bytes();
-                            let lookup_result = this.find_closest_nodes_network(&key_bytes, k).await;
-                            {
-                                let dht = this.dht.read().await;
-                                dht.mark_bucket_probe_finished(bucket_idx).await;
-                            }
-                            match lookup_result {
-                                Ok(nodes) => {
-                                    trace!(
-                                        "Bucket refresh[{bucket_idx}]: discovered {} peers",
-                                        nodes.len()
-                                    );
-                                    for dht_node in nodes {
-                                        if dht_node.peer_id == this.config.peer_id {
-                                            continue;
+                                    let key_bytes: Key = *key.as_bytes();
+                                    let lookup_result =
+                                        this.find_closest_nodes_network(&key_bytes, k).await;
+                                    this.mark_bucket_probe_finished(bucket_idx).await;
+                                    match lookup_result {
+                                        Ok(nodes) => {
+                                            trace!(
+                                                "Bucket refresh[{bucket_idx}]: discovered {} peers",
+                                                nodes.len()
+                                            );
+                                            for dht_node in nodes {
+                                                if dht_node.peer_id == this.config.peer_id {
+                                                    continue;
+                                                }
+                                                this.dial_addresses(
+                                                    &dht_node.peer_id,
+                                                    &dht_node.typed_addresses(),
+                                                )
+                                                .await;
+                                            }
                                         }
-                                        this.dial_addresses(&dht_node.peer_id, &dht_node.typed_addresses())
-                                            .await;
+                                        Err(e) => {
+                                            debug!("Bucket refresh[{bucket_idx}] lookup failed: {e}");
+                                        }
                                     }
                                 }
-                                Err(e) => {
-                                    debug!("Bucket refresh[{bucket_idx}] lookup failed: {e}");
-                                }
+                            }
+                            Err(_) => {
+                                debug!(
+                                    "Bucket refresh skipped: maintenance lookup already running"
+                                );
                             }
                         }
 
@@ -1607,6 +1601,18 @@ impl DhtNetworkManager {
             }
         });
         *handle_slot.write().await = Some(handle);
+    }
+
+    async fn mark_bucket_probe_finished(&self, bucket_idx: usize) {
+        let marked = {
+            let dht = self.dht.read().await;
+            dht.mark_bucket_probe_finished(bucket_idx).await
+        };
+        if !marked {
+            warn!(
+                "Bucket refresh[{bucket_idx}]: probe-finished mark skipped for out-of-range bucket"
+            );
+        }
     }
 
     /// Trigger an immediate self-lookup to refresh the close neighborhood.
@@ -4875,7 +4881,12 @@ mod tests {
 
     #[test]
     fn bucket_refresh_selection_keeps_all_stale_buckets_within_budget() {
-        let candidates: Vec<_> = (0..MAX_BUCKET_REFRESH_LOOKUPS_PER_PASS - 1)
+        assert!(
+            MAX_BUCKET_REFRESH_LOOKUPS_PER_PASS > 0,
+            "bucket refresh budget must allow at least one lookup"
+        );
+
+        let candidates: Vec<_> = (0..MAX_BUCKET_REFRESH_LOOKUPS_PER_PASS)
             .map(|idx| bucket_refresh_candidate(idx, 3_600 + idx as u64))
             .collect();
         let mut selected = DhtNetworkManager::select_bucket_refresh_indices(candidates);
@@ -4883,20 +4894,29 @@ mod tests {
 
         assert_eq!(
             selected,
-            (0..MAX_BUCKET_REFRESH_LOOKUPS_PER_PASS - 1).collect::<Vec<_>>()
+            (0..MAX_BUCKET_REFRESH_LOOKUPS_PER_PASS).collect::<Vec<_>>()
         );
     }
 
     #[test]
     fn bucket_refresh_selection_caps_large_stale_sets_by_debt() {
-        let candidates: Vec<_> = (0..MAX_BUCKET_REFRESH_LOOKUPS_PER_PASS * 3)
+        assert!(
+            MAX_BUCKET_REFRESH_LOOKUPS_PER_PASS > 0,
+            "bucket refresh budget must allow at least one lookup"
+        );
+
+        let candidate_count = MAX_BUCKET_REFRESH_LOOKUPS_PER_PASS * 3;
+        let candidates: Vec<_> = (0..candidate_count)
             .map(|idx| bucket_refresh_candidate(idx, (idx as u64) * 3_600))
             .collect();
         let mut selected = DhtNetworkManager::select_bucket_refresh_indices(candidates);
         selected.sort_unstable();
 
+        let expected_start = candidate_count - MAX_BUCKET_REFRESH_LOOKUPS_PER_PASS;
+        let expected: Vec<_> = (expected_start..candidate_count).collect();
+
         assert_eq!(selected.len(), MAX_BUCKET_REFRESH_LOOKUPS_PER_PASS);
-        assert_eq!(selected, vec![4, 5]);
+        assert_eq!(selected, expected);
     }
 
     #[test]
