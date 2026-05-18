@@ -1107,28 +1107,27 @@ impl KademliaRoutingTable {
             .collect()
     }
 
-    /// Return refresh candidates for buckets whose live-peer refresh exceeds
-    /// `threshold`.
-    fn stale_bucket_refresh_candidates(&self, threshold: Duration) -> Vec<BucketRefreshCandidate> {
+    /// Return refresh candidates for every bucket.
+    ///
+    /// Refresh debt is bounded by both clocks: recent live-peer evidence and a
+    /// recent refresh probe each make the bucket low priority. This keeps bucket
+    /// maintenance continuous without needing a separate stale-age threshold.
+    fn bucket_refresh_candidates(&self) -> Vec<BucketRefreshCandidate> {
         let now = Instant::now();
         self.buckets
             .iter()
             .enumerate()
-            .filter_map(|(index, bucket)| {
+            .map(|(index, bucket)| {
                 let live_peer_age =
                     now.saturating_duration_since(bucket.last_refreshed_by_live_peer);
-                if live_peer_age <= threshold {
-                    return None;
-                }
                 let probe_age = now.saturating_duration_since(bucket.last_probe_finished);
-                let overdue = live_peer_age.saturating_sub(threshold);
-                let refresh_debt = overdue.min(probe_age);
-                Some(BucketRefreshCandidate {
+                let refresh_debt = live_peer_age.min(probe_age);
+                BucketRefreshCandidate {
                     index,
                     refresh_debt,
                     live_peer_age,
                     probe_age,
-                })
+                }
             })
             .collect()
     }
@@ -1360,16 +1359,9 @@ impl DhtCoreEngine {
             .collect()
     }
 
-    /// Return bucket refresh candidates that have not seen live-peer refresh
-    /// within the given threshold.
-    pub(crate) async fn stale_bucket_refresh_candidates(
-        &self,
-        threshold: Duration,
-    ) -> Vec<BucketRefreshCandidate> {
-        self.routing_table
-            .read()
-            .await
-            .stale_bucket_refresh_candidates(threshold)
+    /// Return refresh candidates for every bucket.
+    pub(crate) async fn bucket_refresh_candidates(&self) -> Vec<BucketRefreshCandidate> {
+        self.routing_table.read().await.bucket_refresh_candidates()
     }
 
     /// Mark a bucket refresh probe as completed without changing live-peer
@@ -1384,8 +1376,8 @@ impl DhtCoreEngine {
     /// Generate a random key that would fall into the specified bucket index
     /// relative to this node's ID.
     ///
-    /// Used for bucket refresh: looking up a random key in a stale bucket's range
-    /// discovers new peers that populate that bucket.
+    /// Used for bucket refresh: looking up a random key in a selected bucket's
+    /// range discovers new peers that populate that bucket.
     ///
     /// Returns `None` if `bucket_idx` is out of range (>= 256).
     pub(crate) fn generate_random_key_for_bucket(&self, bucket_idx: usize) -> Option<DhtKey> {
@@ -4054,19 +4046,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_stale_bucket_refresh_candidates_returns_empty_when_fresh() {
+    async fn test_bucket_refresh_candidates_returns_all_buckets_when_fresh() {
         let dht = DhtCoreEngine::new_for_tests(PeerId::random()).unwrap();
-        let stale = dht
-            .stale_bucket_refresh_candidates(Duration::from_secs(3600))
-            .await;
-        assert!(
-            stale.is_empty(),
-            "freshly created routing table should have no stale buckets"
+        let candidates = dht.bucket_refresh_candidates().await;
+        assert_eq!(
+            candidates.len(),
+            KADEMLIA_BUCKET_COUNT,
+            "bucket refresh should continuously rank all buckets"
         );
     }
 
     #[tokio::test]
-    async fn stale_bucket_refresh_candidates_use_probe_debt() {
+    async fn bucket_refresh_candidates_use_probe_debt() {
         let dht = DhtCoreEngine::new_for_tests(PeerId::random()).unwrap();
         let bucket_idx = 7;
         let now = Instant::now();
@@ -4077,13 +4068,11 @@ mod tests {
             bucket.last_probe_finished = now - Duration::from_secs(60);
         }
 
-        let candidates = dht
-            .stale_bucket_refresh_candidates(Duration::from_secs(3600))
-            .await;
+        let candidates = dht.bucket_refresh_candidates().await;
         let candidate = candidates
             .into_iter()
             .find(|candidate| candidate.index == bucket_idx)
-            .expect("stale bucket should be returned");
+            .expect("bucket should be returned");
 
         assert!(candidate.live_peer_age >= Duration::from_secs(2 * 3600));
         assert!(candidate.probe_age >= Duration::from_secs(60));

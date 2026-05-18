@@ -151,42 +151,41 @@ const MAX_CONCURRENT_REVALIDATIONS: usize = 8;
 /// Maximum concurrent pings within a single stale revalidation pass.
 const MAX_CONCURRENT_REVALIDATION_PINGS: usize = 4;
 
-/// Duration after which a bucket without activity is considered stale.
-const STALE_BUCKET_THRESHOLD: Duration = Duration::from_secs(3600); // 1 hour
-
 /// Minimum self-lookup interval (randomized between min and max).
 const SELF_LOOKUP_INTERVAL_MIN: Duration = Duration::from_secs(300); // 5 minutes
 
 /// Maximum self-lookup interval.
 const SELF_LOOKUP_INTERVAL_MAX: Duration = Duration::from_secs(600); // 10 minutes
 
-/// Minimum periodic refresh cadence for stale k-buckets (randomized between
-/// min and max). Jittering this interval prevents 1000s of nodes that started
-/// in lockstep from all firing their bucket-refresh FIND_NODEs in the same
-/// second once their distant buckets cross [`STALE_BUCKET_THRESHOLD`].
+/// Minimum periodic refresh cadence for k-buckets (randomized between min and
+/// max). Jittering this interval prevents 1000s of nodes that started in
+/// lockstep from all firing their bucket-refresh FIND_NODEs in the same second.
 const BUCKET_REFRESH_INTERVAL_MIN: Duration = Duration::from_secs(450); // 7.5 minutes
 
-/// Maximum periodic refresh cadence for stale k-buckets.
+/// Maximum periodic refresh cadence for k-buckets.
 const BUCKET_REFRESH_INTERVAL_MAX: Duration = Duration::from_secs(750); // 12.5 minutes
 
-/// Maximum stale k-buckets refreshed during a single bucket-refresh pass.
+/// Maximum k-buckets refreshed during a single bucket-refresh pass.
 ///
-/// A large production routing table can have many stale buckets at once. Without
-/// a per-pass budget, the refresh task can spend the whole interval running
-/// iterative network lookups back-to-back.
-const MAX_BUCKET_REFRESH_LOOKUPS_PER_PASS: usize = 4;
+/// A large production routing table has 256 buckets to maintain. Without a
+/// per-pass budget, the refresh task can spend the whole interval running
+/// iterative network lookups back-to-back. With the current 7.5-12.5 minute
+/// interval, refreshing two buckets per pass gives an approximate once-per-day
+/// full-table maintenance cadence while keeping background lookup pressure low.
+const MAX_BUCKET_REFRESH_LOOKUPS_PER_PASS: usize = 2;
 
 /// Maximum concurrent maintenance lookups.
 ///
 /// This is intentionally scoped to background maintenance so foreground/user
-/// lookup behaviour remains unchanged.
+/// lookup behaviour remains unchanged. Automatic re-bootstrap is intentionally
+/// exempt: it is gated separately by [`REBOOTSTRAP_COOLDOWN`] and only runs
+/// when the routing table has fallen below [`AUTO_REBOOTSTRAP_THRESHOLD`].
 const MAX_CONCURRENT_MAINTENANCE_LOOKUPS: usize = 1;
 
 /// Random jitter applied to bucket-refresh debt ordering.
 ///
-/// Kept small relative to the one-hour stale threshold so the oldest/debtiest
-/// buckets still dominate, while same-age buckets do not refresh in lockstep
-/// across nodes.
+/// Kept small so the oldest/debtiest buckets still dominate, while same-age
+/// buckets do not refresh in lockstep across nodes.
 const BUCKET_REFRESH_SELECTION_JITTER: Duration = Duration::from_secs(60);
 
 /// Routing table size below which automatic re-bootstrap is triggered.
@@ -1503,10 +1502,10 @@ impl DhtNetworkManager {
     /// Spawn the periodic bucket refresh background task.
     ///
     /// At a randomised interval between [`BUCKET_REFRESH_INTERVAL_MIN`] and
-    /// [`BUCKET_REFRESH_INTERVAL_MAX`], finds stale buckets (not refreshed
-    /// within [`STALE_BUCKET_THRESHOLD`]) and performs a FIND_NODE lookup for
-    /// a random key in each stale bucket's range. This populates stale buckets
-    /// with fresh peers.
+    /// [`BUCKET_REFRESH_INTERVAL_MAX`], selects the highest-debt buckets and
+    /// performs a FIND_NODE lookup for a random key in each selected bucket's
+    /// range. This keeps bucket refresh continuous while the per-pass budget
+    /// limits background lookup volume.
     async fn spawn_bucket_refresh_task(self: &Arc<Self>) {
         let this = Arc::clone(self);
         let shutdown = self.shutdown.clone();
@@ -1530,23 +1529,23 @@ impl DhtNetworkManager {
                 tokio::select! {
                     () = shutdown.cancelled() => break,
                     _ = async {
-                        let stale_candidates = this
+                        let refresh_candidates = this
                             .dht
                             .read()
                             .await
-                            .stale_bucket_refresh_candidates(STALE_BUCKET_THRESHOLD)
+                            .bucket_refresh_candidates()
                             .await;
 
-                        if stale_candidates.is_empty() {
-                            trace!("Bucket refresh: no stale buckets");
+                        if refresh_candidates.is_empty() {
+                            trace!("Bucket refresh: no refresh candidates");
                             return;
                         }
 
-                        let stale_count = stale_candidates.len();
-                        let refresh_indices = Self::select_bucket_refresh_indices(stale_candidates);
+                        let candidate_count = refresh_candidates.len();
+                        let refresh_indices = Self::select_bucket_refresh_indices(refresh_candidates);
                         let refresh_count = refresh_indices.len();
                         debug!(
-                            "Bucket refresh: {stale_count} stale buckets, refreshing {refresh_count}"
+                            "Bucket refresh: {candidate_count} candidate buckets, refreshing {refresh_count}"
                         );
 
                         let Ok(_maintenance_lookup_permit) = Arc::clone(
@@ -1645,7 +1644,10 @@ impl DhtNetworkManager {
     /// [`AUTO_REBOOTSTRAP_THRESHOLD`] and the cooldown has elapsed.
     ///
     /// Uses currently connected peers as bootstrap seeds. The cooldown prevents
-    /// hammering bootstrap nodes during transient network partitions.
+    /// hammering bootstrap nodes during transient network partitions. This is
+    /// deliberately not guarded by `maintenance_lookup_semaphore`: once the
+    /// routing table is below the recovery threshold, bootstrap repair should
+    /// not be skipped just because a best-effort maintenance lookup is running.
     async fn maybe_rebootstrap(&self) {
         let rt_size = self.get_routing_table_size().await;
         if rt_size >= AUTO_REBOOTSTRAP_THRESHOLD {
@@ -4866,7 +4868,7 @@ mod tests {
         BucketRefreshCandidate {
             index,
             refresh_debt,
-            live_peer_age: refresh_debt + STALE_BUCKET_THRESHOLD,
+            live_peer_age: refresh_debt,
             probe_age: refresh_debt,
         }
     }
@@ -4894,7 +4896,7 @@ mod tests {
         selected.sort_unstable();
 
         assert_eq!(selected.len(), MAX_BUCKET_REFRESH_LOOKUPS_PER_PASS);
-        assert_eq!(selected, vec![8, 9, 10, 11]);
+        assert_eq!(selected, vec![4, 5]);
     }
 
     #[test]
