@@ -309,6 +309,7 @@ async fn custom_swap_threshold_respected() {
         .ipv6(false)
         .adaptive_dht_config(AdaptiveDhtConfig {
             swap_threshold: custom_threshold,
+            ..Default::default()
         })
         .build()
         .unwrap();
@@ -400,6 +401,7 @@ async fn invalid_swap_threshold_rejected() {
             .ipv6(false)
             .adaptive_dht_config(AdaptiveDhtConfig {
                 swap_threshold: bad_threshold,
+                ..Default::default()
             })
             .build();
 
