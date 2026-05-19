@@ -523,14 +523,16 @@ impl NodeConfigBuilder {
     /// For fine-grained control over the threshold, use
     /// [`adaptive_dht_config`](Self::adaptive_dht_config) instead.
     pub fn trust_enforcement(mut self, enabled: bool) -> Self {
-        let threshold = if enabled {
-            AdaptiveDhtConfig::default().swap_threshold
+        let adaptive_config = if enabled {
+            AdaptiveDhtConfig::default()
         } else {
-            0.0
+            AdaptiveDhtConfig {
+                swap_threshold: 0.0,
+                quarantine_threshold: 0.0,
+                quarantine_readmit_threshold: 0.0,
+            }
         };
-        self.adaptive_dht_config = Some(AdaptiveDhtConfig {
-            swap_threshold: threshold,
-        });
+        self.adaptive_dht_config = Some(adaptive_config);
         self
     }
 
@@ -905,6 +907,8 @@ impl P2PNode {
             max_concurrent_operations: MAX_ACTIVE_REQUESTS,
             enable_security: true,
             swap_threshold: 0.0, // Set by AdaptiveDHT::new() from AdaptiveDhtConfig
+            quarantine_threshold: 0.0, // Set by AdaptiveDHT::new() from AdaptiveDhtConfig
+            quarantine_readmit_threshold: 0.0, // Set by AdaptiveDHT::new()
         };
         let adaptive_dht = AdaptiveDHT::new(
             transport.clone(),
