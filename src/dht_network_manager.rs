@@ -174,13 +174,14 @@ const BUCKET_REFRESH_INTERVAL_MAX: Duration = Duration::from_secs(750); // 12.5 
 /// full-table maintenance cadence while keeping background lookup pressure low.
 const MAX_BUCKET_REFRESH_LOOKUPS_PER_PASS: usize = 2;
 
-/// Maximum concurrent maintenance lookups.
+/// Maximum concurrent bucket-refresh lookups.
 ///
-/// This is intentionally scoped to background maintenance so foreground/user
-/// lookup behaviour remains unchanged. Automatic re-bootstrap is intentionally
-/// exempt: it is gated separately by [`REBOOTSTRAP_COOLDOWN`] and only runs
-/// when the routing table has fallen below [`AUTO_REBOOTSTRAP_THRESHOLD`].
-const MAX_CONCURRENT_MAINTENANCE_LOOKUPS: usize = 1;
+/// This is intentionally scoped to bucket refresh so periodic self-lookup and
+/// foreground/user lookup behaviour remain unchanged. Automatic re-bootstrap is
+/// intentionally exempt: it is gated separately by [`REBOOTSTRAP_COOLDOWN`] and
+/// only runs when the routing table has fallen below
+/// [`AUTO_REBOOTSTRAP_THRESHOLD`].
+const MAX_CONCURRENT_BUCKET_REFRESH_LOOKUPS: usize = 1;
 
 /// Random jitter applied to bucket-refresh debt ordering.
 ///
@@ -677,10 +678,11 @@ pub struct DhtNetworkManager {
     /// Uses `parking_lot::Mutex` (not tokio) because it is never held across
     /// `.await` and its `Drop`-based guard cleanup requires synchronous locking.
     bucket_revalidation_active: Arc<parking_lot::Mutex<HashSet<usize>>>,
-    /// Semaphore for limiting concurrent background maintenance lookups.
+    /// Semaphore for limiting concurrent bucket-refresh lookups.
     ///
-    /// Foreground/payment/user lookup calls do not use this semaphore.
-    maintenance_lookup_semaphore: Arc<Semaphore>,
+    /// Self-lookups and foreground/payment/user lookup calls do not use this
+    /// semaphore.
+    bucket_refresh_lookup_semaphore: Arc<Semaphore>,
     /// Shutdown token for background tasks
     shutdown: CancellationToken,
     /// Handle for the network event handler task
@@ -1345,8 +1347,8 @@ impl DhtNetworkManager {
             message_handler_semaphore,
             revalidation_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_REVALIDATIONS)),
             bucket_revalidation_active: Arc::new(parking_lot::Mutex::new(HashSet::new())),
-            maintenance_lookup_semaphore: Arc::new(Semaphore::new(
-                MAX_CONCURRENT_MAINTENANCE_LOOKUPS,
+            bucket_refresh_lookup_semaphore: Arc::new(Semaphore::new(
+                MAX_CONCURRENT_BUCKET_REFRESH_LOOKUPS,
             )),
             shutdown: CancellationToken::new(),
             event_handler_handle: Arc::new(RwLock::new(None)),
@@ -1478,17 +1480,8 @@ impl DhtNetworkManager {
                 tokio::select! {
                     () = shutdown.cancelled() => break,
                     _ = async {
-                        match Arc::clone(&this.maintenance_lookup_semaphore).try_acquire_owned() {
-                            Ok(_maintenance_lookup_permit) => {
-                                if let Err(e) = this.trigger_self_lookup().await {
-                                    warn!("Periodic self-lookup failed: {e}");
-                                }
-                            }
-                            Err(_) => {
-                                debug!(
-                                    "Periodic self-lookup skipped: maintenance lookup already running"
-                                );
-                            }
+                        if let Err(e) = this.trigger_self_lookup().await {
+                            warn!("Periodic self-lookup failed: {e}");
                         }
                         this.revalidate_stale_k_closest().await;
                         this.maybe_rebootstrap().await;
@@ -1529,7 +1522,8 @@ impl DhtNetworkManager {
                 tokio::select! {
                     () = shutdown.cancelled() => break,
                     _ = async {
-                        match Arc::clone(&this.maintenance_lookup_semaphore).try_acquire_owned() {
+                        match Arc::clone(&this.bucket_refresh_lookup_semaphore).try_acquire_owned()
+                        {
                             Ok(_maintenance_lookup_permit) => {
                                 let refresh_candidates = this
                                     .dht
@@ -1590,7 +1584,7 @@ impl DhtNetworkManager {
                             }
                             Err(_) => {
                                 debug!(
-                                    "Bucket refresh skipped: maintenance lookup already running"
+                                    "Bucket refresh skipped: bucket refresh lookup already running"
                                 );
                             }
                         }
@@ -1651,9 +1645,9 @@ impl DhtNetworkManager {
     ///
     /// Uses currently connected peers as bootstrap seeds. The cooldown prevents
     /// hammering bootstrap nodes during transient network partitions. This is
-    /// deliberately not guarded by `maintenance_lookup_semaphore`: once the
+    /// deliberately not guarded by `bucket_refresh_lookup_semaphore`: once the
     /// routing table is below the recovery threshold, bootstrap repair should
-    /// not be skipped just because a best-effort maintenance lookup is running.
+    /// not be skipped just because a best-effort bucket refresh is running.
     async fn maybe_rebootstrap(&self) {
         let rt_size = self.get_routing_table_size().await;
         if rt_size >= AUTO_REBOOTSTRAP_THRESHOLD {
