@@ -32,6 +32,13 @@ use std::sync::Arc;
 /// Default trust score threshold below which a peer is eligible for swap-out
 const DEFAULT_SWAP_THRESHOLD: f64 = 0.35;
 
+/// Default trust score threshold below which close-group peers are evicted
+/// immediately and all peers are avoided by automatic lookup/dial paths.
+const DEFAULT_QUARANTINE_THRESHOLD: f64 = 0.20;
+
+/// Default trust score a quarantined peer must recover to before readmission.
+const DEFAULT_QUARANTINE_READMIT_THRESHOLD: f64 = 0.45;
+
 /// Maximum weight multiplier per single consumer-reported event.
 /// Caps the influence of any single consumer event on the EMA.
 const MAX_CONSUMER_WEIGHT: f64 = 5.0;
@@ -42,15 +49,25 @@ const MAX_CONSUMER_WEIGHT: f64 = 5.0;
 pub struct AdaptiveDhtConfig {
     /// Trust score below which a peer becomes eligible for swap-out from
     /// the routing table when a better candidate is available.
-    /// Peers are NOT immediately evicted.
+    /// Peers are not immediately evicted by this threshold alone.
     /// Default: 0.35
     pub swap_threshold: f64,
+    /// Trust score below which automatic lookup/dial paths avoid a peer, and
+    /// K-closest peers are evicted immediately into temporary quarantine.
+    /// Default: 0.20
+    pub quarantine_threshold: f64,
+    /// Trust score a quarantined peer must decay back to before normal
+    /// discovery/admission can accept it again.
+    /// Default: 0.45
+    pub quarantine_readmit_threshold: f64,
 }
 
 impl Default for AdaptiveDhtConfig {
     fn default() -> Self {
         Self {
             swap_threshold: DEFAULT_SWAP_THRESHOLD,
+            quarantine_threshold: DEFAULT_QUARANTINE_THRESHOLD,
+            quarantine_readmit_threshold: DEFAULT_QUARANTINE_READMIT_THRESHOLD,
         }
     }
 }
@@ -58,15 +75,48 @@ impl Default for AdaptiveDhtConfig {
 impl AdaptiveDhtConfig {
     /// Validate that all config values are within acceptable ranges.
     ///
-    /// Returns `Err` if `swap_threshold` is outside `[0.0, 0.5)` or is NaN.
+    /// Returns `Err` if a threshold is outside its safe range or is NaN.
     /// Values >= 0.5 (neutral trust) would make all unknown peers immediately
-    /// swap-eligible since they start at neutral (0.5).
+    /// swap/quarantine eligible since they start at neutral (0.5). The readmit
+    /// threshold must also stay below neutral because quarantined peers recover
+    /// by decay toward neutral, not by active probing.
     pub fn validate(&self) -> crate::error::P2pResult<()> {
         if !(0.0..0.5).contains(&self.swap_threshold) || self.swap_threshold.is_nan() {
             return Err(crate::error::P2PError::Validation(
                 format!(
                     "swap_threshold must be in [0.0, 0.5), got {}",
                     self.swap_threshold
+                )
+                .into(),
+            ));
+        }
+        if !(0.0..0.5).contains(&self.quarantine_threshold) || self.quarantine_threshold.is_nan() {
+            return Err(crate::error::P2PError::Validation(
+                format!(
+                    "quarantine_threshold must be in [0.0, 0.5), got {}",
+                    self.quarantine_threshold
+                )
+                .into(),
+            ));
+        }
+        if !(0.0..0.5).contains(&self.quarantine_readmit_threshold)
+            || self.quarantine_readmit_threshold.is_nan()
+        {
+            return Err(crate::error::P2PError::Validation(
+                format!(
+                    "quarantine_readmit_threshold must be in [0.0, 0.5), got {}",
+                    self.quarantine_readmit_threshold
+                )
+                .into(),
+            ));
+        }
+        if self.quarantine_threshold > 0.0
+            && self.quarantine_readmit_threshold < self.quarantine_threshold
+        {
+            return Err(crate::error::P2PError::Validation(
+                format!(
+                    "quarantine_readmit_threshold ({}) must be >= quarantine_threshold ({})",
+                    self.quarantine_readmit_threshold, self.quarantine_threshold
                 )
                 .into(),
             ));
@@ -144,12 +194,13 @@ impl AdaptiveDHT {
     /// This creates the `TrustEngine` and the `DhtNetworkManager` with the
     /// trust engine injected. Call [`start`](Self::start) to begin DHT
     /// operations. Trust scores are computed live — low-trust peers are
-    /// swapped out when better candidates arrive.
+    /// swapped out when better candidates arrive, and bad close-group peers
+    /// are quarantined immediately.
     ///
     /// # Errors
     ///
-    /// Returns an error if `swap_threshold` is not in `[0.0, 0.5)` or if
-    /// the underlying `DhtNetworkManager` fails to initialise.
+    /// Returns an error if any trust threshold is invalid or if the underlying
+    /// `DhtNetworkManager` fails to initialise.
     pub async fn new(
         transport: Arc<crate::transport_handle::TransportHandle>,
         mut dht_config: DhtNetworkConfig,
@@ -158,6 +209,8 @@ impl AdaptiveDHT {
         adaptive_config.validate()?;
 
         dht_config.swap_threshold = adaptive_config.swap_threshold;
+        dht_config.quarantine_threshold = adaptive_config.quarantine_threshold;
+        dht_config.quarantine_readmit_threshold = adaptive_config.quarantine_readmit_threshold;
 
         let trust_engine = Arc::new(TrustEngine::new());
 
@@ -184,9 +237,10 @@ impl AdaptiveDHT {
     /// to [`MAX_CONSUMER_WEIGHT`]. Zero or negative weights are silently
     /// ignored (no-op).
     ///
-    /// Trust scores are updated immediately but low-trust peers are not
-    /// evicted — they remain in the routing table until a better candidate
-    /// arrives and triggers a swap-out.
+    /// Trust scores are updated immediately. Peers below the quarantine
+    /// threshold are avoided by lookup result selection and automatic
+    /// lookup/dial paths, and K-closest peers below that threshold are
+    /// evicted into temporary quarantine.
     pub async fn report_trust_event(&self, peer_id: &PeerId, event: TrustEvent) {
         match event {
             TrustEvent::ApplicationSuccess(weight) | TrustEvent::ApplicationFailure(weight) => {
@@ -209,6 +263,7 @@ impl AdaptiveDHT {
                 );
             }
         }
+        self.dht_manager.enforce_trust_quarantine(peer_id).await;
     }
 
     /// Get the current trust score for a peer (synchronous).
@@ -244,7 +299,8 @@ impl AdaptiveDHT {
     /// Start the DHT manager.
     ///
     /// Trust scores are computed live — no background tasks needed.
-    /// Low-trust peers are swapped out when better candidates arrive.
+    /// Low-trust peers are swapped out when better candidates arrive; close
+    /// peers below the quarantine threshold are evicted immediately.
     pub async fn start(&self) -> Result<()> {
         Arc::clone(&self.dht_manager).start().await
     }
@@ -311,6 +367,11 @@ mod tests {
     fn test_adaptive_dht_config_defaults() {
         let config = AdaptiveDhtConfig::default();
         assert!((config.swap_threshold - DEFAULT_SWAP_THRESHOLD).abs() < f64::EPSILON);
+        assert!((config.quarantine_threshold - DEFAULT_QUARANTINE_THRESHOLD).abs() < f64::EPSILON);
+        assert!(
+            (config.quarantine_readmit_threshold - DEFAULT_QUARANTINE_READMIT_THRESHOLD).abs()
+                < f64::EPSILON
+        );
     }
 
     #[test]
@@ -328,6 +389,7 @@ mod tests {
         ] {
             let config = AdaptiveDhtConfig {
                 swap_threshold: bad,
+                ..Default::default()
             };
             assert!(
                 config.validate().is_err(),
@@ -341,12 +403,36 @@ mod tests {
         for &good in &[0.0, 0.15, 0.49] {
             let config = AdaptiveDhtConfig {
                 swap_threshold: good,
+                ..Default::default()
             };
             assert!(
                 config.validate().is_ok(),
                 "swap_threshold {good} should pass validation"
             );
         }
+    }
+
+    #[test]
+    fn test_quarantine_threshold_validation() {
+        let valid = AdaptiveDhtConfig {
+            quarantine_threshold: 0.20,
+            quarantine_readmit_threshold: 0.45,
+            ..Default::default()
+        };
+        assert!(valid.validate().is_ok());
+
+        let invalid_readmit = AdaptiveDhtConfig {
+            quarantine_threshold: 0.20,
+            quarantine_readmit_threshold: 0.10,
+            ..Default::default()
+        };
+        assert!(invalid_readmit.validate().is_err());
+
+        let unreachable_readmit = AdaptiveDhtConfig {
+            quarantine_readmit_threshold: 0.50,
+            ..Default::default()
+        };
+        assert!(unreachable_readmit.validate().is_err());
     }
 
     // =========================================================================
