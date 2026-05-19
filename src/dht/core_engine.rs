@@ -251,6 +251,33 @@ impl NodeInfo {
             .collect()
     }
 
+    /// Drop every non-storable address (wildcard `0.0.0.0` / `::`, port-zero)
+    /// in place, keeping `addresses` and `address_types` index-aligned.
+    ///
+    /// This is the record-level equivalent of the single-address filter in
+    /// [`Self::merge_typed_address`]. Admission paths that derive diversity
+    /// state from the raw address list (e.g. `DhtCoreEngine::add_node`
+    /// building `candidate_ips`) must call this first so a record carrying
+    /// both a wildcard and a routable address is admitted with only the
+    /// routable address, instead of being rejected wholesale by the
+    /// unspecified-IP guard before the bucket-side store filter can run.
+    pub fn retain_storable_addresses(&mut self) {
+        // Pad address_types so the index alignment holds before we filter
+        // (legacy records may carry fewer tags than addresses).
+        while self.address_types.len() < self.addresses.len() {
+            self.address_types.push(AddressType::Unverified);
+        }
+        // Rebuild both vectors in lockstep, keeping only storable addresses.
+        let addresses = std::mem::take(&mut self.addresses);
+        let address_types = std::mem::take(&mut self.address_types);
+        for (addr, addr_type) in addresses.into_iter().zip(address_types) {
+            if is_storable_address(&addr) {
+                self.addresses.push(addr);
+                self.address_types.push(addr_type);
+            }
+        }
+    }
+
     /// Merge a new address with default type `Direct`.
     /// Prefer `merge_typed_address` when the type is known.
     pub fn merge_address(&mut self, addr: MultiAddr) {
@@ -1736,18 +1763,30 @@ impl DhtCoreEngine {
     /// the same replacement through [`Self::replace_node_addresses_from_gossip`]
     /// without refreshing liveness.
     ///
-    /// - Loopback entries are filtered out unless [`Self::allow_loopback`]
-    ///   is set (devnets/tests), matching the loopback-injection guard in
-    ///   [`KBucket::touch_node_typed`].
-    /// - Empty input address lists are rejected. If filtering strips every
-    ///   supplied address, the empty set is still applied so stale addresses
-    ///   from an older publish cannot survive a newer full replacement.
+    /// - Empty input address lists are rejected outright (returns `false`).
+    /// - Filtering happens in two stages with **different empty-result
+    ///   semantics**, because they guard against different things:
+    ///   - *Loopback* (this method, via [`Self::filter_publish_address_set`],
+    ///     skipped when [`Self::allow_loopback`] is set for devnets/tests):
+    ///     if stripping loopback empties a non-empty input, the **empty set
+    ///     is still applied**. A publisher that legitimately drops to zero
+    ///     reachable addresses must not keep stale ones alive, and
+    ///     `last_publish_seqs` advances normally.
+    ///   - *Wildcard / port-zero* ([`KBucket::replace_node_addresses_with_mode`]
+    ///     via `is_storable_address`): if this empties a non-empty input the
+    ///     replace is **refused** — prior good addresses are preserved and
+    ///     `last_publish_seqs` is NOT advanced, so a corrected republish at
+    ///     the same `seq` can still land. Wildcard-only is treated as a
+    ///     malformed publish, not an intentional "I have no addresses", so
+    ///     callers and tests must not assume all filter-empty publishes
+    ///     share the same outcome.
     /// - `seq` must be non-zero and strictly exceed the last sequence
     ///   observed from `node_id`; zero, older, or duplicate sequences are
     ///   ignored.
     ///
     /// Returns `true` when the peer's addresses were replaced, `false`
-    /// otherwise (peer absent, stale sequence, or empty input list).
+    /// otherwise (peer absent, stale sequence, empty input list, or a
+    /// wildcard-only input whose prior addresses were preserved).
     pub async fn replace_node_addresses(
         &self,
         node_id: &PeerId,
@@ -1827,7 +1866,7 @@ impl DhtCoreEngine {
     /// (DhtNetworkManager) must handle the revalidation flow.
     pub async fn add_node(
         &mut self,
-        node: NodeInfo,
+        mut node: NodeInfo,
         trust_score: &impl Fn(&PeerId) -> f64,
     ) -> Result<AdmissionResult> {
         // Reject self-insertion — a node must never appear in its own routing table.
@@ -1836,6 +1875,24 @@ impl DhtCoreEngine {
         }
 
         let peer_id = node.id;
+
+        // Strip wildcard / port-zero addresses before any admission logic runs.
+        // Without this, a NodeInfo carrying both /ip4/0.0.0.0/... and a valid
+        // routable address would be rejected wholesale by the unspecified-IP
+        // check in `add_with_diversity` — the per-address store filter in
+        // `KBucket::add_node` never gets a chance to run. Sanitizing here lets
+        // mixed records through with only their routable addresses retained,
+        // matching the store-side filter applied at the bucket boundary.
+        node.retain_storable_addresses();
+
+        // A record left with no addresses after sanitization carried nothing
+        // but wildcard / port-zero entries. It is not a non-IP transport, so
+        // it must not fall through to the non-IP bypass below — reject it.
+        if node.addresses.is_empty() {
+            return Err(anyhow!(
+                "all addresses were wildcard / port-zero; nothing storable"
+            ));
+        }
 
         // Extract ALL IP addresses from the candidate for diversity checking.
         // If candidate has no IP-based addresses, it's a non-IP transport — bypass diversity.
@@ -5138,6 +5195,67 @@ mod tests {
         // After filtering, addresses is empty — add_node rejects the slot.
         let result = bucket.add_node(node);
         assert!(result.is_err());
+    }
+
+    /// Engine-level (P2): a mixed wildcard + routable record must be admitted
+    /// through the public `DhtCoreEngine::add_node` path with only the
+    /// routable address stored. Before the sanitize step, `candidate_ips`
+    /// was built from the raw address list and the unspecified-IP guard in
+    /// `add_with_diversity` rejected the whole record before the bucket-side
+    /// store filter could run.
+    #[tokio::test]
+    async fn engine_add_node_admits_mixed_wildcard_and_routable() {
+        let mut dht = DhtCoreEngine::new_for_tests(PeerId::from_bytes([0u8; 32])).unwrap();
+        let routable: MultiAddr = "/ip4/198.51.100.7/udp/10000/quic".parse().unwrap();
+        let wildcard: MultiAddr = "/ip6/::/udp/10000/quic".parse().unwrap();
+        let peer = PeerId::from_bytes([7u8; 32]);
+        let node = NodeInfo {
+            id: peer,
+            addresses: vec![wildcard, routable.clone()],
+            address_types: vec![AddressType::Direct, AddressType::Direct],
+            last_seen: AtomicInstant::now(),
+        };
+
+        let events = dht.add_node_no_trust(node).await.unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, RoutingTableEvent::PeerAdded(p) if *p == peer)),
+            "mixed record should be admitted, got events: {events:?}"
+        );
+
+        let stored = dht.get_node_addresses(&peer).await;
+        assert_eq!(
+            stored,
+            vec![routable],
+            "only the routable address should survive sanitization"
+        );
+    }
+
+    /// Engine-level: a record carrying *only* wildcard addresses has nothing
+    /// storable left after sanitization and must be rejected by the public
+    /// `add_node` path (the empty `candidate_ips` early-out / bucket filter).
+    #[tokio::test]
+    async fn engine_add_node_rejects_only_wildcard_record() {
+        let mut dht = DhtCoreEngine::new_for_tests(PeerId::from_bytes([0u8; 32])).unwrap();
+        let wildcard: MultiAddr = "/ip4/0.0.0.0/udp/10000/quic".parse().unwrap();
+        let peer = PeerId::from_bytes([9u8; 32]);
+        let node = NodeInfo {
+            id: peer,
+            addresses: vec![wildcard],
+            address_types: vec![AddressType::Direct],
+            last_seen: AtomicInstant::now(),
+        };
+
+        let result = dht.add_node_no_trust(node).await;
+        assert!(
+            result.is_err(),
+            "record with only wildcard addresses must not be admitted"
+        );
+        assert!(
+            dht.get_node_addresses(&peer).await.is_empty(),
+            "rejected peer must not appear in the routing table"
+        );
     }
 
     #[test]
