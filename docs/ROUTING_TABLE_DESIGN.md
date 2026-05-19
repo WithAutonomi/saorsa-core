@@ -56,9 +56,11 @@ All parameters are configurable. Values below are a reference profile used for l
 | `IPV4_SUBNET_MASK` | Prefix length for IPv4 subnet grouping | `/24` |
 | `IPV6_SUBNET_MASK` | Prefix length for IPv6 subnet grouping | `/48` |
 | `TRUST_PROTECTION_THRESHOLD` | Trust score above which a peer resists swap-closer eviction | `0.7` |
-| `BLOCK_THRESHOLD` | Trust score below which a peer is evicted and blocked | `0.15` |
-| `EMA_ALPHA` | EMA smoothing factor — weight of each new observation (higher = faster response) | `0.3` |
-| `DECAY_LAMBDA` | Per-second exponential decay rate toward neutral (0.5) | `4.198e-6` |
+| `SWAP_THRESHOLD` | Trust score below which a peer is eligible for replacement when a better candidate needs the slot | `0.35` |
+| `QUARANTINE_THRESHOLD` | Trust score below which automatic lookup/dial paths avoid the peer, and close-group peers are evicted immediately | `0.20` |
+| `QUARANTINE_READMIT_THRESHOLD` | Trust score a quarantined peer must recover to before normal admission accepts it again | `0.45` |
+| `EMA_ALPHA` | EMA smoothing factor — weight of each new observation (higher = faster response) | `0.124` |
+| `DECAY_LAMBDA` | Per-second exponential decay rate toward neutral (0.5) | `1.394e-5` |
 | `SELF_LOOKUP_INTERVAL` | Periodic self-lookup cadence (maintenance phase only; bootstrap self-lookups run back-to-back with no interval) | random in `[5 min, 10 min]` |
 | `BUCKET_REFRESH_INTERVAL` | Periodic refresh cadence for stale k-buckets, randomised per cycle to break startup-lockstep across the network | random in `[7.5 min, 12.5 min]` |
 | `STALE_BUCKET_THRESHOLD` | Duration after which a bucket without activity is considered stale | `1 hour` |
@@ -90,24 +92,22 @@ score = (1 - EMA_ALPHA)^W * score + (1 - (1 - EMA_ALPHA)^W) * observation
 
 This is equivalent to applying the unit-weight blend step `W` times when `W` is a positive integer, and extends naturally to fractional weights without ambiguity.
 
-**Decay tuning**: `DECAY_LAMBDA = 4.198e-6` is tuned so that a peer experiencing ~3 evenly-spaced failures per day converges to the block threshold (0.15). The worst possible score (0.0) decays back above `BLOCK_THRESHOLD` in ~1 day. Derivation: at steady state with T = 28800 s between events, `0.15 = 0.5·(1 − d) / (1 − 0.7·d)` → `d = 0.8861` → `λ = −ln(0.8861) / 28800 ≈ 4.198e-6`.
+**Decay tuning**: `DECAY_LAMBDA = 1.394e-5` is tuned so that a peer experiencing ~3 evenly-spaced failures per day converges to the swap threshold (0.35). The worst possible score (0.0) decays back above `SWAP_THRESHOLD` in ~1 day, and above the quarantine readmit threshold (0.45) after roughly 46 hours.
 
-**Failures to block** (consecutive negative events from neutral 0.5 to below `BLOCK_THRESHOLD` 0.15, ignoring decay):
+**Failures to cross thresholds** (consecutive unit-weight negative events from neutral 0.5, ignoring decay):
 
-| Event weight | Events to block | Effective failures |
-|---|---|---|
-| `1.0` (internal event) | 4 | 4 |
-| `2.0` | 2 | 4 |
-| `3.0` | 2 | 6 |
-| `5.0` (`MAX_CONSUMER_WEIGHT`) | 1 | 5 |
+| Threshold | Unit failures |
+|---|---|
+| `SWAP_THRESHOLD` (`0.35`) | 3 |
+| `QUARANTINE_THRESHOLD` (`0.20`) | 7 |
 
-Note: time decay between events works in the peer's favor — in practice, more events may be needed if failures are spread over time. Core only records penalties (no internal success events), so the only counterforce is time decay. Higher weights are slightly less efficient per unit weight due to EMA non-linearity: at lower scores, each successive failure has diminishing marginal impact. The "Effective failures" column shows total weight applied (events × weight), not a count of equivalent unit-weight events.
+Note: time decay between events works in the peer's favor — in practice, more events may be needed if failures are spread over time. Core only records penalties (no internal success events), so the only counterforce is time decay. Higher weights are slightly less efficient per unit weight due to EMA non-linearity: at lower scores, each successive failure has diminishing marginal impact.
 
 Parameter safety constraints (MUST hold):
 
 1. `IP_EXACT_LIMIT >= 1`.
 2. `IP_SUBNET_LIMIT >= 1`.
-3. `TRUST_PROTECTION_THRESHOLD > BLOCK_THRESHOLD`.
+3. `TRUST_PROTECTION_THRESHOLD > SWAP_THRESHOLD > QUARANTINE_THRESHOLD`.
 4. `ALPHA >= 1`.
 5. `LIVE_THRESHOLD > max(SELF_LOOKUP_INTERVAL)` (peers touched by self-lookup must not oscillate between live and stale between consecutive cycles; at reference values: 15 min > 10 min). The 5-minute margin at reference values is sufficient for typical network latencies (sub-second RTTs). Operators in high-latency environments (satellite, Tor overlay) SHOULD increase `LIVE_THRESHOLD` proportionally.
 6. `STALE_REVALIDATION_TIMEOUT > 0`.
@@ -129,7 +129,7 @@ Note: `K_BUCKET_SIZE` values below 4 produce degenerate behavior (single-peer ro
 4. **Address requirement**: A `NodeInfo` with an empty address list MUST NOT be admitted to the routing table.
 5. **Authenticated membership**: Only peers that have completed transport-level authentication are eligible for routing table insertion. Unauthenticated peers MUST NOT enter `LocalRT`.
 6. **IP diversity**: No enforcement scope (per-bucket or routing-neighborhood) may exceed `IP_EXACT_LIMIT` nodes per exact IP or `IP_SUBNET_LIMIT` nodes per subnet, except via explicit loopback or testnet overrides.
-7. **Trust blocking**: Peers with `TrustScore(self, P) < BLOCK_THRESHOLD` MUST be evicted from the routing table and MUST NOT be re-admitted until their trust score recovers above `BLOCK_THRESHOLD`.
+7. **Trust quarantine**: Peers with `TrustScore(self, P) < QUARANTINE_THRESHOLD` MUST be skipped by local lookup result selection, FIND_NODE responses, and automatic lookup/dial candidate selection. If such a peer is in the K-closest-to-self set, it MUST be evicted and quarantined until `TrustScore(self, P) >= QUARANTINE_READMIT_THRESHOLD`.
 8. **Trust protection (staleness-gated)**: A peer with `TrustScore(self, P) >= TRUST_PROTECTION_THRESHOLD` **AND** `last_seen` within `LIVE_THRESHOLD` MUST NOT be evicted by swap-closer admission. A peer whose `last_seen` exceeds `LIVE_THRESHOLD` receives no trust protection regardless of score — stale peers MUST NOT hold slots against live candidates.
 9. **Deterministic distance**: `Distance(A, B)` is symmetric, deterministic, and consistent across all nodes. Two nodes compute the same distance between the same pair of keys.
 10. **Atomic admission**: IP diversity checks, capacity checks, swap-closer evictions, trust score reads, and insertion MUST execute within a single write-locked critical section to prevent TOCTOU races. All `TrustScore` queries during admission (steps 4, 8) MUST occur while the routing table write lock is held.
@@ -184,7 +184,7 @@ When a candidate peer `P` with `NodeInfo` and IP address `candidate_ip` is prese
 1. **Self-check**: If `P.id == self.id`, reject.
 2. **Address check**: If `P.addresses` is empty, reject.
 3. **Authentication check**: If `P` has not completed transport-level authentication, reject.
-4. **Trust block check**: If `TrustScore(self, P) < BLOCK_THRESHOLD`, reject.
+4. **Trust quarantine check**: If `TrustScore(self, P) < QUARANTINE_THRESHOLD`, reject. If `P` was previously quarantined, reject until `TrustScore(self, P) >= QUARANTINE_READMIT_THRESHOLD`.
 5. **Update short-circuit**: If `P` already exists in `KBucket(BucketIndex(self, P))`, merge addresses (Section 6.3), refresh `last_seen`, move `P` to tail, and return. The peer already holds its slot — IP diversity and capacity checks are skipped.
 6. **Loopback check**: If `candidate_ip` is loopback and loopback is disallowed, reject. If loopback is allowed, skip all IP diversity checks (step 7–8) and proceed directly to step 9.
 7. **Non-IP transport bypass**: If `P` has no IP-based address (e.g., Bluetooth, LoRa), skip IP diversity checks and proceed directly to step 9.
@@ -209,7 +209,7 @@ When a candidate peer `P` with `NodeInfo` and IP address `candidate_ip` is prese
    - Stale peers in `KBucket(bucket_idx)` (bucket-level contention).
    - Stale routing-neighborhood violators identified in step 8c (if any).
    Release the write lock **once**, ping all collected stale peers in parallel (bounded by `STALE_REVALIDATION_TIMEOUT`), then re-acquire the write lock **once** and **re-evaluate the following checks** against the current routing table state:
-   - Trust block check (step 4): `TrustScore` may have changed during the unlocked window.
+   - Trust quarantine check (step 4): `TrustScore` may have changed during the unlocked window.
    - Per-bucket IP diversity (step 8b): bucket composition may have changed.
    - Routing-neighborhood IP diversity (step 8c): K-closest set may have changed.
    - Capacity pre-check (this step): slots may have been filled by concurrent admissions.
@@ -252,29 +252,27 @@ When an IP diversity limit is exceeded and a candidate `P` contends for a slot:
 
 Rationale: swap-closer prefers geographically closer peers (lower XOR distance) while protecting long-lived, recently-seen, well-trusted peers from displacement by unproven newcomers from the same subnet. A peer that has not been seen within `LIVE_THRESHOLD` loses trust protection regardless of its score — it may have silently departed, and holding its slot against a live candidate degrades routing table quality.
 
-### 7.4 Blocked Peer Handling
+### 7.4 Quarantined Peer Handling
 
-When any interaction records a trust failure and `TrustScore(self, P)` drops below `BLOCK_THRESHOLD`:
+When any interaction records a trust failure and `TrustScore(self, P)` drops below `QUARANTINE_THRESHOLD`:
 
-1. Remove `P` from `LocalRT(self)`.
-2. Disconnect `P` at the transport layer.
-   2a. Cancel all in-flight RPCs to or from `P`. Cancelled operations do not record trust events — the eviction/blocking decision has already been made, and partial responses from a blocked peer should not influence trust state. The mechanism for distinguishing cancellation from genuine failure is an implementation choice, but MUST prevent cancelled RPCs from recording trust events.
-3. Silently drop any incoming DHT messages from `P`.
-4. Do not re-admit `P` until `TrustScore(self, P) >= BLOCK_THRESHOLD`.
+1. If `P` is in the K-closest-to-self set, remove `P` from `LocalRT(self)` and emit `PeerRemoved`.
+2. Keep `P`'s trust record. Do not reset trust on eviction.
+3. Mark `P` as quarantined if it was evicted from the close group.
+4. Do not re-admit quarantined `P` until `TrustScore(self, P) >= QUARANTINE_READMIT_THRESHOLD`.
+5. If `P` is not in the K-closest-to-self set, it may remain in the routing table, but local lookup result selection, FIND_NODE responses, and automatic lookup/dial paths MUST avoid it while `TrustScore(self, P) < QUARANTINE_THRESHOLD`.
 
-Blocking is enforced at both the transport and routing table layers. API consumers can rely on `LocalRT` membership as the trust gate.
+Quarantine is a routing-table and automatic lookup policy. It is not a blanket transport-level block for explicit user-initiated sends.
 
-Transport-level enforcement: the transport layer MUST query `TrustScore(self, P)` at authentication time and reject the connection if the score is below `BLOCK_THRESHOLD`. The transport MUST NOT rely solely on a cached block list, as peers may recover above `BLOCK_THRESHOLD` via time decay (see re-admission path below). The check occurs after the peer's identity is established but before allocating application-layer resources (buffers, session state, routing table interaction). The transport layer MUST also refuse outbound dials to blocked peers.
+Re-admission path: a quarantined peer can only re-enter when its trust score recovers above `QUARANTINE_READMIT_THRESHOLD` through time-decay toward neutral AND the peer is rediscovered through normal network activity:
 
-Re-admission path: a blocked peer can only re-enter when its trust score recovers above `BLOCK_THRESHOLD` through time-decay toward neutral AND the peer is rediscovered through normal network activity:
+1. Peer `P` is returned in a `FIND_NODE` response from another peer during a lookup, or connects through the normal authenticated peer path.
+2. Local node checks `TrustScore(self, P)`. If still below `QUARANTINE_READMIT_THRESHOLD` for a quarantined peer, `P` is skipped/rejected.
+3. If trust has recovered to `QUARANTINE_READMIT_THRESHOLD`, the standard admission flow (Section 7.1) applies.
 
-1. Peer `P` is returned in a `FIND_NODE` response from another peer during a lookup.
-2. Local node checks `TrustScore(self, P)`. If still below `BLOCK_THRESHOLD`, `P` is silently skipped (not dialed).
-3. If trust has recovered above `BLOCK_THRESHOLD`, local node dials `P`, authentication completes, and the standard admission flow (Section 7.1) applies.
+No manual probing is required. Natural rediscovery plus trust decay is the temporary-ban mechanism.
 
-A blocked peer cannot trigger its own re-admission — it requires third-party discovery after trust recovery.
-
-Implementations SHOULD bound trust record storage for peers not in the routing table. The specific mechanism (LRU eviction, TTL-based expiry, score-at-neutral garbage collection) is an implementation choice. Unbounded accumulation of trust records for blocked or departed peers is a memory leak.
+Implementations SHOULD bound trust record storage for peers not in the routing table. The specific mechanism (LRU eviction, TTL-based expiry, score-at-neutral garbage collection) is an implementation choice. Unbounded accumulation of trust records for quarantined or departed peers is a memory leak.
 
 ### 7.5 Stale Peer Revalidation on Admission Contention
 
@@ -339,7 +337,7 @@ Algorithm:
 2. Include self in `best_nodes` (self competes on distance but is never queried).
 3. Mark self as "queried" to prevent self-RPC.
 4. Loop (up to `MAX_LOOKUP_ITERATIONS`):
-   a. Select up to `ALPHA` unqueried peers from `best_nodes`, nearest first. Skip any peer with `TrustScore(self, peer) < BLOCK_THRESHOLD` (the peer may have been blocked since it entered `best_nodes`).
+   a. Select up to `ALPHA` unqueried peers from `best_nodes`, nearest first. Skip any peer that is below `QUARANTINE_THRESHOLD` or is quarantined and still below `QUARANTINE_READMIT_THRESHOLD`. Such peers are also excluded from local lookup results and FIND_NODE responses.
    b. Query each in parallel with `FIND_NODE(K)`.
    c. For each failed query, record trust penalty (`ConnectionFailed`/`ConnectionTimeout`). Successful responses are the expected baseline and do not generate trust events.
    d. For each response, accept at most `MAX_PEERS_PER_RESPONSE` peers (closest to `K` first; additional entries are silently dropped). Merge accepted peers into `best_nodes`, deduplicating by `PeerId`.
@@ -351,7 +349,7 @@ Properties:
 - **Per-lookup isolation**: Each invocation of `find_closest_nodes_network` maintains its own `best_nodes` set, queried set, and top-K convergence state. Concurrent lookups (e.g., a self-lookup and a consumer-triggered lookup running simultaneously) do not share or interfere with each other's state. They may independently query the same remote peers and independently record trust outcomes.
 - Makes network requests: MUST NOT be called from within DHT request handlers (deadlock risk).
 - Trust recording: each RPC outcome is fed to the trust subsystem.
-- Blocked peers: silently excluded from query candidates (they are not in `LocalRT`).
+- Quarantined peers: silently excluded from automatic query candidates until trust recovers.
 
 ## 9. Routing Table Maintenance
 
@@ -395,7 +393,7 @@ The routing table MUST emit events on membership changes to allow consumers to r
 | Event | Trigger |
 |---|---|
 | `PeerAdded(PeerId)` | New peer inserted into routing table |
-| `PeerRemoved(PeerId)` | Peer evicted, blocked, or departed |
+| `PeerRemoved(PeerId)` | Peer evicted, quarantined, or departed |
 | `KClosestPeersChanged { old, new }` | Composition of the `K_BUCKET_SIZE`-closest peers to self changed |
 | `BootstrapComplete { num_peers }` | Bootstrap process finished (routing table stabilized or timeout reached) |
 
@@ -411,7 +409,7 @@ Events MUST be emitted reliably for every routing table mutation. Consumers MAY 
 
 Peers are detected as departed through:
 
-1. **RPC failure**: Failed outbound RPC records trust failure. If trust drops below `BLOCK_THRESHOLD`, peer is evicted (Section 7.4).
+1. **RPC failure**: Failed outbound RPC records trust failure. If trust drops below `QUARANTINE_THRESHOLD` and the peer is in the close group, it is evicted and quarantined (Section 7.4).
 2. **Iterative lookup feedback**: Network lookups record success/failure per queried peer.
 3. **Self-lookup refresh**: Periodic self-lookups discover that a previously-close peer is no longer returned by the network.
 4. **Stale peer revalidation**: When a new candidate contends for a full bucket, all stale peers (not seen within `LIVE_THRESHOLD`) in that bucket are pinged. Non-responders are evicted immediately (Section 7.5).
@@ -433,7 +431,7 @@ All paths converge on the same admission flow (Section 7.1), ensuring consistent
 
 ### 10.3 Automatic Re-Bootstrap
 
-When `routing_table_size()` drops below `AUTO_REBOOTSTRAP_THRESHOLD` (e.g., due to mass blocking or network partition), the node MUST automatically trigger the bootstrap process (Section 11.1 steps 2–7). This prevents permanent isolation when the routing table is depleted.
+When `routing_table_size()` drops below `AUTO_REBOOTSTRAP_THRESHOLD` (e.g., due to mass quarantine/departure or network partition), the node MUST automatically trigger the bootstrap process (Section 11.1 steps 2–7). This prevents permanent isolation when the routing table is depleted.
 
 Re-bootstrap follows the same flow as cold start: dial bootstrap peers, perform self-lookup, refresh buckets, emit `BootstrapComplete`. The close group cache is not reloaded (it reflects the state that led to depletion). A minimum cooldown of `REBOOTSTRAP_COOLDOWN` (reference: 5 minutes) MUST elapse between consecutive re-bootstrap attempts to prevent bootstrap node overload during persistent partitions. Re-bootstrap MAY fire multiple times if the routing table repeatedly drops below the threshold, subject to the cooldown.
 
@@ -500,7 +498,7 @@ Defenses:
 An attacker attempts to insert malicious entries via `FIND_NODE` responses:
 
 1. **No blind insertion**: Peers returned by `FIND_NODE` are not automatically added. They must be dialed, authenticated, and pass the admission flow.
-2. **Trust baseline**: New peers start at neutral trust (0.5), well above `BLOCK_THRESHOLD` (0.15) but below `TRUST_PROTECTION_THRESHOLD` (0.7). They must demonstrate good behavior to earn protection.
+2. **Trust baseline**: New peers start at neutral trust (0.5), above `SWAP_THRESHOLD` (0.35) and `QUARANTINE_THRESHOLD` (0.20), but below `TRUST_PROTECTION_THRESHOLD` (0.7). They must demonstrate good behavior to earn protection.
 3. **IP diversity gates**: Even if an attacker can authenticate many identities, IP diversity limits prevent flooding.
 
 ## 13. Consumer API
@@ -527,12 +525,12 @@ Consumers MUST NOT:
 
 - Directly read or write k-bucket contents.
 - Bypass IP diversity or trust checks when admitting peers.
-- Remove peers from the routing table (that is owned by the trust/blocking subsystem).
+- Remove peers from the routing table (that is owned by the trust/quarantine subsystem).
 - Manipulate trust scores directly — all trust mutations flow through `report_trust_event`.
 
 Consumers MAY:
 
-- Report trust events via `report_trust_event` to reward or penalize peers based on application-level outcomes, which may indirectly cause routing table changes (eviction on block, trust protection gain/loss).
+- Report trust events via `report_trust_event` to reward or penalize peers based on application-level outcomes, which may indirectly cause routing table changes (close-group quarantine, lazy swap eligibility, trust protection gain/loss).
 - Query `peer_trust` to make trust-informed decisions (e.g., preferring higher-trust peers for data retrieval).
 - Request network lookups to discover new peers (which may be admitted to the routing table as a side effect).
 
@@ -589,14 +587,15 @@ All events — internal and consumer-reported — follow the same path through t
 3. **Weight resolution**: Internal events have implicit weight `1.0`. Consumer events use their caller-specified weight (after validation/clamping).
 4. **EMA update**: The trust engine applies time decay, then blends the observation using the EMA model (Section 4). Positive events use observation `1.0`, negative events use `0.0`. The weight scales influence via the continuous formula `score = (1 - EMA_ALPHA)^W * score + (1 - (1 - EMA_ALPHA)^W) * observation`, which generalizes naturally to fractional weights. At reference values (`EMA_ALPHA = 0.3`), a single weight-1.0 failure moves a neutral peer's score from 0.5 to 0.35; a single weight-5.0 failure moves it from 0.5 to ~0.08.
 5. **Threshold checks**:
-   a. **Block check**: If `TrustScore(self, P)` dropped below `BLOCK_THRESHOLD`, trigger the blocked peer handling flow (Section 7.4) — peer is evicted from the routing table, disconnected, and blocked.
-   b. **Protection evaluation**: If `TrustScore(self, P)` crossed `TRUST_PROTECTION_THRESHOLD` in either direction, the peer's swap-closer protection status changes accordingly (Section 7.3).
+   a. **Quarantine check**: If `TrustScore(self, P)` dropped below `QUARANTINE_THRESHOLD`, local lookup results, FIND_NODE responses, and automatic lookup/dial paths avoid the peer. If it is in the K-closest-to-self set, trigger quarantine handling (Section 7.4).
+   b. **Swap eligibility**: If `TrustScore(self, P)` dropped below `SWAP_THRESHOLD`, the peer is eligible for lazy replacement when a better candidate needs its slot.
+   c. **Protection evaluation**: If `TrustScore(self, P)` crossed `TRUST_PROTECTION_THRESHOLD` in either direction, the peer's swap-closer protection status changes accordingly (Section 7.3).
 
 #### Consumer Reporting Invariants
 
 1. **Unified model**: All events (internal and consumer-reported) are processed by the same EMA scoring model. There is no separate scoring path for consumer events. The trust score is a single value derived from the weighted history of all events, with time decay toward neutral.
 2. **Weight as severity**: A consumer event with weight `W` has the same EMA impact as `W` consecutive internal events of the same category (exact for integer `W`, continuously interpolated for fractional `W` via the generalized blend formula in Section 4). Weight `1.0` is equivalent to a single internal event; weight `5.0` is equivalent to five.
-3. **Bounded weight**: A single consumer event's weight is capped at `MAX_CONSUMER_WEIGHT`. At reference values (`EMA_ALPHA = 0.3`, `MAX_CONSUMER_WEIGHT = 5.0`), a single maximum-weight failure moves a neutral peer from 0.5 to ~0.08 — enough to cross `BLOCK_THRESHOLD` (0.15) in one event. This is intentional: with the penalty-only model, a severe application-level failure should be able to immediately block a neutral peer.
+3. **Bounded weight**: A single consumer event's weight is capped at `MAX_CONSUMER_WEIGHT`. At reference values (`EMA_ALPHA = 0.124`, `MAX_CONSUMER_WEIGHT = 5.0`), a single maximum-weight failure moves a neutral peer to ~0.26 — enough to make it swap-eligible but not enough by itself to quarantine it. Severe repeated failures can still push a peer below `QUARANTINE_THRESHOLD`.
 4. **Natural decay**: Because consumer events flow through the EMA, their influence decays over time just like internal events. A penalty reported last week has less influence on the current score than a penalty reported today. A peer that was penalized but then goes idle will drift back toward neutral (0.5).
 5. **Idempotent path**: Reporting a trust event for a peer not in the routing table is valid. The trust engine maintains scores independently of routing table membership (a peer can have a trust record without being in `LocalRT`).
 6. **No direct score manipulation**: Consumers cannot set a trust score to an arbitrary value. Scores are derived exclusively from the weighted EMA of all events plus time decay.
@@ -659,10 +658,10 @@ Use this list to find design flaws before coding:
    - After a long offline period, the close group cache may contain departed peers. Mitigation: warm restart dials cached peers and falls back to bootstrap if they are unreachable. Self-lookup then refreshes the neighborhood.
 
 9. **Consumer trust event flooding**:
-   - A misbehaving or buggy consumer could flood `report_trust_event` with `ApplicationFailure(MAX_CONSUMER_WEIGHT)` events, rapidly blocking many peers and depleting the routing table. Mitigation: `MAX_CONSUMER_WEIGHT` caps per-event influence, and the EMA's smoothing factor limits how far a single event can move the score — even at maximum weight, the score change is bounded by EMA dynamics, not by the weight alone. The consumer is a trusted local process. If rate limiting is needed in the future, it can be added at the `report_trust_event` interface without changing the scoring model. For v1, the consumer is assumed to report events honestly and at a reasonable rate.
+   - A misbehaving or buggy consumer could flood `report_trust_event` with `ApplicationFailure(MAX_CONSUMER_WEIGHT)` events, rapidly quarantining close-group peers and depleting the trusted close group. Mitigation: `MAX_CONSUMER_WEIGHT` caps per-event influence, and the EMA's smoothing factor limits how far a single event can move the score — even at maximum weight, the score change is bounded by EMA dynamics, not by the weight alone. The consumer is a trusted local process. If rate limiting is needed in the future, it can be added at the `report_trust_event` interface without changing the scoring model. For v1, the consumer is assumed to report events honestly and at a reasonable rate.
 
 10. **Internal vs consumer event divergence**:
-    - Core only records penalties (connection failures), so a peer that is DHT-reachable but never receives consumer rewards will gradually drift below neutral as occasional connection hiccups accumulate. Consumer `ApplicationSuccess` events are the only way to push trust above neutral, preventing free-riding on bare connectivity. A peer that is reachable but serves bad data will be blocked even faster since there are no internal success events to counteract consumer-reported failures.
+    - Core only records penalties (connection failures), so a peer that is DHT-reachable but never receives consumer rewards will gradually drift below neutral as occasional connection hiccups accumulate. Consumer `ApplicationSuccess` events are the only way to push trust above neutral, preventing free-riding on bare connectivity. A peer that is reachable but serves bad data will become swap-eligible or quarantined faster since there are no internal success events to counteract consumer-reported failures.
 
 11. **Consumer reward inflation**:
     - A consumer could report `ApplicationSuccess(MAX_CONSUMER_WEIGHT)` for every interaction, inflating a peer's trust toward 1.0. Because all events flow through EMA, the score asymptotically approaches 1.0 but the smoothing factor limits the rate. This is acceptable: the consumer is a trusted local process, and inflating trust simply means the peer gains stronger protection. If the peer later misbehaves, subsequent failures (internal or consumer-reported) will pull the score back down, and time decay ensures idle peers drift toward neutral.
@@ -697,8 +696,8 @@ Each scenario should assert exact expected outcomes and state transitions.
 3. **Empty address rejection**:
    - Candidate with zero addresses. Rejected with error. Routing table unchanged.
 
-4. **Blocked peer rejection**:
-   - Peer with `TrustScore < BLOCK_THRESHOLD`. Rejected. Not in routing table.
+4. **Quarantined peer rejection**:
+   - Peer with `TrustScore < QUARANTINE_THRESHOLD`, or previously quarantined peer with trust below `QUARANTINE_READMIT_THRESHOLD`. Rejected. Not in routing table.
 
 5. **Bucket-full rejection (no stale peers)**:
    - Bucket at `K_BUCKET_SIZE` capacity, candidate cannot swap-closer, all incumbent peers have `last_seen` within `LIVE_THRESHOLD`. Stale revalidation finds no candidates. Rejected with "bucket at capacity." Routing table unchanged.
@@ -799,17 +798,18 @@ Each scenario should assert exact expected outcomes and state transitions.
 35. **KClosestPeersChanged event emission**:
     - Insert a peer into a bucket that affects the K-closest-to-self set. `KClosestPeersChanged` emitted with correct old and new sets. Insert a peer into a distant bucket that does NOT affect the K-closest set. `KClosestPeersChanged` is NOT emitted. Verify at-most-once semantics: a single admission with multiple swaps emits the event at most once.
 
-36. **Blocked peer eviction**:
-    - Peer trust drops below 0.15 after failed interaction. Peer is immediately removed from routing table and disconnected.
+36. **Close-group quarantine eviction**:
+    - K-closest peer trust drops below 0.20 after failed interaction. Peer is immediately removed from routing table, its trust record is retained, and `PeerRemoved` is emitted.
 
-37. **Blocked peer inbound connection rejected**:
-    - Blocked peer initiates inbound connection. Transport identifies peer during authentication, checks trust score, rejects connection. No resources allocated, no routing table interaction.
+37. **Quarantined peer inbound admission rejected**:
+    - Quarantined peer initiates inbound connection. Transport authenticates the peer, the normal routing-table admission path checks trust, and admission is rejected until trust reaches 0.45.
 
-38. **Blocked peer skipped in lookup results**:
-    - Blocked peer appears in `FIND_NODE` response. Local node checks trust, finds it below `BLOCK_THRESHOLD`. Peer silently skipped — not dialed.
+38. **Quarantined peer skipped in lookup results**:
+    - Quarantined peer appears in `FIND_NODE` response from a node that does not quarantine it. Local node checks trust, finds it below the applicable quarantine/readmit threshold. Peer silently skipped — not dialed.
+    - If the local node is answering a `FIND_NODE` request, quarantined peers are omitted from the response entirely.
 
-39. **Blocked peer re-admission via lookup discovery after trust recovery**:
-    - Previously blocked peer's trust decays back above `BLOCK_THRESHOLD`. Peer appears in `FIND_NODE` response. Local node dials, authenticates, and admits through normal admission flow.
+39. **Quarantined peer re-admission via lookup discovery after trust recovery**:
+    - Previously quarantined peer's trust decays back to at least `QUARANTINE_READMIT_THRESHOLD`. Peer appears in `FIND_NODE` response. Local node dials, authenticates, and admits through normal admission flow.
 
 ### Bootstrap Tests
 
@@ -832,7 +832,7 @@ Each scenario should assert exact expected outcomes and state transitions.
     - Close group cache loaded. Cached peers dialed. Self-lookup and bucket refreshes complete. `BootstrapComplete` emitted. Event fires exactly once regardless of cold/warm path.
 
 46. **Auto re-bootstrap on routing table depletion**:
-    - All peers blocked or departed. `routing_table_size()` drops below `AUTO_REBOOTSTRAP_THRESHOLD`. Bootstrap process automatically triggered. Bootstrap peers dialed, self-lookup runs. Routing table repopulated. `BootstrapComplete` emitted.
+    - Peers are quarantined or departed. `routing_table_size()` drops below `AUTO_REBOOTSTRAP_THRESHOLD`. Bootstrap process automatically triggered. Bootstrap peers dialed, self-lookup runs. Routing table repopulated. `BootstrapComplete` emitted.
 
 ### Security Tests
 
@@ -851,19 +851,20 @@ Each scenario should assert exact expected outcomes and state transitions.
 51. **Unauthenticated peer rejected**:
     - Peer returned by `FIND_NODE` but not yet authenticated. Not admitted to routing table. Must complete handshake first.
 
-52. **Blocked peer messages dropped**:
-    - Peer below block threshold sends DHT message. Message silently dropped. No routing table interaction.
+52. **Quarantined peer avoided by automatic lookup**:
+    - Peer below quarantine threshold appears as a candidate. Automatic lookup skips it and spends no alpha slot dialing it.
+    - Local lookup and FIND_NODE response construction do not return the peer as a candidate.
 
 ### Consumer Trust Reporting Tests
 
 53. **Consumer reward improves trust**:
     - Peer starts at neutral trust (0.5). Consumer reports `ApplicationSuccess(1.0)`. Trust score increases above 0.5 (exact value determined by EMA smoothing factor). Peer remains in routing table.
 
-54. **Consumer penalty degrades trust to blocking**:
-    - Peer starts at neutral trust (0.5). Consumer reports repeated `ApplicationFailure(3.0)` events. Trust score decreases with each event. After sufficient events, score drops below `BLOCK_THRESHOLD` (0.15). Peer is evicted from routing table and blocked (Section 7.4).
+54. **Consumer penalty degrades trust to quarantine**:
+    - Peer starts at neutral trust (0.5). Consumer reports repeated `ApplicationFailure(3.0)` events. Trust score decreases with each event. After sufficient events, score drops below `QUARANTINE_THRESHOLD` (0.20). If the peer is in the K-closest set, it is evicted and quarantined (Section 7.4).
 
-55. **Consumer penalty triggers blocking and eviction**:
-    - Peer is in routing table with trust slightly above `BLOCK_THRESHOLD`. Consumer reports `ApplicationFailure(weight)` sufficient to push score below `BLOCK_THRESHOLD`. Peer is immediately evicted from routing table, disconnected at transport layer, and blocked from re-admission. `PeerRemoved` event emitted.
+55. **Consumer penalty triggers close-group quarantine**:
+    - Peer is in the K-closest set with trust slightly above `QUARANTINE_THRESHOLD`. Consumer reports `ApplicationFailure(weight)` sufficient to push score below `QUARANTINE_THRESHOLD`. Peer is immediately evicted from routing table and quarantined from re-admission until trust reaches `QUARANTINE_READMIT_THRESHOLD`. `PeerRemoved` event emitted.
 
 56. **Consumer event for peer not in routing table**:
     - Peer has no routing table entry. Consumer reports `ApplicationFailure(2.0)`. Trust engine records the event and updates the EMA score (decreases from neutral 0.5). Routing table is unchanged. If the peer later attempts admission, the recorded low trust may cause rejection (Section 7.1 step 4).
