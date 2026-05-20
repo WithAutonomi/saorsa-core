@@ -622,8 +622,8 @@ pub struct DhtNetworkConfig {
     /// K-closest peers are immediately evicted into temporary quarantine.
     /// Default: 0.0 (disabled).
     pub quarantine_threshold: f64,
-    /// Trust score required before a quarantined peer can be admitted again,
-    /// and before any new or promoted peer can enter the K-closest set.
+    /// Trust score required before a new peer can enter the routing table,
+    /// and before a quarantined peer can be admitted again.
     /// Default: 0.0 (disabled).
     pub quarantine_readmit_threshold: f64,
 }
@@ -2565,8 +2565,8 @@ impl DhtNetworkManager {
     ///
     /// No network requests are made — safe to call from request handlers.
     /// Only returns peers that passed the `is_dht_participant` security gate,
-    /// were added to the Kademlia routing table, and are not below the trust
-    /// quarantine/readmit thresholds.
+    /// were added to the Kademlia routing table, and are not locally
+    /// quarantined by trust policy.
     ///
     /// Results are sorted by XOR distance to the key.
     pub async fn find_closest_nodes_local(&self, key: &Key, count: usize) -> Vec<DHTNode> {
@@ -2745,7 +2745,7 @@ impl DhtNetworkManager {
         for node in initial {
             if self.should_avoid_automatic_peer(&node.peer_id).await {
                 trace!(
-                    "[NETWORK] Skipping {}: peer is below trust quarantine/readmit threshold",
+                    "[NETWORK] Skipping {}: peer is below trust quarantine/admission threshold",
                     node.peer_id.to_hex()
                 );
                 continue;
@@ -2792,7 +2792,7 @@ impl DhtNetworkManager {
                 if self.should_avoid_automatic_peer(&node.peer_id).await {
                     peer_states.mark_failed(node.peer_id);
                     trace!(
-                        "[NETWORK] Skipping {}: peer is below trust quarantine/readmit threshold",
+                        "[NETWORK] Skipping {}: peer is below trust quarantine/admission threshold",
                         node.peer_id.to_hex()
                     );
                     continue;
@@ -2903,7 +2903,7 @@ impl DhtNetworkManager {
                             if self.should_avoid_automatic_peer(&node.peer_id).await {
                                 peer_states.mark_failed(node.peer_id);
                                 trace!(
-                                    "[NETWORK] Skipping gossiped {}: peer is below trust quarantine/readmit threshold",
+                                    "[NETWORK] Skipping gossiped {}: peer is below trust quarantine/admission threshold",
                                     node.peer_id.to_hex()
                                 );
                                 continue;
@@ -3611,7 +3611,8 @@ impl DhtNetworkManager {
     async fn should_avoid_automatic_peer(&self, peer_id: &PeerId) -> bool {
         let trust_score = self.peer_trust_score(peer_id);
         let dht = self.dht.read().await;
-        dht.should_avoid_for_lookup(peer_id, trust_score)
+        dht.should_avoid_automatic_candidate(peer_id, trust_score)
+            .await
     }
 
     /// Ensure an identity-authenticated channel to `peer_id` exists,
