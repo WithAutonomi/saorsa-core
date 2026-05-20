@@ -58,7 +58,7 @@ All parameters are configurable. Values below are a reference profile used for l
 | `TRUST_PROTECTION_THRESHOLD` | Trust score above which a peer resists swap-closer eviction | `0.7` |
 | `SWAP_THRESHOLD` | Trust score below which a peer is eligible for replacement when a better candidate needs the slot | `0.35` |
 | `QUARANTINE_THRESHOLD` | Trust score below which automatic lookup/dial paths avoid the peer, and close-group peers are evicted immediately | `0.20` |
-| `QUARANTINE_READMIT_THRESHOLD` | Trust score a quarantined peer must recover to before normal admission accepts it again | `0.45` |
+| `QUARANTINE_READMIT_THRESHOLD` | Trust score required for K-closest admission/readmission after quarantine | `0.45` |
 | `EMA_ALPHA` | EMA smoothing factor — weight of each new observation (higher = faster response) | `0.124` |
 | `DECAY_LAMBDA` | Per-second exponential decay rate toward neutral (0.5) | `1.394e-5` |
 | `SELF_LOOKUP_INTERVAL` | Periodic self-lookup cadence (maintenance phase only; bootstrap self-lookups run back-to-back with no interval) | random in `[5 min, 10 min]` |
@@ -129,7 +129,7 @@ Note: `K_BUCKET_SIZE` values below 4 produce degenerate behavior (single-peer ro
 4. **Address requirement**: A `NodeInfo` with an empty address list MUST NOT be admitted to the routing table.
 5. **Authenticated membership**: Only peers that have completed transport-level authentication are eligible for routing table insertion. Unauthenticated peers MUST NOT enter `LocalRT`.
 6. **IP diversity**: No enforcement scope (per-bucket or routing-neighborhood) may exceed `IP_EXACT_LIMIT` nodes per exact IP or `IP_SUBNET_LIMIT` nodes per subnet, except via explicit loopback or testnet overrides.
-7. **Trust quarantine**: Peers with `TrustScore(self, P) < QUARANTINE_THRESHOLD` MUST be skipped by local lookup result selection, FIND_NODE responses, and automatic lookup/dial candidate selection. If such a peer is in the K-closest-to-self set, it MUST be evicted and quarantined until `TrustScore(self, P) >= QUARANTINE_READMIT_THRESHOLD`.
+7. **Trust quarantine and close-group admission**: Peers with `TrustScore(self, P) < QUARANTINE_THRESHOLD` MUST be skipped by local lookup result selection, FIND_NODE responses, and automatic lookup/dial candidate selection. If such a peer is in the K-closest-to-self set, it MUST be evicted and quarantined until `TrustScore(self, P) >= QUARANTINE_READMIT_THRESHOLD`. Any new or promoted K-closest peer MUST have `TrustScore(self, P) >= QUARANTINE_READMIT_THRESHOLD`; peers between the two thresholds may occupy non-close routing-table slots but must not enter the K-closest set.
 8. **Trust protection (staleness-gated)**: A peer with `TrustScore(self, P) >= TRUST_PROTECTION_THRESHOLD` **AND** `last_seen` within `LIVE_THRESHOLD` MUST NOT be evicted by swap-closer admission. A peer whose `last_seen` exceeds `LIVE_THRESHOLD` receives no trust protection regardless of score — stale peers MUST NOT hold slots against live candidates.
 9. **Deterministic distance**: `Distance(A, B)` is symmetric, deterministic, and consistent across all nodes. Two nodes compute the same distance between the same pair of keys.
 10. **Atomic admission**: IP diversity checks, capacity checks, swap-closer evictions, trust score reads, and insertion MUST execute within a single write-locked critical section to prevent TOCTOU races. All `TrustScore` queries during admission (steps 4, 8) MUST occur while the routing table write lock is held.
@@ -185,9 +185,9 @@ When a candidate peer `P` with `NodeInfo` and IP address `candidate_ip` is prese
 2. **Address check**: If `P.addresses` is empty, reject.
 3. **Authentication check**: If `P` has not completed transport-level authentication, reject.
 4. **Trust quarantine check**: If `TrustScore(self, P) < QUARANTINE_THRESHOLD`, reject. If `P` was previously quarantined, reject until `TrustScore(self, P) >= QUARANTINE_READMIT_THRESHOLD`.
-5. **Update short-circuit**: If `P` already exists in `KBucket(BucketIndex(self, P))`, merge addresses (Section 6.3), refresh `last_seen`, move `P` to tail, and return. The peer already holds its slot — IP diversity and capacity checks are skipped.
-6. **Loopback check**: If `candidate_ip` is loopback and loopback is disallowed, reject. If loopback is allowed, skip all IP diversity checks (step 7–8) and proceed directly to step 9.
-7. **Non-IP transport bypass**: If `P` has no IP-based address (e.g., Bluetooth, LoRa), skip IP diversity checks and proceed directly to step 9.
+5. **Update short-circuit**: If `P` already exists in `KBucket(BucketIndex(self, P))`, merge addresses (Section 6.3), refresh `last_seen`, move `P` to tail, and return. The peer already holds its slot — IP diversity, capacity, and close-group admission checks are skipped.
+6. **Loopback check**: If `candidate_ip` is loopback and loopback is disallowed, reject. If loopback is allowed, skip all IP diversity checks (step 7–9) and proceed directly to the close-group admission check (step 10).
+7. **Non-IP transport bypass**: If `P` has no IP-based address (e.g., Bluetooth, LoRa), skip IP diversity checks and proceed directly to the close-group admission check (step 10).
 8. **IP diversity enforcement** (under write lock — Invariant 10):
    a. Compute `bucket_idx = BucketIndex(self, P)`.
    b. Run per-bucket IP diversity check (Section 7.2) against nodes in `KBucket(bucket_idx)`.
@@ -213,9 +213,11 @@ When a candidate peer `P` with `NodeInfo` and IP address `candidate_ip` is prese
    - Per-bucket IP diversity (step 8b): bucket composition may have changed.
    - Routing-neighborhood IP diversity (step 8c): K-closest set may have changed.
    - Capacity pre-check (this step): slots may have been filled by concurrent admissions.
+   - Close-group admission check (step 10): the candidate may now enter the K-closest set after stale evictions.
    Steps 1–3, 5–7 are not re-evaluated (candidate identity, addresses, authentication, and loopback status are immutable within a single admission attempt). Re-evaluation MUST NOT trigger a second round of stale revalidation — if any check fails during re-evaluation, reject the candidate. This bounds admission latency to a single `STALE_REVALIDATION_TIMEOUT` per admission attempt with a single lock-release window. This prevents TOCTOU races caused by concurrent mutations during the unlocked ping window. If revalidation frees at least one slot and re-evaluation passes, proceed. If no slots freed or re-evaluation fails, reject.
-10. **Execute swaps**: Remove all deduplicated swap candidates. Disconnect evicted peers at the transport layer.
-11. **Insert**: Add `P` to `KBucket(bucket_idx)`.
+10. **Close-group admission check**: Before mutating the routing table, compute whether `P` would enter the K-closest-to-self set after planned swaps. If so, require `TrustScore(self, P) >= QUARANTINE_READMIT_THRESHOLD`; otherwise reject without mutating the routing table. Existing close-group peers above `QUARANTINE_THRESHOLD` are not evicted merely for being below this admission threshold.
+11. **Execute swaps**: Remove all deduplicated swap candidates. Disconnect evicted peers at the transport layer.
+12. **Insert**: Add `P` to `KBucket(bucket_idx)`.
 
 ### 7.2 IP Diversity Enforcement
 
@@ -261,14 +263,15 @@ When any interaction records a trust failure and `TrustScore(self, P)` drops bel
 3. Mark `P` as quarantined if it was evicted from the close group.
 4. Do not re-admit quarantined `P` until `TrustScore(self, P) >= QUARANTINE_READMIT_THRESHOLD`.
 5. If `P` is not in the K-closest-to-self set, it may remain in the routing table, but local lookup result selection, FIND_NODE responses, and automatic lookup/dial paths MUST avoid it while `TrustScore(self, P) < QUARANTINE_THRESHOLD`.
+6. If `P` has `QUARANTINE_THRESHOLD <= TrustScore(self, P) < QUARANTINE_READMIT_THRESHOLD`, it may occupy a non-close routing-table slot. If it would newly enter the K-closest set through admission or promotion, remove/reject it until its trust reaches `QUARANTINE_READMIT_THRESHOLD`. Existing close-group peers in this range are retained until they drop below `QUARANTINE_THRESHOLD`.
 
 Quarantine is a routing-table and automatic lookup policy. It is not a blanket transport-level block for explicit user-initiated sends.
 
 Re-admission path: a quarantined peer can only re-enter when its trust score recovers above `QUARANTINE_READMIT_THRESHOLD` through time-decay toward neutral AND the peer is rediscovered through normal network activity:
 
 1. Peer `P` is returned in a `FIND_NODE` response from another peer during a lookup, or connects through the normal authenticated peer path.
-2. Local node checks `TrustScore(self, P)`. If still below `QUARANTINE_READMIT_THRESHOLD` for a quarantined peer, `P` is skipped/rejected.
-3. If trust has recovered to `QUARANTINE_READMIT_THRESHOLD`, the standard admission flow (Section 7.1) applies.
+2. Local node checks `TrustScore(self, P)`. If still below `QUARANTINE_READMIT_THRESHOLD` for a quarantined peer, or if admitting it would place it in the K-closest set, `P` is skipped/rejected.
+3. If trust has recovered to `QUARANTINE_READMIT_THRESHOLD`, the standard admission flow (Section 7.1) applies. Peers below that threshold can still be admitted to non-close routing-table slots as long as they are not quarantined and are at or above `QUARANTINE_THRESHOLD`.
 
 No manual probing is required. Natural rediscovery plus trust decay is the temporary-ban mechanism.
 
@@ -585,9 +588,9 @@ All events — internal and consumer-reported — follow the same path through t
 1. **Event received**: `report_trust_event(P, event)` is called (by DHT internals or by the consumer).
 2. **Category mapping**: Event mapped to positive (successful interaction) or negative (failed interaction).
 3. **Weight resolution**: Internal events have implicit weight `1.0`. Consumer events use their caller-specified weight (after validation/clamping).
-4. **EMA update**: The trust engine applies time decay, then blends the observation using the EMA model (Section 4). Positive events use observation `1.0`, negative events use `0.0`. The weight scales influence via the continuous formula `score = (1 - EMA_ALPHA)^W * score + (1 - (1 - EMA_ALPHA)^W) * observation`, which generalizes naturally to fractional weights. At reference values (`EMA_ALPHA = 0.3`), a single weight-1.0 failure moves a neutral peer's score from 0.5 to 0.35; a single weight-5.0 failure moves it from 0.5 to ~0.08.
+4. **EMA update**: The trust engine applies time decay, then blends the observation using the EMA model (Section 4). Positive events use observation `1.0`, negative events use `0.0`. The weight scales influence via the continuous formula `score = (1 - EMA_ALPHA)^W * score + (1 - (1 - EMA_ALPHA)^W) * observation`, which generalizes naturally to fractional weights. At reference values (`EMA_ALPHA = 0.124`), a single weight-1.0 failure moves a neutral peer's score from 0.5 to ~0.438; a single weight-5.0 failure moves it from 0.5 to ~0.26.
 5. **Threshold checks**:
-   a. **Quarantine check**: If `TrustScore(self, P)` dropped below `QUARANTINE_THRESHOLD`, local lookup results, FIND_NODE responses, and automatic lookup/dial paths avoid the peer. If it is in the K-closest-to-self set, trigger quarantine handling (Section 7.4).
+   a. **Quarantine check**: If `TrustScore(self, P)` dropped below `QUARANTINE_THRESHOLD`, local lookup results, FIND_NODE responses, and automatic lookup/dial paths avoid the peer. If it is in the K-closest-to-self set, trigger quarantine handling (Section 7.4). This is local routing policy only; it MUST NOT change the FIND_NODE/DHTNode wire shape or reinterpret legacy wire fields, because nodes must remain interoperable with older releases.
    b. **Swap eligibility**: If `TrustScore(self, P)` dropped below `SWAP_THRESHOLD`, the peer is eligible for lazy replacement when a better candidate needs its slot.
    c. **Protection evaluation**: If `TrustScore(self, P)` crossed `TRUST_PROTECTION_THRESHOLD` in either direction, the peer's swap-closer protection status changes accordingly (Section 7.3).
 
@@ -698,6 +701,7 @@ Each scenario should assert exact expected outcomes and state transitions.
 
 4. **Quarantined peer rejection**:
    - Peer with `TrustScore < QUARANTINE_THRESHOLD`, or previously quarantined peer with trust below `QUARANTINE_READMIT_THRESHOLD`. Rejected. Not in routing table.
+   - Peer with `QUARANTINE_THRESHOLD <= TrustScore < QUARANTINE_READMIT_THRESHOLD` is admitted when it would occupy a non-close routing-table slot. The same peer is rejected when it would enter the K-closest set.
 
 5. **Bucket-full rejection (no stale peers)**:
    - Bucket at `K_BUCKET_SIZE` capacity, candidate cannot swap-closer, all incumbent peers have `last_seen` within `LIVE_THRESHOLD`. Stale revalidation finds no candidates. Rejected with "bucket at capacity." Routing table unchanged.
@@ -800,6 +804,7 @@ Each scenario should assert exact expected outcomes and state transitions.
 
 36. **Close-group quarantine eviction**:
     - K-closest peer trust drops below 0.20 after failed interaction. Peer is immediately removed from routing table, its trust record is retained, and `PeerRemoved` is emitted.
+    - Non-close peer with trust 0.30 is retained in the routing table. A close-group removal promotes it into the K-closest set. Local trust gate removes it from the routing table without marking it as below-threshold quarantine.
 
 37. **Quarantined peer inbound admission rejected**:
     - Quarantined peer initiates inbound connection. Transport authenticates the peer, the normal routing-table admission path checks trust, and admission is rejected until trust reaches 0.45.

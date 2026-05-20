@@ -88,13 +88,16 @@ Trust affects routing-table membership in two stages:
 |-----------------|-------------------|---------------|
 | Lazy swap eligibility | < 0.35 | `swap_threshold` |
 | Close-group quarantine / lookup avoidance | < 0.20 | `quarantine_threshold` |
-| Quarantine readmission | >= 0.45 | `quarantine_readmit_threshold` |
+| Close-group admission / quarantine readmission | >= 0.45 | `quarantine_readmit_threshold` |
 | Staleness | Configurable | `stale_timeout` |
 
 Peers outside the K-closest set are not globally evicted solely for low trust.
 They are omitted from local lookup results, FIND_NODE responses, and automatic
 lookup paths below the quarantine threshold, and can be lazily replaced when
 better candidates need the slot.
+Peers at or above the quarantine threshold but below the readmission threshold
+may occupy non-close routing-table slots, but cannot newly enter the K-closest
+set until they recover to the readmission threshold.
 
 ### Quarantine Reasons
 

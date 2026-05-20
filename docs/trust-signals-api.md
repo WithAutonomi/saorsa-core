@@ -88,7 +88,9 @@ The routing table uses three trust thresholds:
   and quarantined.
 - `quarantine_readmit_threshold` (`0.45` by default): a quarantined peer can
   only re-enter through normal discovery/admission after its decayed trust
-  reaches this score.
+  reaches this score. New or promoted K-closest peers must also meet this
+  threshold; peers between `0.20` and `0.45` may occupy non-close routing-table
+  slots.
 
 ```rust
 use saorsa_core::AdaptiveDhtConfig;
@@ -104,6 +106,8 @@ let config = AdaptiveDhtConfig {
 Raw DHT routing uses Kademlia XOR distance. Local lookup results, FIND_NODE
 responses, and automatic network lookups avoid quarantined peers so known-bad
 contacts do not consume query slots or get handed out as lookup candidates.
+This filtering is local policy only; the DHT wire protocol and legacy
+`DHTNode` fields remain unchanged for backwards compatibility with older nodes.
 
 ## Architecture
 
