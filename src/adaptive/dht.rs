@@ -36,7 +36,7 @@ const DEFAULT_SWAP_THRESHOLD: f64 = 0.35;
 /// immediately and all peers are avoided by automatic lookup/dial paths.
 const DEFAULT_QUARANTINE_THRESHOLD: f64 = 0.20;
 
-/// Default trust score a quarantined peer must recover to before readmission.
+/// Default trust score a new or quarantined peer must have for admission.
 const DEFAULT_QUARANTINE_READMIT_THRESHOLD: f64 = 0.45;
 
 /// Maximum weight multiplier per single consumer-reported event.
@@ -56,8 +56,8 @@ pub struct AdaptiveDhtConfig {
     /// K-closest peers are evicted immediately into temporary quarantine.
     /// Default: 0.20
     pub quarantine_threshold: f64,
-    /// Trust score required before a quarantined peer can re-enter, and before
-    /// any new or promoted peer can enter the K-closest set.
+    /// Trust score required before a new peer can enter the routing table, and
+    /// before a quarantined peer can re-enter.
     /// Default: 0.45
     pub quarantine_readmit_threshold: f64,
 }
@@ -78,7 +78,7 @@ impl AdaptiveDhtConfig {
     /// Returns `Err` if a threshold is outside its safe range or is NaN.
     /// Values >= 0.5 (neutral trust) would make all unknown peers immediately
     /// swap/quarantine eligible since they start at neutral (0.5). The
-    /// close-group admission/readmit threshold must also stay below neutral
+    /// new-peer admission/readmit threshold must also stay below neutral
     /// because recovery happens by decay toward neutral, not by active probing.
     pub fn validate(&self) -> crate::error::P2pResult<()> {
         if !(0.0..0.5).contains(&self.swap_threshold) || self.swap_threshold.is_nan() {
