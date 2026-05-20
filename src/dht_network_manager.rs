@@ -553,7 +553,8 @@ pub struct DhtNetworkConfig {
     /// Default: 0.0 (disabled).
     pub swap_threshold: f64,
     /// Trust score below which automatic lookup/dial paths avoid a peer, and
-    /// K-closest peers are immediately evicted into temporary quarantine.
+    /// K-closest peers are evicted into temporary quarantine when the routing
+    /// table can keep at least K peers.
     /// Default: 0.0 (disabled).
     pub quarantine_threshold: f64,
     /// Trust score required before a new peer can enter the routing table,
@@ -4602,10 +4603,13 @@ impl DhtNetworkManager {
         info!("Evicted {} offline K-closest peer(s)", non_responders.len());
     }
 
-    fn routing_events_include_close_group_change(events: &[RoutingTableEvent]) -> bool {
-        events
-            .iter()
-            .any(|event| matches!(event, RoutingTableEvent::KClosestPeersChanged { .. }))
+    fn routing_events_can_enable_quarantine_eviction(events: &[RoutingTableEvent]) -> bool {
+        events.iter().any(|event| {
+            matches!(
+                event,
+                RoutingTableEvent::PeerAdded(_) | RoutingTableEvent::KClosestPeersChanged { .. }
+            )
+        })
     }
 
     async fn enforce_close_group_trust_gate(
@@ -4635,7 +4639,7 @@ impl DhtNetworkManager {
     }
 
     async fn broadcast_routing_events_with_quarantine(&self, mut events: Vec<RoutingTableEvent>) {
-        if !Self::routing_events_include_close_group_change(&events) {
+        if !Self::routing_events_can_enable_quarantine_eviction(&events) {
             self.broadcast_routing_events(&events);
             return;
         }
@@ -4652,24 +4656,32 @@ impl DhtNetworkManager {
             return;
         }
 
-        let final_new_close_group = quarantine_events
-            .iter()
-            .rev()
-            .find_map(|event| match event {
-                RoutingTableEvent::KClosestPeersChanged { new, .. } => Some(new.clone()),
-                _ => None,
-            });
+        if let Some(original_old_close_group) = original_old_close_group {
+            let final_new_close_group =
+                quarantine_events
+                    .iter()
+                    .rev()
+                    .find_map(|event| match event {
+                        RoutingTableEvent::KClosestPeersChanged { new, .. } => Some(new.clone()),
+                        _ => None,
+                    });
 
-        events.retain(|event| !matches!(event, RoutingTableEvent::KClosestPeersChanged { .. }));
-        events.extend(
-            quarantine_events
-                .into_iter()
-                .filter(|event| !matches!(event, RoutingTableEvent::KClosestPeersChanged { .. })),
-        );
-        if let (Some(old), Some(new)) = (original_old_close_group, final_new_close_group)
-            && old != new
-        {
-            events.push(RoutingTableEvent::KClosestPeersChanged { old, new });
+            events.retain(|event| !matches!(event, RoutingTableEvent::KClosestPeersChanged { .. }));
+            events.extend(
+                quarantine_events.into_iter().filter(|event| {
+                    !matches!(event, RoutingTableEvent::KClosestPeersChanged { .. })
+                }),
+            );
+            if let Some(new) = final_new_close_group
+                && original_old_close_group != new
+            {
+                events.push(RoutingTableEvent::KClosestPeersChanged {
+                    old: original_old_close_group,
+                    new,
+                });
+            }
+        } else {
+            events.extend(quarantine_events);
         }
 
         self.broadcast_routing_events(&events);
@@ -5228,7 +5240,11 @@ mod tests {
             DhtCoreEngine::new(local_peer, 4, false, DEFAULT_NEUTRAL_TRUST - 0.15).unwrap();
         dht.set_trust_quarantine_thresholds(0.20, 0.45).unwrap();
 
-        dht.add_node_no_trust(routing_test_node(1)).await.unwrap();
+        for byte in 1..=5u8 {
+            dht.add_node_no_trust(routing_test_node(byte))
+                .await
+                .unwrap();
+        }
         let events = dht
             .enforce_close_group_quarantine(&quarantined_peer, 0.10)
             .await;
@@ -6393,7 +6409,7 @@ mod tests {
     fn routing_test_node(byte: u8) -> NodeInfo {
         NodeInfo {
             id: pid(byte),
-            addresses: vec![MultiAddr::quic(sock(&format!("203.0.113.{byte}:9000")))],
+            addresses: vec![MultiAddr::quic(sock(&format!("203.0.{byte}.1:9000")))],
             address_types: vec![AddressType::Direct],
             last_seen: AtomicInstant::now(),
         }
