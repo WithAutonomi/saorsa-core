@@ -22,7 +22,7 @@ name = "saorsa-core"
 # 0.22.0: MASQUE relay data plane, upgrade saorsa-transport to 0.31.0
 # 0.24.0: upgrade saorsa-transport to 0.33.0
 # 0.24.1: release candidate fixes
-version = "0.24.3"
+version = "0.24.4"
 edition = "2024"
 authors = ["Saorsa Labs Limited <david@saorsalabs.com>"]
 license = "AGPL-3.0"
