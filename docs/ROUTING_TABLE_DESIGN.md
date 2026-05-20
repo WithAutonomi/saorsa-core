@@ -57,7 +57,7 @@ All parameters are configurable. Values below are a reference profile used for l
 | `IPV6_SUBNET_MASK` | Prefix length for IPv6 subnet grouping | `/48` |
 | `TRUST_PROTECTION_THRESHOLD` | Trust score above which a peer resists swap-closer eviction | `0.7` |
 | `SWAP_THRESHOLD` | Trust score below which a peer is eligible for replacement when a better candidate needs the slot | `0.35` |
-| `QUARANTINE_THRESHOLD` | Trust score below which automatic lookup/dial paths avoid the peer, and close-group peers are evicted immediately | `0.20` |
+| `QUARANTINE_THRESHOLD` | Trust score below which automatic lookup/dial paths avoid the peer, and close-group peers are evicted when the routing table can retain at least K peers | `0.20` |
 | `QUARANTINE_READMIT_THRESHOLD` | Trust score required for new routing-table admission/readmission after quarantine | `0.45` |
 | `EMA_ALPHA` | EMA smoothing factor — weight of each new observation (higher = faster response) | `0.124` |
 | `DECAY_LAMBDA` | Per-second exponential decay rate toward neutral (0.5) | `1.394e-5` |
@@ -129,7 +129,7 @@ Note: `K_BUCKET_SIZE` values below 4 produce degenerate behavior (single-peer ro
 4. **Address requirement**: A `NodeInfo` with an empty address list MUST NOT be admitted to the routing table.
 5. **Authenticated membership**: Only peers that have completed transport-level authentication are eligible for routing table insertion. Unauthenticated peers MUST NOT enter `LocalRT`.
 6. **IP diversity**: No enforcement scope (per-bucket or routing-neighborhood) may exceed `IP_EXACT_LIMIT` nodes per exact IP or `IP_SUBNET_LIMIT` nodes per subnet, except via explicit loopback or testnet overrides.
-7. **Trust quarantine and admission**: Peers with `TrustScore(self, P) < QUARANTINE_THRESHOLD` MUST be skipped by local lookup result selection, FIND_NODE responses, and automatic lookup/dial candidate selection. If such a peer is in the K-closest-to-self set, it MUST be evicted and quarantined until `TrustScore(self, P) >= QUARANTINE_READMIT_THRESHOLD`. Any new routing-table peer MUST have `TrustScore(self, P) >= QUARANTINE_READMIT_THRESHOLD`; existing routing-table peers between the two thresholds may remain in the table, including after moving into the K-closest set.
+7. **Trust quarantine and admission**: Peers with `TrustScore(self, P) < QUARANTINE_THRESHOLD` MUST be skipped by local lookup result selection, FIND_NODE responses, and automatic lookup/dial candidate selection. If such a peer is in the K-closest-to-self set, it MUST be evicted and quarantined until `TrustScore(self, P) >= QUARANTINE_READMIT_THRESHOLD` whenever eviction leaves `LocalRT(self)` with at least K peers. If eviction would shrink `LocalRT(self)` below K peers, the peer remains in the table but is still avoided by automatic lookup policy. Any new routing-table peer MUST have `TrustScore(self, P) >= QUARANTINE_READMIT_THRESHOLD`; existing routing-table peers between the two thresholds may remain in the table, including after moving into the K-closest set.
 8. **Trust protection (staleness-gated)**: A peer with `TrustScore(self, P) >= TRUST_PROTECTION_THRESHOLD` **AND** `last_seen` within `LIVE_THRESHOLD` MUST NOT be evicted by swap-closer admission. A peer whose `last_seen` exceeds `LIVE_THRESHOLD` receives no trust protection regardless of score — stale peers MUST NOT hold slots against live candidates.
 9. **Deterministic distance**: `Distance(A, B)` is symmetric, deterministic, and consistent across all nodes. Two nodes compute the same distance between the same pair of keys.
 10. **Atomic admission**: IP diversity checks, capacity checks, swap-closer evictions, trust score reads, and insertion MUST execute within a single exclusive admission critical section to prevent TOCTOU races. Implementations may use a routing-table write lock or an outer DHT-engine write guard that serializes admission.
@@ -258,12 +258,13 @@ Rationale: swap-closer prefers geographically closer peers (lower XOR distance) 
 
 When any interaction records a trust failure and `TrustScore(self, P)` drops below `QUARANTINE_THRESHOLD`:
 
-1. If `P` is in the K-closest-to-self set, remove `P` from `LocalRT(self)` and emit `PeerRemoved`.
+1. If `P` is in the K-closest-to-self set and removal leaves at least K peers in `LocalRT(self)`, remove `P` from `LocalRT(self)` and emit `PeerRemoved`.
 2. Keep `P`'s trust record. Do not reset trust on eviction.
 3. Mark `P` as quarantined if it was evicted from the close group.
 4. Do not re-admit quarantined `P` until `TrustScore(self, P) >= QUARANTINE_READMIT_THRESHOLD`.
-5. If `P` is not in the K-closest-to-self set, it may remain in the routing table, but local lookup result selection, FIND_NODE responses, and automatic lookup/dial paths MUST avoid it while `TrustScore(self, P) < QUARANTINE_THRESHOLD`.
-6. If `P` has `QUARANTINE_THRESHOLD <= TrustScore(self, P) < QUARANTINE_READMIT_THRESHOLD` and is already in the routing table, it may remain there, including after moving into the K-closest set. New routing-table admissions in this range are rejected until trust reaches `QUARANTINE_READMIT_THRESHOLD`.
+5. If removal would shrink `LocalRT(self)` below K peers, keep `P` in the routing table until another peer is admitted and the same eviction can happen without underfilling the table.
+6. If `P` is not in the K-closest-to-self set, it may remain in the routing table, but local lookup result selection, FIND_NODE responses, and automatic lookup/dial paths MUST avoid it while `TrustScore(self, P) < QUARANTINE_THRESHOLD`.
+7. If `P` has `QUARANTINE_THRESHOLD <= TrustScore(self, P) < QUARANTINE_READMIT_THRESHOLD` and is already in the routing table, it may remain there, including after moving into the K-closest set. New routing-table admissions in this range are rejected until trust reaches `QUARANTINE_READMIT_THRESHOLD`.
 
 Quarantine is a routing-table and automatic lookup policy. It is not a blanket transport-level block for explicit user-initiated sends.
 
@@ -412,7 +413,7 @@ Events MUST be emitted reliably for every routing table mutation. Consumers MAY 
 
 Peers are detected as departed through:
 
-1. **RPC failure**: Failed outbound RPC records trust failure. If trust drops below `QUARANTINE_THRESHOLD` and the peer is in the close group, it is evicted and quarantined (Section 7.4).
+1. **RPC failure**: Failed outbound RPC records trust failure. If trust drops below `QUARANTINE_THRESHOLD` and the peer is in the close group, it is evicted and quarantined when the routing table can retain at least K peers (Section 7.4).
 2. **Iterative lookup feedback**: Network lookups record success/failure per queried peer.
 3. **Self-lookup refresh**: Periodic self-lookups discover that a previously-close peer is no longer returned by the network.
 4. **Stale peer revalidation**: When a new candidate contends for a full bucket, all stale peers (not seen within `LIVE_THRESHOLD`) in that bucket are pinged. Non-responders are evicted immediately (Section 7.5).
@@ -803,7 +804,7 @@ Each scenario should assert exact expected outcomes and state transitions.
     - Insert a peer into a bucket that affects the K-closest-to-self set. `KClosestPeersChanged` emitted with correct old and new sets. Insert a peer into a distant bucket that does NOT affect the K-closest set. `KClosestPeersChanged` is NOT emitted. Verify at-most-once semantics: a single admission with multiple swaps emits the event at most once.
 
 36. **Close-group quarantine eviction**:
-    - K-closest peer trust drops below 0.20 after failed interaction. Peer is immediately removed from routing table, its trust record is retained, and `PeerRemoved` is emitted.
+    - K-closest peer trust drops below 0.20 after failed interaction. Peer is removed from routing table when the routing table can retain at least K peers, its trust record is retained, and `PeerRemoved` is emitted.
     - Non-close peer with trust 0.30 is retained in the routing table. A close-group removal promotes it into the K-closest set. Local trust gate keeps it because it is already in the routing table and above the quarantine threshold.
 
 37. **Quarantined peer inbound admission rejected**:
@@ -866,10 +867,10 @@ Each scenario should assert exact expected outcomes and state transitions.
     - Peer starts at neutral trust (0.5). Consumer reports `ApplicationSuccess(1.0)`. Trust score increases above 0.5 (exact value determined by EMA smoothing factor). Peer remains in routing table.
 
 54. **Consumer penalty degrades trust to quarantine**:
-    - Peer starts at neutral trust (0.5). Consumer reports repeated `ApplicationFailure(3.0)` events. Trust score decreases with each event. After sufficient events, score drops below `QUARANTINE_THRESHOLD` (0.20). If the peer is in the K-closest set, it is evicted and quarantined (Section 7.4).
+    - Peer starts at neutral trust (0.5). Consumer reports repeated `ApplicationFailure(3.0)` events. Trust score decreases with each event. After sufficient events, score drops below `QUARANTINE_THRESHOLD` (0.20). If the peer is in the K-closest set, it is evicted and quarantined when the routing table can retain at least K peers (Section 7.4).
 
 55. **Consumer penalty triggers close-group quarantine**:
-    - Peer is in the K-closest set with trust slightly above `QUARANTINE_THRESHOLD`. Consumer reports `ApplicationFailure(weight)` sufficient to push score below `QUARANTINE_THRESHOLD`. Peer is immediately evicted from routing table and quarantined from re-admission until trust reaches `QUARANTINE_READMIT_THRESHOLD`. `PeerRemoved` event emitted.
+    - Peer is in the K-closest set with trust slightly above `QUARANTINE_THRESHOLD`. Consumer reports `ApplicationFailure(weight)` sufficient to push score below `QUARANTINE_THRESHOLD`. Peer is evicted from routing table, when doing so retains at least K peers, and quarantined from re-admission until trust reaches `QUARANTINE_READMIT_THRESHOLD`. `PeerRemoved` event emitted.
 
 56. **Consumer event for peer not in routing table**:
     - Peer has no routing table entry. Consumer reports `ApplicationFailure(2.0)`. Trust engine records the event and updates the EMA score (decreases from neutral 0.5). Routing table is unchanged. If the peer later attempts admission, the recorded low trust may cause rejection (Section 7.1 step 4).
