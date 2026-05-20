@@ -33,7 +33,8 @@ use std::sync::Arc;
 const DEFAULT_SWAP_THRESHOLD: f64 = 0.35;
 
 /// Default trust score threshold below which close-group peers are evicted
-/// immediately and all peers are avoided by automatic lookup/dial paths.
+/// when doing so still leaves at least K routing-table peers, and all peers
+/// are avoided by automatic lookup/dial paths.
 const DEFAULT_QUARANTINE_THRESHOLD: f64 = 0.20;
 
 /// Default trust score a new or quarantined peer must have for admission.
@@ -53,7 +54,8 @@ pub struct AdaptiveDhtConfig {
     /// Default: 0.35
     pub swap_threshold: f64,
     /// Trust score below which automatic lookup/dial paths avoid a peer, and
-    /// K-closest peers are evicted immediately into temporary quarantine.
+    /// K-closest peers are evicted into temporary quarantine when the routing
+    /// table can keep at least K peers.
     /// Default: 0.20
     pub quarantine_threshold: f64,
     /// Trust score required before a new peer can enter the routing table, and
@@ -195,7 +197,7 @@ impl AdaptiveDHT {
     /// trust engine injected. Call [`start`](Self::start) to begin DHT
     /// operations. Trust scores are computed live — low-trust peers are
     /// swapped out when better candidates arrive, and bad close-group peers
-    /// are quarantined immediately.
+    /// are quarantined when the routing table has enough peers.
     ///
     /// # Errors
     ///
@@ -240,7 +242,8 @@ impl AdaptiveDHT {
     /// Trust scores are updated immediately. Peers below the quarantine
     /// threshold are avoided by lookup result selection and automatic
     /// lookup/dial paths, and K-closest peers below that threshold are
-    /// evicted into temporary quarantine.
+    /// evicted into temporary quarantine when the routing table can keep at
+    /// least K peers.
     pub async fn report_trust_event(&self, peer_id: &PeerId, event: TrustEvent) {
         match event {
             TrustEvent::ApplicationSuccess(weight) | TrustEvent::ApplicationFailure(weight) => {
@@ -300,7 +303,8 @@ impl AdaptiveDHT {
     ///
     /// Trust scores are computed live — no background tasks needed.
     /// Low-trust peers are swapped out when better candidates arrive; close
-    /// peers below the quarantine threshold are evicted immediately.
+    /// peers below the quarantine threshold are evicted when the routing table
+    /// has enough peers.
     pub async fn start(&self) -> Result<()> {
         Arc::clone(&self.dht_manager).start().await
     }

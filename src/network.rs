@@ -502,17 +502,18 @@ impl NodeConfigBuilder {
         self
     }
 
-    /// Enable or disable trust-based peer swap-out.
+    /// Enable or disable trust-based routing-table enforcement.
     ///
-    /// When `false`, peers are never swapped out of the routing table
-    /// based on trust scores. Trust scores are still tracked but have
-    /// no enforcement effect.
+    /// When `false`, trust scores are still tracked but have no routing-table
+    /// enforcement effect.
     ///
-    /// When `true` (the default), peers whose trust score falls below the
-    /// swap threshold (0.35) become eligible for replacement when a
-    /// better candidate arrives.
+    /// When `true` (the default), the default adaptive DHT policy applies:
+    /// peers below the swap threshold (0.35) become eligible for replacement,
+    /// peers below the quarantine threshold (0.20) are avoided by automatic
+    /// lookup/dial paths, and new routing-table peers must meet the readmission
+    /// threshold (0.45).
     ///
-    /// For fine-grained control over the threshold, use
+    /// For fine-grained control over these thresholds, use
     /// [`adaptive_dht_config`](Self::adaptive_dht_config) instead.
     pub fn trust_enforcement(mut self, enabled: bool) -> Self {
         let adaptive_config = if enabled {
