@@ -556,8 +556,8 @@ pub struct DhtNetworkConfig {
     /// K-closest peers are immediately evicted into temporary quarantine.
     /// Default: 0.0 (disabled).
     pub quarantine_threshold: f64,
-    /// Trust score required before a quarantined peer can be admitted again
-    /// through the normal discovery/admission path.
+    /// Trust score required before a quarantined peer can be admitted again,
+    /// and before any new or promoted peer can enter the K-closest set.
     /// Default: 0.0 (disabled).
     pub quarantine_readmit_threshold: f64,
 }
@@ -2052,7 +2052,10 @@ impl DhtNetworkManager {
                     address_types: node.address_types,
                     addresses: node.addresses,
                     distance: encode_publish_seq_distance(publish_seq),
-                    reliability,
+                    // Keep the legacy wire value stable. Trust is local policy
+                    // used for filtering and should not change DHTNode wire
+                    // semantics for older nodes.
+                    reliability: SELF_RELIABILITY_SCORE,
                 })
             })
             .take(count)
@@ -2381,7 +2384,8 @@ impl DhtNetworkManager {
                         let mut dht = self.dht.write().await;
                         let rt_events = dht.remove_node_by_id(&peer_id).await;
                         drop(dht);
-                        self.broadcast_routing_events(&rt_events);
+                        self.broadcast_routing_events_with_quarantine(rt_events)
+                            .await;
                         let _ = self.transport.disconnect_peer(&peer_id).await;
                     }
                     Ok(_) => {
@@ -2919,16 +2923,12 @@ impl DhtNetworkManager {
             return false;
         };
         let trust_score = engine.score(peer_id);
-        let rt_events = {
-            let mut dht = self.dht.write().await;
-            dht.enforce_close_group_quarantine(peer_id, trust_score)
-                .await
-        };
+        let rt_events = self.enforce_close_group_trust_gate(None).await;
         if rt_events.is_empty() {
             return false;
         }
         info!(
-            "Evicted quarantined close-group peer {} with trust {:.3}",
+            "Evicted quarantined close-group peer(s) after trust update for {} with trust {:.3}",
             peer_id.to_hex(),
             trust_score
         );
@@ -3080,7 +3080,8 @@ impl DhtNetworkManager {
                 let mut dht = self.dht.write().await;
                 dht.remove_node_by_id(peer_id).await
             };
-            self.broadcast_routing_events(&rt_events);
+            self.broadcast_routing_events_with_quarantine(rt_events)
+                .await;
         }
 
         // Broadcast and clear. Remove BEFORE sending so any task
@@ -4151,7 +4152,8 @@ impl DhtNetworkManager {
             match add_result {
                 Ok(AdmissionResult::Admitted(rt_events)) => {
                     info!("Added peer {} to DHT routing table", app_peer_id_hex);
-                    self.broadcast_routing_events(&rt_events);
+                    self.broadcast_routing_events_with_quarantine(rt_events)
+                        .await;
                 }
                 Ok(AdmissionResult::StaleRevalidationNeeded {
                     candidate,
@@ -4239,7 +4241,8 @@ impl DhtNetworkManager {
                         "Added peer {} to DHT routing table after stale revalidation",
                         app_peer_id_hex
                     );
-                    this.broadcast_routing_events(&rt_events);
+                    this.broadcast_routing_events_with_quarantine(rt_events)
+                        .await;
                 }
                 Err(e) => {
                     warn!(
@@ -4593,8 +4596,82 @@ impl DhtNetworkManager {
             events
         };
 
-        self.broadcast_routing_events(&all_events);
+        self.broadcast_routing_events_with_quarantine(all_events)
+            .await;
         info!("Evicted {} offline K-closest peer(s)", non_responders.len());
+    }
+
+    fn routing_events_include_close_group_change(events: &[RoutingTableEvent]) -> bool {
+        events
+            .iter()
+            .any(|event| matches!(event, RoutingTableEvent::KClosestPeersChanged { .. }))
+    }
+
+    async fn enforce_close_group_trust_gate(
+        &self,
+        previous_close_group: Option<&[PeerId]>,
+    ) -> Vec<RoutingTableEvent> {
+        let Some(ref engine) = self.trust_engine else {
+            return Vec::new();
+        };
+        let trust_score = |peer_id: &PeerId| engine.score(peer_id);
+        let rt_events = {
+            let mut dht = self.dht.write().await;
+            dht.enforce_close_group_trust_gate(previous_close_group, &trust_score)
+                .await
+        };
+        if !rt_events.is_empty() {
+            let removed: Vec<String> = rt_events
+                .iter()
+                .filter_map(|event| match event {
+                    RoutingTableEvent::PeerRemoved(peer_id) => Some(peer_id.to_hex()),
+                    _ => None,
+                })
+                .collect();
+            info!("Removed close-group trust-gated peer(s): {:?}", removed);
+        }
+        rt_events
+    }
+
+    async fn broadcast_routing_events_with_quarantine(&self, mut events: Vec<RoutingTableEvent>) {
+        if !Self::routing_events_include_close_group_change(&events) {
+            self.broadcast_routing_events(&events);
+            return;
+        }
+
+        let original_old_close_group = events.iter().find_map(|event| match event {
+            RoutingTableEvent::KClosestPeersChanged { old, .. } => Some(old.clone()),
+            _ => None,
+        });
+        let quarantine_events = self
+            .enforce_close_group_trust_gate(original_old_close_group.as_deref())
+            .await;
+        if quarantine_events.is_empty() {
+            self.broadcast_routing_events(&events);
+            return;
+        }
+
+        let final_new_close_group = quarantine_events
+            .iter()
+            .rev()
+            .find_map(|event| match event {
+                RoutingTableEvent::KClosestPeersChanged { new, .. } => Some(new.clone()),
+                _ => None,
+            });
+
+        events.retain(|event| !matches!(event, RoutingTableEvent::KClosestPeersChanged { .. }));
+        events.extend(
+            quarantine_events
+                .into_iter()
+                .filter(|event| !matches!(event, RoutingTableEvent::KClosestPeersChanged { .. })),
+        );
+        if let (Some(old), Some(new)) = (original_old_close_group, final_new_close_group)
+            && old != new
+        {
+            events.push(RoutingTableEvent::KClosestPeersChanged { old, new });
+        }
+
+        self.broadcast_routing_events(&events);
     }
 
     /// Translate core engine routing table events into network events and broadcast them.
@@ -5187,6 +5264,12 @@ mod tests {
         let result_ids: Vec<PeerId> = results.iter().map(|node| node.peer_id).collect();
 
         assert_eq!(result_ids, vec![healthy_peer]);
+        assert!(
+            results
+                .iter()
+                .all(|node| (node.reliability - SELF_RELIABILITY_SCORE).abs() < f64::EPSILON),
+            "trust filtering must not change the legacy DHTNode reliability wire value"
+        );
     }
 
     #[test]
