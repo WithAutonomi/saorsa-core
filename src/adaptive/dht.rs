@@ -82,6 +82,8 @@ impl AdaptiveDhtConfig {
     /// swap/quarantine eligible since they start at neutral (0.5). The
     /// new-peer admission/readmit threshold must also stay below neutral
     /// because recovery happens by decay toward neutral, not by active probing.
+    /// When swap enforcement is enabled, the swap threshold must remain above
+    /// the quarantine threshold so quarantine is strictly more severe.
     pub fn validate(&self) -> crate::error::P2pResult<()> {
         if !(0.0..0.5).contains(&self.swap_threshold) || self.swap_threshold.is_nan() {
             return Err(crate::error::P2PError::Validation(
@@ -119,6 +121,18 @@ impl AdaptiveDhtConfig {
                 format!(
                     "quarantine_readmit_threshold ({}) must be >= quarantine_threshold ({})",
                     self.quarantine_readmit_threshold, self.quarantine_threshold
+                )
+                .into(),
+            ));
+        }
+        if self.swap_threshold > 0.0
+            && self.quarantine_threshold > 0.0
+            && self.swap_threshold <= self.quarantine_threshold
+        {
+            return Err(crate::error::P2PError::Validation(
+                format!(
+                    "swap_threshold ({}) must be > quarantine_threshold ({}) when both are enabled",
+                    self.swap_threshold, self.quarantine_threshold
                 )
                 .into(),
             ));
@@ -390,7 +404,7 @@ mod tests {
 
     #[test]
     fn test_swap_threshold_validation_accepts_valid() {
-        for &good in &[0.0, 0.15, 0.49] {
+        for &good in &[0.0, 0.25, 0.49] {
             let config = AdaptiveDhtConfig {
                 swap_threshold: good,
                 ..Default::default()
@@ -400,6 +414,30 @@ mod tests {
                 "swap_threshold {good} should pass validation"
             );
         }
+
+        let quarantine_disabled = AdaptiveDhtConfig {
+            swap_threshold: 0.15,
+            quarantine_threshold: 0.0,
+            quarantine_readmit_threshold: 0.0,
+        };
+        assert!(quarantine_disabled.validate().is_ok());
+    }
+
+    #[test]
+    fn test_swap_threshold_must_exceed_quarantine_threshold_when_enabled() {
+        let equal = AdaptiveDhtConfig {
+            swap_threshold: 0.20,
+            quarantine_threshold: 0.20,
+            ..Default::default()
+        };
+        assert!(equal.validate().is_err());
+
+        let below = AdaptiveDhtConfig {
+            swap_threshold: 0.15,
+            quarantine_threshold: 0.20,
+            ..Default::default()
+        };
+        assert!(below.validate().is_err());
     }
 
     #[test]
