@@ -2009,23 +2009,20 @@ impl DhtNetworkManager {
         );
 
         let dht_guard = self.dht.read().await;
-        let candidate_count = if dht_guard.trust_quarantine_enabled() {
-            dht_guard.routing_table_size().await.max(count)
-        } else {
-            count
-        };
+        let dht_key = DhtKey::from_bytes(*key);
+        let local_peer_id = self.config.peer_id;
         let trust_score = |peer_id: &PeerId| self.peer_trust_score(peer_id);
         match dht_guard
-            .find_nodes_with_publish_seq(&DhtKey::from_bytes(*key), candidate_count)
+            .find_nodes_with_publish_seq_filtered(&dht_key, count, |node| {
+                if node.id == local_peer_id {
+                    return false;
+                }
+                let score = trust_score(&node.id);
+                !dht_guard.should_avoid_for_lookup(&node.id, score)
+            })
             .await
         {
-            Ok(nodes) => Self::lookup_results_from_routing_nodes(
-                self.config.peer_id,
-                &dht_guard,
-                nodes,
-                &trust_score,
-                count,
-            ),
+            Ok(nodes) => Self::lookup_results_from_routing_nodes(nodes, count),
             Err(e) => {
                 warn!("find_nodes failed for key {}: {e}", hex::encode(key));
                 Vec::new()
@@ -2034,32 +2031,22 @@ impl DhtNetworkManager {
     }
 
     fn lookup_results_from_routing_nodes(
-        local_peer_id: PeerId,
-        dht: &DhtCoreEngine,
         nodes: Vec<(NodeInfo, u64)>,
-        trust_score: &impl Fn(&PeerId) -> f64,
         count: usize,
     ) -> Vec<DHTNode> {
         nodes
             .into_iter()
-            .filter(|(node, _)| node.id != local_peer_id)
-            .filter_map(|(node, publish_seq)| {
-                let reliability = trust_score(&node.id);
-                if dht.should_avoid_for_lookup(&node.id, reliability) {
-                    return None;
-                }
-                Some(DHTNode {
-                    peer_id: node.id,
-                    address_types: node.address_types,
-                    addresses: node.addresses,
-                    distance: encode_publish_seq_distance(publish_seq),
-                    // Keep the legacy wire value stable. Trust is local policy
-                    // used for filtering and should not change DHTNode wire
-                    // semantics for older nodes.
-                    reliability: SELF_RELIABILITY_SCORE,
-                })
-            })
             .take(count)
+            .map(|(node, publish_seq)| DHTNode {
+                peer_id: node.id,
+                address_types: node.address_types,
+                addresses: node.addresses,
+                distance: encode_publish_seq_distance(publish_seq),
+                // Keep the legacy wire value stable. Trust is local policy
+                // used for filtering and should not change DHTNode wire
+                // semantics for older nodes.
+                reliability: SELF_RELIABILITY_SCORE,
+            })
             .collect()
     }
 
@@ -2924,7 +2911,7 @@ impl DhtNetworkManager {
             return false;
         };
         let trust_score = engine.score(peer_id);
-        let rt_events = self.enforce_close_group_trust_gate(None).await;
+        let rt_events = self.enforce_close_group_trust_gate().await;
         if rt_events.is_empty() {
             return false;
         }
@@ -4612,18 +4599,14 @@ impl DhtNetworkManager {
         })
     }
 
-    async fn enforce_close_group_trust_gate(
-        &self,
-        previous_close_group: Option<&[PeerId]>,
-    ) -> Vec<RoutingTableEvent> {
+    async fn enforce_close_group_trust_gate(&self) -> Vec<RoutingTableEvent> {
         let Some(ref engine) = self.trust_engine else {
             return Vec::new();
         };
         let trust_score = |peer_id: &PeerId| engine.score(peer_id);
         let rt_events = {
             let mut dht = self.dht.write().await;
-            dht.enforce_close_group_trust_gate(previous_close_group, &trust_score)
-                .await
+            dht.enforce_close_group_trust_gate(&trust_score).await
         };
         if !rt_events.is_empty() {
             let removed: Vec<String> = rt_events
@@ -4648,9 +4631,7 @@ impl DhtNetworkManager {
             RoutingTableEvent::KClosestPeersChanged { old, .. } => Some(old.clone()),
             _ => None,
         });
-        let quarantine_events = self
-            .enforce_close_group_trust_gate(original_old_close_group.as_deref())
-            .await;
+        let quarantine_events = self.enforce_close_group_trust_gate().await;
         if quarantine_events.is_empty() {
             self.broadcast_routing_events(&events);
             return;
@@ -5251,12 +5232,6 @@ mod tests {
             "test setup should quarantine the close-group peer"
         );
 
-        let nodes = vec![
-            (routing_test_node(0), 0),
-            (routing_test_node(1), 0),
-            (routing_test_node(2), 0),
-            (routing_test_node(3), 0),
-        ];
         let trust_score = |peer_id: &PeerId| {
             if *peer_id == quarantined_peer {
                 0.30
@@ -5267,16 +5242,18 @@ mod tests {
             }
         };
 
-        let results = DhtNetworkManager::lookup_results_from_routing_nodes(
-            local_peer,
-            &dht,
-            nodes,
-            &trust_score,
-            4,
-        );
+        let lookup_key = DhtKey::from_bytes(*local_peer.as_bytes());
+        let nodes = dht
+            .find_nodes_with_publish_seq_filtered(&lookup_key, 4, |node| {
+                let score = trust_score(&node.id);
+                node.id != local_peer && !dht.should_avoid_for_lookup(&node.id, score)
+            })
+            .await
+            .unwrap();
+        let results = DhtNetworkManager::lookup_results_from_routing_nodes(nodes, 4);
         let result_ids: Vec<PeerId> = results.iter().map(|node| node.peer_id).collect();
 
-        assert_eq!(result_ids, vec![healthy_peer]);
+        assert_eq!(result_ids, vec![healthy_peer, pid(4), pid(5)]);
         assert!(
             results
                 .iter()

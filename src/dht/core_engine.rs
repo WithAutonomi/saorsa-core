@@ -9,7 +9,8 @@ use crate::security::{IP_EXACT_LIMIT, IPDiversityConfig, canonicalize_ip, ip_sub
 use anyhow::{Result, anyhow};
 use parking_lot::Mutex as PlMutex;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -210,6 +211,31 @@ const DEFAULT_QUARANTINE_THRESHOLD: f64 = 0.20;
 /// Default trust score required for new routing-table admission/readmission.
 #[allow(dead_code)]
 const DEFAULT_QUARANTINE_READMIT_THRESHOLD: f64 = 0.45;
+
+/// Maximum number of evicted quarantine markers retained by the routing engine.
+const MAX_QUARANTINED_PEERS: usize = 8192;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ClosestNodeCandidate {
+    distance: [u8; 32],
+    peer_id: PeerId,
+    bucket_index: usize,
+    node_index: usize,
+}
+
+impl Ord for ClosestNodeCandidate {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.distance
+            .cmp(&other.distance)
+            .then_with(|| self.peer_id.cmp(&other.peer_id))
+    }
+}
+
+impl PartialOrd for ClosestNodeCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
 
 /// Node information for routing.
 ///
@@ -1118,42 +1144,67 @@ impl KademliaRoutingTable {
     }
 
     fn find_closest_nodes(&self, key: &DhtKey, count: usize) -> Vec<NodeInfo> {
-        // Collect ALL entries from every bucket. Bucket index correlates with
-        // distance from *self*, not from key K — peers in distant buckets can
-        // be closer to K than peers in nearby buckets. The routing table holds
-        // at most 256 * K_BUCKET_SIZE entries, so a full scan is trivially fast.
-        let mut candidates: Vec<(NodeInfo, [u8; 32])> = Vec::with_capacity(count * 2);
-
-        for bucket in &self.buckets {
-            for node in bucket.get_nodes() {
-                let distance = xor_distance_bytes(node.id.to_bytes(), key.as_bytes());
-                candidates.push((node.clone(), distance));
-            }
-        }
-
-        // Sort by distance
-        candidates.sort_by_key(|a| a.1);
-
-        // Return top `count` nodes
-        candidates
+        self.find_closest_node_candidates_filtered(key, count, |_| true)
             .into_iter()
-            .take(count)
-            .map(|(node, _)| node)
+            .map(|candidate| {
+                self.buckets[candidate.bucket_index].nodes[candidate.node_index].clone()
+            })
             .collect()
     }
 
-    fn find_closest_nodes_with_publish_seq(
+    fn find_closest_nodes_with_publish_seq_filtered(
         &self,
         key: &DhtKey,
         count: usize,
+        include: impl Fn(&NodeInfo) -> bool,
     ) -> Vec<(NodeInfo, u64)> {
-        self.find_closest_nodes(key, count)
+        self.find_closest_node_candidates_filtered(key, count, include)
             .into_iter()
-            .map(|node| {
+            .map(|candidate| {
+                let node = self.buckets[candidate.bucket_index].nodes[candidate.node_index].clone();
                 let seq = self.publish_seq_for(&node.id);
                 (node, seq)
             })
             .collect()
+    }
+
+    fn find_closest_node_candidates_filtered(
+        &self,
+        key: &DhtKey,
+        count: usize,
+        include: impl Fn(&NodeInfo) -> bool,
+    ) -> Vec<ClosestNodeCandidate> {
+        if count == 0 {
+            return Vec::new();
+        }
+
+        let mut closest = BinaryHeap::with_capacity(count);
+
+        for (bucket_index, bucket) in self.buckets.iter().enumerate() {
+            for (node_index, node) in bucket.get_nodes().iter().enumerate() {
+                if !include(node) {
+                    continue;
+                }
+
+                let candidate = ClosestNodeCandidate {
+                    distance: xor_distance_bytes(node.id.to_bytes(), key.as_bytes()),
+                    peer_id: node.id,
+                    bucket_index,
+                    node_index,
+                };
+
+                if closest.len() < count {
+                    closest.push(candidate);
+                } else if closest.peek().is_some_and(|farthest| candidate < *farthest) {
+                    closest.pop();
+                    closest.push(candidate);
+                }
+            }
+        }
+
+        let mut selected = closest.into_vec();
+        selected.sort_unstable();
+        selected
     }
 
     /// Returns the k-bucket index for a key, or `None` when the key equals
@@ -1390,10 +1441,13 @@ pub struct DhtCoreEngine {
     /// before a quarantined peer can re-enter.
     quarantine_readmit_threshold: f64,
 
-    /// Peers evicted from the close group by quarantine. They remain in this
-    /// set until discovered naturally and admitted after crossing the readmit
+    /// Peers evicted from the close group by quarantine. Markers are bounded
+    /// to cap memory use and are removed when the peer crosses the readmit
     /// threshold.
     quarantined_peers: HashSet<PeerId>,
+
+    /// FIFO order used to prune the bounded quarantine marker set.
+    quarantined_peer_order: VecDeque<PeerId>,
 
     /// Duration of no contact after which a peer is considered stale.
     /// Defaults to [`LIVE_THRESHOLD`]; overridden in tests to avoid
@@ -1443,6 +1497,7 @@ impl DhtCoreEngine {
             quarantine_threshold: DEFAULT_QUARANTINE_THRESHOLD,
             quarantine_readmit_threshold: DEFAULT_QUARANTINE_READMIT_THRESHOLD,
             quarantined_peers: HashSet::new(),
+            quarantined_peer_order: VecDeque::new(),
             live_threshold: LIVE_THRESHOLD,
             shutdown: CancellationToken::new(),
         })
@@ -1488,11 +1543,6 @@ impl DhtCoreEngine {
         self.quarantine_threshold > 0.0
     }
 
-    /// Return whether trust quarantine affects lookup result filtering.
-    pub(crate) fn trust_quarantine_enabled(&self) -> bool {
-        self.quarantine_enabled()
-    }
-
     fn check_new_peer_admission(&mut self, peer_id: &PeerId, trust_score: f64) -> Result<()> {
         if !self.quarantine_enabled() {
             return Ok(());
@@ -1517,8 +1567,44 @@ impl DhtCoreEngine {
                 self.quarantine_readmit_threshold
             ));
         }
-        self.quarantined_peers.remove(peer_id);
+        self.forget_quarantined_peer(peer_id);
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn remember_quarantined_peer(&mut self, peer_id: PeerId) {
+        Self::remember_quarantined_peer_in(
+            &mut self.quarantined_peers,
+            &mut self.quarantined_peer_order,
+            peer_id,
+        );
+    }
+
+    fn remember_quarantined_peer_in(
+        quarantined_peers: &mut HashSet<PeerId>,
+        quarantined_peer_order: &mut VecDeque<PeerId>,
+        peer_id: PeerId,
+    ) {
+        if !quarantined_peers.insert(peer_id) {
+            return;
+        }
+
+        quarantined_peer_order.push_back(peer_id);
+        while quarantined_peers.len() > MAX_QUARANTINED_PEERS {
+            let Some(stale_peer) = quarantined_peer_order.pop_front() else {
+                break;
+            };
+            quarantined_peers.remove(&stale_peer);
+        }
+    }
+
+    fn forget_quarantined_peer(&mut self, peer_id: &PeerId) {
+        if !self.quarantined_peers.remove(peer_id) {
+            return;
+        }
+
+        self.quarantined_peer_order
+            .retain(|quarantined_peer| quarantined_peer != peer_id);
     }
 
     /// Return whether automatic lookup/dial paths should avoid this peer.
@@ -1581,7 +1667,11 @@ impl DhtCoreEngine {
             return Vec::new();
         }
 
-        self.quarantined_peers.insert(*peer_id);
+        Self::remember_quarantined_peer_in(
+            &mut self.quarantined_peers,
+            &mut self.quarantined_peer_order,
+            *peer_id,
+        );
         routing.remove_node(peer_id);
 
         let k_after = routing.k_closest_ids(self.k_value);
@@ -1604,7 +1694,6 @@ impl DhtCoreEngine {
     /// retained rather than shrinking the routing table below K entries.
     pub(crate) async fn enforce_close_group_trust_gate(
         &mut self,
-        _previous_close_group: Option<&[PeerId]>,
         trust_score: &impl Fn(&PeerId) -> f64,
     ) -> Vec<RoutingTableEvent> {
         if !self.quarantine_enabled() {
@@ -1627,9 +1716,11 @@ impl DhtCoreEngine {
                 break;
             };
 
-            if trust_score(&peer_id) < self.quarantine_threshold {
-                self.quarantined_peers.insert(peer_id);
-            }
+            Self::remember_quarantined_peer_in(
+                &mut self.quarantined_peers,
+                &mut self.quarantined_peer_order,
+                peer_id,
+            );
             routing.remove_node(&peer_id);
             removed.push(peer_id);
         }
@@ -1787,15 +1878,16 @@ impl DhtCoreEngine {
         Ok(routing.find_closest_nodes(key, count))
     }
 
-    /// Find nodes closest to a key and include the latest authoritative
-    /// `PublishAddressSet` sequence known for each returned record.
-    pub async fn find_nodes_with_publish_seq(
+    /// Find nodes closest to a key after applying a caller-provided routing
+    /// policy filter.
+    pub(crate) async fn find_nodes_with_publish_seq_filtered(
         &self,
         key: &DhtKey,
         count: usize,
+        include: impl Fn(&NodeInfo) -> bool,
     ) -> Result<Vec<(NodeInfo, u64)>> {
         let routing = self.routing_table.read().await;
-        Ok(routing.find_closest_nodes_with_publish_seq(key, count))
+        Ok(routing.find_closest_nodes_with_publish_seq_filtered(key, count, include))
     }
 
     /// Find nodes closest to a key, including self as a candidate.
@@ -2840,6 +2932,14 @@ mod tests {
             address_types: vec![AddressType::Direct],
             last_seen: AtomicInstant::now(),
         }
+    }
+
+    fn peer_id_from_index(index: usize) -> PeerId {
+        let mut id = [0u8; 32];
+        let index_bytes = index.to_be_bytes();
+        let offset = id.len() - index_bytes.len();
+        id[offset..].copy_from_slice(&index_bytes);
+        PeerId::from_bytes(id)
     }
 
     // -----------------------------------------------------------------------
@@ -5145,7 +5245,7 @@ mod tests {
 
         let low_peer = close_peer_ids[0];
         let events = dht
-            .enforce_close_group_trust_gate(None, &|id| if *id == low_peer { 0.10 } else { 0.5 })
+            .enforce_close_group_trust_gate(&|id| if *id == low_peer { 0.10 } else { 0.5 })
             .await;
 
         assert!(
@@ -5189,7 +5289,7 @@ mod tests {
 
         let low_peer = close_peer_ids[0];
         let deferred = dht
-            .enforce_close_group_trust_gate(None, &|id| if *id == low_peer { 0.10 } else { 0.5 })
+            .enforce_close_group_trust_gate(&|id| if *id == low_peer { 0.10 } else { 0.5 })
             .await;
         assert!(deferred.is_empty());
 
@@ -5204,7 +5304,7 @@ mod tests {
         assert_eq!(dht.routing_table_size().await, SMALL_TEST_K + 1);
 
         let events = dht
-            .enforce_close_group_trust_gate(None, &|id| if *id == low_peer { 0.10 } else { 0.5 })
+            .enforce_close_group_trust_gate(&|id| if *id == low_peer { 0.10 } else { 0.5 })
             .await;
         assert!(
             events.iter().any(
@@ -5221,6 +5321,28 @@ mod tests {
         let mut dht = DhtCoreEngine::new_for_tests(PeerId::from_bytes([0u8; 32])).unwrap();
         assert!(dht.set_trust_quarantine_thresholds(0.20, 0.49).is_ok());
         assert!(dht.set_trust_quarantine_thresholds(0.20, 0.50).is_err());
+    }
+
+    #[test]
+    fn test_quarantined_peer_markers_are_bounded() {
+        let mut dht = DhtCoreEngine::new_for_tests(PeerId::from_bytes([0u8; 32])).unwrap();
+        let oldest_peer = peer_id_from_index(0);
+        let newest_peer = peer_id_from_index(MAX_QUARANTINED_PEERS);
+
+        for index in 0..=MAX_QUARANTINED_PEERS {
+            dht.remember_quarantined_peer(peer_id_from_index(index));
+        }
+
+        assert_eq!(dht.quarantined_peers.len(), MAX_QUARANTINED_PEERS);
+        assert_eq!(dht.quarantined_peer_order.len(), MAX_QUARANTINED_PEERS);
+        assert!(
+            !dht.quarantined_peers.contains(&oldest_peer),
+            "oldest quarantine marker should be pruned at capacity"
+        );
+        assert!(
+            dht.quarantined_peers.contains(&newest_peer),
+            "newest quarantine marker should be retained"
+        );
     }
 
     /// New peers must meet the readmit/admission threshold even when they would
@@ -5387,8 +5509,6 @@ mod tests {
             .await
             .unwrap();
         }
-        let previous_close_group = close_peer_ids.clone();
-
         let mut promoted_id = [0u8; 32];
         promoted_id[0] = 0x80;
         let promoted_peer = PeerId::from_bytes(promoted_id);
@@ -5400,7 +5520,7 @@ mod tests {
         .unwrap();
 
         let no_events = dht
-            .enforce_close_group_trust_gate(Some(&previous_close_group), &|id| {
+            .enforce_close_group_trust_gate(&|id| {
                 if *id == promoted_peer { 0.30 } else { 0.5 }
             })
             .await;
@@ -5412,7 +5532,7 @@ mod tests {
 
         dht.remove_node_by_id(&close_peer_ids[0]).await;
         let events = dht
-            .enforce_close_group_trust_gate(Some(&previous_close_group), &|id| {
+            .enforce_close_group_trust_gate(&|id| {
                 if *id == promoted_peer || *id == close_peer_ids[1] {
                     0.30
                 } else {
@@ -5434,7 +5554,7 @@ mod tests {
         );
 
         let retained_events = dht
-            .enforce_close_group_trust_gate(Some(&previous_close_group), &|id| {
+            .enforce_close_group_trust_gate(&|id| {
                 if *id == promoted_peer { 0.10 } else { 0.5 }
             })
             .await;
@@ -5454,7 +5574,7 @@ mod tests {
         .unwrap();
 
         let quarantine_events = dht
-            .enforce_close_group_trust_gate(Some(&previous_close_group), &|id| {
+            .enforce_close_group_trust_gate(&|id| {
                 if *id == promoted_peer { 0.10 } else { 0.5 }
             })
             .await;
