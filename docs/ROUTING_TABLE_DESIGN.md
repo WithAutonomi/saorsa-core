@@ -107,7 +107,8 @@ Parameter safety constraints (MUST hold):
 
 1. `IP_EXACT_LIMIT >= 1`.
 2. `IP_SUBNET_LIMIT >= 1`.
-3. `TRUST_PROTECTION_THRESHOLD > SWAP_THRESHOLD > QUARANTINE_THRESHOLD`.
+3. `TRUST_PROTECTION_THRESHOLD > SWAP_THRESHOLD > QUARANTINE_THRESHOLD` when swap enforcement is enabled. `SWAP_THRESHOLD = 0.0` is the explicit
+   disabled state and may be paired with quarantine enforcement.
 4. `ALPHA >= 1`.
 5. `LIVE_THRESHOLD > max(SELF_LOOKUP_INTERVAL)` (peers touched by self-lookup must not oscillate between live and stale between consecutive cycles; at reference values: 15 min > 10 min). The 5-minute margin at reference values is sufficient for typical network latencies (sub-second RTTs). Operators in high-latency environments (satellite, Tor overlay) SHOULD increase `LIVE_THRESHOLD` proportionally.
 6. `STALE_REVALIDATION_TIMEOUT > 0`.
