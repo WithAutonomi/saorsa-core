@@ -1528,7 +1528,7 @@ impl DhtCoreEngine {
             ip_diversity_config: IPDiversityConfig::default(),
             allow_loopback,
             swap_threshold,
-            quarantine_threshold: 0.0,
+            quarantine_threshold: DEFAULT_QUARANTINE_THRESHOLD,
             quarantine_readmit_threshold: DEFAULT_QUARANTINE_READMIT_THRESHOLD,
             quarantined_peers: HashSet::new(),
             live_threshold: LIVE_THRESHOLD,
@@ -3844,25 +3844,24 @@ mod tests {
     const TEST_STALE_AGE: Duration = Duration::from_secs(2);
 
     // -----------------------------------------------------------------------
-    // Test 4: low-trust peer admission (lazy swap-out model)
+    // Test 4: low-trust peer admission is gated by default quarantine policy
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn test_low_trust_candidate_still_admitted() {
+    async fn test_low_trust_candidate_rejected_by_default_quarantine() {
         let mut dht = DhtCoreEngine::new_for_tests(PeerId::from_bytes([0u8; 32])).unwrap();
         let node = make_node(1, "/ip4/10.0.0.1/udp/9000/quic");
         let peer_id = node.id;
 
-        // Candidate with trust below swap threshold is still admitted
-        // (lazy swap-out model: no admission blocking)
+        // Candidate below the default readmission/admission threshold is rejected.
         let result = dht
             .add_node(node, &|id| {
                 if *id == peer_id { 0.1 } else { 0.5 }
             })
             .await;
 
-        assert!(result.is_ok(), "low-trust candidate should be admitted");
-        assert!(dht.has_node(&peer_id).await);
+        assert!(result.is_err(), "low-trust candidate should be rejected");
+        assert!(!dht.has_node(&peer_id).await);
     }
 
     // -----------------------------------------------------------------------
@@ -4340,7 +4339,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_re_evaluate_admits_low_trust_candidate() {
+    async fn test_re_evaluate_rejects_low_trust_candidate_by_default() {
         let mut dht = DhtCoreEngine::new(
             PeerId::from_bytes([0u8; 32]),
             20,
@@ -4354,14 +4353,14 @@ mod tests {
         let candidate = make_node_with_addr(id, "/ip4/10.0.0.1/udp/9000/quic");
         let candidate_ips = vec!["10.0.0.1".parse().unwrap()];
 
-        // Trust below swap threshold — should still be admitted
+        // Trust below readmission/admission threshold is rejected by default.
         let result = dht
             .re_evaluate_admission(candidate, &candidate_ips, &|_| 0.1)
             .await;
 
         assert!(
-            result.is_ok(),
-            "low-trust candidate should be admitted via re-evaluate"
+            result.is_err(),
+            "low-trust candidate should be rejected via re-evaluate"
         );
     }
 
