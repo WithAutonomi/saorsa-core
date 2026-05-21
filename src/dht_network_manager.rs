@@ -5099,13 +5099,13 @@ mod tests {
         }
     }
 
+    const _: () = assert!(
+        MAX_BUCKET_REFRESH_LOOKUPS_PER_PASS > 0,
+        "bucket refresh budget must allow at least one lookup"
+    );
+
     #[test]
     fn bucket_refresh_selection_keeps_all_stale_buckets_within_budget() {
-        assert!(
-            MAX_BUCKET_REFRESH_LOOKUPS_PER_PASS > 0,
-            "bucket refresh budget must allow at least one lookup"
-        );
-
         let candidates: Vec<_> = (0..MAX_BUCKET_REFRESH_LOOKUPS_PER_PASS)
             .map(|idx| bucket_refresh_candidate(idx, 3_600 + idx as u64))
             .collect();
@@ -5120,11 +5120,6 @@ mod tests {
 
     #[test]
     fn bucket_refresh_selection_caps_large_stale_sets_by_debt() {
-        assert!(
-            MAX_BUCKET_REFRESH_LOOKUPS_PER_PASS > 0,
-            "bucket refresh budget must allow at least one lookup"
-        );
-
         let candidate_count = MAX_BUCKET_REFRESH_LOOKUPS_PER_PASS * 3;
         let candidates: Vec<_> = (0..candidate_count)
             .map(|idx| bucket_refresh_candidate(idx, (idx as u64) * 3_600))

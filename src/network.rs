@@ -260,13 +260,13 @@ pub struct NodeConfig {
     #[serde(default)]
     pub allow_loopback: bool,
 
-    /// Adaptive DHT configuration (trust-based swap-out).
+    /// Adaptive DHT configuration for trust-based routing enforcement.
     ///
-    /// Controls whether peers with low trust scores are eligible for
-    /// swap-out from the routing table when better candidates arrive. Use
-    /// `NodeConfigBuilder::trust_enforcement` for a simple on/off toggle.
+    /// Controls lazy swap-out, close-group quarantine, automatic lookup
+    /// avoidance, and new-peer/readmission trust thresholds. Use
+    /// [`NodeConfigBuilder::trust_enforcement`] for a simple on/off toggle.
     ///
-    /// Default: enabled with a swap threshold of 0.35.
+    /// Default: enabled with the default [`AdaptiveDhtConfig`] thresholds.
     #[serde(default)]
     pub adaptive_dht_config: AdaptiveDhtConfig,
 
