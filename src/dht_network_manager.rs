@@ -21,7 +21,7 @@
 use crate::{
     P2PError, PeerId, Result,
     adaptive::trust::DEFAULT_NEUTRAL_TRUST,
-    adaptive::{NodeStatisticsUpdate, TrustEngine},
+    adaptive::{AdaptiveDhtConfig, NodeStatisticsUpdate, TrustEngine},
     address::{MultiAddr, is_lan_ip},
     dht::core_engine::{AddressType, AtomicInstant, BucketRefreshCandidate, NodeInfo},
     dht::{AdmissionResult, DhtCoreEngine, DhtKey, Key, RoutingTableEvent},
@@ -616,16 +616,16 @@ pub struct DhtNetworkConfig {
     pub enable_security: bool,
     /// Trust score below which a peer is eligible for swap-out from the
     /// routing table when a better candidate is available.
-    /// Default: 0.0 (disabled).
+    /// Default: [`AdaptiveDhtConfig::default`].
     pub swap_threshold: f64,
     /// Trust score below which automatic lookup/dial paths avoid a peer, and
     /// K-closest peers are evicted into temporary quarantine when the routing
     /// table can keep at least K peers.
-    /// Default: 0.0 (disabled).
+    /// Default: [`AdaptiveDhtConfig::default`].
     pub quarantine_threshold: f64,
     /// Trust score required before a new peer can enter the routing table,
     /// and before a quarantined peer can be admitted again.
-    /// Default: 0.0 (disabled).
+    /// Default: [`AdaptiveDhtConfig::default`].
     pub quarantine_readmit_threshold: f64,
 }
 
@@ -5740,15 +5740,16 @@ const DEFAULT_MAX_CONCURRENT_OPS: usize = 100;
 
 impl Default for DhtNetworkConfig {
     fn default() -> Self {
+        let adaptive_config = AdaptiveDhtConfig::default();
         Self {
             peer_id: PeerId::from_bytes([0u8; 32]),
             node_config: NodeConfig::default(),
             request_timeout: Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS),
             max_concurrent_operations: DEFAULT_MAX_CONCURRENT_OPS,
             enable_security: true,
-            swap_threshold: 0.0,
-            quarantine_threshold: 0.0,
-            quarantine_readmit_threshold: 0.0,
+            swap_threshold: adaptive_config.swap_threshold,
+            quarantine_threshold: adaptive_config.quarantine_threshold,
+            quarantine_readmit_threshold: adaptive_config.quarantine_readmit_threshold,
         }
     }
 }
