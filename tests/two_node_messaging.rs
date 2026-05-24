@@ -19,7 +19,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use saorsa_core::{NodeConfig, P2PEvent, P2PNode, PeerId, TrustEvent};
+use saorsa_core::{Key, NodeConfig, P2PEvent, P2PNode, PeerId, TrustEvent};
 use std::time::Duration;
 use tokio::time::timeout;
 
@@ -276,6 +276,50 @@ async fn peer_count_reflects_connections() {
     assert!(
         node_a.peer_count().await >= 1,
         "node_a should have at least 1 peer after connecting"
+    );
+
+    node_a.stop().await.unwrap();
+    node_b.stop().await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Reliability stamping (Fix E.2)
+// ---------------------------------------------------------------------------
+
+/// `find_closest_nodes_local` stamps the real trust score, not the old
+/// hardcoded `1.0`. A freshly-discovered peer that has never failed sits at the
+/// trust engine's neutral default (`DEFAULT_NEUTRAL_TRUST = 0.5`).
+#[tokio::test]
+async fn local_selection_stamps_neutral_trust_not_hardcoded_one() {
+    // `DEFAULT_NEUTRAL_TRUST` lives in a pub(crate) module, so it cannot be
+    // imported here; mirror its value with a comment instead.
+    const NEUTRAL_TRUST: f64 = 0.5;
+
+    let (node_a, node_b, peer_b) = connected_pair().await;
+
+    // Query closest to node_b's own ID so node_b (XOR distance 0) is returned
+    // once it lands in node_a's routing table. Poll briefly: identity exchange
+    // completing does not instantly guarantee a routing-table entry.
+    let key: Key = *peer_b.as_bytes();
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let node_b_entry = loop {
+        let nodes = node_a.dht_manager().find_closest_nodes_local(&key, 8).await;
+        if let Some(entry) = nodes.into_iter().find(|n| n.peer_id == peer_b) {
+            break Some(entry);
+        }
+        if std::time::Instant::now() >= deadline {
+            break None;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+
+    let node_b_entry =
+        node_b_entry.expect("node_b should appear in node_a's local selection after connecting");
+
+    assert!(
+        (node_b_entry.reliability - NEUTRAL_TRUST).abs() < 1e-9,
+        "expected neutral trust {NEUTRAL_TRUST}, got {} (the old hardcoded path returned 1.0)",
+        node_b_entry.reliability
     );
 
     node_a.stop().await.unwrap();
