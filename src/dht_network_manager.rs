@@ -2121,6 +2121,46 @@ impl DhtNetworkManager {
         nodes
     }
 
+    /// XOR-only, self-inclusive variant of
+    /// [`find_closest_nodes_local_by_distance`].
+    ///
+    /// Mirrors [`find_closest_nodes_local_with_self`] — it includes the local
+    /// node in the candidate set so a caller can compute `IsResponsible(self,
+    /// K)` — but orders purely by XOR distance and does **not** prefer
+    /// directly-reachable peers.
+    ///
+    /// Use this for closeness *verification* (the single-node payment
+    /// close-group check, the Merkle candidate-pool check), which must mirror
+    /// the uploader's pure XOR-distance peer selection rather than the
+    /// reachability re-rank used for storage *selection*. The reachability
+    /// re-rank in [`find_closest_nodes_local_with_self`] can demote an
+    /// XOR-close relay-only peer out of the compared window and falsely reject
+    /// an honest payment that legitimately quoted that peer — see
+    /// saorsa-labs/saorsa-core#121, which added the XOR-only
+    /// [`find_closest_nodes_local_by_distance`] for exactly this purpose.
+    ///
+    /// Like the other `_local` lookups this is a pure in-memory routing-table
+    /// read (no network I/O). Self competes on XOR distance and may displace
+    /// the farthest peer.
+    pub async fn find_closest_nodes_local_by_distance_with_self(
+        &self,
+        key: &Key,
+        count: usize,
+    ) -> Vec<DHTNode> {
+        // Fetch the XOR-closest `count` peers (self is excluded by the
+        // underlying lookup), append self, re-sort by pure XOR distance, and
+        // truncate back to `count`. Any peer beyond the closest `count` is
+        // farther than all of them, so adding only self cannot pull it into
+        // the top-`count` — fetching `count` is sufficient.
+        let mut nodes = self.find_closest_nodes_local_by_distance(key, count).await;
+
+        nodes.push(self.local_dht_node().await);
+
+        nodes.sort_by(|a, b| Self::compare_node_distance(a, b, key));
+        nodes.truncate(count);
+        nodes
+    }
+
     /// Find closest nodes to a key using iterative network lookup.
     ///
     /// This implements Kademlia-style iterative lookup:
