@@ -1301,7 +1301,14 @@ fn apply_lookup_report_winners(
     }
 
     let mut refreshed: Vec<DHTNode> = by_peer.into_values().collect();
-    refreshed.sort_by(|a, b| DhtNetworkManager::compare_node_distance(a, b, key));
+    // Fix E: final re-rank of the converged candidate pool by
+    // (reachability_tier, xor_distance) so directly-reachable peers lead the
+    // result. This is the sole final-ordering chokepoint for the network path
+    // (the Merkle candidate pool and the client's find_closest_peers), so the
+    // re-rank applies to the returned order without touching the iterative
+    // convergence or the dial-failure skip. Re-rank only — truncation is
+    // unchanged, so the result can never drop below `count`.
+    refreshed.sort_by(|a, b| DhtNetworkManager::compare_node_reachability_then_distance(a, b, key));
     refreshed.truncate(count);
     refreshed
 }
@@ -1961,24 +1968,124 @@ impl DhtNetworkManager {
             hex::encode(key)
         );
 
+        // Over-fetch so the reachability re-rank below has material to demote
+        // with: an XOR-closer relay-only peer can be displaced by a slightly
+        // farther directly-reachable one only if the latter is in the fetched
+        // set. The routing table is scanned per bucket regardless, so a 2x
+        // over-fetch is cheap.
+        let overfetch = count.saturating_mul(2);
+
+        let dht_guard = self.dht.read().await;
+        match dht_guard
+            .find_nodes_with_publish_seq(&DhtKey::from_bytes(*key), overfetch)
+            .await
+        {
+            Ok(nodes) => {
+                let mut nodes: Vec<DHTNode> = nodes
+                    .into_iter()
+                    .filter(|(node, _)| !self.is_local_peer_id(&node.id))
+                    .map(|(node, publish_seq)| {
+                        // Fix E: stamp the real trust score instead of a
+                        // hardcoded constant so downstream consumers (ant-node
+                        // replication/payment) see a meaningful reliability.
+                        // Never-failed peers sit at DEFAULT_NEUTRAL_TRUST, so
+                        // reachability tier (below) is the primary signal and
+                        // trust is only a future tiebreaker.
+                        let reliability = self
+                            .trust_engine
+                            .as_ref()
+                            .map(|engine| engine.score(&node.id))
+                            .unwrap_or(DEFAULT_NEUTRAL_TRUST);
+                        DHTNode {
+                            peer_id: node.id,
+                            address_types: node.address_types,
+                            addresses: node.addresses,
+                            distance: encode_publish_seq_distance(publish_seq),
+                            reliability,
+                        }
+                    })
+                    .collect();
+
+                // Re-rank by (reachability_tier, xor_distance) and truncate
+                // back to `count`. Re-rank only, never filter: this can never
+                // return fewer than `count` reachable-or-not peers, keeping the
+                // close-group selection sparse-network-safe.
+                nodes.sort_by(|a, b| Self::compare_node_reachability_then_distance(a, b, key));
+                nodes.truncate(count);
+                nodes
+            }
+            Err(e) => {
+                warn!("find_nodes failed for key {}: {e}", hex::encode(key));
+                Vec::new()
+            }
+        }
+    }
+
+    /// Find closest nodes to a key using the local routing table, ordered by
+    /// **XOR distance only** (no reachability re-rank).
+    ///
+    /// This is the distance-pure counterpart to [`find_closest_nodes_local`].
+    /// The two exist because the routing table serves two consumers with
+    /// opposite ordering needs:
+    ///
+    /// - **Close-group / candidate *selection* for storage** (the majority of
+    ///   callers) benefits from the `(reachability_tier, xor_distance)`
+    ///   re-rank in [`find_closest_nodes_local`]: a directly-reachable peer is
+    ///   a better place to put data than an XOR-equal relay-only one.
+    /// - **Closeness *verification*** (ant-node's Merkle pay-yourself defence)
+    ///   must instead mirror the *uploader's* view, which is built from a
+    ///   pure XOR-distance network lookup. If the verifier re-ranked by
+    ///   reachability it could demote an XOR-close relay-only peer out of the
+    ///   compared window and falsely reject an honest candidate pool that
+    ///   legitimately contains that peer. Verification therefore needs the raw
+    ///   XOR ordering this method provides.
+    ///
+    /// Like [`find_closest_nodes_local`] this is a pure in-memory routing-table
+    /// read (no network I/O) and excludes the local peer. Reliability is still
+    /// stamped with the real trust score so consumers see a meaningful value;
+    /// only the *ordering* differs.
+    pub async fn find_closest_nodes_local_by_distance(
+        &self,
+        key: &Key,
+        count: usize,
+    ) -> Vec<DHTNode> {
+        debug!(
+            "[LOCAL] Finding {} closest nodes (XOR-only) to key: {}",
+            count,
+            hex::encode(key)
+        );
+
         let dht_guard = self.dht.read().await;
         match dht_guard
             .find_nodes_with_publish_seq(&DhtKey::from_bytes(*key), count)
             .await
         {
+            // `find_nodes_with_publish_seq` already returns peers in ascending
+            // XOR-distance order; we keep that order intact — no re-rank, no
+            // truncation beyond what the routing table returned.
             Ok(nodes) => nodes
                 .into_iter()
                 .filter(|(node, _)| !self.is_local_peer_id(&node.id))
-                .map(|(node, publish_seq)| DHTNode {
-                    peer_id: node.id,
-                    address_types: node.address_types,
-                    addresses: node.addresses,
-                    distance: encode_publish_seq_distance(publish_seq),
-                    reliability: SELF_RELIABILITY_SCORE,
+                .map(|(node, publish_seq)| {
+                    let reliability = self
+                        .trust_engine
+                        .as_ref()
+                        .map(|engine| engine.score(&node.id))
+                        .unwrap_or(DEFAULT_NEUTRAL_TRUST);
+                    DHTNode {
+                        peer_id: node.id,
+                        address_types: node.address_types,
+                        addresses: node.addresses,
+                        distance: encode_publish_seq_distance(publish_seq),
+                        reliability,
+                    }
                 })
                 .collect(),
             Err(e) => {
-                warn!("find_nodes failed for key {}: {e}", hex::encode(key));
+                warn!(
+                    "find_nodes (XOR-only) failed for key {}: {e}",
+                    hex::encode(key)
+                );
                 Vec::new()
             }
         }
@@ -1993,7 +2100,8 @@ impl DhtNetworkManager {
     /// `IsResponsible(self, K)` by checking whether self appears in the
     /// top-N results.
     ///
-    /// Results are sorted by XOR distance to the key and truncated to `count`.
+    /// Results are sorted by `(reachability_tier, XOR distance)` to the key —
+    /// directly-reachable peers first — and truncated to `count`.
     pub async fn find_closest_nodes_local_with_self(
         &self,
         key: &Key,
@@ -2005,12 +2113,10 @@ impl DhtNetworkManager {
 
         nodes.push(self.local_dht_node().await);
 
-        let key_peer = PeerId::from_bytes(*key);
-        nodes.sort_by(|a, b| {
-            let da = a.peer_id.xor_distance(&key_peer);
-            let db = b.peer_id.xor_distance(&key_peer);
-            da.cmp(&db)
-        });
+        // Same reachability-aware ordering as find_closest_nodes_local: prefer
+        // directly-reachable peers, XOR distance as tiebreaker. Self competes
+        // on the same terms and may displace the farthest peer.
+        nodes.sort_by(|a, b| Self::compare_node_reachability_then_distance(a, b, key));
         nodes.truncate(count);
         nodes
     }
@@ -2446,6 +2552,33 @@ impl DhtNetworkManager {
         a.peer_id
             .distance(&target_key)
             .cmp(&b.peer_id.distance(&target_key))
+    }
+
+    /// Reachability tier for selection ranking: `0` when the node exposes a
+    /// directly-dialable address, `1` when it is relay-only / NAT-stuck (no
+    /// `Direct` address). Used as the primary sort key so a directly-reachable
+    /// peer is preferred over an XOR-equal unreachable one (Fix E).
+    ///
+    /// Keyed on the *absence* of a `Direct` address, not on the presence of a
+    /// `Relay` address — a peer that advertises both stays tier `0`. This is a
+    /// re-ranking signal only; it is never used to filter peers out, so it can
+    /// never shrink a close group below the requested `count`.
+    fn reachability_tier(node: &DHTNode) -> u8 {
+        u8::from(Self::first_direct_dialable(node).is_none())
+    }
+
+    /// Order nodes by `(reachability_tier, xor_distance)`: directly-reachable
+    /// peers first, then by XOR distance to `key` within each tier. The XOR
+    /// tiebreaker reuses [`Self::compare_node_distance`], keeping ordering
+    /// deterministic for equal tiers (stable, no churn).
+    fn compare_node_reachability_then_distance(
+        a: &DHTNode,
+        b: &DHTNode,
+        key: &Key,
+    ) -> std::cmp::Ordering {
+        Self::reachability_tier(a)
+            .cmp(&Self::reachability_tier(b))
+            .then_with(|| Self::compare_node_distance(a, b, key))
     }
 
     /// Drain an iteration's α queries with a bounded wait after first response.
@@ -5533,6 +5666,91 @@ mod tests {
     fn first_direct_dialable_returns_none_when_only_relay() {
         let node = dht_node(1, vec![("/ip4/10.0.0.1/udp/9000/quic", AddressType::Relay)]);
         assert_eq!(DhtNetworkManager::first_direct_dialable(&node), None);
+    }
+
+    // ---- Fix E: reachability-aware selection re-rank ----
+
+    #[test]
+    fn reachability_tier_is_zero_for_direct_one_for_relay_only() {
+        let direct = dht_node(
+            1,
+            vec![("/ip4/203.0.113.7/udp/9001/quic", AddressType::Direct)],
+        );
+        let relay_only = dht_node(2, vec![("/ip4/10.0.0.1/udp/9000/quic", AddressType::Relay)]);
+        let empty = DHTNode {
+            peer_id: PeerId::from_bytes([3u8; 32]),
+            addresses: vec![],
+            address_types: vec![],
+            distance: None,
+            reliability: 1.0,
+        };
+
+        assert_eq!(DhtNetworkManager::reachability_tier(&direct), 0);
+        assert_eq!(DhtNetworkManager::reachability_tier(&relay_only), 1);
+        assert_eq!(DhtNetworkManager::reachability_tier(&empty), 1);
+    }
+
+    #[test]
+    fn reachability_tier_zero_when_node_has_both_relay_and_direct() {
+        // A peer advertising both a relay and a direct address is still
+        // directly reachable — tier keyed on absence of Direct, not presence
+        // of Relay.
+        let node = dht_node(
+            1,
+            vec![
+                ("/ip4/10.0.0.1/udp/9000/quic", AddressType::Relay),
+                ("/ip4/203.0.113.7/udp/9001/quic", AddressType::Direct),
+            ],
+        );
+        assert_eq!(DhtNetworkManager::reachability_tier(&node), 0);
+    }
+
+    #[test]
+    fn reachability_rerank_prefers_direct_over_xor_closer_relay_only() {
+        // With key = [0; 32], xor_distance == peer_id, so the lower seed is the
+        // XOR-closer peer. The relay-only peer (seed 1) is XOR-closer; the
+        // direct peer (seed 2) is farther. Reachability tier must win: the
+        // direct peer is ranked first despite the larger XOR distance.
+        let key: Key = [0u8; 32];
+        let relay_closer = dht_node(1, vec![("/ip4/10.0.0.1/udp/9000/quic", AddressType::Relay)]);
+        let direct_farther = dht_node(
+            2,
+            vec![("/ip4/203.0.113.7/udp/9001/quic", AddressType::Direct)],
+        );
+
+        let mut nodes = [relay_closer, direct_farther];
+        nodes
+            .sort_by(|a, b| DhtNetworkManager::compare_node_reachability_then_distance(a, b, &key));
+
+        assert_eq!(nodes.len(), 2, "re-rank must never drop peers");
+        assert_eq!(
+            nodes[0].peer_id,
+            PeerId::from_bytes([2u8; 32]),
+            "directly-reachable peer must rank first even though it is XOR-farther"
+        );
+        assert_eq!(nodes[1].peer_id, PeerId::from_bytes([1u8; 32]));
+    }
+
+    #[test]
+    fn reachability_rerank_sparse_all_relay_only_keeps_count_in_xor_order() {
+        // Sparse-network safety: when every candidate is relay-only they all
+        // share tier 1, so ordering falls back to XOR distance and truncation
+        // still yields `count` members — selection never shrinks below `count`.
+        let key: Key = [0u8; 32];
+        let mut nodes = vec![
+            dht_node(3, vec![("/ip4/10.0.0.3/udp/9000/quic", AddressType::Relay)]),
+            dht_node(1, vec![("/ip4/10.0.0.1/udp/9000/quic", AddressType::Relay)]),
+            dht_node(2, vec![("/ip4/10.0.0.2/udp/9000/quic", AddressType::Relay)]),
+        ];
+        nodes
+            .sort_by(|a, b| DhtNetworkManager::compare_node_reachability_then_distance(a, b, &key));
+
+        let count = 2;
+        nodes.truncate(count);
+
+        assert_eq!(nodes.len(), count, "sparse selection must still fill count");
+        assert_eq!(nodes[0].peer_id, PeerId::from_bytes([1u8; 32]));
+        assert_eq!(nodes[1].peer_id, PeerId::from_bytes([2u8; 32]));
     }
 
     #[test]
