@@ -5773,6 +5773,39 @@ mod tests {
     }
 
     #[test]
+    fn by_distance_comparator_keeps_xor_closer_relay_only_ahead_of_direct() {
+        // Complement of `reachability_rerank_prefers_direct_over_xor_closer_relay_only`,
+        // and the property the closeness-verification path relies on: the XOR-only
+        // `compare_node_distance` (used by `find_closest_nodes_local_by_distance`
+        // and `find_closest_nodes_local_by_distance_with_self`) must NOT apply the
+        // reachability re-rank. With key = [0; 32], xor_distance == peer_id, so the
+        // lower seed is XOR-closer. The relay-only peer (seed 1) is XOR-closer and
+        // must therefore rank first even though it is relay-only — mirroring the
+        // uploader's pure-XOR view so an honest payment quoting that peer is not
+        // falsely rejected. (The reranked comparator would put the direct peer first.)
+        let key: Key = [0u8; 32];
+        let relay_closer = dht_node(1, vec![("/ip4/10.0.0.1/udp/9000/quic", AddressType::Relay)]);
+        let direct_farther = dht_node(
+            2,
+            vec![("/ip4/203.0.113.7/udp/9001/quic", AddressType::Direct)],
+        );
+
+        // Start in the opposite order so a passing assertion proves the sort
+        // actually reordered (rather than leaving an already-correct input).
+        let mut nodes = [direct_farther, relay_closer];
+        nodes.sort_by(|a, b| DhtNetworkManager::compare_node_distance(a, b, &key));
+
+        assert_eq!(nodes.len(), 2, "distance sort must never drop peers");
+        assert_eq!(
+            nodes[0].peer_id,
+            PeerId::from_bytes([1u8; 32]),
+            "XOR-only ordering must keep the XOR-closer relay-only peer first, \
+             unlike compare_node_reachability_then_distance"
+        );
+        assert_eq!(nodes[1].peer_id, PeerId::from_bytes([2u8; 32]));
+    }
+
+    #[test]
     fn reachability_rerank_sparse_all_relay_only_keeps_count_in_xor_order() {
         // Sparse-network safety: when every candidate is relay-only they all
         // share tier 1, so ordering falls back to XOR distance and truncation

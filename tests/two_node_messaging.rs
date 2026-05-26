@@ -382,3 +382,61 @@ async fn local_by_distance_returns_peer_and_stamps_neutral_trust() {
     node_a.stop().await.unwrap();
     node_b.stop().await.unwrap();
 }
+
+/// `find_closest_nodes_local_by_distance_with_self` is the self-inclusive
+/// counterpart of `find_closest_nodes_local_by_distance`, used by the
+/// single-node payment close-group verification so the storer's view mirrors
+/// the uploader's pure-XOR selection rather than the reachability re-rank.
+///
+/// Wiring/contract smoke test. The distinguishing contract vs `_by_distance` is
+/// that the local node MUST be included (so the storer can satisfy
+/// `IsResponsible(self, K)`); it also returns the connected peer and stamps the
+/// real (neutral) trust score. The XOR-vs-reachability *ordering* divergence is
+/// covered by the `by_distance_comparator_keeps_xor_closer_relay_only_ahead_of_direct`
+/// unit test — this function deliberately sorts with `compare_node_distance`,
+/// never `compare_node_reachability_then_distance`.
+#[tokio::test]
+async fn local_by_distance_with_self_includes_self_and_connected_peer() {
+    const NEUTRAL_TRUST: f64 = 0.5;
+
+    let (node_a, node_b, peer_b) = connected_pair().await;
+
+    // Query closest to node_b's own ID, mirroring the sibling tests above.
+    let key: Key = *peer_b.as_bytes();
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let nodes = loop {
+        let nodes = node_a
+            .dht_manager()
+            .find_closest_nodes_local_by_distance_with_self(&key, 8)
+            .await;
+        if nodes.iter().any(|n| n.peer_id == peer_b) {
+            break nodes;
+        }
+        if std::time::Instant::now() >= deadline {
+            break nodes;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+
+    // The self-inclusive variant MUST include the local peer — this is the
+    // distinguishing contract vs `find_closest_nodes_local_by_distance`, which
+    // excludes self.
+    assert!(
+        nodes.iter().any(|n| &n.peer_id == node_a.peer_id()),
+        "self-inclusive XOR-only lookup must include the local peer"
+    );
+
+    let node_b_entry = nodes
+        .into_iter()
+        .find(|n| n.peer_id == peer_b)
+        .expect("node_b should appear in node_a's self-inclusive XOR-only selection");
+
+    assert!(
+        (node_b_entry.reliability - NEUTRAL_TRUST).abs() < 1e-9,
+        "expected neutral trust {NEUTRAL_TRUST}, got {}",
+        node_b_entry.reliability
+    );
+
+    node_a.stop().await.unwrap();
+    node_b.stop().await.unwrap();
+}
