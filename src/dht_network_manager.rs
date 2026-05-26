@@ -2121,6 +2121,46 @@ impl DhtNetworkManager {
         nodes
     }
 
+    /// XOR-only, self-inclusive variant of
+    /// [`find_closest_nodes_local_by_distance`].
+    ///
+    /// Mirrors [`find_closest_nodes_local_with_self`] — it includes the local
+    /// node in the candidate set so a caller can compute `IsResponsible(self,
+    /// K)` — but orders purely by XOR distance and does **not** prefer
+    /// directly-reachable peers.
+    ///
+    /// Use this for closeness *verification* (the single-node payment
+    /// close-group check, the Merkle candidate-pool check), which must mirror
+    /// the uploader's pure XOR-distance peer selection rather than the
+    /// reachability re-rank used for storage *selection*. The reachability
+    /// re-rank in [`find_closest_nodes_local_with_self`] can demote an
+    /// XOR-close relay-only peer out of the compared window and falsely reject
+    /// an honest payment that legitimately quoted that peer — see
+    /// saorsa-labs/saorsa-core#121, which added the XOR-only
+    /// [`find_closest_nodes_local_by_distance`] for exactly this purpose.
+    ///
+    /// Like the other `_local` lookups this is a pure in-memory routing-table
+    /// read (no network I/O). Self competes on XOR distance and may displace
+    /// the farthest peer.
+    pub async fn find_closest_nodes_local_by_distance_with_self(
+        &self,
+        key: &Key,
+        count: usize,
+    ) -> Vec<DHTNode> {
+        // Fetch the XOR-closest `count` peers (self is excluded by the
+        // underlying lookup), append self, re-sort by pure XOR distance, and
+        // truncate back to `count`. Any peer beyond the closest `count` is
+        // farther than all of them, so adding only self cannot pull it into
+        // the top-`count` — fetching `count` is sufficient.
+        let mut nodes = self.find_closest_nodes_local_by_distance(key, count).await;
+
+        nodes.push(self.local_dht_node().await);
+
+        nodes.sort_by(|a, b| Self::compare_node_distance(a, b, key));
+        nodes.truncate(count);
+        nodes
+    }
+
     /// Find closest nodes to a key using iterative network lookup.
     ///
     /// This implements Kademlia-style iterative lookup:
@@ -5729,6 +5769,39 @@ mod tests {
             "directly-reachable peer must rank first even though it is XOR-farther"
         );
         assert_eq!(nodes[1].peer_id, PeerId::from_bytes([1u8; 32]));
+    }
+
+    #[test]
+    fn by_distance_comparator_keeps_xor_closer_relay_only_ahead_of_direct() {
+        // Complement of `reachability_rerank_prefers_direct_over_xor_closer_relay_only`,
+        // and the property the closeness-verification path relies on: the XOR-only
+        // `compare_node_distance` (used by `find_closest_nodes_local_by_distance`
+        // and `find_closest_nodes_local_by_distance_with_self`) must NOT apply the
+        // reachability re-rank. With key = [0; 32], xor_distance == peer_id, so the
+        // lower seed is XOR-closer. The relay-only peer (seed 1) is XOR-closer and
+        // must therefore rank first even though it is relay-only — mirroring the
+        // uploader's pure-XOR view so an honest payment quoting that peer is not
+        // falsely rejected. (The reranked comparator would put the direct peer first.)
+        let key: Key = [0u8; 32];
+        let relay_closer = dht_node(1, vec![("/ip4/10.0.0.1/udp/9000/quic", AddressType::Relay)]);
+        let direct_farther = dht_node(
+            2,
+            vec![("/ip4/203.0.113.7/udp/9001/quic", AddressType::Direct)],
+        );
+
+        // Start in the opposite order so a passing assertion proves the sort
+        // actually reordered (rather than leaving an already-correct input).
+        let mut nodes = [direct_farther, relay_closer];
+        nodes.sort_by(|a, b| DhtNetworkManager::compare_node_distance(a, b, &key));
+
+        assert_eq!(nodes.len(), 2, "distance sort must never drop peers");
+        assert_eq!(
+            nodes[0].peer_id,
+            PeerId::from_bytes([1u8; 32]),
+            "XOR-only ordering must keep the XOR-closer relay-only peer first, \
+             unlike compare_node_reachability_then_distance"
+        );
+        assert_eq!(nodes[1].peer_id, PeerId::from_bytes([2u8; 32]));
     }
 
     #[test]
