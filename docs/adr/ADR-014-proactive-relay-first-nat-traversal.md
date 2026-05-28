@@ -206,3 +206,11 @@ The following items form the concrete work package. Order is suggestive, not str
 - iroh/Tailscale `netcheck` — reference for 5-minute reprobe cadence
 - [ADR-002: Delegated Transport](./ADR-002-delegated-transport.md) — the delegation boundary this ADR operates within
 - [ADR-007: Adaptive Networking with ML](./ADR-007-adaptive-networking.md) — trust/adaptive layer this ADR inherits from
+- **IETF MASQUE Drafts**:
+  - `draft-ietf-masque-connect-udp-listen-11` — Bound UDP proxying over HTTP (January 2026)
+    - https://datatracker.ietf.org/doc/html/draft-ietf-masque-connect-udp-listen
+  - `draft-ietf-masque-quic-proxy-08` — QUIC-aware proxying using HTTP (March 2026)
+    - https://datatracker.ietf.org/doc/html/draft-ietf-masque-quic-proxy
+- **IETF QUIC NAT Traversal Draft**:
+  - `draft-seemann-quic-nat-traversal-02` — Using QUIC to traverse NATs (March 2024)
+    - https://datatracker.ietf.org/doc/html/draft-seemann-quic-nat-traversal
