@@ -1723,16 +1723,6 @@ impl P2PNode {
     }
 }
 
-/// Parse a postcard-encoded protocol message into a `P2PEvent::Message`.
-///
-/// Returns `None` if the bytes cannot be deserialized as a valid `WireMessage`.
-///
-/// The `from` field is a required part of the wire protocol but is **not**
-/// used as the event source. Instead, `source` — the transport-level peer ID
-/// derived from the authenticated QUIC connection — is used so that consumers
-/// can pass it directly to `send_message()`. This eliminates a spoofing
-/// vector where a peer could claim an arbitrary identity via the payload.
-///
 /// Convenience constructor for `P2PError::Network(NetworkError::ProtocolError(...))`.
 fn protocol_error(msg: impl std::fmt::Display) -> P2PError {
     P2PError::Network(NetworkError::ProtocolError(msg.to_string().into()))
@@ -1755,6 +1745,15 @@ pub(crate) struct ParsedMessage {
     pub(crate) user_agent: String,
 }
 
+/// Parse a postcard-encoded protocol message into a `P2PEvent::Message`.
+///
+/// Returns `None` if the bytes cannot be deserialized as a valid `WireMessage`.
+///
+/// The `from` field is a required part of the wire protocol but is **not**
+/// used as the event source. Instead, `source` — the transport-level peer ID
+/// derived from the authenticated QUIC connection — is used so that consumers
+/// can pass it directly to `send_message()`. This eliminates a spoofing
+/// vector where a peer could claim an arbitrary identity via the payload.
 pub(crate) fn parse_protocol_message(bytes: &[u8], source: &str) -> Option<ParsedMessage> {
     let message: WireMessage = postcard::from_bytes(bytes).ok()?;
     let transport_source = source.parse::<SocketAddr>().ok().map(MultiAddr::quic);
@@ -3258,7 +3257,7 @@ mod tests {
             .unwrap_or(0)
     }
 
-    /// Helper to create a postcard-serialized WireMessage for tests
+    /// Helper to create a postcard-serialized unsigned WireMessage for tests
     fn make_wire_bytes(protocol: &str, data: Vec<u8>, from: &str, timestamp: u64) -> Vec<u8> {
         let msg = WireMessage {
             protocol: protocol.to_string(),
@@ -3268,6 +3267,31 @@ mod tests {
             user_agent: String::new(),
             public_key: Vec::new(),
             signature: Vec::new(),
+        };
+        postcard::to_stdvec(&msg).unwrap()
+    }
+
+    /// Helper to create a postcard-serialized signed WireMessage for tests.
+    fn make_signed_wire_bytes(
+        identity: &NodeIdentity,
+        protocol: &str,
+        data: Vec<u8>,
+        timestamp: u64,
+    ) -> Vec<u8> {
+        let from = *identity.peer_id();
+        let user_agent = "test/1.0";
+        let signable =
+            postcard::to_stdvec(&(protocol, data.as_slice(), &from, timestamp, user_agent))
+                .unwrap();
+        let sig = identity.sign(&signable).expect("signing should succeed");
+        let msg = WireMessage {
+            protocol: protocol.to_string(),
+            data,
+            from,
+            timestamp,
+            user_agent: user_agent.to_string(),
+            public_key: identity.public_key().as_bytes().to_vec(),
+            signature: sig.as_bytes().to_vec(),
         };
         postcard::to_stdvec(&msg).unwrap()
     }
@@ -3498,15 +3522,32 @@ mod tests {
         let old_bytes = make_wire_bytes("test/old", payload.clone(), "sender", old_ts);
         assert!(
             parse_protocol_message(&old_bytes, "peer-id").is_some(),
-            "should accept message with timestamp 10h in the past"
+            "should accept unsigned message with timestamp 10h in the past"
         );
 
         // 10 hours in the future
         let future_ts = current_timestamp().saturating_add(36_000);
-        let future_bytes = make_wire_bytes("test/future", payload, "sender", future_ts);
+        let future_bytes = make_wire_bytes("test/future", payload.clone(), "sender", future_ts);
         assert!(
             parse_protocol_message(&future_bytes, "peer-id").is_some(),
-            "should accept message with timestamp 10h in the future"
+            "should accept unsigned message with timestamp 10h in the future"
+        );
+
+        // Signed messages must take the same path: timestamp remains part of the
+        // signed bytes for integrity, but is not used for wall-clock rejection.
+        let identity = NodeIdentity::generate().expect("should generate identity");
+        let signed_old =
+            make_signed_wire_bytes(&identity, "test/signed-old", payload.clone(), old_ts);
+        assert!(
+            parse_protocol_message(&signed_old, "transport-xyz").is_some(),
+            "should accept signed message with timestamp 10h in the past"
+        );
+
+        let signed_future =
+            make_signed_wire_bytes(&identity, "test/signed-future", payload, future_ts);
+        assert!(
+            parse_protocol_message(&signed_future, "transport-xyz").is_some(),
+            "should accept signed message with timestamp 10h in the future"
         );
     }
 }
