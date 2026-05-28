@@ -828,23 +828,13 @@ impl<T: LinkTransport + Send + Sync + 'static> P2PNetworkNode<T> {
         //
         // The transport's default StrategyConfig::direct_only() disables
         // hole-punching and the in-cascade relay fallback, so this dial
-        // is single-shot. 6 s covers the transport's 1 s progress timeout
-        // plus 4 s handshake timeout, with margin for task scheduling.
-        const DIAL_TIMEOUT: Duration = Duration::from_secs(6);
-
-        let conn = tokio::time::timeout(
-            DIAL_TIMEOUT,
-            self.transport.dial_addr(peer_addr, SAORSA_DHT_PROTOCOL),
-        )
-        .await
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "Connection timeout after {:?} to {}",
-                DIAL_TIMEOUT,
-                peer_addr
-            )
-        })?
-        .map_err(|e| anyhow::anyhow!("Failed to connect to peer {}: {}", peer_addr, e))?;
+        // is bounded by the direct connect and handshake timeouts configured
+        // on the transport strategy.
+        let conn = self
+            .transport
+            .dial_addr(peer_addr, SAORSA_DHT_PROTOCOL)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to connect to peer {}: {}", peer_addr, e))?;
 
         let remote_addr = conn.remote_addr();
 

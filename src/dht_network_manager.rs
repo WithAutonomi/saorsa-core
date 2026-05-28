@@ -3493,34 +3493,18 @@ impl DhtNetworkManager {
             return None;
         }
 
-        let dial_timeout = self
-            .transport
-            .connection_timeout()
-            .min(self.config.request_timeout);
-        match tokio::time::timeout(
-            dial_timeout,
-            self.transport.connect_peer_typed(address, kind),
-        )
-        .await
-        {
-            Ok(Ok(channel_id)) => {
+        match self.transport.connect_peer_typed(address, kind).await {
+            Ok(channel_id) => {
                 debug!(
                     "dial_candidate: connected to {} at {} ({:?}) (channel {})",
                     peer_hex, address, kind, channel_id
                 );
                 Some(channel_id)
             }
-            Ok(Err(e)) => {
+            Err(e) => {
                 debug!(
                     "dial_candidate: failed to connect to {} at {} ({:?}): {}",
                     peer_hex, address, kind, e
-                );
-                None
-            }
-            Err(_) => {
-                debug!(
-                    "dial_candidate: timeout connecting to {} at {} ({:?}) (>{:?})",
-                    peer_hex, address, kind, dial_timeout
                 );
                 None
             }
@@ -4974,10 +4958,8 @@ impl DhtNetworkManager {
 
 /// Default request timeout for outbound DHT operations (seconds).
 ///
-/// Governs `wait_for_response` and the upper bound of `dial_candidate`'s
-/// dial timeout (`min(connection_timeout, request_timeout)`). Must stay
-/// above the relay stage (~10s) so it never truncates the NAT traversal
-/// cascade.
+/// Governs `wait_for_response`. Peer dials are bounded by the transport
+/// strategy's direct connect and handshake timeouts.
 const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 15;
 
 /// Maximum additional wait for outstanding α queries after the first

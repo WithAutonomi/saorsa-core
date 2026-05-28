@@ -1341,13 +1341,8 @@ impl TransportHandle {
             dial_target_normalized.ip(),
         ));
 
-        let peer_id = match tokio::time::timeout(
-            self.connection_timeout,
-            self.dual_node.connect_happy_eyeballs(&addr_list),
-        )
-        .await
-        {
-            Ok(Ok(addr)) => {
+        let peer_id = match self.dual_node.connect_happy_eyeballs(&addr_list).await {
+            Ok(addr) => {
                 let connected_peer_id = canonical_channel_id(addr);
 
                 // Prevent self-connections by comparing against all listen
@@ -1377,7 +1372,7 @@ impl TransportHandle {
                 );
                 connected_peer_id
             }
-            Ok(Err(e)) => {
+            Err(e) => {
                 warn!(
                     kind = kind_label,
                     %address,
@@ -1390,15 +1385,6 @@ impl TransportHandle {
                         reason: e.to_string().into(),
                     },
                 ));
-            }
-            Err(_) => {
-                warn!(
-                    kind = kind_label,
-                    %address,
-                    timeout = ?self.connection_timeout,
-                    "connect_happy_eyeballs timed out"
-                );
-                return Err(P2PError::Timeout(self.connection_timeout));
             }
         };
 
