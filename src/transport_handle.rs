@@ -2125,10 +2125,16 @@ impl TransportHandle {
             );
         }
 
+        // Self-emit to local subscribers. The on-wire timestamp lives on each
+        // serialized WireMessage built by `send_on_channel`; this local copy
+        // just stamps "when the publisher sent it" so handlers see the same
+        // shape they would for a received signed message.
+        let timestamp = Self::current_timestamp_secs().unwrap_or(0);
         self.send_event(P2PEvent::Message {
             topic: topic.to_string(),
             source: Some(*self.node_identity.peer_id()),
             transport_source: None,
+            timestamp,
             data: data.to_vec(),
         });
 

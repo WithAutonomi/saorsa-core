@@ -709,6 +709,14 @@ pub enum P2PEvent {
         ///
         /// This is provenance metadata, not an identity signal.
         transport_source: Option<MultiAddr>,
+        /// Sender-supplied Unix timestamp in seconds.
+        ///
+        /// For signed messages this value is covered by the ML-DSA-65 signature
+        /// alongside the payload, so handlers can use it for application-level
+        /// freshness or replay defense. Wire-level acceptance no longer gates
+        /// on this value; subscribers MUST do their own age/dedup checks when
+        /// the protocol requires them.
+        timestamp: u64,
         /// Raw message data payload
         data: Vec<u8>,
     },
@@ -1736,6 +1744,10 @@ pub(crate) fn broadcast_event(tx: &broadcast::Sender<P2PEvent>, event: P2PEvent)
 }
 
 /// Result of parsing a protocol message, including optional authenticated identity.
+///
+/// The signed wire timestamp is carried on the inner [`P2PEvent::Message`]
+/// (see its `timestamp` field) so subscribers can apply their own freshness
+/// or replay policy now that the wire-level skew gate is gone.
 pub(crate) struct ParsedMessage {
     /// The P2P event to broadcast.
     pub(crate) event: P2PEvent,
@@ -1794,6 +1806,7 @@ pub(crate) fn parse_protocol_message(bytes: &[u8], source: &str) -> Option<Parse
             topic: message.protocol,
             source: authenticated_node_id,
             transport_source,
+            timestamp: message.timestamp,
             data: message.data,
         },
         authenticated_node_id,
@@ -3315,6 +3328,7 @@ mod tests {
                 topic,
                 source,
                 transport_source,
+                timestamp: _,
                 data,
             } => {
                 assert!(source.is_none(), "unsigned message source must be None");
@@ -3548,6 +3562,48 @@ mod tests {
         assert!(
             parse_protocol_message(&signed_future, "transport-xyz").is_some(),
             "should accept signed message with timestamp 10h in the future"
+        );
+    }
+
+    #[test]
+    fn test_parse_protocol_message_exposes_timestamp_on_event() {
+        // After removing the wall-clock skew gate, the signed timestamp must
+        // remain reachable on `P2PEvent::Message` so application-layer handlers
+        // can implement freshness / replay defense.
+        let ts: u64 = 1_234_567_890;
+        let bytes = make_wire_bytes("test/ts", vec![9, 9, 9], "sender", ts);
+        let parsed = parse_protocol_message(&bytes, "peer-id").expect("valid message should parse");
+        match parsed.event {
+            P2PEvent::Message { timestamp, .. } => {
+                assert_eq!(timestamp, ts, "P2PEvent::Message.timestamp must round-trip");
+            }
+            other => panic!("expected P2PEvent::Message, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_signed_message_timestamp_is_signature_covered() {
+        // Sign once, mutate only the timestamp, assert rejection. This is the
+        // only timestamp property still enforced by `parse_protocol_message`
+        // after the wall-clock gate was removed: signature integrity.
+        let identity = NodeIdentity::generate().expect("should generate identity");
+        let ts: u64 = 1_700_000_000;
+        let signed = make_signed_wire_bytes(&identity, "test/sig", vec![1, 2, 3], ts);
+
+        // Sanity: unmodified bytes parse and authenticate.
+        let parsed = parse_protocol_message(&signed, "transport-xyz")
+            .expect("unmodified signed message should parse");
+        assert!(parsed.authenticated_node_id.is_some());
+
+        // Now tamper with just the timestamp on the wire and re-serialize.
+        let mut tampered: WireMessage =
+            postcard::from_bytes(&signed).expect("signed bytes must deserialize");
+        tampered.timestamp = ts.wrapping_add(1);
+        let tampered_bytes = postcard::to_stdvec(&tampered).expect("re-serialize");
+
+        assert!(
+            parse_protocol_message(&tampered_bytes, "transport-xyz").is_none(),
+            "timestamp-only mutation on a signed message must fail signature verification"
         );
     }
 }

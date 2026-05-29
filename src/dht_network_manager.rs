@@ -4165,6 +4165,7 @@ impl DhtNetworkManager {
                                     topic,
                                     source,
                                     transport_source,
+                                    timestamp: _,
                                     data,
                                 } => {
                                     trace!(
