@@ -2615,7 +2615,7 @@ mod tests {
     // "All connect attempts failed" even with IPv4-only config, long delays,
     // and multiple retry attempts. The underlying saorsa-transport library may have
     // issues on Windows that need investigation.
-    // See: https://github.com/dirvine/saorsa-core/issues/TBD
+    // See: https://github.com/WithAutonomi/saorsa-core/issues/TBD
     #[cfg_attr(target_os = "windows", ignore)]
     #[tokio::test]
     async fn test_event_subscription() -> Result<()> {

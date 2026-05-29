@@ -49,6 +49,12 @@ An Architecture Decision Record (ADR) is a document that captures an important a
 |-----|-------|--------|---------|
 | [ADR-013](./ADR-013-no-offline-delivery-v1.md) | No Offline Message Delivery (v1) | Accepted | 1-hour TTL limit without extended offline delivery (future reconsideration) |
 
+### Operations
+
+| ADR | Title | Status | Summary |
+|-----|-------|--------|---------|
+| [ADR-015](./ADR-015-repository-ownership.md) | Repository Ownership under WithAutonomi | Accepted | Host Autonomi-specific saorsa-core under WithAutonomi for clearer release ownership and monitoring |
+
 ## ADR Template
 
 When creating new ADRs, use this template:

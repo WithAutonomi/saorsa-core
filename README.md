@@ -1,6 +1,6 @@
 # Saorsa Core
 
-[![CI](https://github.com/dirvine/saorsa-core-foundation/actions/workflows/rust.yml/badge.svg)](https://github.com/dirvine/saorsa-core-foundation/actions/workflows/rust.yml)
+[![CI](https://github.com/WithAutonomi/saorsa-core/actions/workflows/rust.yml/badge.svg)](https://github.com/WithAutonomi/saorsa-core/actions/workflows/rust.yml)
 [![Crates.io](https://img.shields.io/crates/v/saorsa-core.svg)](https://crates.io/crates/saorsa-core)
 [![Documentation](https://docs.rs/saorsa-core/badge.svg)](https://docs.rs/saorsa-core)
 
@@ -267,8 +267,8 @@ See [CHANGELOG.md](CHANGELOG.md) for version history.
 
 ## Support
 
-- **Issues**: [GitHub Issues](https://github.com/dirvine/saorsa-core-foundation/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/dirvine/saorsa-core-foundation/discussions)
+- **Issues**: [GitHub Issues](https://github.com/WithAutonomi/saorsa-core/issues)
+- **Discussions**: [GitHub Discussions](https://github.com/WithAutonomi/saorsa-core/discussions)
 - **Email**: david@saorsalabs.com
 
 ---

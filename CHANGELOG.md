@@ -408,6 +408,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Documentation inconsistencies
 - Strong typing improvements
 
-[0.4.0]: https://github.com/dirvine/saorsa-core-foundation/compare/v0.3.28...v0.4.0
-[0.3.28]: https://github.com/dirvine/saorsa-core-foundation/compare/v0.3.24...v0.3.28
-[0.3.24]: https://github.com/dirvine/saorsa-core-foundation/releases/tag/v0.3.24
+[0.4.0]: https://github.com/WithAutonomi/saorsa-core/compare/v0.3.28...v0.4.0
+[0.3.28]: https://github.com/WithAutonomi/saorsa-core/compare/v0.3.24...v0.3.28
+[0.3.24]: https://github.com/WithAutonomi/saorsa-core/releases/tag/v0.3.24
