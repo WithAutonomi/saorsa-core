@@ -845,6 +845,16 @@ impl DialFailureCache {
         Self::default()
     }
 
+    /// Canonicalize a cache key so an IPv4-mapped IPv6 socket
+    /// (`[::ffff:a.b.c.d]:p`) and its bare IPv4 form (`a.b.c.d:p`) resolve to
+    /// the **same** entry — matching how the rest of the dial path
+    /// canonicalizes endpoint identity (see [`canonicalize_ip`]). Without
+    /// this, a failure recorded under one form would neither suppress nor be
+    /// cleared by the other for the same physical endpoint.
+    fn canon_key(addr: SocketAddr) -> SocketAddr {
+        SocketAddr::new(canonicalize_ip(addr.ip()), addr.port())
+    }
+
     /// Returns true if `addr` should be skipped because it failed a dial
     /// within the last [`DIAL_FAILURE_CACHE_TTL`] (per-`SocketAddr` tier),
     /// or — for `AddressType::Relay` dials only — because its relay-server
@@ -857,7 +867,8 @@ impl DialFailureCache {
     /// [`Self::record_failure`] cannot slip a fresh entry in between
     /// the check and the eviction.
     fn is_failed(&self, addr: &SocketAddr, ty: AddressType) -> bool {
-        let per_addr_failed = match self.entries.entry(*addr) {
+        let addr = Self::canon_key(*addr);
+        let per_addr_failed = match self.entries.entry(addr) {
             DashEntry::Occupied(entry) => {
                 if entry.get().elapsed() < DIAL_FAILURE_CACHE_TTL {
                     true
@@ -904,13 +915,29 @@ impl DialFailureCache {
     /// when `ty` is [`AddressType::Relay`], so enough distinct dead
     /// sessions at one IP trip IP-level suppression.
     fn record_failure(&self, addr: SocketAddr, ty: AddressType) {
+        let addr = Self::canon_key(addr);
         let now = Instant::now();
         self.entries.insert(addr, now);
         if ty == AddressType::Relay {
-            self.ip_failures
-                .entry(addr.ip())
-                .or_default()
-                .insert(addr, now);
+            let mut sessions = self.ip_failures.entry(addr.ip()).or_default();
+            let newly_distinct = sessions.insert(addr, now).is_none();
+            let count = sessions.len();
+            drop(sessions);
+            // Log once — when a newly-distinct failed session first brings the
+            // IP to the suppression threshold — so traces can tell a single
+            // skipped address apart from a fully suppressed relay IP. (The
+            // count may include not-yet-expired entries; `ip_is_suppressed`
+            // prunes on read, so this is best-effort observability.)
+            if newly_distinct && count == DIAL_FAILURE_IP_SUPPRESS_THRESHOLD {
+                debug!(
+                    "DialFailureCache: relay IP {} reached the suppression threshold \
+                     ({} distinct failed sessions, no intervening success); suppressing \
+                     all further relay dials to this IP for up to {:?}",
+                    addr.ip(),
+                    DIAL_FAILURE_IP_SUPPRESS_THRESHOLD,
+                    DIAL_FAILURE_CACHE_TTL
+                );
+            }
         }
     }
 
@@ -924,7 +951,8 @@ impl DialFailureCache {
     /// immediately. Type-agnostic on purpose — a Direct success behind a
     /// shared NAT IP re-admits relay sessions there too.
     fn clear(&self, addr: &SocketAddr) {
-        self.entries.remove(addr);
+        let addr = Self::canon_key(*addr);
+        self.entries.remove(&addr);
         self.ip_failures.remove(&addr.ip());
     }
 }
@@ -2303,7 +2331,10 @@ impl DhtNetworkManager {
         for node in initial {
             if peer_states.is_contactable(&node.peer_id) {
                 if self.lookup_candidate_dial_plan_is_exhausted(&node).await {
-                    peer_states.mark_failed(node.peer_id);
+                    // Cache exhaustion is a transient, address-view-local
+                    // decision — not a terminal peer failure. Skip this view
+                    // but leave the peer contactable so a later responder can
+                    // still revive it with a usable (e.g. Direct) address.
                     continue;
                 }
                 let dist = node.peer_id.distance(&target_key);
@@ -2338,9 +2369,12 @@ impl DhtNetworkManager {
                     continue;
                 }
                 if self.lookup_candidate_dial_plan_is_exhausted(&node).await {
-                    peer_states.mark_failed(node.peer_id);
+                    // Transient skip, not a terminal failure: keep the peer
+                    // contactable so a better address from a later responder
+                    // can re-admit it (it may have become exhausted only
+                    // because of a coarse relay-IP suppression).
                     trace!(
-                        "[NETWORK] Skipping {}: all FIND_NODE dial candidates are in the failure cache",
+                        "[NETWORK] Skipping {} this round: all dial candidates currently in the failure cache (peer left contactable)",
                         node.peer_id.to_hex()
                     );
                     continue;
@@ -2438,9 +2472,14 @@ impl DhtNetworkManager {
                                 continue;
                             }
                             if self.lookup_candidate_dial_plan_is_exhausted(&node).await {
-                                peer_states.mark_failed(node.peer_id);
+                                // Transient skip, not a terminal failure: a
+                                // single responder's stale/suppressed (e.g.
+                                // relay-only) view of this peer must not poison
+                                // it for the rest of the lookup. Leave it
+                                // contactable so another responder's usable
+                                // (e.g. Direct) address can still win.
                                 trace!(
-                                    "[NETWORK] Skipping gossiped {}: all FIND_NODE dial candidates are in the failure cache",
+                                    "[NETWORK] Skipping gossiped {} this round: all dial candidates currently in the failure cache (peer left contactable)",
                                     node.peer_id.to_hex()
                                 );
                                 continue;
@@ -6634,6 +6673,46 @@ mod tests {
         assert!(
             cache.ip_failures.get(&ip).is_none(),
             "an IP whose session set empties on expiry must be evicted"
+        );
+    }
+
+    #[test]
+    fn dial_failure_cache_canonicalizes_v4_mapped_v6_key() {
+        // A failure recorded under the IPv4-mapped IPv6 form must suppress —
+        // and be cleared by — the bare IPv4 form of the same endpoint, so the
+        // cache matches the transport's canonicalized endpoint identity.
+        let cache = DialFailureCache::new();
+        let mapped: SocketAddr = "[::ffff:203.0.113.7]:9001".parse().unwrap();
+        let bare: SocketAddr = "203.0.113.7:9001".parse().unwrap();
+
+        cache.record_failure(mapped, AddressType::Direct);
+        assert!(
+            cache.is_failed(&bare, AddressType::Direct),
+            "failure recorded under v4-mapped-v6 must suppress the bare IPv4 form"
+        );
+        cache.clear(&mapped);
+        assert!(
+            !cache.is_failed(&bare, AddressType::Direct),
+            "clear under v4-mapped-v6 must clear the bare IPv4 form"
+        );
+    }
+
+    #[test]
+    fn dial_failure_ip_tier_canonicalizes_v4_mapped_v6() {
+        // IP-tier suppression must collapse v4-mapped-v6 and bare IPv4 to the
+        // same relay-server IP: threshold sessions recorded under the mapped
+        // form must suppress an unseen bare-IPv4 session at the same endpoint.
+        let cache = DialFailureCache::new();
+        for port in 0..DIAL_FAILURE_IP_SUPPRESS_THRESHOLD as u16 {
+            let mapped: SocketAddr = format!("[::ffff:203.0.113.50]:{}", 9001 + port)
+                .parse()
+                .unwrap();
+            cache.record_failure(mapped, AddressType::Relay);
+        }
+        let bare_unseen: SocketAddr = "203.0.113.50:9500".parse().unwrap();
+        assert!(
+            cache.is_failed(&bare_unseen, AddressType::Relay),
+            "IP-tier suppression must apply across v4-mapped-v6 / bare IPv4 forms of one IP"
         );
     }
 
