@@ -418,34 +418,19 @@ pub struct DHTNode {
 /// Witnessed close-group selection result for a target key.
 ///
 /// `initial_closest` is the client's initial pure-XOR K lookup. Each
-/// `responder_views` entry is that responder's closest-K view after making
-/// the response self-inclusive. `vote_counts` contains every witnessed
-/// candidate, including rejected candidates below quorum. `consensus` contains
-/// the quorum-recognised candidates sorted by pure XOR distance and truncated
-/// to K.
+/// `responder_views` entry is that responder's closest-K node view after making
+/// the response self-inclusive. The DHT layer owns lookup/transcript hygiene;
+/// downstream protocol users own quorum, fallback, and payment policy.
 #[derive(Debug, Clone)]
 pub struct WitnessedCloseGroup {
     /// Target key the group was built for.
     pub target: Key,
     /// Requested close-group size.
     pub k: usize,
-    /// Minimum responder votes required for a peer to be eligible.
-    pub quorum: usize,
     /// Initial K closest responders from the client lookup, ordered by XOR.
     pub initial_closest: Vec<DHTNode>,
-    /// Self-inclusive closest-K view for each responder that replied.
+    /// Self-inclusive closest-K node view for each responder that replied.
     pub responder_views: Vec<ResponderView>,
-    /// Vote counts for all witnessed candidates, ordered by XOR.
-    pub vote_counts: Vec<(PeerId, usize)>,
-    /// Quorum-recognised candidates, ordered by XOR and truncated to K.
-    pub consensus: Vec<ConsensusNode>,
-}
-
-impl WitnessedCloseGroup {
-    /// Returns true when the quorum-recognised consensus has at least K peers.
-    pub fn is_complete(&self) -> bool {
-        self.consensus.len() >= self.k
-    }
 }
 
 /// One responder's self-inclusive closest-K view.
@@ -453,17 +438,8 @@ impl WitnessedCloseGroup {
 pub struct ResponderView {
     /// The peer that supplied this view.
     pub responder: PeerId,
-    /// Peers in the responder's self-inclusive closest-K view.
-    pub closest: Vec<PeerId>,
-}
-
-/// A quorum-recognised close-group candidate.
-#[derive(Debug, Clone)]
-pub struct ConsensusNode {
-    /// Candidate node record.
-    pub node: DHTNode,
-    /// Number of initial responders whose local view recognised this peer.
-    pub votes: usize,
+    /// Nodes in the responder's self-inclusive closest-K view.
+    pub closest: Vec<DHTNode>,
 }
 
 impl DHTNode {
@@ -1516,14 +1492,6 @@ fn compare_peer_distance(a: &PeerId, b: &PeerId, key: &Key) -> std::cmp::Orderin
         .then_with(|| a.as_bytes().cmp(b.as_bytes()))
 }
 
-fn compare_consensus_node_distance(
-    a: &ConsensusNode,
-    b: &ConsensusNode,
-    key: &Key,
-) -> std::cmp::Ordering {
-    compare_peer_distance(&a.node.peer_id, &b.node.peer_id, key)
-}
-
 fn sort_dedup_witnessed_nodes(mut nodes: Vec<DHTNode>, key: &Key, count: usize) -> Vec<DHTNode> {
     let mut by_peer: HashMap<PeerId, DHTNode> = HashMap::new();
     for node in nodes.drain(..) {
@@ -1542,7 +1510,7 @@ fn self_inclusive_responder_view(
     known_nodes: &HashMap<PeerId, DHTNode>,
     key: &Key,
     count: usize,
-) -> Vec<PeerId> {
+) -> Vec<DHTNode> {
     let mut view_nodes: HashMap<PeerId, DHTNode> = HashMap::new();
     for node in closest {
         merge_witnessed_node(&mut view_nodes, node);
@@ -1552,16 +1520,15 @@ fn self_inclusive_responder_view(
         merge_witnessed_node(&mut view_nodes, responder_node.clone());
     }
 
-    let mut peers: Vec<PeerId> = view_nodes.into_keys().collect();
-    peers.sort_by(|a, b| compare_peer_distance(a, b, key));
-    peers.truncate(count);
-    peers
+    let mut nodes: Vec<DHTNode> = view_nodes.into_values().collect();
+    nodes.sort_by(|a, b| compare_peer_distance(&a.peer_id, &b.peer_id, key));
+    nodes.truncate(count);
+    nodes
 }
 
 fn build_witnessed_close_group(
     key: &Key,
     count: usize,
-    quorum: usize,
     initial_closest: Vec<DHTNode>,
     responder_node_views: Vec<(PeerId, Vec<DHTNode>)>,
 ) -> WitnessedCloseGroup {
@@ -1577,48 +1544,20 @@ fn build_witnessed_close_group(
         }
     }
 
-    let mut vote_counts_by_peer: HashMap<PeerId, usize> = HashMap::new();
     let mut responder_views = Vec::with_capacity(responder_node_views.len());
 
     for (responder, closest) in responder_node_views {
         let closest = self_inclusive_responder_view(responder, closest, &known_nodes, key, count);
-        let mut voted = HashSet::new();
-        for peer_id in &closest {
-            if voted.insert(*peer_id) {
-                *vote_counts_by_peer.entry(*peer_id).or_insert(0) += 1;
-            }
-        }
         responder_views.push(ResponderView { responder, closest });
     }
 
     responder_views.sort_by(|a, b| compare_peer_distance(&a.responder, &b.responder, key));
 
-    let mut vote_counts: Vec<(PeerId, usize)> = vote_counts_by_peer.into_iter().collect();
-    vote_counts.sort_by(|a, b| compare_peer_distance(&a.0, &b.0, key));
-
-    let mut consensus: Vec<ConsensusNode> = vote_counts
-        .iter()
-        .filter_map(|(peer_id, votes)| {
-            if *votes < quorum {
-                return None;
-            }
-            known_nodes.get(peer_id).cloned().map(|node| ConsensusNode {
-                node,
-                votes: *votes,
-            })
-        })
-        .collect();
-    consensus.sort_by(|a, b| compare_consensus_node_distance(a, b, key));
-    consensus.truncate(count);
-
     WitnessedCloseGroup {
         target: *key,
         k: count,
-        quorum,
         initial_closest,
         responder_views,
-        vote_counts,
-        consensus,
     }
 }
 
@@ -2224,28 +2163,23 @@ impl DhtNetworkManager {
     /// 3. Make each responder view self-inclusive, so a responder that belongs
     ///    in its own local close group recognises itself even though standard
     ///    FIND_NODE responses omit the responder.
-    /// 4. Keep candidates recognised by at least `quorum` initial responders,
-    ///    then order and truncate the final set by pure XOR distance.
+    /// 4. Return the trusted, self-inclusive closest-K view for each responder.
+    ///    Callers decide quorum, fallback, and payment policy from that
+    ///    transcript.
     ///
-    /// The returned [`WitnessedCloseGroup`] includes diagnostics even when
-    /// fewer than K peers reach quorum. Callers that require a complete close
-    /// group should check [`WitnessedCloseGroup::is_complete`] and fail before
-    /// performing irreversible work such as payment.
+    /// The returned [`WitnessedCloseGroup`] is a validated DHT transcript. It
+    /// can be inconclusive when some initial responders do not provide views;
+    /// callers that require a complete or quorum-backed close group should
+    /// evaluate that before performing irreversible work such as payment.
     pub async fn find_witnessed_close_group(
         &self,
         key: &Key,
         count: usize,
-        quorum: usize,
     ) -> Result<WitnessedCloseGroup> {
         if count == 0 {
             return Err(P2PError::InvalidInput(
                 "witnessed close group count must be greater than zero".to_string(),
             ));
-        }
-        if quorum == 0 || quorum > count {
-            return Err(P2PError::InvalidInput(format!(
-                "witnessed close group quorum must be in 1..={count}, got {quorum}"
-            )));
         }
 
         let initial_lookup_count = count.saturating_add(1);
@@ -2345,15 +2279,12 @@ impl DhtNetworkManager {
         }
 
         let witnessed =
-            build_witnessed_close_group(key, count, quorum, initial_closest, responder_node_views);
+            build_witnessed_close_group(key, count, initial_closest, responder_node_views);
 
-        if !witnessed.is_complete() {
+        if witnessed.responder_views.len() < witnessed.initial_closest.len() {
             warn!(
-                "Witnessed close group inconclusive for key {}: consensus={}/{} quorum={} responders={}/{}",
+                "Witnessed close group transcript incomplete for key {}: responders={}/{}",
                 hex::encode(key),
-                witnessed.consensus.len(),
-                count,
-                quorum,
                 witnessed.responder_views.len(),
                 witnessed.initial_closest.len()
             );
@@ -5821,7 +5752,6 @@ mod tests {
     }
 
     const TEST_WITNESS_K: usize = 7;
-    const TEST_WITNESS_QUORUM: usize = 5;
 
     fn witness_node(seed: u8) -> DHTNode {
         DHTNode {
@@ -5844,22 +5774,11 @@ mod tests {
         )
     }
 
-    fn consensus_seeds(group: &WitnessedCloseGroup) -> Vec<u8> {
-        group
-            .consensus
+    fn responder_view_seeds(view: &ResponderView) -> Vec<u8> {
+        view.closest
             .iter()
-            .map(|node| node.node.peer_id.to_bytes()[0])
+            .map(|node| node.peer_id.to_bytes()[0])
             .collect()
-    }
-
-    fn votes_for(group: &WitnessedCloseGroup, seed: u8) -> usize {
-        let peer = PeerId::from_bytes([seed; 32]);
-        group
-            .vote_counts
-            .iter()
-            .find(|(candidate, _)| *candidate == peer)
-            .map(|(_, votes)| *votes)
-            .unwrap_or(0)
     }
 
     #[test]
@@ -5898,34 +5817,24 @@ mod tests {
     }
 
     #[test]
-    fn witnessed_group_keeps_quorum_candidates_and_sorts_by_xor_not_votes() {
+    fn witnessed_group_returns_self_inclusive_capped_node_views_sorted_by_xor() {
+        const FALLBACK_TEST_K: usize = 2;
+
         let key: Key = [0u8; 32];
-        let initial = witness_nodes(&[1, 2, 3, 4, 5, 6, 7]);
-        let views = vec![
-            witness_view(1, &[2, 3, 4, 5, 6, 8, 9]),
-            witness_view(2, &[1, 3, 4, 5, 6, 8, 9]),
-            witness_view(3, &[1, 2, 4, 5, 6, 8, 9]),
-            witness_view(4, &[1, 2, 3, 5, 6, 8, 9]),
-            witness_view(5, &[1, 2, 3, 4, 8, 9, 10]),
-            witness_view(6, &[1, 2, 3, 4, 5, 8, 9]),
-            witness_view(7, &[1, 2, 3, 4, 5, 8, 9]),
-        ];
+        let initial = witness_nodes(&[1, 2]);
+        let views = vec![witness_view(1, &[4, 5]), witness_view(2, &[3, 6])];
 
-        let group =
-            build_witnessed_close_group(&key, TEST_WITNESS_K, TEST_WITNESS_QUORUM, initial, views);
+        let group = build_witnessed_close_group(&key, FALLBACK_TEST_K, initial, views);
 
-        assert!(group.is_complete());
-        assert_eq!(votes_for(&group, 8), 7);
-        assert_eq!(votes_for(&group, 7), 1);
         assert!(
-            votes_for(&group, 8) > votes_for(&group, 6),
-            "the farther candidate has more votes in this fixture"
+            group
+                .responder_views
+                .iter()
+                .all(|view| view.closest.len() <= FALLBACK_TEST_K),
+            "each responder still votes only for its local closest-K view"
         );
-        assert_eq!(
-            consensus_seeds(&group),
-            vec![1, 2, 3, 4, 5, 6, 8],
-            "quorum decides eligibility, but XOR distance decides final order"
-        );
+        assert_eq!(responder_view_seeds(&group.responder_views[0]), vec![1, 4]);
+        assert_eq!(responder_view_seeds(&group.responder_views[1]), vec![2, 3]);
     }
 
     #[test]
@@ -5934,7 +5843,7 @@ mod tests {
         let initial = witness_nodes(&[1, 2, 3, 4, 5, 6, 7]);
         let views = vec![witness_view(3, &[1, 2, 4, 5, 6, 7, 8])];
 
-        let group = build_witnessed_close_group(&key, TEST_WITNESS_K, 1, initial, views);
+        let group = build_witnessed_close_group(&key, TEST_WITNESS_K, initial, views);
         let view = group
             .responder_views
             .iter()
@@ -5942,35 +5851,18 @@ mod tests {
             .expect("responder view should be present");
 
         assert!(
-            view.closest.contains(&PeerId::from_bytes([3; 32])),
+            view.closest
+                .iter()
+                .any(|node| node.peer_id == PeerId::from_bytes([3; 32])),
             "responder should recognise itself after self-inclusion"
         );
         assert!(
-            !view.closest.contains(&PeerId::from_bytes([8; 32])),
+            !view
+                .closest
+                .iter()
+                .any(|node| node.peer_id == PeerId::from_bytes([8; 32])),
             "self-inclusion should still cap the view to K closest peers"
         );
-        assert_eq!(votes_for(&group, 3), 1);
-    }
-
-    #[test]
-    fn witnessed_group_reports_inconclusive_when_fewer_than_k_reach_quorum() {
-        let key: Key = [0u8; 32];
-        let initial = witness_nodes(&[1, 2, 3, 4, 5, 6, 7]);
-        let views = vec![
-            witness_view(1, &[2, 3, 4]),
-            witness_view(2, &[1, 3, 4]),
-            witness_view(3, &[1, 2, 4]),
-            witness_view(4, &[1, 2, 3]),
-            witness_view(5, &[1, 2, 3, 4]),
-            witness_view(6, &[1, 2, 3, 4]),
-            witness_view(7, &[1, 2, 3, 4]),
-        ];
-
-        let group =
-            build_witnessed_close_group(&key, TEST_WITNESS_K, TEST_WITNESS_QUORUM, initial, views);
-
-        assert!(!group.is_complete());
-        assert_eq!(consensus_seeds(&group), vec![1, 2, 3, 4]);
     }
 
     #[test]
@@ -5999,15 +5891,15 @@ mod tests {
             .map(|seed| (PeerId::from_bytes([seed; 32]), view_nodes.clone()))
             .collect();
 
-        let group =
-            build_witnessed_close_group(&key, TEST_WITNESS_K, TEST_WITNESS_QUORUM, initial, views);
+        let group = build_witnessed_close_group(&key, TEST_WITNESS_K, initial, views);
 
-        assert_eq!(consensus_seeds(&group)[..2], [1, 2]);
-        assert_eq!(group.consensus[0].node.address_types[0], AddressType::Relay);
+        let closest = &group.responder_views[0].closest;
         assert_eq!(
-            group.consensus[1].node.address_types[0],
-            AddressType::Direct
+            responder_view_seeds(&group.responder_views[0]),
+            vec![1, 2, 3, 4, 5, 6, 7]
         );
+        assert_eq!(closest[0].address_types[0], AddressType::Relay);
+        assert_eq!(closest[1].address_types[0], AddressType::Direct);
     }
 
     #[test]
