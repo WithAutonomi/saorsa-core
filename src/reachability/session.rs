@@ -11,27 +11,30 @@
 // distributed under these licenses is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 
-//! Unconditional MASQUE relay acquisition.
+//! MASQUE relay acquisition candidate walk.
 //!
 //! Every non-client node tries to acquire a MASQUE relay from an XOR-closest
 //! peer after bootstrap. Candidates on the same WAN as this node are filtered
-//! out because they do not provide a distinct public route. There is no
-//! dial-back probe and no broader public/private classification: the "is this
-//! candidate public?" question is answered ambiently by the dial attempt
-//! itself. A candidate whose Direct address is unreachable will simply fail to
-//! accept the CONNECT-UDP request, and the walker moves to the next-closest
-//! peer.
+//! out because they do not provide a distinct public route. A candidate whose
+//! Direct address is unreachable will simply fail to accept the CONNECT-UDP
+//! request, and the walker moves to the next-closest peer.
+//!
+//! The acquisition walk only proves that the local node can reserve relay
+//! service from a candidate. The driver must still run third-party canaries
+//! before publishing the relay-allocated address.
 //!
 //! The acquisition walk is a thin wrapper around the reusable
 //! [`RelayAcquisition`] coordinator: build a filtered candidate list from
 //! the routing table, hand it off, and return the outcome.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
 use rand::Rng;
 use tracing::{debug, info, warn};
 
+use crate::PeerId;
 use crate::dht_network_manager::DhtNetworkManager;
 use crate::reachability::acquisition::{AcquiredRelay, RelayAcquisition, RelayCandidate};
 use crate::transport_handle::TransportHandle;
@@ -88,6 +91,7 @@ pub(crate) enum RelayAcquisitionOutcome {
 pub(crate) async fn run_relay_acquisition(
     dht: &DhtNetworkManager,
     transport: &Arc<TransportHandle>,
+    excluded_relayers: &HashSet<PeerId>,
 ) -> RelayAcquisitionOutcome {
     let jitter_ms = rand::thread_rng().gen_range(0..STARTUP_JITTER_UPPER_MS);
     if jitter_ms > 0 {
@@ -100,11 +104,20 @@ pub(crate) async fn run_relay_acquisition(
 
     debug!(
         closest_count = closest.len(),
+        excluded_relayers = excluded_relayers.len(),
         "relay acquisition: evaluating closest peers for Direct relay candidates"
     );
 
     let mut candidates: Vec<RelayCandidate> = Vec::new();
     for node in &closest {
+        if excluded_relayers.contains(&node.peer_id) {
+            debug!(
+                peer = %node.peer_id.to_hex(),
+                "relay acquisition: skipping relayer rejected by canary in this round"
+            );
+            continue;
+        }
+
         let typed = node.typed_addresses();
         let direct =
             DhtNetworkManager::first_direct_dialable_for_relay(node, &local_address_context);

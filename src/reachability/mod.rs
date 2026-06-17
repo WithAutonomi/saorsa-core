@@ -11,20 +11,21 @@
 // distributed under these licenses is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 
-//! # Unconditional relay acquisition
+//! # Canary-gated relay acquisition
 //!
 //! Every non-client node tries to acquire a MASQUE relay from an XOR-closest
-//! peer after bootstrap. There is no dial-back probe, no `Public`/`Private`
-//! classification, and no `AssumePrivate` flag: the "is this candidate
-//! public?" question is inferred ambiently from the dial attempt itself.
-//! A private candidate's Direct address is unreachable from outside its NAT,
-//! so the QUIC dial fails and the walker advances to the next close peer.
+//! peer after bootstrap. Once a candidate accepts, the driver asks
+//! independent close-group witnesses to cold-dial the relay-allocated
+//! address and confirm this node's authenticated identity before the address
+//! is published to the DHT.
 //!
 //! ## Module layout
 //!
 //! - [`acquisition`]: the reusable XOR-closest [`RelayAcquisition`]
 //!   coordinator. Pure logic — wraps a [`RelaySessionEstablisher`] trait so
 //!   the walk can be unit-tested with mock establishers.
+//! - [`canary`]: internal request/response protocol and quorum check used
+//!   to verify a freshly acquired relay from third-party vantage points.
 //! - [`session`]: the [`run_relay_acquisition`] entry point. Builds the
 //!   filtered candidate list from the routing table and hands it to the
 //!   coordinator.
@@ -34,6 +35,7 @@
 //!   the republish-then-reacquire sequence on loss.
 
 pub(crate) mod acquisition;
+pub(crate) mod canary;
 pub(crate) mod driver;
 pub(crate) mod session;
 

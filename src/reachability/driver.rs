@@ -23,14 +23,16 @@
 //!
 //! The driver runs as a single tokio task and cycles through three states:
 //!
-//! 1. **Acquiring**: call [`run_relay_acquisition`]. On success, publish
-//!    the full typed self-record (relay-allocated address tagged
-//!    [`AddressType::Relay`] first, then one best non-relay address per
-//!    IP family) to K-closest peers, store the relayer peer ID, and enter
-//!    the **Holding** state. Relay serving stays permanently enabled. On
+//! 1. **Acquiring**: call [`run_relay_acquisition`]. On success, run
+//!    third-party relay canaries before publishing. Only a canary-verified
+//!    relay is written to the full typed self-record (relay-allocated
+//!    address tagged [`AddressType::Relay`] first, then one best non-relay
+//!    address per IP family), stored as the current relayer, and held. A
+//!    canary-rejected relayer is excluded from subsequent acquisition attempts
+//!    until a relay verifies or witness coverage drops below quorum. On
 //!    failure, publish the direct-only address set so the node remains as
-//!    reachable as possible, arm the exponential backoff timer, and enter
-//!    the **Backoff** state.
+//!    reachable as possible, arm the exponential backoff timer, and enter the
+//!    **Backoff** state.
 //! 2. **Holding**: subscribe to `KClosestPeersChanged` events, republish
 //!    when a pinned external address is promoted to
 //!    [`AddressType::Direct`], and poll
@@ -52,6 +54,7 @@
 //! not spawn the driver at all — they are outbound-only and do not need
 //! a relay.
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -63,6 +66,7 @@ use tracing::{debug, info, trace, warn};
 
 use crate::dht::AddressType;
 use crate::dht_network_manager::{DhtNetworkEvent, DhtNetworkManager};
+use crate::reachability::canary::{RelayCanaryVerdict, verify_relay_with_canaries};
 use crate::reachability::session::{RelayAcquisitionOutcome, run_relay_acquisition};
 use crate::self_address::build_self_address_set;
 use crate::transport_handle::TransportHandle;
@@ -111,6 +115,7 @@ pub(crate) fn spawn_acquisition_driver(
             shutdown,
             current_backoff: BACKOFF_INITIAL,
             last_published_typed_set: None,
+            canary_rejected_relayers: HashSet::new(),
         };
         driver.run().await;
     });
@@ -127,6 +132,7 @@ struct AcquisitionDriver {
     shutdown: CancellationToken,
     current_backoff: Duration,
     last_published_typed_set: Option<PublishedTypedSet>,
+    canary_rejected_relayers: HashSet<PeerId>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -144,34 +150,97 @@ impl AcquisitionDriver {
                 return;
             }
 
-            let outcome = run_relay_acquisition(self.dht.as_ref(), &self.transport).await;
+            let outcome = run_relay_acquisition(
+                self.dht.as_ref(),
+                &self.transport,
+                &self.canary_rejected_relayers,
+            )
+            .await;
             match outcome {
                 RelayAcquisitionOutcome::Acquired(relay) => {
-                    self.current_backoff = BACKOFF_INITIAL;
-                    *self.relayer_peer_id.write().await = Some(relay.relayer);
-                    *self.relay_address.write().await = Some(relay.allocated_public_addr);
-                    self.transport
-                        .set_relay_address(relay.allocated_public_addr);
-                    self.force_publish_typed_set(Some(relay.allocated_public_addr))
-                        .await;
-                    info!(
-                        relayer = ?relay.relayer,
-                        allocated = %relay.allocated_public_addr,
-                        "driver: relay acquired and published"
-                    );
-                    // Hold the relay until an eviction or tunnel-death
-                    // event forces us back into the acquisition loop.
-                    if self.hold_until_lost().await {
-                        // shutdown
-                        return;
+                    match verify_relay_with_canaries(
+                        &self.dht,
+                        relay.relayer,
+                        relay.allocated_public_addr,
+                    )
+                    .await
+                    {
+                        RelayCanaryVerdict::Verified {
+                            successes,
+                            attempts,
+                        } => {
+                            self.canary_rejected_relayers.clear();
+                            self.current_backoff = BACKOFF_INITIAL;
+                            *self.relayer_peer_id.write().await = Some(relay.relayer);
+                            *self.relay_address.write().await = Some(relay.allocated_public_addr);
+                            self.transport
+                                .set_relay_address(relay.allocated_public_addr);
+                            self.force_publish_typed_set(Some(relay.allocated_public_addr))
+                                .await;
+                            info!(
+                                relayer = ?relay.relayer,
+                                allocated = %relay.allocated_public_addr,
+                                successes,
+                                attempts,
+                                "driver: relay canary verified and published"
+                            );
+                            // Hold the relay until an eviction or tunnel-death
+                            // event forces us back into the acquisition loop.
+                            if self.hold_until_lost().await {
+                                // shutdown
+                                return;
+                            }
+                            // Fall through: hold_until_lost() returned false, the
+                            // relay is considered lost, we need to republish
+                            // direct-only BEFORE re-trying acquisition.
+                            self.lose_relay_and_republish().await;
+                        }
+                        RelayCanaryVerdict::Rejected {
+                            successes,
+                            attempts,
+                        } => {
+                            warn!(
+                                relayer = ?relay.relayer,
+                                allocated = %relay.allocated_public_addr,
+                                successes,
+                                attempts,
+                                "driver: relay failed canary quorum, entering backoff before trying next candidate"
+                            );
+                            self.canary_rejected_relayers.insert(relay.relayer);
+                            self.clear_unpublished_relay_state().await;
+                            self.publish_typed_set(None).await;
+                            if self.wait_backoff_or_event().await {
+                                return; // shutdown
+                            }
+                            self.advance_backoff();
+                        }
+                        RelayCanaryVerdict::InsufficientWitnesses {
+                            available,
+                            required,
+                        } => {
+                            warn!(
+                                relayer = ?relay.relayer,
+                                allocated = %relay.allocated_public_addr,
+                                available,
+                                required,
+                                "driver: insufficient relay canary witnesses, entering backoff without publishing relay"
+                            );
+                            self.canary_rejected_relayers.clear();
+                            self.clear_unpublished_relay_state().await;
+                            self.publish_typed_set(None).await;
+                            if self.wait_backoff_or_event().await {
+                                return; // shutdown
+                            }
+                            self.advance_backoff();
+                        }
                     }
-                    // Fall through: hold_until_lost() returned false, the
-                    // relay is considered lost, we need to republish
-                    // direct-only BEFORE re-trying acquisition.
-                    self.lose_relay_and_republish().await;
                 }
                 RelayAcquisitionOutcome::Failed(reason) => {
-                    warn!(reason, "driver: acquisition failed, entering backoff");
+                    warn!(
+                        reason,
+                        rejected_relayers = self.canary_rejected_relayers.len(),
+                        "driver: acquisition failed, entering backoff"
+                    );
                     *self.relayer_peer_id.write().await = None;
                     *self.relay_address.write().await = None;
                     self.transport.clear_relay_address();
@@ -216,6 +285,19 @@ impl AcquisitionDriver {
 
     async fn force_publish_typed_set(&mut self, relay: Option<SocketAddr>) {
         self.publish_typed_set_with_policy(relay, true).await;
+    }
+
+    /// Clear core advertisement state for a relay that never passed canary.
+    ///
+    /// This prevents DHT publication. Core also ignores peer ADD_ADDRESS relay
+    /// hints, so unverified relays cannot enter DHT gossip through the legacy
+    /// transport bridge. A future saorsa-transport API still needs to defer
+    /// outbound ADD_ADDRESS and tear down rejected MASQUE sessions for a fully
+    /// airtight transport-layer gate.
+    async fn clear_unpublished_relay_state(&mut self) {
+        *self.relayer_peer_id.write().await = None;
+        *self.relay_address.write().await = None;
+        self.transport.clear_relay_address();
     }
 
     async fn publish_typed_set_with_policy(&mut self, relay: Option<SocketAddr>, force: bool) {
