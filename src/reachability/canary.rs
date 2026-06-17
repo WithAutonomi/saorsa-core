@@ -25,6 +25,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::stream::{FuturesUnordered, StreamExt};
+use rand::{Rng, seq::SliceRandom};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
@@ -42,7 +43,7 @@ pub(crate) const RELAY_CANARY_PROTOCOL: &str = "relay-canary";
 /// Wire topic emitted by the request/response wrapper for canary requests.
 pub(crate) const RELAY_CANARY_WIRE_TOPIC: &str = "/rr/relay-canary";
 
-/// Number of independent witnesses to ask for a relay proof.
+/// Number of independent non-close witnesses to ask for a relay proof.
 const RELAY_CANARY_WITNESS_TARGET: usize = 3;
 
 /// Minimum successful witness probes needed before a relay is publishable.
@@ -343,13 +344,23 @@ pub(crate) async fn verify_relay_with_canaries(
         };
     }
 
-    let own_key = *target_peer_id.to_bytes();
-    let closest = dht.find_closest_nodes_local(&own_key, dht.k_value()).await;
+    let target_key = *target_peer_id.to_bytes();
+    let close_group_ids: HashSet<PeerId> = dht
+        .find_closest_nodes_local(&target_key, dht.k_value())
+        .await
+        .into_iter()
+        .map(|node| node.peer_id)
+        .collect();
+    let routing_table = dht.routing_table_peers().await;
+    let routing_table_size = routing_table.len();
     let witnesses = select_relay_canary_witnesses(
-        &closest,
+        routing_table,
+        &close_group_ids,
         &target_peer_id,
         &relayer,
+        relay_addr.ip(),
         RELAY_CANARY_WITNESS_TARGET,
+        &mut rand::thread_rng(),
     );
 
     if witnesses.len() < RELAY_CANARY_REQUIRED_SUCCESSES {
@@ -358,7 +369,9 @@ pub(crate) async fn verify_relay_with_canaries(
             relay = %relay_addr,
             available = witnesses.len(),
             required = RELAY_CANARY_REQUIRED_SUCCESSES,
-            "relay canary: insufficient independent witnesses, refusing to publish relay"
+            close_group_excluded = close_group_ids.len(),
+            routing_table_size,
+            "relay canary: insufficient random non-close witnesses, refusing to publish relay"
         );
         return RelayCanaryVerdict::InsufficientWitnesses {
             available: witnesses.len(),
@@ -513,17 +526,25 @@ pub(crate) async fn answer_relay_canary_request(
     RelayCanaryResponse { result }
 }
 
-fn select_relay_canary_witnesses(
-    closest: &[DHTNode],
+fn select_relay_canary_witnesses<R: Rng + ?Sized>(
+    mut candidates: Vec<DHTNode>,
+    close_group_ids: &HashSet<PeerId>,
     target_peer_id: &PeerId,
     relayer: &PeerId,
+    relay_ip: IpAddr,
     count: usize,
+    rng: &mut R,
 ) -> Vec<RelayCanaryWitness> {
     let mut witnesses = Vec::with_capacity(count);
     let mut seen_ips = HashSet::new();
+    let relay_ip = canonicalize_ip(relay_ip);
 
-    for node in closest {
-        if node.peer_id == *target_peer_id || node.peer_id == *relayer {
+    candidates.shuffle(rng);
+    for node in candidates {
+        if node.peer_id == *target_peer_id
+            || node.peer_id == *relayer
+            || close_group_ids.contains(&node.peer_id)
+        {
             continue;
         }
 
@@ -535,9 +556,11 @@ fn select_relay_canary_witnesses(
             continue;
         }
 
-        if let Some(ip) = first_dialable_ip(&typed_addresses)
-            && !seen_ips.insert(canonicalize_ip(ip))
-        {
+        let Some(ip) = first_dialable_ip(&typed_addresses) else {
+            continue;
+        };
+        let ip = canonicalize_ip(ip);
+        if ip == relay_ip || !seen_ips.insert(ip) {
             continue;
         }
 
@@ -599,17 +622,24 @@ fn canary_request_error_disposition(error: &P2PError) -> RelayCanaryProbeDisposi
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::net::{Ipv4Addr, SocketAddr};
+
+    use rand::SeedableRng;
+    use rand::rngs::StdRng;
 
     use super::*;
 
     const TARGET_SEED: u8 = 1;
     const RELAYER_SEED: u8 = 2;
-    const FIRST_WITNESS_SEED: u8 = 3;
-    const SECOND_WITNESS_SEED: u8 = 4;
-    const DUPLICATE_IP_WITNESS_SEED: u8 = 5;
+    const CLOSE_GROUP_SEED: u8 = 3;
+    const FIRST_WITNESS_SEED: u8 = 4;
+    const SECOND_WITNESS_SEED: u8 = 5;
     const THIRD_WITNESS_SEED: u8 = 6;
+    const DUPLICATE_IP_WITNESS_SEED: u8 = 7;
+    const RELAY_IP_WITNESS_SEED: u8 = 8;
     const TEST_PORT: u16 = 9000;
+    const TEST_RNG_SEED: u64 = 42;
 
     fn peer_id(seed: u8) -> PeerId {
         PeerId::from_bytes([seed; 32])
@@ -626,30 +656,45 @@ mod tests {
     }
 
     #[test]
-    fn witness_selection_excludes_target_relayer_and_duplicate_ips() {
+    fn witness_selection_uses_random_non_close_independent_sources() {
         let target = peer_id(TARGET_SEED);
         let relayer = peer_id(RELAYER_SEED);
-        let closest = vec![
+        let relay_ip = Ipv4Addr::new(203, 0, 113, 2);
+        let close_group_ids = HashSet::from([peer_id(CLOSE_GROUP_SEED)]);
+        let candidates = vec![
             node(TARGET_SEED, Ipv4Addr::new(203, 0, 113, 1)),
-            node(RELAYER_SEED, Ipv4Addr::new(203, 0, 113, 2)),
+            node(RELAYER_SEED, relay_ip),
+            node(CLOSE_GROUP_SEED, Ipv4Addr::new(203, 0, 113, 3)),
             node(FIRST_WITNESS_SEED, Ipv4Addr::new(203, 0, 113, 3)),
-            node(DUPLICATE_IP_WITNESS_SEED, Ipv4Addr::new(203, 0, 113, 3)),
             node(SECOND_WITNESS_SEED, Ipv4Addr::new(203, 0, 113, 4)),
             node(THIRD_WITNESS_SEED, Ipv4Addr::new(203, 0, 113, 5)),
+            node(DUPLICATE_IP_WITNESS_SEED, Ipv4Addr::new(203, 0, 113, 3)),
+            node(RELAY_IP_WITNESS_SEED, relay_ip),
         ];
+        let mut rng = StdRng::seed_from_u64(TEST_RNG_SEED);
 
-        let witnesses =
-            select_relay_canary_witnesses(&closest, &target, &relayer, RELAY_CANARY_WITNESS_TARGET);
-
-        let selected: Vec<PeerId> = witnesses.iter().map(|w| w.peer_id).collect();
-        assert_eq!(
-            selected,
-            vec![
-                peer_id(FIRST_WITNESS_SEED),
-                peer_id(SECOND_WITNESS_SEED),
-                peer_id(THIRD_WITNESS_SEED)
-            ]
+        let witnesses = select_relay_canary_witnesses(
+            candidates,
+            &close_group_ids,
+            &target,
+            &relayer,
+            IpAddr::V4(relay_ip),
+            RELAY_CANARY_WITNESS_TARGET,
+            &mut rng,
         );
+
+        let selected: HashSet<PeerId> = witnesses.iter().map(|w| w.peer_id).collect();
+        assert_eq!(selected.len(), RELAY_CANARY_WITNESS_TARGET);
+        assert!(!selected.contains(&target));
+        assert!(!selected.contains(&relayer));
+        assert!(!selected.contains(&peer_id(CLOSE_GROUP_SEED)));
+        assert!(!selected.contains(&peer_id(RELAY_IP_WITNESS_SEED)));
+        assert!(selected.contains(&peer_id(SECOND_WITNESS_SEED)));
+        assert!(selected.contains(&peer_id(THIRD_WITNESS_SEED)));
+
+        let duplicate_pair_selected = selected.contains(&peer_id(FIRST_WITNESS_SEED))
+            && selected.contains(&peer_id(DUPLICATE_IP_WITNESS_SEED));
+        assert!(!duplicate_pair_selected);
     }
 
     #[test]
