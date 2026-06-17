@@ -1200,49 +1200,16 @@ impl P2PNode {
             info!("client mode — skipping relay acquisition driver");
         }
 
-        // Spawn background task to forward peer address updates to the DHT.
+        // Drain peer-advertised ADD_ADDRESS updates from the transport layer.
         //
-        // Two event streams are bridged from the transport layer onto DHT
-        // routing-table mutations:
-        //
-        //  - **Relay established**: when THIS node sets up a MASQUE relay,
-        //    perform a DHT self-lookup so the transport's re-advertisement
-        //    loop can ADD_ADDRESS the new relay address to the K closest
-        //    peers — propagating it beyond peers we already happen to be
-        //    connected to.
-        //  - **Peer address update**: when a connected peer advertises a new
-        //    reachable address via ADD_ADDRESS (typically its relay), update
-        //    the DHT routing table so future lookups return that address.
-        //
-        // Both are handled in a `tokio::select!` against the receiver
-        // futures so updates propagate immediately. The previous
-        // implementation polled both queues on a 1-second interval, which
-        // opened a race window in which a freshly-established relay was
-        // invisible to outbound DHT queries until the next tick — causing
-        // the first peers to dial direct (and fail) before learning about
-        // the relay.
-        //
-        // **Slow work isolation**: the relay-propagation path runs an
-        // iterative DHT lookup (`find_closest_nodes_network`) which can
-        // take many seconds. Doing it inline in the select loop would
-        // starve the peer-address-update branch and back up the bounded
-        // forwarder mpsc into drop territory. Instead, the lookup +
-        // publish is detached into its own task per relay event, so the
-        // select loop keeps polling both branches.
-        // DHT_BRIDGE: forward peer-advertised address updates from the
-        // transport layer onto DHT routing table mutations. When a connected
-        // peer's ADD_ADDRESS notification carries a different IP than the
-        // connection's source (i.e., the peer is behind a relay or has
-        // migrated), merge the advertised address into the peer's DHT entry.
-        //
-        // This node's OWN relay state changes are NOT handled here — the
-        // relay acquisition driver (see `reachability::driver`) owns them
-        // directly, so the "relay established" branch no longer belongs to
-        // the bridge. The driver knows the full typed address set for the
-        // self-record; the bridge did not.
+        // Relay-looking ADD_ADDRESS frames are intentionally not merged into
+        // DHT records. Relay reachability must arrive through the sequenced
+        // self-record path owned by `reachability::driver`, after the relay
+        // canary quorum has passed. Accepting transport hints here would let
+        // an unverified relay allocation leak into routing-table gossip before
+        // the canary gate has made a verdict.
         {
             let transport = Arc::clone(&self.transport);
-            let dht = self.adaptive_dht.dht_manager().clone();
             let shutdown = self.shutdown.clone();
             tokio::spawn(async move {
                 loop {
@@ -1255,10 +1222,10 @@ impl P2PNode {
                                 saorsa_transport::shared::normalize_socket_addr(peer_addr);
                             let normalized_adv =
                                 saorsa_transport::shared::normalize_socket_addr(advertised_addr);
-                            // Only update DHT when the advertised IP differs
-                            // from the peer's connection IP. Same-IP updates
-                            // are just different NATted ports (useless for
-                            // symmetric NAT); different-IP means a relay.
+                            // Same-IP updates are just different NATted ports,
+                            // which are useless for symmetric NAT. Different
+                            // IPs are relay-like hints and must not bypass the
+                            // canary-gated DHT publish path.
                             if normalized_peer.ip() == normalized_adv.ip() {
                                 debug!(
                                     "DHT_BRIDGE: dropping same-IP update peer={} addr={}",
@@ -1267,31 +1234,11 @@ impl P2PNode {
                                 );
                                 continue;
                             }
-                            info!(
-                                "DHT_BRIDGE: processing relay update peer={} addr={}",
+                            debug!(
+                                "DHT_BRIDGE: ignoring relay ADD_ADDRESS update pending sequenced canary publish peer={} addr={}",
                                 normalized_peer,
                                 normalized_adv
                             );
-                            // Look up peer ID by address (tries both IPv4 and
-                            // IPv4-mapped IPv6 forms via dual_stack_alternate).
-                            // For symmetric NAT, this may fail because the
-                            // connection's channel key uses a different NATted port.
-                            if let Some(peer_id) = transport.peer_id_for_addr(&normalized_peer).await {
-                                let multi_addr = MultiAddr::quic(normalized_adv);
-                                info!(
-                                    "Updating DHT: peer {} relay address {} (connection was {})",
-                                    peer_id, advertised_addr, peer_addr
-                                );
-                                if !dht
-                                    .touch_legacy_relay_hint_if_unsequenced(&peer_id, &multi_addr)
-                                    .await
-                                {
-                                    debug!(
-                                        "DHT_BRIDGE: ignored legacy relay hint for sequenced peer {} addr {}",
-                                        peer_id, advertised_addr
-                                    );
-                                }
-                            }
                         }
                     }
                 }

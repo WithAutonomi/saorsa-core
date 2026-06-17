@@ -15,10 +15,9 @@
 //!
 //! Every non-client node calls [`RelayAcquisition::acquire`] after bootstrap
 //! to establish a relay from a close-group peer. The walker is unaware of
-//! whether the local node is public or private — if a candidate's Direct
-//! address is unreachable (private peer), the QUIC dial fails and the walk
-//! advances to the next-closest peer. "Is this candidate public?" is
-//! inferred ambiently from the dial attempt.
+//! whether the accepted relay is externally useful for third parties; it
+//! only establishes the MASQUE session. The reachability driver runs relay
+//! canaries before publishing the allocated address.
 //!
 //! 1. The caller supplies a pre-filtered list of [`RelayCandidate`]s sorted
 //!    by XOR distance (closest first). Filtering — selecting peers whose
