@@ -2522,7 +2522,7 @@ dependencies = [
 
 [[package]]
 name = "saorsa-core"
-version = "0.26.0-rc.2"
+version = "0.26.0"
 dependencies = [
  "anyhow",
  "async-trait",
