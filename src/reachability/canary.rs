@@ -32,7 +32,7 @@ use tracing::{debug, info, warn};
 use crate::address::is_lan_ip;
 use crate::dht::AddressType;
 use crate::dht_network_manager::{DHTNode, DhtNetworkManager, IDENTITY_EXCHANGE_TIMEOUT};
-use crate::error::{NetworkError, P2PError};
+use crate::error::P2PError;
 use crate::rate_limit::EngineConfig;
 use crate::security::canonicalize_ip;
 use crate::transport_handle::TransportHandle;
@@ -645,13 +645,11 @@ async fn request_relay_canary(
     }
 }
 
-fn canary_request_error_disposition(error: &P2PError) -> RelayCanaryProbeDisposition {
-    match error {
-        P2PError::Timeout(_) | P2PError::Network(NetworkError::Timeout) => {
-            RelayCanaryProbeDisposition::Failure
-        }
-        _ => RelayCanaryProbeDisposition::Ineligible,
-    }
+fn canary_request_error_disposition(_error: &P2PError) -> RelayCanaryProbeDisposition {
+    // Request-level failures do not prove the relay is bad: in mixed-version
+    // networks the witness may simply not implement the relay canary protocol.
+    // Only typed canary responses count as eligible probe attempts.
+    RelayCanaryProbeDisposition::Ineligible
 }
 
 #[cfg(test)]
@@ -663,6 +661,7 @@ mod tests {
     use rand::rngs::StdRng;
 
     use super::*;
+    use crate::error::NetworkError;
     use crate::rate_limit::Engine;
 
     const TARGET_SEED: u8 = 1;
@@ -741,6 +740,22 @@ mod tests {
     }
 
     #[test]
+    fn explicit_probe_failures_count_as_relay_failures() {
+        assert_eq!(
+            RelayCanaryProbeResult::DialFailed.disposition(),
+            RelayCanaryProbeDisposition::Failure
+        );
+        assert_eq!(
+            RelayCanaryProbeResult::IdentityExchangeFailed.disposition(),
+            RelayCanaryProbeDisposition::Failure
+        );
+        assert_eq!(
+            RelayCanaryProbeResult::IdentityMismatch.disposition(),
+            RelayCanaryProbeDisposition::Failure
+        );
+    }
+
+    #[test]
     fn rate_limit_throttles_per_source_not_across_sources() {
         let limiter = Engine::new(relay_canary_rate_limit_config());
         let source = peer_id(FIRST_WITNESS_SEED);
@@ -796,10 +811,14 @@ mod tests {
     }
 
     #[test]
-    fn request_timeout_counts_as_probe_failure() {
+    fn request_timeout_is_ineligible_for_mixed_version_witness() {
         assert_eq!(
             canary_request_error_disposition(&P2PError::Timeout(RELAY_CANARY_REQUEST_TIMEOUT)),
-            RelayCanaryProbeDisposition::Failure
+            RelayCanaryProbeDisposition::Ineligible
+        );
+        assert_eq!(
+            canary_request_error_disposition(&P2PError::Network(NetworkError::Timeout)),
+            RelayCanaryProbeDisposition::Ineligible
         );
     }
 
