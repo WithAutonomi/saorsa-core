@@ -33,6 +33,7 @@ use crate::address::is_lan_ip;
 use crate::dht::AddressType;
 use crate::dht_network_manager::{DHTNode, DhtNetworkManager, IDENTITY_EXCHANGE_TIMEOUT};
 use crate::error::{NetworkError, P2PError};
+use crate::rate_limit::EngineConfig;
 use crate::security::canonicalize_ip;
 use crate::transport_handle::TransportHandle;
 use crate::{MultiAddr, PeerId};
@@ -73,6 +74,27 @@ const RELAY_CANARY_CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
 /// Cold-dial identity budget spent by a witness when probing a relay address.
 const RELAY_CANARY_DIAL_TIMEOUT: Duration = IDENTITY_EXCHANGE_TIMEOUT;
 
+/// Sliding window for per-source relay canary rate limiting.
+const RELAY_CANARY_RATE_WINDOW: Duration = Duration::from_secs(10);
+
+/// Maximum canary-triggered cold dials a single source may request per window.
+const RELAY_CANARY_RATE_MAX_PER_WINDOW: u32 = 1;
+
+/// Per-source throttle applied to inbound relay canary requests.
+///
+/// Answering a canary request makes this node cold-dial an arbitrary relay
+/// address, so each authenticated source is limited to one dial per window to
+/// stop a peer using this node as a reflection/amplification dialer. A
+/// legitimate source asks any given witness at most once per acquisition cycle
+/// (>= the driver backoff), so this never throttles honest traffic.
+pub(crate) fn relay_canary_rate_limit_config() -> EngineConfig {
+    EngineConfig {
+        window: RELAY_CANARY_RATE_WINDOW,
+        max_requests: RELAY_CANARY_RATE_MAX_PER_WINDOW,
+        burst_size: RELAY_CANARY_RATE_MAX_PER_WINDOW,
+    }
+}
+
 /// Socket port zero is not a routable service endpoint.
 const UNSPECIFIED_PORT: u16 = 0;
 
@@ -107,14 +129,14 @@ pub(crate) enum RelayCanaryProbeResult {
     DialFailed,
     IdentityExchangeFailed,
     IdentityMismatch,
-    RelayerUnknown,
+    WitnessRateLimited,
 }
 
 impl RelayCanaryProbeResult {
     fn disposition(&self) -> RelayCanaryProbeDisposition {
         match self {
             Self::Success => RelayCanaryProbeDisposition::Success,
-            Self::RelayerUnknown => RelayCanaryProbeDisposition::Ineligible,
+            Self::WitnessRateLimited => RelayCanaryProbeDisposition::Ineligible,
             Self::DialFailed | Self::IdentityExchangeFailed | Self::IdentityMismatch => {
                 RelayCanaryProbeDisposition::Failure
             }
@@ -127,7 +149,7 @@ impl RelayCanaryProbeResult {
             Self::DialFailed => "dial failed".to_string(),
             Self::IdentityExchangeFailed => "identity exchange failed".to_string(),
             Self::IdentityMismatch => "identity mismatch".to_string(),
-            Self::RelayerUnknown => "witness does not know relayer direct address".to_string(),
+            Self::WitnessRateLimited => "witness rate-limited source".to_string(),
         }
     }
 }
@@ -641,6 +663,7 @@ mod tests {
     use rand::rngs::StdRng;
 
     use super::*;
+    use crate::rate_limit::Engine;
 
     const TARGET_SEED: u8 = 1;
     const RELAYER_SEED: u8 = 2;
@@ -710,11 +733,24 @@ mod tests {
     }
 
     #[test]
-    fn relayer_unknown_is_ineligible_not_relay_failure() {
+    fn witness_rate_limited_is_ineligible_not_relay_failure() {
         assert_eq!(
-            RelayCanaryProbeResult::RelayerUnknown.disposition(),
+            RelayCanaryProbeResult::WitnessRateLimited.disposition(),
             RelayCanaryProbeDisposition::Ineligible
         );
+    }
+
+    #[test]
+    fn rate_limit_throttles_per_source_not_across_sources() {
+        let limiter = Engine::new(relay_canary_rate_limit_config());
+        let source = peer_id(FIRST_WITNESS_SEED);
+        let other_source = peer_id(SECOND_WITNESS_SEED);
+
+        // First request from a source is admitted, the immediate next is not.
+        assert!(limiter.try_consume_key(&source));
+        assert!(!limiter.try_consume_key(&source));
+        // A different source is unaffected by another source's throttle.
+        assert!(limiter.try_consume_key(&other_source));
     }
 
     #[test]

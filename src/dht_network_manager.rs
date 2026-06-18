@@ -27,17 +27,18 @@ use crate::{
     dht::{AdmissionResult, DhtCoreEngine, DhtKey, Key, RoutingTableEvent},
     error::{DhtError, IdentityError, NetworkError},
     network::{NodeConfig, NodeMode},
+    rate_limit::{Engine, SharedEngine},
     reachability::canary::{
         RELAY_CANARY_HANDLER_TIMEOUT, RELAY_CANARY_PROTOCOL, RELAY_CANARY_WIRE_TOPIC,
         RelayCanaryProbeResult, RelayCanaryRequest, RelayCanaryResponse,
-        answer_relay_canary_request, validate_relay_canary_request,
+        answer_relay_canary_request, relay_canary_rate_limit_config, validate_relay_canary_request,
     },
     security::canonicalize_ip,
     self_address::build_self_address_set,
 };
 use anyhow::Context as _;
+use dashmap::DashMap;
 use dashmap::mapref::entry::Entry as DashEntry;
-use dashmap::{DashMap, DashSet};
 use futures::stream::{FuturesUnordered, StreamExt};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -733,12 +734,12 @@ pub struct DhtNetworkManager {
     /// Self-lookups and foreground/payment/user lookup calls do not use this
     /// semaphore.
     bucket_refresh_lookup_semaphore: Arc<Semaphore>,
-    /// Per-source in-flight canary guard.
+    /// Per-source relay canary rate limiter.
     ///
-    /// Canary requests intentionally trigger a cold relay dial. Only one
-    /// outstanding request per authenticated routing-table peer is allowed so
-    /// a peer cannot fan out concurrent dials through this node.
-    relay_canary_inflight: Arc<DashSet<PeerId>>,
+    /// Answering a canary request triggers a cold relay dial, so each
+    /// authenticated source is throttled (see [`relay_canary_rate_limit_config`])
+    /// to stop a peer using this node as a reflection/amplification dialer.
+    relay_canary_rate_limiter: SharedEngine<PeerId>,
     /// Shutdown token for background tasks
     shutdown: CancellationToken,
     /// Handle for the network event handler task
@@ -1269,17 +1270,6 @@ impl LookupFailureCoordinator {
     }
 }
 
-struct RelayCanaryInflightGuard {
-    inflight: Arc<DashSet<PeerId>>,
-    peer_id: PeerId,
-}
-
-impl Drop for RelayCanaryInflightGuard {
-    fn drop(&mut self) {
-        self.inflight.remove(&self.peer_id);
-    }
-}
-
 /// Per-lookup state for peers in an iterative FIND_NODE query.
 ///
 /// Mirrors rust-libp2p's closest-peer iterator model: peers move from
@@ -1655,7 +1645,7 @@ impl DhtNetworkManager {
             identity_failure_cache: Arc::new(IdentityFailureCache::new()),
             pending_peer_dials: Arc::new(DashMap::new()),
             lookup_failures: Arc::new(LookupFailureCoordinator::new()),
-            relay_canary_inflight: Arc::new(DashSet::new()),
+            relay_canary_rate_limiter: Arc::new(Engine::new(relay_canary_rate_limit_config())),
         })
     }
 
@@ -4293,18 +4283,6 @@ impl DhtNetworkManager {
             return Ok(());
         }
 
-        if !self.relay_canary_inflight.insert(source_peer) {
-            debug!(
-                peer = %source_peer.to_hex(),
-                "Ignoring concurrent relay canary request from peer"
-            );
-            return Ok(());
-        }
-        let _inflight_guard = RelayCanaryInflightGuard {
-            inflight: Arc::clone(&self.relay_canary_inflight),
-            peer_id: source_peer,
-        };
-
         let Some((message_id, is_response, payload)) =
             crate::transport_handle::TransportHandle::parse_request_envelope(&data)
         else {
@@ -4343,18 +4321,16 @@ impl DhtNetworkManager {
             );
             return Ok(());
         }
-        if !self
-            .relay_canary_addr_matches_relayer_record(&request)
-            .await
-        {
+        // Answering this request makes us cold-dial `relay_addr`, so throttle
+        // each authenticated source to stop a peer using this node as a
+        // reflection/amplification dialer toward an address of its choosing.
+        if !self.relay_canary_rate_limiter.try_consume_key(&source_peer) {
             debug!(
                 peer = %source_peer.to_hex(),
-                relayer = %request.relayer_peer_id.to_hex(),
-                relay = %request.relay_addr,
-                "Relay canary witness cannot evaluate request: relayer Direct address unknown"
+                "Throttling relay canary request from source"
             );
             let response = RelayCanaryResponse {
-                result: RelayCanaryProbeResult::RelayerUnknown,
+                result: RelayCanaryProbeResult::WitnessRateLimited,
             };
             return self
                 .send_relay_canary_response(&source_peer, &message_id, response)
@@ -4382,19 +4358,6 @@ impl DhtNetworkManager {
                 response_bytes,
             )
             .await
-    }
-
-    async fn relay_canary_addr_matches_relayer_record(&self, request: &RelayCanaryRequest) -> bool {
-        let relay_ip = canonicalize_ip(request.relay_addr.ip());
-        self.peer_addresses_for_dial_typed(&request.relayer_peer_id)
-            .await
-            .into_iter()
-            .any(|(addr, ty)| {
-                ty == AddressType::Direct
-                    && addr
-                        .dialable_socket_addr()
-                        .is_some_and(|sa| canonicalize_ip(sa.ip()) == relay_ip)
-            })
     }
 
     /// Handle DHT response message
