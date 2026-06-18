@@ -15,8 +15,8 @@
 //!
 //! A relay acquisition is not publishable just because the local node
 //! established a MASQUE session to a candidate relayer. Before the driver
-//! writes the relay-allocated address into the DHT, it asks independent
-//! close-group peers to cold-dial that address and confirm that the
+//! writes the relay-allocated address into the DHT, it asks randomized
+//! non-close peers to cold-dial that address and confirm that the
 //! authenticated identity on the far end is this node.
 
 use std::collections::HashSet;
@@ -38,10 +38,10 @@ use crate::transport_handle::TransportHandle;
 use crate::{MultiAddr, PeerId};
 
 /// Request/response protocol name used with `TransportHandle::send_request`.
-pub(crate) const RELAY_CANARY_PROTOCOL: &str = "relay-canary";
+pub(crate) const RELAY_CANARY_PROTOCOL: &str = "relay-canary-v1";
 
 /// Wire topic emitted by the request/response wrapper for canary requests.
-pub(crate) const RELAY_CANARY_WIRE_TOPIC: &str = "/rr/relay-canary";
+pub(crate) const RELAY_CANARY_WIRE_TOPIC: &str = "/rr/relay-canary-v1";
 
 /// Number of independent non-close witnesses to ask for a relay proof.
 const RELAY_CANARY_WITNESS_TARGET: usize = 3;
@@ -379,6 +379,15 @@ pub(crate) async fn verify_relay_with_canaries(
         };
     }
 
+    debug!(
+        relayer = %relayer.to_hex(),
+        relay = %relay_addr,
+        available_witnesses = witnesses.len(),
+        routing_table_size,
+        close_group_excluded = close_group_ids.len(),
+        "relay canary: probing random non-close witnesses"
+    );
+
     let mut progress = RelayCanaryProgress::new(witnesses.len());
     let mut probes = FuturesUnordered::new();
     for witness in witnesses {
@@ -428,6 +437,8 @@ pub(crate) async fn verify_relay_with_canaries(
                     successes,
                     attempts,
                     responses = progress.responses,
+                    ineligible = progress.ineligible,
+                    available_witnesses = progress.total,
                     "relay canary: quorum verified relay"
                 );
                 return RelayCanaryVerdict::Verified {
@@ -446,6 +457,7 @@ pub(crate) async fn verify_relay_with_canaries(
                     attempts,
                     responses = progress.responses,
                     total = progress.total,
+                    ineligible = progress.ineligible,
                     "relay canary: quorum failed relay"
                 );
                 return RelayCanaryVerdict::Rejected {

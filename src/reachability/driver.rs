@@ -29,10 +29,10 @@
 //!    address tagged [`AddressType::Relay`] first, then one best non-relay
 //!    address per IP family), stored as the current relayer, and held. A
 //!    canary-rejected relayer is excluded from subsequent acquisition attempts
-//!    until a relay verifies or witness coverage drops below quorum. On
-//!    failure, publish the direct-only address set so the node remains as
-//!    reachable as possible, arm the exponential backoff timer, and enter the
-//!    **Backoff** state.
+//!    until a relay verifies or non-close witness coverage drops below
+//!    quorum. On failure, publish the direct-only address set so the node
+//!    remains as reachable as possible, arm the exponential backoff timer,
+//!    and enter the **Backoff** state.
 //! 2. **Holding**: subscribe to `KClosestPeersChanged` events, republish
 //!    when a pinned external address is promoted to
 //!    [`AddressType::Direct`], and poll
@@ -141,6 +141,29 @@ struct PublishedTypedSet {
     peers: Vec<PeerId>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CanaryRejectionEvent {
+    Verified,
+    Rejected(PeerId),
+    InsufficientWitnesses,
+    AcquisitionFailed,
+}
+
+fn apply_canary_rejection_event(
+    rejected_relayers: &mut HashSet<PeerId>,
+    event: CanaryRejectionEvent,
+) {
+    match event {
+        CanaryRejectionEvent::Verified | CanaryRejectionEvent::InsufficientWitnesses => {
+            rejected_relayers.clear();
+        }
+        CanaryRejectionEvent::Rejected(relayer) => {
+            rejected_relayers.insert(relayer);
+        }
+        CanaryRejectionEvent::AcquisitionFailed => {}
+    }
+}
+
 impl AcquisitionDriver {
     async fn run(&mut self) {
         info!("relay acquisition driver starting");
@@ -169,7 +192,10 @@ impl AcquisitionDriver {
                             successes,
                             attempts,
                         } => {
-                            self.canary_rejected_relayers.clear();
+                            apply_canary_rejection_event(
+                                &mut self.canary_rejected_relayers,
+                                CanaryRejectionEvent::Verified,
+                            );
                             self.current_backoff = BACKOFF_INITIAL;
                             *self.relayer_peer_id.write().await = Some(relay.relayer);
                             *self.relay_address.write().await = Some(relay.allocated_public_addr);
@@ -206,7 +232,10 @@ impl AcquisitionDriver {
                                 attempts,
                                 "driver: relay failed canary quorum, entering backoff before trying next candidate"
                             );
-                            self.canary_rejected_relayers.insert(relay.relayer);
+                            apply_canary_rejection_event(
+                                &mut self.canary_rejected_relayers,
+                                CanaryRejectionEvent::Rejected(relay.relayer),
+                            );
                             self.clear_unpublished_relay_state().await;
                             self.publish_typed_set(None).await;
                             if self.wait_backoff_or_event().await {
@@ -225,7 +254,10 @@ impl AcquisitionDriver {
                                 required,
                                 "driver: insufficient relay canary witnesses, entering backoff without publishing relay"
                             );
-                            self.canary_rejected_relayers.clear();
+                            apply_canary_rejection_event(
+                                &mut self.canary_rejected_relayers,
+                                CanaryRejectionEvent::InsufficientWitnesses,
+                            );
                             self.clear_unpublished_relay_state().await;
                             self.publish_typed_set(None).await;
                             if self.wait_backoff_or_event().await {
@@ -236,6 +268,10 @@ impl AcquisitionDriver {
                     }
                 }
                 RelayAcquisitionOutcome::Failed(reason) => {
+                    apply_canary_rejection_event(
+                        &mut self.canary_rejected_relayers,
+                        CanaryRejectionEvent::AcquisitionFailed,
+                    );
                     warn!(
                         reason,
                         rejected_relayers = self.canary_rejected_relayers.len(),
@@ -293,7 +329,8 @@ impl AcquisitionDriver {
     /// hints, so unverified relays cannot enter DHT gossip through the legacy
     /// transport bridge. A future saorsa-transport API still needs to defer
     /// outbound ADD_ADDRESS and tear down rejected MASQUE sessions for a fully
-    /// airtight transport-layer gate.
+    /// airtight transport-layer gate. Tracked in
+    /// <https://github.com/WithAutonomi/saorsa-core/issues/138>.
     async fn clear_unpublished_relay_state(&mut self) {
         *self.relayer_peer_id.write().await = None;
         *self.relay_address.write().await = None;
@@ -548,5 +585,67 @@ impl AcquisitionDriver {
     fn advance_backoff(&mut self) {
         let next = self.current_backoff.saturating_mul(BACKOFF_FACTOR);
         self.current_backoff = next.min(BACKOFF_MAX);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const REJECTED_RELAYER_SEED: u8 = 7;
+    const SECOND_RELAYER_SEED: u8 = 8;
+    const PEER_ID_BYTES: usize = 32;
+
+    fn peer_id(seed: u8) -> PeerId {
+        PeerId::from_bytes([seed; PEER_ID_BYTES])
+    }
+
+    #[test]
+    fn acquisition_failure_preserves_canary_rejected_relayers() {
+        let rejected_relayer = peer_id(REJECTED_RELAYER_SEED);
+        let mut rejected_relayers = HashSet::from([rejected_relayer]);
+
+        apply_canary_rejection_event(
+            &mut rejected_relayers,
+            CanaryRejectionEvent::AcquisitionFailed,
+        );
+
+        assert!(rejected_relayers.contains(&rejected_relayer));
+    }
+
+    #[test]
+    fn verified_relay_clears_canary_rejected_relayers() {
+        let mut rejected_relayers =
+            HashSet::from([peer_id(REJECTED_RELAYER_SEED), peer_id(SECOND_RELAYER_SEED)]);
+
+        apply_canary_rejection_event(&mut rejected_relayers, CanaryRejectionEvent::Verified);
+
+        assert!(rejected_relayers.is_empty());
+    }
+
+    #[test]
+    fn insufficient_witnesses_clear_canary_rejected_relayers() {
+        let mut rejected_relayers =
+            HashSet::from([peer_id(REJECTED_RELAYER_SEED), peer_id(SECOND_RELAYER_SEED)]);
+
+        apply_canary_rejection_event(
+            &mut rejected_relayers,
+            CanaryRejectionEvent::InsufficientWitnesses,
+        );
+
+        assert!(rejected_relayers.is_empty());
+    }
+
+    #[test]
+    fn canary_rejection_adds_relayer_to_exclusion_set() {
+        let relayer = peer_id(REJECTED_RELAYER_SEED);
+        let mut rejected_relayers = HashSet::new();
+
+        apply_canary_rejection_event(
+            &mut rejected_relayers,
+            CanaryRejectionEvent::Rejected(relayer),
+        );
+
+        assert!(rejected_relayers.contains(&relayer));
     }
 }

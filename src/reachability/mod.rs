@@ -15,7 +15,7 @@
 //!
 //! Every non-client node tries to acquire a MASQUE relay from an XOR-closest
 //! peer after bootstrap. Once a candidate accepts, the driver asks
-//! independent close-group witnesses to cold-dial the relay-allocated
+//! independent randomized non-close witnesses to cold-dial the relay-allocated
 //! address and confirm this node's authenticated identity before the address
 //! is published to the DHT.
 //!
