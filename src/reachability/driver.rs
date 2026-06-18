@@ -149,18 +149,32 @@ enum CanaryRejectionEvent {
     AcquisitionFailed,
 }
 
+/// Update the per-acquisition canary exclusion set in response to an outcome.
+///
+/// Exclusions accumulate only across a contiguous run of canary `Rejected`
+/// verdicts, so the next acquisition walk skips a relay that just failed its
+/// proof and advances to the next candidate. Every other outcome resets the
+/// set:
+/// - `Verified`: a relay was published; prior rejections are no longer relevant.
+/// - `InsufficientWitnesses`: the relay was never disproven, only unverifiable.
+/// - `AcquisitionFailed`: no candidate could be acquired at all. Preserving the
+///   set here would be a trap — if the only close Direct candidate is the
+///   excluded relayer, acquisition fails every round and the node stays
+///   permanently relay-less. Clearing lets it retry; backoff rate-limits the
+///   retries and a still-unreachable relay is simply re-excluded next round.
 fn apply_canary_rejection_event(
     rejected_relayers: &mut HashSet<PeerId>,
     event: CanaryRejectionEvent,
 ) {
     match event {
-        CanaryRejectionEvent::Verified | CanaryRejectionEvent::InsufficientWitnesses => {
+        CanaryRejectionEvent::Verified
+        | CanaryRejectionEvent::InsufficientWitnesses
+        | CanaryRejectionEvent::AcquisitionFailed => {
             rejected_relayers.clear();
         }
         CanaryRejectionEvent::Rejected(relayer) => {
             rejected_relayers.insert(relayer);
         }
-        CanaryRejectionEvent::AcquisitionFailed => {}
     }
 }
 
@@ -268,14 +282,14 @@ impl AcquisitionDriver {
                     }
                 }
                 RelayAcquisitionOutcome::Failed(reason) => {
-                    apply_canary_rejection_event(
-                        &mut self.canary_rejected_relayers,
-                        CanaryRejectionEvent::AcquisitionFailed,
-                    );
                     warn!(
                         reason,
                         rejected_relayers = self.canary_rejected_relayers.len(),
-                        "driver: acquisition failed, entering backoff"
+                        "driver: acquisition failed, clearing canary exclusions and entering backoff"
+                    );
+                    apply_canary_rejection_event(
+                        &mut self.canary_rejected_relayers,
+                        CanaryRejectionEvent::AcquisitionFailed,
                     );
                     *self.relayer_peer_id.write().await = None;
                     *self.relay_address.write().await = None;
@@ -601,16 +615,19 @@ mod tests {
     }
 
     #[test]
-    fn acquisition_failure_preserves_canary_rejected_relayers() {
-        let rejected_relayer = peer_id(REJECTED_RELAYER_SEED);
-        let mut rejected_relayers = HashSet::from([rejected_relayer]);
+    fn acquisition_failure_clears_canary_rejected_relayers() {
+        // A failed acquisition must reset exclusions: if the only close Direct
+        // candidate is the excluded relayer, preserving the set would fail
+        // acquisition every round and leave the node permanently relay-less.
+        let mut rejected_relayers =
+            HashSet::from([peer_id(REJECTED_RELAYER_SEED), peer_id(SECOND_RELAYER_SEED)]);
 
         apply_canary_rejection_event(
             &mut rejected_relayers,
             CanaryRejectionEvent::AcquisitionFailed,
         );
 
-        assert!(rejected_relayers.contains(&rejected_relayer));
+        assert!(rejected_relayers.is_empty());
     }
 
     #[test]
