@@ -415,6 +415,33 @@ pub struct DHTNode {
     pub reliability: f64,
 }
 
+/// Witnessed close-group selection result for a target key.
+///
+/// `initial_closest` is the client's initial pure-XOR K lookup. Each
+/// `responder_views` entry is that responder's closest-K node view after making
+/// the response self-inclusive. The DHT layer owns lookup/transcript hygiene;
+/// downstream protocol users own quorum, fallback, and payment policy.
+#[derive(Debug, Clone)]
+pub struct WitnessedCloseGroup {
+    /// Target key the group was built for.
+    pub target: Key,
+    /// Requested close-group size.
+    pub k: usize,
+    /// Initial K closest responders from the client lookup, ordered by XOR.
+    pub initial_closest: Vec<DHTNode>,
+    /// Self-inclusive closest-K node view for each responder that replied.
+    pub responder_views: Vec<ResponderView>,
+}
+
+/// One responder's self-inclusive closest-K view.
+#[derive(Debug, Clone)]
+pub struct ResponderView {
+    /// The peer that supplied this view.
+    pub responder: PeerId,
+    /// Nodes in the responder's self-inclusive closest-K view.
+    pub closest: Vec<DHTNode>,
+}
+
 impl DHTNode {
     /// Pair each address with its type tag.
     ///
@@ -1188,6 +1215,27 @@ const QUORUM_THRESHOLD: usize = 2;
 /// arrive and feeds [`compute_winner`].
 type SubjectReports = HashMap<PeerId, DHTNode>;
 
+#[derive(Debug, Default)]
+struct FindNodeLookupTranscript {
+    responder_views: HashMap<PeerId, Vec<DHTNode>>,
+}
+
+impl FindNodeLookupTranscript {
+    fn record_responder_view(&mut self, responder: PeerId, closest: Vec<DHTNode>) {
+        self.responder_views.insert(responder, closest);
+    }
+
+    fn take_responder_view(&mut self, responder: &PeerId) -> Option<Vec<DHTNode>> {
+        self.responder_views.remove(responder)
+    }
+}
+
+#[derive(Debug)]
+struct FindNodeLookupOutcome {
+    closest_nodes: Vec<DHTNode>,
+    transcript: FindNodeLookupTranscript,
+}
+
 #[derive(Debug)]
 struct LookupFailureCoordinator {
     tx: broadcast::Sender<PeerId>,
@@ -1421,16 +1469,115 @@ fn apply_lookup_report_winners(
     }
 
     let mut refreshed: Vec<DHTNode> = by_peer.into_values().collect();
-    // Fix E: final re-rank of the converged candidate pool by
-    // (reachability_tier, xor_distance) so directly-reachable peers lead the
-    // result. This is the sole final-ordering chokepoint for the network path
-    // (the Merkle candidate pool and the client's find_closest_peers), so the
-    // re-rank applies to the returned order without touching the iterative
-    // convergence or the dial-failure skip. Re-rank only — truncation is
-    // unchanged, so the result can never drop below `count`.
-    refreshed.sort_by(|a, b| DhtNetworkManager::compare_node_reachability_then_distance(a, b, key));
+    refreshed.sort_by(|a, b| DhtNetworkManager::compare_node_distance(a, b, key));
     refreshed.truncate(count);
     refreshed
+}
+
+fn merge_witnessed_node(nodes: &mut HashMap<PeerId, DHTNode>, node: DHTNode) {
+    match nodes.entry(node.peer_id) {
+        std::collections::hash_map::Entry::Occupied(mut entry) => {
+            entry.get_mut().merge_from(node);
+        }
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            entry.insert(node);
+        }
+    }
+}
+
+fn compare_peer_distance(a: &PeerId, b: &PeerId, key: &Key) -> std::cmp::Ordering {
+    let target_key = DhtKey::from_bytes(*key);
+    a.distance(&target_key)
+        .cmp(&b.distance(&target_key))
+        .then_with(|| a.as_bytes().cmp(b.as_bytes()))
+}
+
+fn sort_dedup_witnessed_nodes(mut nodes: Vec<DHTNode>, key: &Key, count: usize) -> Vec<DHTNode> {
+    let mut by_peer: HashMap<PeerId, DHTNode> = HashMap::new();
+    for node in nodes.drain(..) {
+        merge_witnessed_node(&mut by_peer, node);
+    }
+
+    let mut deduped: Vec<DHTNode> = by_peer.into_values().collect();
+    deduped.sort_by(|a, b| compare_peer_distance(&a.peer_id, &b.peer_id, key));
+    deduped.truncate(count);
+    deduped
+}
+
+fn self_inclusive_responder_view(
+    responder: PeerId,
+    closest: Vec<DHTNode>,
+    known_nodes: &HashMap<PeerId, DHTNode>,
+    key: &Key,
+    count: usize,
+) -> Vec<DHTNode> {
+    let mut view_nodes: HashMap<PeerId, DHTNode> = HashMap::new();
+    for node in closest {
+        merge_witnessed_node(&mut view_nodes, node);
+    }
+
+    if let Some(responder_node) = known_nodes.get(&responder) {
+        merge_witnessed_node(&mut view_nodes, responder_node.clone());
+    }
+
+    let mut nodes: Vec<DHTNode> = view_nodes.into_values().collect();
+    nodes.sort_by(|a, b| compare_peer_distance(&a.peer_id, &b.peer_id, key));
+    nodes.truncate(count);
+    nodes
+}
+
+fn build_witnessed_close_group(
+    key: &Key,
+    count: usize,
+    view_count: usize,
+    initial_closest: Vec<DHTNode>,
+    responder_node_views: Vec<(PeerId, Vec<DHTNode>)>,
+) -> WitnessedCloseGroup {
+    let initial_closest = sort_dedup_witnessed_nodes(initial_closest, key, count);
+
+    let mut known_nodes: HashMap<PeerId, DHTNode> = HashMap::new();
+    for node in &initial_closest {
+        merge_witnessed_node(&mut known_nodes, node.clone());
+    }
+    for (_, closest) in &responder_node_views {
+        for node in closest {
+            merge_witnessed_node(&mut known_nodes, node.clone());
+        }
+    }
+
+    let mut responder_views = Vec::with_capacity(responder_node_views.len());
+
+    for (responder, closest) in responder_node_views {
+        let closest =
+            self_inclusive_responder_view(responder, closest, &known_nodes, key, view_count);
+        responder_views.push(ResponderView { responder, closest });
+    }
+
+    responder_views.sort_by(|a, b| compare_peer_distance(&a.responder, &b.responder, key));
+
+    WitnessedCloseGroup {
+        target: *key,
+        k: count,
+        initial_closest,
+        responder_views,
+    }
+}
+
+fn split_witnessed_transcript_views(
+    initial_closest: &[DHTNode],
+    transcript: &mut FindNodeLookupTranscript,
+) -> (Vec<(PeerId, Vec<DHTNode>)>, Vec<DHTNode>) {
+    let mut responder_node_views = Vec::with_capacity(initial_closest.len());
+    let mut missing_responders = Vec::new();
+
+    for node in initial_closest {
+        match transcript.take_responder_view(&node.peer_id) {
+            Some(view) => responder_node_views.push((node.peer_id, view)),
+            None => missing_responders.push(node.clone()),
+        }
+    }
+
+    (responder_node_views, missing_responders)
 }
 
 impl DhtNetworkManager {
@@ -2005,6 +2152,175 @@ impl DhtNetworkManager {
         self.find_closest_nodes_network(key, count).await
     }
 
+    /// Find a quorum-witnessed close group for a target key.
+    ///
+    /// This is a specialised close-group authority API. It does not change
+    /// regular FIND_NODE semantics:
+    ///
+    /// 1. Perform the normal iterative pure-XOR lookup and keep the closest K
+    ///    remote responders.
+    /// 2. Reuse each initial responder's closest-K view from the iterative
+    ///    lookup transcript when available; query only responders whose view
+    ///    was not captured during convergence.
+    /// 3. Make each responder view self-inclusive, so a responder that belongs
+    ///    in its own local close group recognises itself even though standard
+    ///    FIND_NODE responses omit the responder.
+    /// 4. Return the trusted, self-inclusive closest-K view for each responder.
+    ///    Callers decide quorum, fallback, and payment policy from that
+    ///    transcript.
+    ///
+    /// The returned [`WitnessedCloseGroup`] is a validated DHT transcript. It
+    /// can be inconclusive when some initial responders do not provide views;
+    /// callers that require a complete or quorum-backed close group should
+    /// evaluate that before performing irreversible work such as payment.
+    pub async fn find_witnessed_close_group(
+        &self,
+        key: &Key,
+        count: usize,
+    ) -> Result<WitnessedCloseGroup> {
+        self.find_witnessed_close_group_with_view_count(key, count, count)
+            .await
+    }
+
+    /// Find a witnessed close-group transcript with independently sized
+    /// responder views.
+    ///
+    /// `count` controls the initial pure-XOR responder set. `view_count`
+    /// controls how many closest nodes each responder view may contribute to
+    /// the transcript.
+    pub async fn find_witnessed_close_group_with_view_count(
+        &self,
+        key: &Key,
+        count: usize,
+        view_count: usize,
+    ) -> Result<WitnessedCloseGroup> {
+        if count == 0 {
+            return Err(P2PError::InvalidInput(
+                "witnessed close group count must be greater than zero".to_string(),
+            ));
+        }
+        if view_count == 0 {
+            return Err(P2PError::InvalidInput(
+                "witnessed close group view count must be greater than zero".to_string(),
+            ));
+        }
+
+        let initial_lookup_count = count.saturating_add(1);
+        let FindNodeLookupOutcome {
+            closest_nodes,
+            mut transcript,
+        } = self
+            .find_closest_nodes_network_with_transcript(key, initial_lookup_count, Some(view_count))
+            .await?;
+        let initial_closest: Vec<DHTNode> = sort_dedup_witnessed_nodes(
+            closest_nodes
+                .into_iter()
+                .filter(|node| !self.is_local_peer_id(&node.peer_id))
+                .collect(),
+            key,
+            count,
+        );
+
+        if initial_closest.len() < count {
+            return Err(P2PError::Dht(DhtError::InsufficientPeers(
+                format!(
+                    "witnessed close group initial lookup found {} peers, need {count} for key {}",
+                    initial_closest.len(),
+                    hex::encode(key)
+                )
+                .into(),
+            )));
+        }
+
+        let (mut responder_node_views, missing_responders) =
+            split_witnessed_transcript_views(&initial_closest, &mut transcript);
+        for (_, nodes) in &responder_node_views {
+            for node in nodes {
+                self.merge_trusted_gossiped_typed_addresses(node).await;
+            }
+        }
+        if !missing_responders.is_empty() {
+            debug!(
+                "Witnessed close group re-querying {} responder(s) without transcript views for key {}",
+                missing_responders.len(),
+                hex::encode(key)
+            );
+        }
+
+        let mut query_stream: FuturesUnordered<_> = missing_responders
+            .iter()
+            .map(|node| {
+                let peer_id = node.peer_id;
+                let typed = node.typed_addresses();
+                let lookup_key = *key;
+                let failure_rx = self.lookup_failures.subscribe();
+                async move {
+                    self.send_find_node_lookup_request(peer_id, typed, lookup_key, failure_rx)
+                        .await
+                }
+            })
+            .collect();
+
+        while let Some((responder, result)) = query_stream.next().await {
+            match result {
+                Ok(DhtResponseEnvelope {
+                    result: DhtNetworkResult::NodesFound { nodes, .. },
+                    transport_source,
+                    ..
+                }) => {
+                    let (_, trusted_nodes) = self
+                        .trusted_find_node_response_nodes(
+                            nodes,
+                            transport_source.as_ref(),
+                            key,
+                            0,
+                            view_count,
+                        )
+                        .await;
+                    for node in &trusted_nodes {
+                        self.merge_trusted_gossiped_typed_addresses(node).await;
+                    }
+
+                    responder_node_views.push((responder, trusted_nodes));
+                }
+                Ok(other) => {
+                    warn!(
+                        "Witnessed close-group FIND_NODE from {} returned unexpected result: {:?}",
+                        responder.to_hex(),
+                        other
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        "Witnessed close-group FIND_NODE from {} failed for key {}: {}",
+                        responder.to_hex(),
+                        hex::encode(key),
+                        e
+                    );
+                }
+            }
+        }
+
+        let witnessed = build_witnessed_close_group(
+            key,
+            count,
+            view_count,
+            initial_closest,
+            responder_node_views,
+        );
+
+        if witnessed.responder_views.len() < witnessed.initial_closest.len() {
+            warn!(
+                "Witnessed close group transcript incomplete for key {}: responders={}/{}",
+                hex::encode(key),
+                witnessed.responder_views.len(),
+                witnessed.initial_closest.len()
+            );
+        }
+
+        Ok(witnessed)
+    }
+
     /// Find nodes closest to a key using iterative network lookup
     pub async fn find_node(&self, key: &Key) -> Result<DhtNetworkResult> {
         info!("Finding nodes closest to key: {}", hex::encode(key));
@@ -2088,124 +2404,24 @@ impl DhtNetworkManager {
             hex::encode(key)
         );
 
-        // Over-fetch so the reachability re-rank below has material to demote
-        // with: an XOR-closer relay-only peer can be displaced by a slightly
-        // farther directly-reachable one only if the latter is in the fetched
-        // set. The routing table is scanned per bucket regardless, so a 2x
-        // over-fetch is cheap.
-        let overfetch = count.saturating_mul(2);
-
-        let dht_guard = self.dht.read().await;
-        match dht_guard
-            .find_nodes_with_publish_seq(&DhtKey::from_bytes(*key), overfetch)
-            .await
-        {
-            Ok(nodes) => {
-                let mut nodes: Vec<DHTNode> = nodes
-                    .into_iter()
-                    .filter(|(node, _)| !self.is_local_peer_id(&node.id))
-                    .map(|(node, publish_seq)| {
-                        // Fix E: stamp the real trust score instead of a
-                        // hardcoded constant so downstream consumers (ant-node
-                        // replication/payment) see a meaningful reliability.
-                        // Never-failed peers sit at DEFAULT_NEUTRAL_TRUST, so
-                        // reachability tier (below) is the primary signal and
-                        // trust is only a future tiebreaker.
-                        let reliability = self
-                            .trust_engine
-                            .as_ref()
-                            .map(|engine| engine.score(&node.id))
-                            .unwrap_or(DEFAULT_NEUTRAL_TRUST);
-                        DHTNode {
-                            peer_id: node.id,
-                            address_types: node.address_types,
-                            addresses: node.addresses,
-                            distance: encode_publish_seq_distance(publish_seq),
-                            reliability,
-                        }
-                    })
-                    .collect();
-
-                // Re-rank by (reachability_tier, xor_distance) and truncate
-                // back to `count`. Re-rank only, never filter: this can never
-                // return fewer than `count` reachable-or-not peers, keeping the
-                // close-group selection sparse-network-safe.
-                nodes.sort_by(|a, b| Self::compare_node_reachability_then_distance(a, b, key));
-                nodes.truncate(count);
-                nodes
-            }
-            Err(e) => {
-                warn!("find_nodes failed for key {}: {e}", hex::encode(key));
-                Vec::new()
-            }
-        }
-    }
-
-    /// Find closest nodes to a key using the local routing table, ordered by
-    /// **XOR distance only** (no reachability re-rank).
-    ///
-    /// This is the distance-pure counterpart to [`find_closest_nodes_local`].
-    /// The two exist because the routing table serves two consumers with
-    /// opposite ordering needs:
-    ///
-    /// - **Close-group / candidate *selection* for storage** (the majority of
-    ///   callers) benefits from the `(reachability_tier, xor_distance)`
-    ///   re-rank in [`find_closest_nodes_local`]: a directly-reachable peer is
-    ///   a better place to put data than an XOR-equal relay-only one.
-    /// - **Closeness *verification*** (ant-node's Merkle pay-yourself defence)
-    ///   must instead mirror the *uploader's* view, which is built from a
-    ///   pure XOR-distance network lookup. If the verifier re-ranked by
-    ///   reachability it could demote an XOR-close relay-only peer out of the
-    ///   compared window and falsely reject an honest candidate pool that
-    ///   legitimately contains that peer. Verification therefore needs the raw
-    ///   XOR ordering this method provides.
-    ///
-    /// Like [`find_closest_nodes_local`] this is a pure in-memory routing-table
-    /// read (no network I/O) and excludes the local peer. Reliability is still
-    /// stamped with the real trust score so consumers see a meaningful value;
-    /// only the *ordering* differs.
-    pub async fn find_closest_nodes_local_by_distance(
-        &self,
-        key: &Key,
-        count: usize,
-    ) -> Vec<DHTNode> {
-        debug!(
-            "[LOCAL] Finding {} closest nodes (XOR-only) to key: {}",
-            count,
-            hex::encode(key)
-        );
-
         let dht_guard = self.dht.read().await;
         match dht_guard
             .find_nodes_with_publish_seq(&DhtKey::from_bytes(*key), count)
             .await
         {
-            // `find_nodes_with_publish_seq` already returns peers in ascending
-            // XOR-distance order; we keep that order intact — no re-rank, no
-            // truncation beyond what the routing table returned.
             Ok(nodes) => nodes
                 .into_iter()
                 .filter(|(node, _)| !self.is_local_peer_id(&node.id))
-                .map(|(node, publish_seq)| {
-                    let reliability = self
-                        .trust_engine
-                        .as_ref()
-                        .map(|engine| engine.score(&node.id))
-                        .unwrap_or(DEFAULT_NEUTRAL_TRUST);
-                    DHTNode {
-                        peer_id: node.id,
-                        address_types: node.address_types,
-                        addresses: node.addresses,
-                        distance: encode_publish_seq_distance(publish_seq),
-                        reliability,
-                    }
+                .map(|(node, publish_seq)| DHTNode {
+                    peer_id: node.id,
+                    address_types: node.address_types,
+                    addresses: node.addresses,
+                    distance: encode_publish_seq_distance(publish_seq),
+                    reliability: SELF_RELIABILITY_SCORE,
                 })
                 .collect(),
             Err(e) => {
-                warn!(
-                    "find_nodes (XOR-only) failed for key {}: {e}",
-                    hex::encode(key)
-                );
+                warn!("find_nodes failed for key {}: {e}", hex::encode(key));
                 Vec::new()
             }
         }
@@ -2220,8 +2436,7 @@ impl DhtNetworkManager {
     /// `IsResponsible(self, K)` by checking whether self appears in the
     /// top-N results.
     ///
-    /// Results are sorted by `(reachability_tier, XOR distance)` to the key —
-    /// directly-reachable peers first — and truncated to `count`.
+    /// Results are sorted by XOR distance to the key and truncated to `count`.
     pub async fn find_closest_nodes_local_with_self(
         &self,
         key: &Key,
@@ -2233,46 +2448,28 @@ impl DhtNetworkManager {
 
         nodes.push(self.local_dht_node().await);
 
-        // Same reachability-aware ordering as find_closest_nodes_local: prefer
-        // directly-reachable peers, XOR distance as tiebreaker. Self competes
-        // on the same terms and may displace the farthest peer.
-        nodes.sort_by(|a, b| Self::compare_node_reachability_then_distance(a, b, key));
+        let key_peer = PeerId::from_bytes(*key);
+        nodes.sort_by(|a, b| {
+            let da = a.peer_id.xor_distance(&key_peer);
+            let db = b.peer_id.xor_distance(&key_peer);
+            da.cmp(&db)
+        });
         nodes.truncate(count);
         nodes
     }
 
-    /// XOR-only, self-inclusive variant of
-    /// [`find_closest_nodes_local_by_distance`].
+    /// Self-inclusive local lookup ordered by XOR distance.
     ///
-    /// Mirrors [`find_closest_nodes_local_with_self`] — it includes the local
-    /// node in the candidate set so a caller can compute `IsResponsible(self,
-    /// K)` — but orders purely by XOR distance and does **not** prefer
-    /// directly-reachable peers.
-    ///
-    /// Use this for closeness *verification* (the single-node payment
-    /// close-group check, the Merkle candidate-pool check), which must mirror
-    /// the uploader's pure XOR-distance peer selection rather than the
-    /// reachability re-rank used for storage *selection*. The reachability
-    /// re-rank in [`find_closest_nodes_local_with_self`] can demote an
-    /// XOR-close relay-only peer out of the compared window and falsely reject
-    /// an honest payment that legitimately quoted that peer — see
-    /// saorsa-labs/saorsa-core#121, which added the XOR-only
-    /// [`find_closest_nodes_local_by_distance`] for exactly this purpose.
-    ///
-    /// Like the other `_local` lookups this is a pure in-memory routing-table
-    /// read (no network I/O). Self competes on XOR distance and may displace
-    /// the farthest peer.
+    /// This mirrors [`find_closest_nodes_local_with_self`]: it includes the
+    /// local node in the candidate set so a caller can compute
+    /// `IsResponsible(self, K)`, orders by XOR distance, and truncates to
+    /// `count`.
     pub async fn find_closest_nodes_local_by_distance_with_self(
         &self,
         key: &Key,
         count: usize,
     ) -> Vec<DHTNode> {
-        // Fetch the XOR-closest `count` peers (self is excluded by the
-        // underlying lookup), append self, re-sort by pure XOR distance, and
-        // truncate back to `count`. Any peer beyond the closest `count` is
-        // farther than all of them, so adding only self cannot pull it into
-        // the top-`count` — fetching `count` is sufficient.
-        let mut nodes = self.find_closest_nodes_local_by_distance(key, count).await;
+        let mut nodes = self.find_closest_nodes_local(key, count).await;
 
         nodes.push(self.local_dht_node().await);
 
@@ -2295,6 +2492,18 @@ impl DhtNetworkManager {
         key: &Key,
         count: usize,
     ) -> Result<Vec<DHTNode>> {
+        Ok(self
+            .find_closest_nodes_network_with_transcript(key, count, None)
+            .await?
+            .closest_nodes)
+    }
+
+    async fn find_closest_nodes_network_with_transcript(
+        &self,
+        key: &Key,
+        count: usize,
+        transcript_view_count: Option<usize>,
+    ) -> Result<FindNodeLookupOutcome> {
         const MAX_ITERATIONS: usize = 20;
         const ALPHA: usize = 3; // Parallel queries per iteration
 
@@ -2325,6 +2534,7 @@ impl DhtNetworkManager {
         // third close-XOR responder has replied can supersede a
         // previously-stored single-source pick.
         let mut subject_reports: HashMap<PeerId, SubjectReports> = HashMap::new();
+        let mut transcript = FindNodeLookupTranscript::default();
 
         // Start with local knowledge
         let initial = self.find_closest_nodes_local(key, count).await;
@@ -2444,7 +2654,7 @@ impl DhtNetworkManager {
             for (peer_id, result) in results {
                 match result {
                     Ok(DhtResponseEnvelope {
-                        result: DhtNetworkResult::NodesFound { mut nodes, .. },
+                        result: DhtNetworkResult::NodesFound { nodes, .. },
                         transport_source,
                         ..
                     }) => {
@@ -2454,21 +2664,21 @@ impl DhtNetworkManager {
                             best_nodes.push(queried_node.clone());
                         }
 
-                        // Truncate response to K closest to the lookup key to
-                        // limit amplification from a single response and bound
-                        // per-iteration memory growth.
-                        nodes.sort_by(|a, b| Self::compare_node_distance(a, b, key));
-                        nodes.truncate(self.k_value());
-                        for node in nodes {
-                            let node = self
-                                .gossiped_node_with_trusted_addresses(
-                                    node,
-                                    transport_source.as_ref(),
-                                )
-                                .await;
-                            if !peer_states.is_contactable(&node.peer_id)
-                                || self.is_local_peer_id(&node.peer_id)
-                            {
+                        let (candidate_nodes, responder_view) = self
+                            .trusted_find_node_response_nodes(
+                                nodes,
+                                transport_source.as_ref(),
+                                key,
+                                self.k_value(),
+                                transcript_view_count.unwrap_or(0),
+                            )
+                            .await;
+                        if transcript_view_count.is_some() {
+                            transcript.record_responder_view(peer_id, responder_view);
+                        }
+
+                        for node in candidate_nodes {
+                            if !peer_states.is_contactable(&node.peer_id) {
                                 continue;
                             }
                             if self.lookup_candidate_dial_plan_is_exhausted(&node).await {
@@ -2629,7 +2839,10 @@ impl DhtNetworkManager {
                 .collect::<Vec<_>>()
         );
 
-        Ok(best_nodes)
+        Ok(FindNodeLookupOutcome {
+            closest_nodes: best_nodes,
+            transcript,
+        })
     }
 
     /// Send one iterative FIND_NODE probe, aborting early if another active
@@ -2725,31 +2938,43 @@ impl DhtNetworkManager {
             .cmp(&b.peer_id.distance(&target_key))
     }
 
-    /// Reachability tier for selection ranking: `0` when the node exposes a
-    /// directly-dialable address, `1` when it is relay-only / NAT-stuck (no
-    /// `Direct` address). Used as the primary sort key so a directly-reachable
-    /// peer is preferred over an XOR-equal unreachable one (Fix E).
-    ///
-    /// Keyed on the *absence* of a `Direct` address, not on the presence of a
-    /// `Relay` address — a peer that advertises both stays tier `0`. This is a
-    /// re-ranking signal only; it is never used to filter peers out, so it can
-    /// never shrink a close group below the requested `count`.
-    fn reachability_tier(node: &DHTNode) -> u8 {
-        u8::from(Self::first_direct_dialable(node).is_none())
-    }
-
-    /// Order nodes by `(reachability_tier, xor_distance)`: directly-reachable
-    /// peers first, then by XOR distance to `key` within each tier. The XOR
-    /// tiebreaker reuses [`Self::compare_node_distance`], keeping ordering
-    /// deterministic for equal tiers (stable, no churn).
-    fn compare_node_reachability_then_distance(
-        a: &DHTNode,
-        b: &DHTNode,
+    async fn trusted_find_node_response_nodes(
+        &self,
+        mut nodes: Vec<SerializableDHTNode>,
+        transport_source: Option<&MultiAddr>,
         key: &Key,
-    ) -> std::cmp::Ordering {
-        Self::reachability_tier(a)
-            .cmp(&Self::reachability_tier(b))
-            .then_with(|| Self::compare_node_distance(a, b, key))
+        candidate_limit: usize,
+        transcript_limit: usize,
+    ) -> (Vec<DHTNode>, Vec<DHTNode>) {
+        let processing_limit = candidate_limit.max(transcript_limit);
+        nodes.sort_by(|a, b| Self::compare_node_distance(a, b, key));
+        nodes.truncate(processing_limit);
+
+        let mut candidate_nodes = Vec::with_capacity(candidate_limit.min(nodes.len()));
+        let mut transcript_nodes = Vec::with_capacity(transcript_limit.min(nodes.len()));
+
+        for (index, node) in nodes.into_iter().enumerate() {
+            let node = self
+                .gossiped_node_with_trusted_addresses(node, transport_source)
+                .await;
+            if self.is_local_peer_id(&node.peer_id) {
+                continue;
+            }
+
+            let is_candidate_node = index < candidate_limit;
+            let is_transcript_node = index < transcript_limit;
+            match (is_candidate_node, is_transcript_node) {
+                (true, true) => {
+                    candidate_nodes.push(node.clone());
+                    transcript_nodes.push(node);
+                }
+                (true, false) => candidate_nodes.push(node),
+                (false, true) => transcript_nodes.push(node),
+                (false, false) => {}
+            }
+        }
+
+        (candidate_nodes, transcript_nodes)
     }
 
     /// Drain an iteration's α queries with a bounded wait after first response.
@@ -5554,6 +5779,189 @@ mod tests {
         }
     }
 
+    const TEST_WITNESS_K: usize = 7;
+
+    fn witness_node(seed: u8) -> DHTNode {
+        DHTNode {
+            peer_id: PeerId::from_bytes([seed; 32]),
+            addresses: Vec::new(),
+            address_types: Vec::new(),
+            distance: None,
+            reliability: 1.0,
+        }
+    }
+
+    fn witness_nodes(seeds: &[u8]) -> Vec<DHTNode> {
+        seeds.iter().copied().map(witness_node).collect()
+    }
+
+    fn witness_view(responder_seed: u8, closest_seeds: &[u8]) -> (PeerId, Vec<DHTNode>) {
+        (
+            PeerId::from_bytes([responder_seed; 32]),
+            witness_nodes(closest_seeds),
+        )
+    }
+
+    fn responder_view_seeds(view: &ResponderView) -> Vec<u8> {
+        view.closest
+            .iter()
+            .map(|node| node.peer_id.to_bytes()[0])
+            .collect()
+    }
+
+    #[test]
+    fn witnessed_lookup_reuses_transcript_views_and_only_requeries_missing_responders() {
+        let mut transcript = FindNodeLookupTranscript::default();
+        transcript.record_responder_view(PeerId::from_bytes([1; 32]), witness_nodes(&[2, 3]));
+        transcript.record_responder_view(PeerId::from_bytes([3; 32]), Vec::new());
+
+        let initial = witness_nodes(&[1, 2, 3]);
+        let (views, missing) = split_witnessed_transcript_views(&initial, &mut transcript);
+
+        assert_eq!(views.len(), 2);
+        assert_eq!(views[0].0, PeerId::from_bytes([1; 32]));
+        assert_eq!(
+            views[0]
+                .1
+                .iter()
+                .map(|node| node.peer_id.to_bytes()[0])
+                .collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+        assert_eq!(views[1].0, PeerId::from_bytes([3; 32]));
+        assert!(views[1].1.is_empty());
+        assert_eq!(
+            missing
+                .iter()
+                .map(|node| node.peer_id.to_bytes()[0])
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
+        assert!(
+            transcript
+                .take_responder_view(&PeerId::from_bytes([1; 32]))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn witnessed_group_returns_self_inclusive_capped_node_views_sorted_by_xor() {
+        const FALLBACK_TEST_K: usize = 2;
+
+        let key: Key = [0u8; 32];
+        let initial = witness_nodes(&[1, 2]);
+        let views = vec![witness_view(1, &[4, 5]), witness_view(2, &[3, 6])];
+
+        let group =
+            build_witnessed_close_group(&key, FALLBACK_TEST_K, FALLBACK_TEST_K, initial, views);
+
+        assert!(
+            group
+                .responder_views
+                .iter()
+                .all(|view| view.closest.len() <= FALLBACK_TEST_K),
+            "each responder still votes only for its local closest-K view"
+        );
+        assert_eq!(responder_view_seeds(&group.responder_views[0]), vec![1, 4]);
+        assert_eq!(responder_view_seeds(&group.responder_views[1]), vec![2, 3]);
+    }
+
+    #[test]
+    fn witnessed_group_allows_wider_responder_views_than_initial_group() {
+        const INITIAL_K: usize = 2;
+        const VIEW_K: usize = 3;
+
+        let key: Key = [0u8; 32];
+        let initial = witness_nodes(&[1, 2]);
+        let views = vec![witness_view(1, &[4, 5]), witness_view(2, &[3, 6])];
+
+        let group = build_witnessed_close_group(&key, INITIAL_K, VIEW_K, initial, views);
+
+        assert_eq!(group.k, INITIAL_K);
+        assert!(
+            group
+                .responder_views
+                .iter()
+                .all(|view| view.closest.len() <= VIEW_K),
+            "responder views should use the independent view cap"
+        );
+        assert_eq!(
+            responder_view_seeds(&group.responder_views[0]),
+            vec![1, 4, 5]
+        );
+        assert_eq!(
+            responder_view_seeds(&group.responder_views[1]),
+            vec![2, 3, 6]
+        );
+    }
+
+    #[test]
+    fn witnessed_group_self_includes_responder_when_response_omits_self() {
+        let key: Key = [0u8; 32];
+        let initial = witness_nodes(&[1, 2, 3, 4, 5, 6, 7]);
+        let views = vec![witness_view(3, &[1, 2, 4, 5, 6, 7, 8])];
+
+        let group =
+            build_witnessed_close_group(&key, TEST_WITNESS_K, TEST_WITNESS_K, initial, views);
+        let view = group
+            .responder_views
+            .iter()
+            .find(|view| view.responder == PeerId::from_bytes([3; 32]))
+            .expect("responder view should be present");
+
+        assert!(
+            view.closest
+                .iter()
+                .any(|node| node.peer_id == PeerId::from_bytes([3; 32])),
+            "responder should recognise itself after self-inclusion"
+        );
+        assert!(
+            !view
+                .closest
+                .iter()
+                .any(|node| node.peer_id == PeerId::from_bytes([8; 32])),
+            "self-inclusion should still cap the view to K closest peers"
+        );
+    }
+
+    #[test]
+    fn witnessed_group_keeps_relay_only_xor_closer_peer_ahead_of_direct_farther_peer() {
+        let key: Key = [0u8; 32];
+        let relay_closer = dht_node(
+            1,
+            vec![("/ip4/198.51.100.1/udp/9001/quic", AddressType::Relay)],
+        );
+        let direct_farther = dht_node(
+            2,
+            vec![("/ip4/198.51.100.2/udp/9002/quic", AddressType::Direct)],
+        );
+        let mut initial = vec![relay_closer.clone(), direct_farther.clone()];
+        initial.extend(witness_nodes(&[3, 4, 5, 6, 7]));
+        let view_nodes = vec![
+            relay_closer,
+            direct_farther,
+            witness_node(3),
+            witness_node(4),
+            witness_node(5),
+            witness_node(6),
+            witness_node(7),
+        ];
+        let views: Vec<_> = (1..=7)
+            .map(|seed| (PeerId::from_bytes([seed; 32]), view_nodes.clone()))
+            .collect();
+
+        let group =
+            build_witnessed_close_group(&key, TEST_WITNESS_K, TEST_WITNESS_K, initial, views);
+
+        let closest = &group.responder_views[0].closest;
+        assert_eq!(
+            responder_view_seeds(&group.responder_views[0]),
+            vec![1, 2, 3, 4, 5, 6, 7]
+        );
+        assert_eq!(closest[0].address_types[0], AddressType::Relay);
+        assert_eq!(closest[1].address_types[0], AddressType::Direct);
+    }
+
     #[test]
     fn winner_empty_reports_returns_none() {
         let reports = SubjectReports::new();
@@ -5821,80 +6229,10 @@ mod tests {
         assert_eq!(DhtNetworkManager::first_direct_dialable(&node), None);
     }
 
-    // ---- Fix E: reachability-aware selection re-rank ----
-
-    #[test]
-    fn reachability_tier_is_zero_for_direct_one_for_relay_only() {
-        let direct = dht_node(
-            1,
-            vec![("/ip4/203.0.113.7/udp/9001/quic", AddressType::Direct)],
-        );
-        let relay_only = dht_node(2, vec![("/ip4/10.0.0.1/udp/9000/quic", AddressType::Relay)]);
-        let empty = DHTNode {
-            peer_id: PeerId::from_bytes([3u8; 32]),
-            addresses: vec![],
-            address_types: vec![],
-            distance: None,
-            reliability: 1.0,
-        };
-
-        assert_eq!(DhtNetworkManager::reachability_tier(&direct), 0);
-        assert_eq!(DhtNetworkManager::reachability_tier(&relay_only), 1);
-        assert_eq!(DhtNetworkManager::reachability_tier(&empty), 1);
-    }
-
-    #[test]
-    fn reachability_tier_zero_when_node_has_both_relay_and_direct() {
-        // A peer advertising both a relay and a direct address is still
-        // directly reachable — tier keyed on absence of Direct, not presence
-        // of Relay.
-        let node = dht_node(
-            1,
-            vec![
-                ("/ip4/10.0.0.1/udp/9000/quic", AddressType::Relay),
-                ("/ip4/203.0.113.7/udp/9001/quic", AddressType::Direct),
-            ],
-        );
-        assert_eq!(DhtNetworkManager::reachability_tier(&node), 0);
-    }
-
-    #[test]
-    fn reachability_rerank_prefers_direct_over_xor_closer_relay_only() {
-        // With key = [0; 32], xor_distance == peer_id, so the lower seed is the
-        // XOR-closer peer. The relay-only peer (seed 1) is XOR-closer; the
-        // direct peer (seed 2) is farther. Reachability tier must win: the
-        // direct peer is ranked first despite the larger XOR distance.
-        let key: Key = [0u8; 32];
-        let relay_closer = dht_node(1, vec![("/ip4/10.0.0.1/udp/9000/quic", AddressType::Relay)]);
-        let direct_farther = dht_node(
-            2,
-            vec![("/ip4/203.0.113.7/udp/9001/quic", AddressType::Direct)],
-        );
-
-        let mut nodes = [relay_closer, direct_farther];
-        nodes
-            .sort_by(|a, b| DhtNetworkManager::compare_node_reachability_then_distance(a, b, &key));
-
-        assert_eq!(nodes.len(), 2, "re-rank must never drop peers");
-        assert_eq!(
-            nodes[0].peer_id,
-            PeerId::from_bytes([2u8; 32]),
-            "directly-reachable peer must rank first even though it is XOR-farther"
-        );
-        assert_eq!(nodes[1].peer_id, PeerId::from_bytes([1u8; 32]));
-    }
-
     #[test]
     fn by_distance_comparator_keeps_xor_closer_relay_only_ahead_of_direct() {
-        // Complement of `reachability_rerank_prefers_direct_over_xor_closer_relay_only`,
-        // and the property the closeness-verification path relies on: the XOR-only
-        // `compare_node_distance` (used by `find_closest_nodes_local_by_distance`
-        // and `find_closest_nodes_local_by_distance_with_self`) must NOT apply the
-        // reachability re-rank. With key = [0; 32], xor_distance == peer_id, so the
-        // lower seed is XOR-closer. The relay-only peer (seed 1) is XOR-closer and
-        // must therefore rank first even though it is relay-only — mirroring the
-        // uploader's pure-XOR view so an honest payment quoting that peer is not
-        // falsely rejected. (The reranked comparator would put the direct peer first.)
+        // With key = [0; 32], xor_distance == peer_id, so the lower seed is
+        // XOR-closer. Address type must not affect pure distance ordering.
         let key: Key = [0u8; 32];
         let relay_closer = dht_node(1, vec![("/ip4/10.0.0.1/udp/9000/quic", AddressType::Relay)]);
         let direct_farther = dht_node(
@@ -5911,34 +6249,10 @@ mod tests {
         assert_eq!(
             nodes[0].peer_id,
             PeerId::from_bytes([1u8; 32]),
-            "XOR-only ordering must keep the XOR-closer relay-only peer first, \
-             unlike compare_node_reachability_then_distance"
+            "XOR-only ordering must keep the XOR-closer peer first"
         );
         assert_eq!(nodes[1].peer_id, PeerId::from_bytes([2u8; 32]));
     }
-
-    #[test]
-    fn reachability_rerank_sparse_all_relay_only_keeps_count_in_xor_order() {
-        // Sparse-network safety: when every candidate is relay-only they all
-        // share tier 1, so ordering falls back to XOR distance and truncation
-        // still yields `count` members — selection never shrinks below `count`.
-        let key: Key = [0u8; 32];
-        let mut nodes = vec![
-            dht_node(3, vec![("/ip4/10.0.0.3/udp/9000/quic", AddressType::Relay)]),
-            dht_node(1, vec![("/ip4/10.0.0.1/udp/9000/quic", AddressType::Relay)]),
-            dht_node(2, vec![("/ip4/10.0.0.2/udp/9000/quic", AddressType::Relay)]),
-        ];
-        nodes
-            .sort_by(|a, b| DhtNetworkManager::compare_node_reachability_then_distance(a, b, &key));
-
-        let count = 2;
-        nodes.truncate(count);
-
-        assert_eq!(nodes.len(), count, "sparse selection must still fill count");
-        assert_eq!(nodes[0].peer_id, PeerId::from_bytes([1u8; 32]));
-        assert_eq!(nodes[1].peer_id, PeerId::from_bytes([2u8; 32]));
-    }
-
     #[test]
     fn first_direct_dialable_skips_wildcard_direct() {
         let node = dht_node(

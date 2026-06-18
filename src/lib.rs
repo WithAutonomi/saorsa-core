@@ -64,7 +64,7 @@ pub use network::{NodeConfig, NodeMode, P2PEvent, P2PNode};
 
 // DHT types — peer discovery, routing, and network events
 pub use dht::Key;
-pub use dht_network_manager::{DHTNode, DhtNetworkEvent};
+pub use dht_network_manager::{DHTNode, DhtNetworkEvent, ResponderView, WitnessedCloseGroup};
 
 // Close-group cache
 pub use bootstrap::{CachedCloseGroupPeer, CloseGroupCache};
