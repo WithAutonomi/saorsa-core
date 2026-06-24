@@ -20,8 +20,8 @@
 
 use crate::{
     P2PError, PeerId, Result,
-    adaptive::TrustEngine,
     adaptive::trust::DEFAULT_NEUTRAL_TRUST,
+    adaptive::{NodeStatisticsUpdate, TrustEngine},
     address::{MultiAddr, is_lan_ip},
     dht::core_engine::{AddressType, AtomicInstant, BucketRefreshCandidate, NodeInfo},
     dht::{AdmissionResult, DhtCoreEngine, DhtKey, Key, RoutingTableEvent},
@@ -227,6 +227,15 @@ const DIAL_FAILURE_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
 /// success-clears-immediately guards against suppressing a live IP because
 /// one peer behind a shared NAT IP churned.
 const DIAL_FAILURE_IP_SUPPRESS_THRESHOLD: usize = 4;
+
+/// Trust-score log reason for a failed pre-request dial.
+const TRUST_REASON_DHT_DIAL_FAILED: &str = "dht_dial_failed";
+
+/// Trust-score log reason for a failed post-dial identity exchange.
+const TRUST_REASON_DHT_IDENTITY_EXCHANGE_FAILED: &str = "dht_identity_exchange_failed";
+
+/// Trust-score log reason for a sent DHT request that failed or timed out.
+const TRUST_REASON_DHT_REQUEST_FAILED: &str = "dht_request_failed";
 
 /// Worst-case number of addresses
 /// [`DhtNetworkManager::select_dial_candidates_with_context`] returns for a
@@ -3335,11 +3344,12 @@ impl DhtNetworkManager {
             })
     }
 
-    async fn record_peer_failure(&self, peer_id: &PeerId) {
+    async fn record_peer_failure(&self, peer_id: &PeerId, reason: &'static str) {
         if let Some(ref engine) = self.trust_engine {
-            engine.update_node_stats(
+            engine.update_node_stats_with_reason(
                 peer_id,
-                crate::adaptive::NodeStatisticsUpdate::FailedResponse,
+                NodeStatisticsUpdate::FailedResponse,
+                reason,
             );
         }
     }
@@ -3517,7 +3527,8 @@ impl DhtNetworkManager {
                 peer_hex,
                 candidates.len()
             );
-            self.record_peer_failure(peer_id).await;
+            self.record_peer_failure(peer_id, TRUST_REASON_DHT_DIAL_FAILED)
+                .await;
             return PendingDialOutcome::DialFailed {
                 candidates_count: candidates.len(),
             };
@@ -3574,7 +3585,8 @@ impl DhtNetworkManager {
                     local_hex, peer_hex, e
                 );
                 self.transport.disconnect_channel(&channel_id).await;
-                self.record_peer_failure(peer_id).await;
+                self.record_peer_failure(peer_id, TRUST_REASON_DHT_IDENTITY_EXCHANGE_FAILED)
+                    .await;
                 // Suppress further dials to this peer for
                 // [`IDENTITY_FAILURE_CACHE_TTL`] so that the next
                 // iterative DHT lookup (or chunk-fetch close-group
@@ -3791,7 +3803,8 @@ impl DhtNetworkManager {
         // Record trust failure at the RPC level so every failed request
         // (send error, response timeout, etc.) is counted exactly once.
         if result.is_err() {
-            self.record_peer_failure(peer_id).await;
+            self.record_peer_failure(peer_id, TRUST_REASON_DHT_REQUEST_FAILED)
+                .await;
         }
 
         result

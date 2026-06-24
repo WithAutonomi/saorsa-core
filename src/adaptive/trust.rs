@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use tracing::info;
 
 /// Default trust score for unknown peers
 pub const DEFAULT_NEUTRAL_TRUST: f64 = 0.5;
@@ -99,21 +100,27 @@ impl PeerTrust {
     /// `(1-α)^W * score + (1-(1-α)^W) * observation` generalizes the unit-weight
     /// formula and is equivalent to applying `W` consecutive unit-weight updates
     /// for integer W.
-    fn record_weighted(&mut self, observation: f64, weight: f64) {
+    fn record_weighted(&mut self, observation: f64, weight: f64) -> Option<(f64, f64)> {
         if !weight.is_finite() || weight <= 0.0 {
-            return;
+            return None;
         }
         self.apply_decay();
+        let previous_score = self.score;
         let alpha_w = 1.0 - (1.0 - EMA_WEIGHT).powf(weight);
         self.score = (1.0 - alpha_w) * self.score + alpha_w * observation;
         self.score = self.score.clamp(MIN_TRUST_SCORE, MAX_TRUST_SCORE);
         self.last_updated = Instant::now();
+        if (self.score - previous_score).abs() > f64::EPSILON {
+            Some((previous_score, self.score))
+        } else {
+            None
+        }
     }
 
     /// Apply a new observation via EMA with unit weight, after first applying decay.
     #[allow(dead_code)] // design API: retained as convenience wrapper for record_weighted
     fn record(&mut self, observation: f64) {
-        self.record_weighted(observation, 1.0);
+        let _ = self.record_weighted(observation, 1.0);
     }
 
     /// Get the current score with decay applied (does not mutate).
@@ -140,12 +147,28 @@ const SUCCESS_OBSERVATION: f64 = 1.0;
 const FAILURE_OBSERVATION: f64 = 0.0;
 
 /// Statistics update type for recording peer interaction outcomes
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub enum NodeStatisticsUpdate {
     /// Peer provided a correct response
     CorrectResponse,
     /// Peer failed to provide a response
     FailedResponse,
+}
+
+impl NodeStatisticsUpdate {
+    const fn observation(self) -> f64 {
+        match self {
+            Self::CorrectResponse => SUCCESS_OBSERVATION,
+            Self::FailedResponse => FAILURE_OBSERVATION,
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::CorrectResponse => "correct_response",
+            Self::FailedResponse => "failed_response",
+        }
+    }
 }
 
 /// Serializable trust snapshot for persistence across restarts.
@@ -191,6 +214,16 @@ impl TrustEngine {
         self.update_node_stats_weighted(node_id, update, 1.0);
     }
 
+    /// Record a peer interaction outcome with an internal reason label.
+    pub(crate) fn update_node_stats_with_reason(
+        &self,
+        node_id: &PeerId,
+        update: NodeStatisticsUpdate,
+        reason: &'static str,
+    ) {
+        self.update_node_stats_weighted_with_reason(node_id, update, 1.0, reason);
+    }
+
     /// Record a peer interaction outcome with an explicit weight.
     ///
     /// Weight `1.0` is equivalent to a single internal event. Higher weights
@@ -202,15 +235,36 @@ impl TrustEngine {
         update: NodeStatisticsUpdate,
         weight: f64,
     ) {
-        let mut peers = self.peers.write();
-        let entry = peers.entry(*node_id).or_insert_with(PeerTrust::new);
+        self.update_node_stats_weighted_with_reason(node_id, update, weight, update.as_str());
+    }
 
-        let observation = match update {
-            NodeStatisticsUpdate::CorrectResponse => SUCCESS_OBSERVATION,
-            NodeStatisticsUpdate::FailedResponse => FAILURE_OBSERVATION,
+    /// Record a weighted peer interaction outcome with an internal reason label.
+    pub(crate) fn update_node_stats_weighted_with_reason(
+        &self,
+        node_id: &PeerId,
+        update: NodeStatisticsUpdate,
+        weight: f64,
+        reason: &'static str,
+    ) {
+        let score_change = {
+            let mut peers = self.peers.write();
+            let entry = peers.entry(*node_id).or_insert_with(PeerTrust::new);
+
+            entry.record_weighted(update.observation(), weight)
         };
 
-        entry.record_weighted(observation, weight);
+        if let Some((previous_score, current_score)) = score_change {
+            info!(
+                peer_id = %node_id.to_hex(),
+                reason = %reason,
+                update = %update.as_str(),
+                previous_score,
+                current_score,
+                delta = current_score - previous_score,
+                weight,
+                "peer trust score changed"
+            );
+        }
     }
 
     /// Get current trust score for a peer (synchronous).

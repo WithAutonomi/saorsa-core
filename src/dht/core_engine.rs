@@ -1352,6 +1352,94 @@ pub enum AdmissionResult {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PeerSwapReason {
+    BucketIpDiversity,
+    CloseGroupIpDiversity,
+    LowTrust,
+}
+
+impl PeerSwapReason {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::BucketIpDiversity => "bucket_ip_diversity",
+            Self::CloseGroupIpDiversity => "close_group_ip_diversity",
+            Self::LowTrust => "trust_below_swap_threshold",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PlannedPeerSwap {
+    peer_id: PeerId,
+    reason: PeerSwapReason,
+    evicted_trust_score: Option<f64>,
+    swap_threshold: Option<f64>,
+}
+
+impl PlannedPeerSwap {
+    const fn new(peer_id: PeerId, reason: PeerSwapReason) -> Self {
+        Self {
+            peer_id,
+            reason,
+            evicted_trust_score: None,
+            swap_threshold: None,
+        }
+    }
+
+    const fn trust_based(peer_id: PeerId, evicted_trust_score: f64, swap_threshold: f64) -> Self {
+        Self {
+            peer_id,
+            reason: PeerSwapReason::LowTrust,
+            evicted_trust_score: Some(evicted_trust_score),
+            swap_threshold: Some(swap_threshold),
+        }
+    }
+}
+
+fn planned_swaps_contain(swaps: &[PlannedPeerSwap], peer_id: &PeerId) -> bool {
+    swaps.iter().any(|swap| swap.peer_id == *peer_id)
+}
+
+fn peer_ids_to_hex(peer_ids: &[PeerId]) -> Vec<String> {
+    peer_ids.iter().map(PeerId::to_hex).collect()
+}
+
+fn log_k_closest_peer_swap(
+    added_peer_id: &PeerId,
+    executed_swaps: &[PlannedPeerSwap],
+    k_before: &[PeerId],
+    k_after: &[PeerId],
+) {
+    if executed_swaps.is_empty() || k_before == k_after {
+        return;
+    }
+
+    let old_k_closest_peer_ids = peer_ids_to_hex(k_before);
+    let new_k_closest_peer_ids = peer_ids_to_hex(k_after);
+    let added_to_k_closest = k_after.contains(added_peer_id) && !k_before.contains(added_peer_id);
+
+    for swap in executed_swaps {
+        let removed_from_k_closest = k_before.contains(&swap.peer_id);
+        if !removed_from_k_closest && !added_to_k_closest {
+            continue;
+        }
+
+        tracing::info!(
+            added_peer_id = %added_peer_id.to_hex(),
+            removed_peer_id = %swap.peer_id.to_hex(),
+            reason = %swap.reason.as_str(),
+            removed_from_k_closest,
+            added_to_k_closest,
+            evicted_trust_score = ?swap.evicted_trust_score,
+            swap_threshold = ?swap.swap_threshold,
+            old_k_closest_peer_ids = ?old_k_closest_peer_ids,
+            new_k_closest_peer_ids = ?new_k_closest_peer_ids,
+            "K-closest peer swap completed"
+        );
+    }
+}
+
 /// Main DHT Core Engine
 pub struct DhtCoreEngine {
     node_id: PeerId,
@@ -2325,7 +2413,7 @@ impl DhtCoreEngine {
         // After identifying a swap for one IP, exclude that peer from subsequent
         // checks so that each IP sees the state after prior swaps — preventing
         // over-eviction when a candidate has multiple IPs.
-        let mut all_bucket_swaps: Vec<PeerId> = Vec::new();
+        let mut all_bucket_swaps: Vec<PlannedPeerSwap> = Vec::new();
         for &candidate_ip in candidate_ips {
             if candidate_ip.is_loopback() {
                 continue;
@@ -2333,7 +2421,7 @@ impl DhtCoreEngine {
             let bucket_view: Vec<NodeInfo> = routing.buckets[bucket_idx]
                 .nodes
                 .iter()
-                .filter(|n| !all_bucket_swaps.contains(&n.id))
+                .filter(|n| !planned_swaps_contain(&all_bucket_swaps, &n.id))
                 .cloned()
                 .collect();
             let swap = self.find_ip_swap_in_scope(
@@ -2345,9 +2433,9 @@ impl DhtCoreEngine {
                 trust_score,
             )?;
             if let Some(id) = swap
-                && !all_bucket_swaps.contains(&id)
+                && !planned_swaps_contain(&all_bucket_swaps, &id)
             {
-                all_bucket_swaps.push(id);
+                all_bucket_swaps.push(PlannedPeerSwap::new(id, PeerSwapReason::BucketIpDiversity));
             }
         }
 
@@ -2356,26 +2444,26 @@ impl DhtCoreEngine {
 
         let effective_close_len = close_group
             .iter()
-            .filter(|n| !all_bucket_swaps.contains(&n.id))
+            .filter(|n| !planned_swaps_contain(&all_bucket_swaps, &n.id))
             .count();
 
         let candidate_in_close = effective_close_len < self.k_value
             || close_group
                 .iter()
-                .rfind(|n| !all_bucket_swaps.contains(&n.id))
+                .rfind(|n| !planned_swaps_contain(&all_bucket_swaps, &n.id))
                 .map(|n| {
                     candidate_distance
                         < xor_distance_bytes(self.node_id.to_bytes(), n.id.to_bytes())
                 })
                 .unwrap_or(true);
 
-        let mut all_close_swaps: Vec<PeerId> = Vec::new();
+        let mut all_close_swaps: Vec<PlannedPeerSwap> = Vec::new();
 
         if candidate_in_close {
             // Build hypothetical close group as Vec<NodeInfo>
             let mut hyp_close: Vec<NodeInfo> = close_group
                 .iter()
-                .filter(|n| !all_bucket_swaps.contains(&n.id) && n.id != node.id)
+                .filter(|n| !planned_swaps_contain(&all_bucket_swaps, &n.id) && n.id != node.id)
                 .cloned()
                 .collect();
             hyp_close.push(node.clone());
@@ -2395,7 +2483,7 @@ impl DhtCoreEngine {
                 }
                 let close_view: Vec<NodeInfo> = hyp_close
                     .iter()
-                    .filter(|n| !all_close_swaps.contains(&n.id))
+                    .filter(|n| !planned_swaps_contain(&all_close_swaps, &n.id))
                     .cloned()
                     .collect();
                 let swap = self.find_ip_swap_in_scope(
@@ -2408,8 +2496,13 @@ impl DhtCoreEngine {
                 )?;
                 if let Some(id) = swap {
                     // Deduplicate: don't plan a close swap that's already a bucket swap
-                    if !all_bucket_swaps.contains(&id) && !all_close_swaps.contains(&id) {
-                        all_close_swaps.push(id);
+                    if !planned_swaps_contain(&all_bucket_swaps, &id)
+                        && !planned_swaps_contain(&all_close_swaps, &id)
+                    {
+                        all_close_swaps.push(PlannedPeerSwap::new(
+                            id,
+                            PeerSwapReason::CloseGroupIpDiversity,
+                        ));
                     }
                 }
             }
@@ -2424,7 +2517,7 @@ impl DhtCoreEngine {
             let swap_frees_slot = !all_bucket_swaps.is_empty()
                 || all_close_swaps
                     .iter()
-                    .any(|id| routing.get_bucket_index(id) == Some(bucket_idx));
+                    .any(|swap| routing.get_bucket_index(&swap.peer_id) == Some(bucket_idx));
             if !already_exists && !has_room && !swap_frees_slot {
                 // --- Trust-based swap-out (lazy eviction) ---
                 // When a bucket is full and no IP-diversity swap is available,
@@ -2442,8 +2535,12 @@ impl DhtCoreEngine {
                             a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
                         });
 
-                    if let Some((swap_id, _)) = lowest {
-                        all_bucket_swaps.push(swap_id);
+                    if let Some((swap_id, score)) = lowest {
+                        all_bucket_swaps.push(PlannedPeerSwap::trust_based(
+                            swap_id,
+                            score,
+                            self.swap_threshold,
+                        ));
                     }
                 }
 
@@ -2451,7 +2548,7 @@ impl DhtCoreEngine {
                 let swap_frees_slot_now = !all_bucket_swaps.is_empty()
                     || all_close_swaps
                         .iter()
-                        .any(|id| routing.get_bucket_index(id) == Some(bucket_idx));
+                        .any(|swap| routing.get_bucket_index(&swap.peer_id) == Some(bucket_idx));
 
                 if !swap_frees_slot_now {
                     if allow_stale_revalidation {
@@ -2466,15 +2563,17 @@ impl DhtCoreEngine {
                         // bucket-level set. Evicting these may resolve the close-group
                         // diversity violation and (if they happen to reside in the same
                         // bucket) free capacity for the candidate.
-                        for close_swap_id in &all_close_swaps {
-                            if stale_peers.iter().any(|(id, _)| id == close_swap_id) {
+                        for close_swap in &all_close_swaps {
+                            if stale_peers.iter().any(|(id, _)| id == &close_swap.peer_id) {
                                 continue;
                             }
-                            if let Some(swap_bucket_idx) = routing.get_bucket_index(close_swap_id)
-                                && let Some(swap_node) = routing.find_node_by_id(close_swap_id)
+                            if let Some(swap_bucket_idx) =
+                                routing.get_bucket_index(&close_swap.peer_id)
+                                && let Some(swap_node) =
+                                    routing.find_node_by_id(&close_swap.peer_id)
                                 && swap_node.last_seen.elapsed() > self.live_threshold
                             {
-                                stale_peers.push((*close_swap_id, swap_bucket_idx));
+                                stale_peers.push((close_swap.peer_id, swap_bucket_idx));
                             }
                         }
 
@@ -2500,15 +2599,15 @@ impl DhtCoreEngine {
         let k_before = routing.k_closest_ids(self.k_value);
 
         // === Execute all swaps (deduplicated) ===
-        let mut executed: Vec<PeerId> = Vec::with_capacity(2);
-        for swap_id in all_bucket_swaps
+        let mut executed: Vec<PlannedPeerSwap> = Vec::with_capacity(2);
+        for swap in all_bucket_swaps
             .iter()
             .chain(all_close_swaps.iter())
             .copied()
         {
-            if !executed.contains(&swap_id) {
-                routing.remove_node(&swap_id);
-                executed.push(swap_id);
+            if !planned_swaps_contain(&executed, &swap.peer_id) {
+                routing.remove_node(&swap.peer_id);
+                executed.push(swap);
             }
         }
 
@@ -2516,14 +2615,15 @@ impl DhtCoreEngine {
 
         // === Build events ===
         let mut events: Vec<RoutingTableEvent> = Vec::with_capacity(executed.len() + 2);
-        for removed_id in &executed {
-            events.push(RoutingTableEvent::PeerRemoved(*removed_id));
+        for removed in &executed {
+            events.push(RoutingTableEvent::PeerRemoved(removed.peer_id));
         }
         events.push(RoutingTableEvent::PeerAdded(peer_id));
 
         // === Snapshot K-closest AFTER mutation ===
         let k_after = routing.k_closest_ids(self.k_value);
         if k_before != k_after {
+            log_k_closest_peer_swap(&peer_id, &executed, &k_before, &k_after);
             events.push(RoutingTableEvent::KClosestPeersChanged {
                 old: k_before,
                 new: k_after,

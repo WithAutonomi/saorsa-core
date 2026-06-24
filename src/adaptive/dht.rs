@@ -110,6 +110,16 @@ impl TrustEvent {
             | TrustEvent::ApplicationFailure(_) => NodeStatisticsUpdate::FailedResponse,
         }
     }
+
+    /// Stable reason label used in trust-score change logs.
+    const fn reason_label(self) -> &'static str {
+        match self {
+            TrustEvent::ConnectionFailed => "connection_failed",
+            TrustEvent::ConnectionTimeout => "connection_timeout",
+            TrustEvent::ApplicationSuccess(_) => "application_success",
+            TrustEvent::ApplicationFailure(_) => "application_failure",
+        }
+    }
 }
 
 /// AdaptiveDHT — the trust boundary for all DHT operations.
@@ -182,17 +192,21 @@ impl AdaptiveDHT {
             TrustEvent::ApplicationSuccess(weight) | TrustEvent::ApplicationFailure(weight) => {
                 if weight > 0.0 {
                     let clamped_weight = weight.min(MAX_CONSUMER_WEIGHT);
-                    self.trust_engine.update_node_stats_weighted(
+                    self.trust_engine.update_node_stats_weighted_with_reason(
                         peer_id,
                         event.to_stats_update(),
                         clamped_weight,
+                        event.reason_label(),
                     );
                 }
             }
             _ => {
                 // Internal events: unit weight
-                self.trust_engine
-                    .update_node_stats(peer_id, event.to_stats_update());
+                self.trust_engine.update_node_stats_with_reason(
+                    peer_id,
+                    event.to_stats_update(),
+                    event.reason_label(),
+                );
             }
         }
     }
