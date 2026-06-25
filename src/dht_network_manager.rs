@@ -228,6 +228,18 @@ const DIAL_FAILURE_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
 /// one peer behind a shared NAT IP churned.
 const DIAL_FAILURE_IP_SUPPRESS_THRESHOLD: usize = 4;
 
+/// How long a freshly re-attested (re-published) relay address bypasses
+/// IP-level suppression (ADR-011 self-heal).
+///
+/// When a peer reclaims its previous stable relay port and re-attests it via a
+/// newer `PublishAddressSet`, that exact `ip:port` should be retried promptly
+/// even if its relay IP is still IP-suppressed by *other* dead sessions —
+/// otherwise the self-healed record waits out the full
+/// [`DIAL_FAILURE_CACHE_TTL`]. The exemption is scoped to the single re-attested
+/// socket (never the whole IP), and kept short so it only bridges the gap to the
+/// next dial attempt rather than masking a genuinely dead relay IP for long.
+const DIAL_FAILURE_PUBLISH_EXEMPTION_TTL: Duration = Duration::from_secs(2 * 60);
+
 /// Trust-score log reason for a failed pre-request dial.
 const TRUST_REASON_DHT_DIAL_FAILED: &str = "dht_dial_failed";
 
@@ -874,6 +886,12 @@ struct DialFailureCache {
     /// cannot inflate the distinct count. Only `AddressType::Relay`
     /// failures populate this map.
     ip_failures: DashMap<IpAddr, HashMap<SocketAddr, Instant>>,
+    /// Relay `SocketAddr`s freshly re-attested by their owner via an applied
+    /// `PublishAddressSet`, each with the time it was re-attested. While fresh
+    /// (within [`DIAL_FAILURE_PUBLISH_EXEMPTION_TTL`]) the exact socket bypasses
+    /// IP-level suppression so ADR-011 self-heal can retry it promptly, without
+    /// lifting suppression for other dead sessions on the same relay IP.
+    exempt: DashMap<SocketAddr, Instant>,
 }
 
 impl DialFailureCache {
@@ -918,7 +936,26 @@ impl DialFailureCache {
         if per_addr_failed {
             return true;
         }
-        ty == AddressType::Relay && self.ip_is_suppressed(&addr.ip())
+        if ty != AddressType::Relay || !self.ip_is_suppressed(&addr.ip()) {
+            return false;
+        }
+        // The relay IP is suppressed — but a socket its owner just re-attested via
+        // a fresh `PublishAddressSet` gets a short, per-socket exemption so ADR-011
+        // self-heal can retry the exact reclaimed stable port now instead of
+        // waiting out the IP-tier TTL. Stale exemptions are pruned on read; a fresh
+        // one is left in place so repeated checks (the dial-plan predicate and the
+        // dial itself) stay consistent across the window.
+        match self.exempt.entry(addr) {
+            DashEntry::Occupied(entry) => {
+                if entry.get().elapsed() < DIAL_FAILURE_PUBLISH_EXEMPTION_TTL {
+                    false
+                } else {
+                    entry.remove();
+                    true
+                }
+            }
+            DashEntry::Vacant(_) => true,
+        }
     }
 
     /// Returns true if `ip` has at least
@@ -954,6 +991,8 @@ impl DialFailureCache {
         let addr = Self::canon_key(addr);
         let now = Instant::now();
         self.entries.insert(addr, now);
+        // A fresh failure overrides any re-attestation exemption for this socket.
+        self.exempt.remove(&addr);
         if ty == AddressType::Relay {
             let mut sessions = self.ip_failures.entry(addr.ip()).or_default();
             let newly_distinct = sessions.insert(addr, now).is_none();
@@ -990,19 +1029,26 @@ impl DialFailureCache {
         let addr = Self::canon_key(*addr);
         self.entries.remove(&addr);
         self.ip_failures.remove(&addr.ip());
+        self.exempt.remove(&addr);
     }
 
-    /// Clear only the per-address failure for `addr`, used when its owner
-    /// re-attests it via an applied `PublishAddressSet`.
+    /// Mark `addr` as freshly re-attested by its owner via an applied
+    /// `PublishAddressSet` (ADR-011 self-heal).
     ///
-    /// Unlike [`Self::clear`], this deliberately does NOT lift IP-level
-    /// suppression: a re-publish proves the owner re-attested this address, not
-    /// that *this* node can now reach the relay IP. Unrelated failed relay
-    /// sessions on the same IP therefore stay suppressed, and the re-attested
-    /// address itself remains IP-suppressed if the IP is over threshold.
-    fn clear_address(&self, addr: &SocketAddr) {
+    /// Clears the address's own per-address failure and grants it a short,
+    /// per-socket exemption from IP-level suppression (see
+    /// [`DIAL_FAILURE_PUBLISH_EXEMPTION_TTL`]) so the exact reclaimed stable port
+    /// is retried promptly rather than waiting out the IP-tier TTL. Deliberately
+    /// does NOT touch the IP-level failure set: a re-publish proves the owner
+    /// re-attested this address, not that *this* node can reach the relay IP, so
+    /// other dead sessions on the same IP stay suppressed. Stale exemptions are
+    /// pruned here to keep the map bounded.
+    fn note_republished(&self, addr: &SocketAddr) {
         let addr = Self::canon_key(*addr);
         self.entries.remove(&addr);
+        self.exempt
+            .retain(|_, at| at.elapsed() < DIAL_FAILURE_PUBLISH_EXEMPTION_TTL);
+        self.exempt.insert(addr, Instant::now());
     }
 }
 
@@ -1024,9 +1070,10 @@ fn clear_dial_failures_for_published(
     let mut cleared = 0;
     for (addr, _ty) in addresses {
         if let Some(socket_addr) = addr.dialable_socket_addr() {
-            // Per-address only: re-attestation must not lift IP-level relay
-            // suppression (that requires a real dial success, not a republish).
-            cache.clear_address(&socket_addr);
+            // Clears this address's own failure and grants it a short per-socket
+            // exemption from IP suppression — but never lifts IP-level relay
+            // suppression for other sessions (that needs a real dial success).
+            cache.note_republished(&socket_addr);
             cleared += 1;
         }
     }
@@ -6932,6 +6979,54 @@ mod tests {
         assert!(
             cache.is_failed(&socks[1], AddressType::Relay),
             "another failed relay session on the same IP stays suppressed"
+        );
+    }
+
+    #[test]
+    fn publish_self_heal_exempts_reattested_address_from_ip_suppression() {
+        let cache = DialFailureCache::new();
+        // Suppress a relay IP with distinct dead sessions.
+        let mut socks = Vec::new();
+        for port in 9001..9001 + DIAL_FAILURE_IP_SUPPRESS_THRESHOLD as u16 {
+            let sa = sock(&format!("198.51.100.9:{port}"));
+            cache.record_failure(sa, AddressType::Relay);
+            socks.push(sa);
+        }
+        let ip = socks[0].ip();
+        assert!(cache.ip_is_suppressed(&ip));
+        // Before re-attestation the exact address is suppressed.
+        assert!(cache.is_failed(&socks[0], AddressType::Relay));
+
+        // Its owner reclaims and re-attests it via an applied publish.
+        let addrs = vec![(crate::MultiAddr::quic(socks[0]), AddressType::Relay)];
+        assert_eq!(clear_dial_failures_for_published(&cache, true, &addrs), 1);
+
+        // The exact re-attested socket is now dialable despite the IP staying
+        // suppressed for the other dead sessions — ADR-011 self-heal can retry it
+        // immediately instead of waiting out the IP-tier TTL.
+        assert!(
+            !cache.is_failed(&socks[0], AddressType::Relay),
+            "re-attested stable address must bypass IP-tier suppression"
+        );
+        assert!(
+            cache.ip_is_suppressed(&ip),
+            "IP tier stays suppressed for the unrelated dead sessions"
+        );
+        assert!(
+            cache.is_failed(&socks[1], AddressType::Relay),
+            "an unrelated dead session on the same IP is still suppressed"
+        );
+
+        // The exemption is idempotent across repeated checks within the window
+        // (the dial-plan predicate and the dial itself both see it).
+        assert!(!cache.is_failed(&socks[0], AddressType::Relay));
+
+        // A fresh failure of the re-attested address ends the exemption, so it
+        // does not mask a genuinely dead address.
+        cache.record_failure(socks[0], AddressType::Relay);
+        assert!(
+            cache.is_failed(&socks[0], AddressType::Relay),
+            "a fresh failure re-suppresses the address"
         );
     }
 
