@@ -3048,7 +3048,12 @@ impl DhtCoreEngine {
         candidate_ips: &[IpAddr],
         trust_score: &impl Fn(&PeerId) -> f64,
     ) -> Result<Vec<RoutingTableEvent>> {
-        self.check_new_peer_admission(&candidate.id, trust_score(&candidate.id))?;
+        let candidate_id = candidate.id;
+        let candidate_trust_score = trust_score(&candidate_id);
+        let peer_already_known = self.has_node(&candidate_id).await;
+        if !peer_already_known {
+            self.check_new_peer_admission(&candidate_id, candidate_trust_score)?;
+        }
         let mut routing = self.routing_table.write().await;
         match self.add_with_diversity(&mut routing, candidate, candidate_ips, trust_score, false)? {
             AdmissionResult::Admitted(events) => Ok(events),
@@ -4541,6 +4546,46 @@ mod tests {
         assert!(
             result.is_err(),
             "low-trust candidate should be rejected via re-evaluate"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_re_evaluate_updates_existing_peer_below_readmit_threshold() {
+        let mut dht = DhtCoreEngine::new(
+            PeerId::from_bytes([0u8; 32]),
+            20,
+            false,
+            DEFAULT_SWAP_THRESHOLD,
+        )
+        .unwrap();
+        dht.set_trust_quarantine_thresholds(0.20, 0.45).unwrap();
+
+        let mut id = [0u8; 32];
+        id[0] = 0x80;
+        let peer = PeerId::from_bytes(id);
+        dht.add_node_no_trust(make_node_with_addr(id, "/ip4/10.0.0.1/udp/9000/quic"))
+            .await
+            .unwrap();
+
+        let candidate = make_node_with_addr(id, "/ip4/10.0.0.2/udp/9000/quic");
+        let candidate_ips = vec!["10.0.0.2".parse().unwrap()];
+
+        let events = dht
+            .re_evaluate_admission(candidate, &candidate_ips, &|id| {
+                if *id == peer { 0.30 } else { 0.5 }
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            events.is_empty(),
+            "existing peer update should not emit a second admission event"
+        );
+        assert!(dht.has_node(&peer).await);
+        assert!(
+            dht.get_node_addresses(&peer)
+                .await
+                .contains(&"/ip4/10.0.0.2/udp/9000/quic".parse().unwrap())
         );
     }
 
