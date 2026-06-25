@@ -4751,11 +4751,18 @@ impl DhtNetworkManager {
             };
 
             match result {
-                Ok(rt_events) => {
-                    info!(
-                        "Added peer {} to DHT routing table after stale revalidation",
-                        app_peer_id_hex
-                    );
+                Ok((rt_events, candidate_admitted)) => {
+                    if candidate_admitted {
+                        info!(
+                            "Added peer {} to DHT routing table after stale revalidation",
+                            app_peer_id_hex
+                        );
+                    } else {
+                        info!(
+                            "Stale revalidation removed stale peers; peer {} was not admitted",
+                            app_peer_id_hex
+                        );
+                    }
                     this.broadcast_routing_events_with_quarantine(rt_events)
                         .await;
                 }
@@ -4926,7 +4933,7 @@ impl DhtNetworkManager {
         bucket_idx: usize,
         stale_peers: Vec<(PeerId, usize)>,
         trust_fn: &impl Fn(&PeerId) -> f64,
-    ) -> anyhow::Result<Vec<RoutingTableEvent>> {
+    ) -> anyhow::Result<(Vec<RoutingTableEvent>, bool)> {
         if stale_peers.is_empty() {
             return Err(anyhow::anyhow!("no stale peers to revalidate"));
         }
@@ -5001,12 +5008,27 @@ impl DhtNetworkManager {
             all_events.extend(removal_events);
         }
 
-        let admission_events = dht
+        let candidate_id = candidate.id;
+        let candidate_admitted = match dht
             .re_evaluate_admission(candidate, &candidate_ips, trust_fn)
-            .await?;
-        all_events.extend(admission_events);
+            .await
+        {
+            Ok(admission_events) => {
+                all_events.extend(admission_events);
+                true
+            }
+            Err(err) if !all_events.is_empty() => {
+                warn!(
+                    "Candidate {} was not admitted after stale-peer eviction: {}; broadcasting committed removal events",
+                    candidate_id.to_hex(),
+                    err
+                );
+                false
+            }
+            Err(err) => return Err(err),
+        };
 
-        Ok(all_events)
+        Ok((all_events, candidate_admitted))
     }
 
     /// Ping a peer to check liveness.
