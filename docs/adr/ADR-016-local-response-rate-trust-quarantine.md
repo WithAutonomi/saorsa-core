@@ -1,4 +1,4 @@
-# ADR-016: Local response-rate trust quarantine for DHT routing
+# ADR-016: Local Response-Rate Trust Quarantine for DHT Routing
 
 ## Status
 
