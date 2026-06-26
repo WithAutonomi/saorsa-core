@@ -185,6 +185,15 @@ impl NodeIdentity {
         self.secret_key.as_bytes()
     }
 
+    /// Get the ML-DSA-65 secret key.
+    ///
+    /// Used to seed the transport endpoint's TLS identity so a node presents its
+    /// *persistent* fingerprint across restarts (ADR-011), rather than a fresh
+    /// per-process key.
+    pub fn secret_key(&self) -> &MlDsaSecretKey {
+        &self.secret_key
+    }
+
     /// Sign a message
     pub fn sign(&self, message: &[u8]) -> Result<MlDsaSignature> {
         crate::quantum_crypto::ml_dsa_sign(&self.secret_key, message).map_err(|e| {

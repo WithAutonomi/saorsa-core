@@ -417,6 +417,14 @@ impl TransportHandle {
                 config.allow_loopback,
                 config.enable_relay_service,
                 config.advertise_external_addresses,
+                // ADR-011: seed the transport TLS identity with the node's
+                // persistent ML-DSA key so the relay-authenticated fingerprint
+                // is stable across restarts (the on-disk node_identity, not a
+                // fresh per-process key).
+                Some((
+                    config.node_identity.public_key().clone(),
+                    config.node_identity.secret_key().clone(),
+                )),
             )
             .await
             .map_err(|e| {

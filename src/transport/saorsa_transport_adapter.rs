@@ -60,6 +60,7 @@ use saorsa_transport::{
 };
 
 // Import saorsa-transport types for SharedTransport integration
+use crate::quantum_crypto::saorsa_transport_integration::{MlDsaPublicKey, MlDsaSecretKey};
 use futures::StreamExt;
 use saorsa_transport::SharedTransport;
 use saorsa_transport::link_transport::StreamType;
@@ -506,7 +507,16 @@ impl P2PNetworkNode<P2pLinkTransport> {
         max_connections: usize,
         max_msg_size: Option<usize>,
     ) -> Result<Self> {
-        Self::new_with_options(bind_addr, max_connections, max_msg_size, false, true, true).await
+        Self::new_with_options(
+            bind_addr,
+            max_connections,
+            max_msg_size,
+            false,
+            true,
+            true,
+            None,
+        )
+        .await
     }
 
     /// Create a new P2P network node with full control over connection
@@ -519,6 +529,7 @@ impl P2PNetworkNode<P2pLinkTransport> {
         allow_loopback: bool,
         enable_relay_service: bool,
         advertise_external_addresses: bool,
+        keypair: Option<(MlDsaPublicKey, MlDsaSecretKey)>,
     ) -> Result<Self> {
         let mut builder = P2pConfig::builder()
             .bind_addr(bind_addr)
@@ -533,6 +544,13 @@ impl P2PNetworkNode<P2pLinkTransport> {
             });
         if let Some(max_msg_size) = max_msg_size {
             builder = builder.max_message_size(max_msg_size);
+        }
+        // Use the node's persistent ML-DSA identity for the transport TLS cert
+        // when provided, so the relay-authenticated fingerprint is stable across
+        // restarts (ADR-011). Without it the endpoint generates a fresh keypair
+        // each process start.
+        if let Some((public_key, secret_key)) = keypair {
+            builder = builder.keypair(public_key, secret_key);
         }
         let config = builder
             .build()
@@ -1761,6 +1779,7 @@ impl DualStackNetworkNode<P2pLinkTransport> {
             false,
             true,
             true,
+            None,
         )
         .await
     }
@@ -1776,7 +1795,10 @@ impl DualStackNetworkNode<P2pLinkTransport> {
         allow_loopback: bool,
         enable_relay_service: bool,
         advertise_external_addresses: bool,
+        keypair: Option<(MlDsaPublicKey, MlDsaSecretKey)>,
     ) -> Result<Self> {
+        // Both the v4 and v6 endpoints present the node's single persistent
+        // identity (ADR-011), so the same keypair is used for each.
         let v6 = if let Some(addr) = v6_addr {
             Some(
                 P2PNetworkNode::new_with_options(
@@ -1786,6 +1808,7 @@ impl DualStackNetworkNode<P2pLinkTransport> {
                     allow_loopback,
                     enable_relay_service,
                     advertise_external_addresses,
+                    keypair.clone(),
                 )
                 .await?,
             )
@@ -1800,6 +1823,7 @@ impl DualStackNetworkNode<P2pLinkTransport> {
                 allow_loopback,
                 enable_relay_service,
                 advertise_external_addresses,
+                keypair,
             )
             .await
             {
