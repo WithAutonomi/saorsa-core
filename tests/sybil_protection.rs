@@ -13,9 +13,9 @@
 
 //! Integration tests for trust-based peer management (sybil protection).
 //!
-//! These tests verify that low-trust peers are NOT blocked from `send_request`
-//! (the lazy swap-out model only replaces them during routing table admission).
-//! Trust scores are still tracked and affect routing table swap-out decisions.
+//! These tests verify that low-trust peers are NOT blocked from explicit
+//! `send_request` calls. Trust scores are still tracked and affect routing
+//! table swap-out, close-group quarantine, and automatic lookup decisions.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -158,6 +158,7 @@ async fn custom_swap_threshold_accepted() {
         .ipv6(false)
         .adaptive_dht_config(AdaptiveDhtConfig {
             swap_threshold: custom_threshold,
+            ..Default::default()
         })
         .build()
         .unwrap();

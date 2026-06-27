@@ -11,9 +11,9 @@ responsibility via `TrustEvent::ApplicationSuccess`.
 
 The trust system enables:
 - **Sybil resistance**: Malicious nodes are downscored automatically
-- **Binary blocking**: Peers below the block threshold are evicted and rejected
-- **Self-healing**: Time decay moves blocked peers back toward neutral over days
-- **Live eviction**: Peers below trust threshold are evicted from the routing table immediately
+- **Close-group quarantine**: K-closest peers below the quarantine threshold are evicted when the routing table can retain at least K peers
+- **Self-healing**: Time decay moves quarantined peers back toward neutral over days
+- **Lazy swap-out**: Low-trust peers outside the close group are replaced when better candidates arrive
 
 ## Quick Start
 
@@ -76,23 +76,38 @@ are not rewarded.
 
 Note: Peer disconnects are normal connection lifecycle — they do not affect trust.
 
-## Peer Blocking
+## Trust Thresholds
 
-Peers whose trust score falls below `block_threshold` are:
-- **Evicted** from the DHT routing table (via EvictionManager)
-- **Blocked** from sending DHT messages (silently dropped)
-- **Rejected** from re-entering the routing table on reconnect
+The routing table uses three trust thresholds:
+
+- `swap_threshold` (`0.35` by default): peers below this score are eligible
+  for replacement when a better candidate needs the slot.
+- `quarantine_threshold` (`0.20` by default): peers below this score are
+  skipped by lookup result selection and automatic lookup/dial paths. If such
+  a peer is currently in the K-closest-to-self set, it is evicted and
+  quarantined when the routing table can retain at least K peers.
+- `quarantine_readmit_threshold` (`0.45` by default): a quarantined peer can
+  only re-enter through normal discovery/admission after its decayed trust
+  reaches this score. New peers must also meet this threshold before entering
+  the routing table. Existing routing-table peers between `0.20` and `0.45`
+  may remain in the table, including after moving into the close group.
 
 ```rust
 use saorsa_core::AdaptiveDhtConfig;
 
 let config = AdaptiveDhtConfig {
-    block_threshold: 0.15,  // Block peers below 15% trust
+    swap_threshold: 0.35,
+    quarantine_threshold: 0.20,
+    quarantine_readmit_threshold: 0.45,
     ..Default::default()
 };
 ```
 
-DHT routing uses pure Kademlia XOR distance — trust does not influence peer selection order.
+Raw DHT routing uses Kademlia XOR distance. Local lookup results, FIND_NODE
+responses, and automatic network lookups avoid quarantined peers so known-bad
+contacts do not consume query slots or get handed out as lookup candidates.
+This filtering is local policy only; the DHT wire protocol and legacy
+`DHTNode` fields remain unchanged for backwards compatibility with older nodes.
 
 ## Architecture
 
