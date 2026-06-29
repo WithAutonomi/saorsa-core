@@ -27,6 +27,12 @@ use crate::{
     dht::{AdmissionResult, DhtCoreEngine, DhtKey, Key, RoutingTableEvent},
     error::{DhtError, IdentityError, NetworkError},
     network::{NodeConfig, NodeMode},
+    rate_limit::{Engine, SharedEngine},
+    reachability::canary::{
+        RELAY_CANARY_HANDLER_TIMEOUT, RELAY_CANARY_PROTOCOL, RELAY_CANARY_WIRE_TOPIC,
+        RelayCanaryProbeResult, RelayCanaryRequest, RelayCanaryResponse,
+        answer_relay_canary_request, relay_canary_rate_limit_config, validate_relay_canary_request,
+    },
     security::canonicalize_ip,
     self_address::build_self_address_set,
 };
@@ -749,6 +755,12 @@ pub struct DhtNetworkManager {
     /// Self-lookups and foreground/payment/user lookup calls do not use this
     /// semaphore.
     bucket_refresh_lookup_semaphore: Arc<Semaphore>,
+    /// Per-source relay canary rate limiter.
+    ///
+    /// Answering a canary request triggers a cold relay dial, so each
+    /// authenticated source is throttled (see [`relay_canary_rate_limit_config`])
+    /// to stop a peer using this node as a reflection/amplification dialer.
+    relay_canary_rate_limiter: SharedEngine<PeerId>,
     /// Shutdown token for background tasks
     shutdown: CancellationToken,
     /// Handle for the network event handler task
@@ -1759,6 +1771,7 @@ impl DhtNetworkManager {
             identity_failure_cache: Arc::new(IdentityFailureCache::new()),
             pending_peer_dials: Arc::new(DashMap::new()),
             lookup_failures: Arc::new(LookupFailureCoordinator::new()),
+            relay_canary_rate_limiter: Arc::new(Engine::new(relay_canary_rate_limit_config())),
         })
     }
 
@@ -4413,6 +4426,116 @@ impl DhtNetworkManager {
         self.send_dht_request(peer_id, operation, None).await
     }
 
+    /// Ask a peer to cold-dial a freshly acquired relay address.
+    ///
+    /// This intentionally uses the generic request/response transport rather
+    /// than adding a DHT operation: the canary is a reachability proof for the
+    /// acquisition driver, not routing-table state.
+    pub(crate) async fn send_relay_canary_request(
+        &self,
+        peer_id: &PeerId,
+        candidates: &[(MultiAddr, AddressType)],
+        request: RelayCanaryRequest,
+        timeout: Duration,
+    ) -> Result<RelayCanaryResponse> {
+        self.ensure_peer_channel(peer_id, candidates).await?;
+
+        let request_bytes = postcard::to_stdvec(&request)
+            .map_err(|e| P2PError::Serialization(e.to_string().into()))?;
+        let response = self
+            .transport
+            .send_request(peer_id, RELAY_CANARY_PROTOCOL, request_bytes, timeout)
+            .await?;
+        postcard::from_bytes(&response.data)
+            .map_err(|e| P2PError::Serialization(e.to_string().into()))
+    }
+
+    async fn handle_relay_canary_message(&self, source_peer: PeerId, data: Vec<u8>) -> Result<()> {
+        if data.len() > MAX_MESSAGE_SIZE {
+            debug!(
+                "Ignoring oversized relay canary message from {source_peer}: {} bytes (max: {MAX_MESSAGE_SIZE})",
+                data.len()
+            );
+            return Ok(());
+        }
+
+        let Some((message_id, is_response, payload)) =
+            crate::transport_handle::TransportHandle::parse_request_envelope(&data)
+        else {
+            debug!(
+                peer = %source_peer.to_hex(),
+                "Ignoring malformed relay canary request envelope"
+            );
+            return Ok(());
+        };
+
+        if is_response {
+            trace!(
+                message_id = %message_id,
+                peer = %source_peer.to_hex(),
+                "Ignoring relay canary response in request handler"
+            );
+            return Ok(());
+        }
+
+        let request: RelayCanaryRequest = match postcard::from_bytes(&payload) {
+            Ok(request) => request,
+            Err(e) => {
+                debug!(
+                    peer = %source_peer.to_hex(),
+                    error = %e,
+                    "Ignoring malformed relay canary request payload"
+                );
+                return Ok(());
+            }
+        };
+        if let Err(reason) = validate_relay_canary_request(&source_peer, &request) {
+            debug!(
+                peer = %source_peer.to_hex(),
+                reason = %reason.summary(),
+                "Rejecting relay canary request"
+            );
+            return Ok(());
+        }
+        // Answering this request makes us cold-dial `relay_addr`, so throttle
+        // each authenticated source to stop a peer using this node as a
+        // reflection/amplification dialer toward an address of its choosing.
+        if !self.relay_canary_rate_limiter.try_consume_key(&source_peer) {
+            debug!(
+                peer = %source_peer.to_hex(),
+                "Throttling relay canary request from source"
+            );
+            let response = RelayCanaryResponse {
+                result: RelayCanaryProbeResult::WitnessRateLimited,
+            };
+            return self
+                .send_relay_canary_response(&source_peer, &message_id, response)
+                .await;
+        }
+
+        let response = answer_relay_canary_request(self.transport.as_ref(), request).await;
+        self.send_relay_canary_response(&source_peer, &message_id, response)
+            .await
+    }
+
+    async fn send_relay_canary_response(
+        &self,
+        source_peer: &PeerId,
+        message_id: &str,
+        response: RelayCanaryResponse,
+    ) -> Result<()> {
+        let response_bytes = postcard::to_stdvec(&response)
+            .map_err(|e| P2PError::Serialization(e.to_string().into()))?;
+        self.transport
+            .send_response(
+                source_peer,
+                RELAY_CANARY_PROTOCOL,
+                message_id,
+                response_bytes,
+            )
+            .await
+    }
+
     /// Handle DHT response message
     ///
     /// Delivers the response via oneshot channel to the waiting request coroutine.
@@ -4926,6 +5049,48 @@ impl DhtNetworkManager {
                                                 }
                                             }
                                             // _permit dropped here, releasing semaphore slot
+                                        });
+                                    } else if topic == RELAY_CANARY_WIRE_TOPIC {
+                                        // Relay canary requests must be authenticated so the
+                                        // response can be routed back through request/response.
+                                        let Some(source_peer) = source else {
+                                            warn!("Ignoring unsigned relay canary request");
+                                            continue;
+                                        };
+                                        let manager_clone = Arc::clone(&self_arc);
+                                        let semaphore = Arc::clone(&self_arc.message_handler_semaphore);
+                                        tokio::spawn(async move {
+                                            let _permit = match semaphore.acquire().await {
+                                                Ok(permit) => permit,
+                                                Err(_) => {
+                                                    warn!("Message handler semaphore closed");
+                                                    return;
+                                                }
+                                            };
+
+                                            match tokio::time::timeout(
+                                                RELAY_CANARY_HANDLER_TIMEOUT,
+                                                manager_clone
+                                                    .handle_relay_canary_message(source_peer, data),
+                                            )
+                                            .await
+                                            {
+                                                Ok(Ok(())) => {}
+                                                Ok(Err(e)) => {
+                                                    warn!(
+                                                        peer = %source_peer.to_hex(),
+                                                        error = %e,
+                                                        "Failed to handle relay canary request"
+                                                    );
+                                                }
+                                                Err(_) => {
+                                                    warn!(
+                                                        timeout = ?RELAY_CANARY_HANDLER_TIMEOUT,
+                                                        peer = %source_peer.to_hex(),
+                                                        "Relay canary request handler timed out"
+                                                    );
+                                                }
+                                            }
                                         });
                                     }
                                 }
