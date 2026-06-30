@@ -1036,22 +1036,128 @@ impl P2PNode {
         data: Vec<u8>,
         timeout: Duration,
     ) -> Result<PeerResponse> {
+        let result = self
+            .send_request_reconnecting(peer_id, protocol, data, timeout)
+            .await;
+        if let Err(ref e) = result {
+            let event = if matches!(e, P2PError::Timeout(_)) {
+                TrustEvent::ConnectionTimeout
+            } else {
+                TrustEvent::ConnectionFailed
+            };
+            self.report_trust_event(peer_id, event).await;
+        }
+        result
+    }
+
+    /// Request/response send with reconnect-on-demand.
+    ///
+    /// Mirrors [`Self::send_message`]: when there is no live channel to
+    /// `peer_id` it dials one (serialised per peer via
+    /// [`Self::reconnect_lock_for`]) before sending, and when an existing
+    /// channel turns out to be stale it tears it down, reconnects, and retries
+    /// the request exactly once. The plain transport `send_request` only sends
+    /// over a pre-existing channel and fails fast with `PeerNotFound`
+    /// otherwise; routing request/response through this reconnecting path means
+    /// a request to a peer whose QUIC connection has dropped (e.g. a periodic
+    /// audit of a close peer that idled out) re-establishes the connection
+    /// instead of surfacing as a spurious timeout.
+    ///
+    /// `timeout` bounds only the response wait inside the transport; the dial
+    /// is independently bounded by `connect_peer_typed` plus
+    /// [`IDENTITY_EXCHANGE_TIMEOUT`].
+    async fn send_request_reconnecting(
+        &self,
+        peer_id: &PeerId,
+        protocol: &str,
+        data: Vec<u8>,
+        timeout: Duration,
+    ) -> Result<PeerResponse> {
+        // Snapshot channel IDs before the send attempt — transport.send_request
+        // prunes dead channels from bookkeeping but does NOT close the
+        // underlying QUIC connection. We need the original IDs for
+        // disconnect_channel later.
+        let existing_channels = self.transport.channels_for_peer(peer_id).await;
+
+        // No live channel — serialise dials so concurrent requests to the same
+        // unconnected peer don't each open their own QUIC connection.
+        if existing_channels.is_empty() {
+            // Hold the per-peer reconnect lock only across the dial so
+            // concurrent requests to the same cold peer collapse onto one dial —
+            // not across the response wait, which would serialise every such
+            // request for the full `timeout`.
+            {
+                let lock = self.reconnect_lock_for(peer_id);
+                let _guard = lock.lock().await;
+                // Another caller may have connected while we waited for the lock.
+                if !self.transport.is_peer_connected(peer_id).await {
+                    self.ensure_channel(peer_id, &[], &[], &[]).await?;
+                }
+            }
+            return self
+                .transport
+                .send_request(peer_id, protocol, data, timeout)
+                .await;
+        }
+
+        // Snapshot addresses before the attempt — transport.send_request prunes
+        // stale channels, which removes peer_info.
+        let saved_addrs: Vec<MultiAddr> = self
+            .transport
+            .peer_info(peer_id)
+            .await
+            .map(|info| info.addresses)
+            .unwrap_or_default();
+
+        // Clone the payload for a possible retry — transport.send_request
+        // consumes the Vec, and only stale-channel failures are retried.
+        let retry_data = data.clone();
+
+        // Fast path: try the existing connection.
         match self
             .transport
             .send_request(peer_id, protocol, data, timeout)
             .await
         {
-            Ok(resp) => Ok(resp),
+            Ok(resp) => return Ok(resp),
             Err(e) => {
-                let event = if matches!(&e, P2PError::Timeout(_)) {
-                    TrustEvent::ConnectionTimeout
-                } else {
-                    TrustEvent::ConnectionFailed
-                };
-                self.report_trust_event(peer_id, event).await;
-                Err(e)
+                // A response-deadline timeout means the request WAS delivered
+                // but went unanswered — reconnecting would not help, so do not
+                // retry. Only a stale-channel send failure warrants a redial.
+                if !e.is_stale_channel_send_failure() {
+                    return Err(e);
+                }
+                debug!(
+                    peer = %peer_id.to_hex(),
+                    error = %e,
+                    "stale channel request failed, attempting reconnect",
+                );
             }
         }
+
+        // Serialise the reconnect (stale-channel teardown + dial) so concurrent
+        // requests to the same stale peer don't race to dial, but release the
+        // lock before the response wait so they don't serialise for the full
+        // `timeout`.
+        {
+            let lock = self.reconnect_lock_for(peer_id);
+            let _guard = lock.lock().await;
+
+            // Another caller may have reconnected while we waited for the lock.
+            if self.transport.is_peer_connected(peer_id).await {
+                // Close stale QUIC connections that transport.send_request's
+                // bookkeeping cleanup didn't tear down (it only drops the mapping).
+                for channel_id in &existing_channels {
+                    self.transport.disconnect_channel(channel_id).await;
+                }
+            } else {
+                self.ensure_channel(peer_id, &[], &saved_addrs, &existing_channels)
+                    .await?;
+            }
+        }
+        self.transport
+            .send_request(peer_id, protocol, retry_data, timeout)
+            .await
     }
 
     pub async fn send_response(
@@ -1573,12 +1679,23 @@ impl P2PNode {
         .await
     }
 
-    /// Tear down stale channels, reconnect to a peer, and send a message.
-    async fn reconnect_and_send(
+    /// Ensure an identity-authenticated channel to `peer_id` exists, dialing a
+    /// fresh connection when necessary.
+    ///
+    /// Resolves a dial address (caller-provided > saved > DHT routing table),
+    /// tears down any stale channels, dials, waits for the identity exchange,
+    /// and verifies the authenticated peer matches `peer_id`. On success the
+    /// transport's `peer_to_channel` map is populated, so a subsequent
+    /// `send_message` / `send_request` finds the channel instead of failing
+    /// with `PeerNotFound`. Returns `PeerNotFound` when no dialable address is
+    /// available.
+    ///
+    /// Shared by [`Self::reconnect_and_send`] and
+    /// [`Self::send_request_reconnecting`] so both gain identical dial
+    /// behaviour.
+    async fn ensure_channel(
         &self,
         peer_id: &PeerId,
-        protocol: &str,
-        data: Vec<u8>,
         addrs: &[MultiAddr],
         saved_addrs: &[MultiAddr],
         stale_channels: &[String],
@@ -1627,6 +1744,21 @@ impl P2PNode {
             }));
         }
 
+        Ok(())
+    }
+
+    /// Tear down stale channels, reconnect to a peer, and send a message.
+    async fn reconnect_and_send(
+        &self,
+        peer_id: &PeerId,
+        protocol: &str,
+        data: Vec<u8>,
+        addrs: &[MultiAddr],
+        saved_addrs: &[MultiAddr],
+        stale_channels: &[String],
+    ) -> Result<()> {
+        self.ensure_channel(peer_id, addrs, saved_addrs, stale_channels)
+            .await?;
         // Send on the fresh connection.
         self.transport.send_message(peer_id, protocol, data).await
     }
