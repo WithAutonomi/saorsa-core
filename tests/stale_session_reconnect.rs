@@ -13,15 +13,15 @@
 
 //! Integration test: stale QUIC session recovery.
 //!
-//! Verifies that `send_message` transparently reconnects when the underlying
-//! QUIC connection is dead but the channel bookkeeping still considers it
-//! alive.  This exercises the reconnect-and-retry path in
-//! `P2PNode::send_message`.
+//! Verifies that `send_message` and `send_request` transparently reconnect when
+//! the underlying QUIC connection is dead but the channel bookkeeping still
+//! considers it alive.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use saorsa_core::{NodeConfig, P2PNode, PeerId};
+use saorsa_core::{NodeConfig, P2PEvent, P2PNode, PeerId};
 use std::time::Duration;
+use tokio::sync::broadcast;
 use tokio::time::timeout;
 
 /// Maximum time to wait for node_b to recognise node_a after initial dial.
@@ -32,6 +32,30 @@ const QUIC_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Polling interval when waiting for bilateral connection.
 const CONNECT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Time to wait for QUIC close propagation before sending on stale local state.
+const QUIC_CLOSE_PROPAGATION_GRACE: Duration = Duration::from_millis(200);
+
+/// Outer bound for reconnecting request/response operations in this test.
+const REQUEST_RECONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Response deadline passed into `send_request`.
+const REQUEST_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Maximum time for the responder to observe an incoming request event.
+const RESPONDER_EVENT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Request/response application protocol used by stale-session tests.
+const REQUEST_PROTOCOL: &str = "test_echo";
+
+/// Wire topic emitted for request/response messages on `REQUEST_PROTOCOL`.
+const REQUEST_TOPIC: &str = "/rr/test_echo";
+
+/// Payload sent after the stale channel is detected.
+const REQUEST_AFTER_DISCONNECT: &[u8] = b"request after disconnect";
+
+/// Response payload returned by the target after reconnect.
+const RESPONSE_AFTER_RECONNECT: &[u8] = b"response after reconnect";
 
 /// Helper: local loopback, ephemeral port, IPv4-only config.
 fn test_config() -> NodeConfig {
@@ -108,6 +132,57 @@ async fn connected_pair() -> (P2PNode, PeerId, P2PNode, PeerId) {
     (node_a, peer_a, node_b, peer_b)
 }
 
+async fn respond_to_next_request(
+    node: &P2PNode,
+    requester: PeerId,
+    expected_payload: &[u8],
+    response_payload: &[u8],
+    events_rx: &mut broadcast::Receiver<P2PEvent>,
+) {
+    let response_result = timeout(RESPONDER_EVENT_TIMEOUT, async {
+        loop {
+            let event = events_rx
+                .recv()
+                .await
+                .expect("event stream should stay open");
+            let P2PEvent::Message {
+                topic,
+                source,
+                data,
+                ..
+            } = event
+            else {
+                continue;
+            };
+
+            if topic != REQUEST_TOPIC || source != Some(requester) {
+                continue;
+            }
+
+            let (message_id, is_response, payload) = P2PNode::parse_request_envelope(&data)
+                .expect("request/response envelope should parse");
+            assert!(!is_response, "responder should receive a request envelope");
+            assert_eq!(payload, expected_payload);
+
+            node.send_response(
+                &requester,
+                REQUEST_PROTOCOL,
+                &message_id,
+                response_payload.to_vec(),
+            )
+            .await
+            .expect("send_response should succeed");
+            break;
+        }
+    })
+    .await;
+    assert!(
+        response_result.is_ok(),
+        "responder should receive request within {:?}",
+        RESPONDER_EVENT_TIMEOUT,
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Target-side disconnect (the common real-world scenario)
 // ---------------------------------------------------------------------------
@@ -138,7 +213,7 @@ async fn send_recovers_when_target_drops_connection() {
     node_b.disconnect_peer(&peer_a).await.unwrap();
 
     // Brief pause so the QUIC close propagates at the transport level.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    tokio::time::sleep(QUIC_CLOSE_PROPAGATION_GRACE).await;
 
     // node_a still thinks it's connected, but the next send should fail on
     // the dead QUIC session, trigger reconnect, and succeed on a fresh
@@ -154,6 +229,51 @@ async fn send_recovers_when_target_drops_connection() {
         "send_message should recover after target drops connection: {:?}",
         post_result.unwrap_err()
     );
+
+    node_a.stop().await.unwrap();
+    node_b.stop().await.unwrap();
+}
+
+/// `send_request` should also detect the stale channel, reconnect, deliver the
+/// request, and route the response back to the original caller.
+#[tokio::test]
+async fn send_request_recovers_when_target_drops_connection() {
+    let (node_a, peer_a, node_b, peer_b) = connected_pair().await;
+    let mut events_rx = node_b.subscribe_events();
+
+    node_b.disconnect_peer(&peer_a).await.unwrap();
+    tokio::time::sleep(QUIC_CLOSE_PROPAGATION_GRACE).await;
+
+    let request = timeout(
+        REQUEST_RECONNECT_TIMEOUT,
+        node_a.send_request(
+            &peer_b,
+            REQUEST_PROTOCOL,
+            REQUEST_AFTER_DISCONNECT.to_vec(),
+            REQUEST_RESPONSE_TIMEOUT,
+        ),
+    );
+    let responder = respond_to_next_request(
+        &node_b,
+        peer_a,
+        REQUEST_AFTER_DISCONNECT,
+        RESPONSE_AFTER_RECONNECT,
+        &mut events_rx,
+    );
+
+    tokio::pin!(request);
+    tokio::pin!(responder);
+
+    let request_result = tokio::select! {
+        result = &mut request => result,
+        () = &mut responder => request.await,
+    };
+    let response = request_result
+        .expect("send_request should not exceed outer reconnect timeout")
+        .expect("send_request should recover after target drops connection");
+
+    assert_eq!(response.peer_id, peer_b);
+    assert_eq!(response.data, RESPONSE_AFTER_RECONNECT);
 
     node_a.stop().await.unwrap();
     node_b.stop().await.unwrap();
