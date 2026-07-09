@@ -208,6 +208,15 @@ const DEFAULT_SWAP_THRESHOLD: f64 = 0.35;
 #[allow(dead_code)]
 const DEFAULT_QUARANTINE_THRESHOLD: f64 = 0.20;
 
+/// Immediate close-group eviction is disabled until trust scoring is stable.
+///
+/// Low-trust peers remain eligible for lazy swap-out through
+/// [`DhtCoreEngine::add_node`], but existing close-group peers are not evicted
+/// solely because their score drops below the quarantine threshold.
+fn close_group_immediate_eviction_enabled() -> bool {
+    false
+}
+
 /// Default trust score required for new routing-table admission/readmission.
 #[allow(dead_code)]
 const DEFAULT_QUARANTINE_READMIT_THRESHOLD: f64 = 0.45;
@@ -1525,8 +1534,7 @@ pub struct DhtCoreEngine {
     swap_threshold: f64,
 
     /// Trust score below which a peer is avoided for automatic lookup/dial
-    /// paths, and evicted if it is in the K-closest close group and the
-    /// routing table can keep at least K peers.
+    /// paths.
     quarantine_threshold: f64,
 
     /// Trust score required before a new peer can enter the routing table, and
@@ -1598,9 +1606,7 @@ impl DhtCoreEngine {
     /// Configure trust quarantine thresholds.
     ///
     /// A `quarantine_threshold` of `0.0` disables quarantine enforcement.
-    /// Otherwise, peers below that score are avoided for automatic lookups,
-    /// and K-closest peers below it are evicted and quarantined when the
-    /// routing table can keep at least K peers.
+    /// Otherwise, peers below that score are avoided for automatic lookups.
     /// Quarantined peers can only re-enter through normal admission after
     /// their decayed trust reaches `quarantine_readmit_threshold`; new peers
     /// must also meet that threshold before entering the routing table.
@@ -1664,7 +1670,7 @@ impl DhtCoreEngine {
     }
 
     #[cfg(test)]
-    fn remember_quarantined_peer(
+    pub(crate) fn remember_quarantined_peer(
         &mut self,
         peer_id: PeerId,
         trust_score: &impl Fn(&PeerId) -> f64,
@@ -1790,12 +1796,20 @@ impl DhtCoreEngine {
 
     /// Evict a quarantined peer if it currently occupies the K-closest set and
     /// removal will not shrink the routing table below K peers.
+    ///
+    /// Temporarily disabled until trust scoring is considered stable. Low-trust
+    /// peers continue to leave through lazy swap-out when better candidates are
+    /// admitted.
     #[cfg(test)]
     pub(crate) async fn enforce_close_group_quarantine(
         &mut self,
         peer_id: &PeerId,
         trust_score: f64,
     ) -> Vec<RoutingTableEvent> {
+        if !close_group_immediate_eviction_enabled() {
+            return Vec::new();
+        }
+
         if !self.quarantine_enabled()
             || !trust_score.is_finite()
             || trust_score >= self.quarantine_threshold
@@ -1846,15 +1860,17 @@ impl DhtCoreEngine {
 
     /// Enforce trust gates over the current K-closest set.
     ///
-    /// Peers below the quarantine threshold are evicted from the close group
-    /// while the routing table has more than K entries. Peers already in the
-    /// routing table may move into the close group as long as they are not
-    /// below the quarantine threshold, and low-trust close-group peers are
-    /// retained rather than shrinking the routing table below K entries.
+    /// Temporarily leaves close-group peers in place even when they are below
+    /// the quarantine threshold. Lazy swap-out remains responsible for
+    /// replacing low-trust peers when better candidates arrive.
     pub(crate) async fn enforce_close_group_trust_gate(
         &mut self,
         trust_score: &impl Fn(&PeerId) -> f64,
     ) -> Vec<RoutingTableEvent> {
+        if !close_group_immediate_eviction_enabled() {
+            return Vec::new();
+        }
+
         if !self.quarantine_enabled() {
             return Vec::new();
         }
@@ -5366,11 +5382,10 @@ mod tests {
         assert!(dht.has_node(&low_peer).await);
     }
 
-    /// A K-closest peer below the quarantine threshold is evicted when the
-    /// routing table has surplus above K and cannot be readmitted until its
-    /// trust has recovered to the readmit threshold.
+    /// A K-closest peer below the quarantine threshold is retained while
+    /// immediate close-group eviction is disabled.
     #[tokio::test]
-    async fn test_close_group_peer_below_quarantine_is_evicted_until_readmit() {
+    async fn test_close_group_peer_below_quarantine_is_not_immediately_evicted() {
         let mut dht = DhtCoreEngine::new(
             PeerId::from_bytes([0u8; 32]),
             SMALL_TEST_K,
@@ -5407,26 +5422,29 @@ mod tests {
 
         let events = dht.enforce_close_group_quarantine(&peer, 0.19).await;
         assert!(
-            events
-                .iter()
-                .any(|event| matches!(event, RoutingTableEvent::PeerRemoved(id) if *id == peer)),
-            "close-group peer below quarantine threshold should emit PeerRemoved"
+            events.is_empty(),
+            "close-group peer below quarantine threshold should not be immediately evicted"
         );
         assert!(
-            !dht.has_node(&peer).await,
-            "quarantined close-group peer should be removed from RT"
+            dht.has_node(&peer).await,
+            "close-group peer should remain in RT while immediate eviction is disabled"
         );
-        assert_eq!(dht.routing_table_size().await, SMALL_TEST_K);
+        assert_eq!(dht.routing_table_size().await, SMALL_TEST_K + 1);
+        assert!(
+            dht.should_avoid_for_lookup(&peer, 0.19),
+            "retained low-trust peer should still be avoided by lookup policy"
+        );
 
-        let early_readmit = dht
+        dht.remove_node_by_id(&peer).await;
+        let below_admission = dht
             .add_node(
                 make_node_with_addr(peer_id_bytes, "/ip4/10.10.0.1/udp/9000/quic"),
                 &|id| if *id == peer { 0.30 } else { 0.5 },
             )
             .await;
         assert!(
-            early_readmit.is_err(),
-            "quarantined peer should not readmit below 0.45"
+            below_admission.is_err(),
+            "removed peer should not readmit below 0.45"
         );
 
         let recovered = dht
@@ -5437,7 +5455,7 @@ mod tests {
             .await;
         assert!(
             recovered.is_ok(),
-            "quarantined peer should readmit once trust reaches 0.45"
+            "removed peer should readmit once trust reaches 0.45"
         );
         assert!(dht.has_node(&peer).await);
     }
@@ -5485,10 +5503,10 @@ mod tests {
         );
     }
 
-    /// Once a new routing-table peer creates surplus above K, a previously
-    /// deferred close-group quarantine can remove the low-trust peer.
+    /// Once a new routing-table peer creates surplus above K, a low-trust
+    /// close-group peer is still retained while immediate eviction is disabled.
     #[tokio::test]
-    async fn test_new_peer_surplus_allows_deferred_close_group_quarantine() {
+    async fn test_new_peer_surplus_does_not_trigger_close_group_quarantine() {
         let mut dht = DhtCoreEngine::new(
             PeerId::from_bytes([0u8; 32]),
             SMALL_TEST_K,
@@ -5532,13 +5550,11 @@ mod tests {
             .enforce_close_group_trust_gate(&|id| if *id == low_peer { 0.10 } else { 0.5 })
             .await;
         assert!(
-            events.iter().any(
-                |event| matches!(event, RoutingTableEvent::PeerRemoved(id) if *id == low_peer)
-            ),
-            "surplus peer should allow deferred close-group quarantine"
+            events.is_empty(),
+            "surplus peer should not trigger close-group quarantine while immediate eviction is disabled"
         );
-        assert_eq!(dht.routing_table_size().await, SMALL_TEST_K);
-        assert!(!dht.has_node(&low_peer).await);
+        assert_eq!(dht.routing_table_size().await, SMALL_TEST_K + 1);
+        assert!(dht.has_node(&low_peer).await);
     }
 
     #[test]
@@ -5748,8 +5764,8 @@ mod tests {
     /// Removing one close peer can promote a non-close peer into the close
     /// group. Existing routing-table peers above the quarantine threshold stay
     /// even when below the new-peer admission threshold; peers below the
-    /// quarantine threshold are removed once the routing table has surplus
-    /// above K.
+    /// quarantine threshold are also retained while immediate eviction is
+    /// disabled.
     #[tokio::test]
     async fn test_close_group_gate_allows_existing_promotions_above_quarantine() {
         let mut dht = DhtCoreEngine::new(
@@ -5843,12 +5859,10 @@ mod tests {
             })
             .await;
         assert!(
-            quarantine_events.iter().any(
-                |event| matches!(event, RoutingTableEvent::PeerRemoved(id) if *id == promoted_peer)
-            ),
-            "existing promoted peer below quarantine threshold should be removed once there is surplus"
+            quarantine_events.is_empty(),
+            "existing promoted peer below quarantine threshold should stay even when there is surplus"
         );
-        assert!(!dht.has_node(&promoted_peer).await);
+        assert!(dht.has_node(&promoted_peer).await);
     }
 
     /// A non-close peer below the quarantine threshold is avoided by automatic
