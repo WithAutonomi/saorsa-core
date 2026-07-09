@@ -254,8 +254,8 @@ pub struct NodeConfig {
 
     /// Adaptive DHT configuration for trust-based routing enforcement.
     ///
-    /// Controls lazy swap-out, close-group quarantine, automatic lookup
-    /// avoidance, and new-peer/readmission trust thresholds. Use
+    /// Controls lazy swap-out, automatic lookup avoidance, and
+    /// new-peer/readmission trust thresholds. Use
     /// [`NodeConfigBuilder::trust_enforcement`] for a simple on/off toggle.
     ///
     /// Default: enabled with the default [`AdaptiveDhtConfig`] thresholds.

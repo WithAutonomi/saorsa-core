@@ -618,9 +618,9 @@ pub struct DhtNetworkConfig {
     /// routing table when a better candidate is available.
     /// Default: [`AdaptiveDhtConfig::default`].
     pub swap_threshold: f64,
-    /// Trust score below which automatic lookup/dial paths avoid a peer, and
-    /// K-closest peers are evicted into temporary quarantine when the routing
-    /// table can keep at least K peers.
+    /// Trust score below which automatic lookup/dial paths avoid a peer.
+    /// Immediate close-group eviction is temporarily disabled until trust
+    /// scoring is stable.
     /// Default: [`AdaptiveDhtConfig::default`].
     pub quarantine_threshold: f64,
     /// Trust score required before a new peer can enter the routing table,
@@ -5933,15 +5933,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let events = dht
-            .enforce_close_group_quarantine(&quarantined_peer, 0.10)
-            .await;
-        assert!(
-            events
-                .iter()
-                .any(|event| matches!(event, RoutingTableEvent::PeerRemoved(id) if *id == quarantined_peer)),
-            "test setup should quarantine the close-group peer"
-        );
+        dht.remember_quarantined_peer(quarantined_peer, &|_| 0.30);
 
         let trust_score = |peer_id: &PeerId| {
             if *peer_id == quarantined_peer {

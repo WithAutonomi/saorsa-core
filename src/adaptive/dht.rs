@@ -32,9 +32,8 @@ use std::sync::Arc;
 /// Default trust score threshold below which a peer is eligible for swap-out
 const DEFAULT_SWAP_THRESHOLD: f64 = 0.35;
 
-/// Default trust score threshold below which close-group peers are evicted
-/// when doing so still leaves at least K routing-table peers, and all peers
-/// are avoided by automatic lookup/dial paths.
+/// Default trust score threshold below which peers are avoided by automatic
+/// lookup/dial paths.
 const DEFAULT_QUARANTINE_THRESHOLD: f64 = 0.20;
 
 /// Default trust score a new or quarantined peer must have for admission.
@@ -53,9 +52,7 @@ pub struct AdaptiveDhtConfig {
     /// Peers are not immediately evicted by this threshold alone.
     /// Default: 0.35
     pub swap_threshold: f64,
-    /// Trust score below which automatic lookup/dial paths avoid a peer, and
-    /// K-closest peers are evicted into temporary quarantine when the routing
-    /// table can keep at least K peers.
+    /// Trust score below which automatic lookup/dial paths avoid a peer.
     /// Default: 0.20
     pub quarantine_threshold: f64,
     /// Trust score required before a new peer can enter the routing table, and
@@ -255,9 +252,9 @@ impl AdaptiveDHT {
     ///
     /// Trust scores are updated immediately. Peers below the quarantine
     /// threshold are avoided by lookup result selection and automatic
-    /// lookup/dial paths, and K-closest peers below that threshold are
-    /// evicted into temporary quarantine when the routing table can keep at
-    /// least K peers.
+    /// lookup/dial paths. Immediate close-group eviction is temporarily
+    /// disabled until trust scoring is stable; low-trust peers remain eligible
+    /// for lazy swap-out when better candidates arrive.
     pub async fn report_trust_event(&self, peer_id: &PeerId, event: TrustEvent) {
         match event {
             TrustEvent::ApplicationSuccess(weight) | TrustEvent::ApplicationFailure(weight) => {
@@ -316,9 +313,9 @@ impl AdaptiveDHT {
     /// Start the DHT manager.
     ///
     /// Trust scores are computed live — no background tasks needed.
-    /// Low-trust peers are swapped out when better candidates arrive; close
-    /// peers below the quarantine threshold are evicted when the routing table
-    /// has enough peers.
+    /// Low-trust peers are swapped out when better candidates arrive. Immediate
+    /// close-group eviction is temporarily disabled until trust scoring is
+    /// stable.
     pub async fn start(&self) -> Result<()> {
         Arc::clone(&self.dht_manager).start().await
     }
