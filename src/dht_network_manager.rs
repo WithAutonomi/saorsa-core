@@ -243,6 +243,12 @@ const DIAL_FAILURE_PUBLISH_EXEMPTION_TTL: Duration = Duration::from_secs(2 * 60)
 /// Trust-score log reason for a failed pre-request dial.
 const TRUST_REASON_DHT_DIAL_FAILED: &str = "dht_dial_failed";
 
+/// Trust weight for failed pre-request dials.
+///
+/// At the current trust EMA and decay rate, four evenly-spaced dial failures
+/// over six hours take a neutral peer below the 0.20 lookup-avoid threshold.
+const DHT_DIAL_FAILURE_TRUST_WEIGHT: f64 = 2.25;
+
 /// Trust-score log reason for a failed post-dial identity exchange.
 const TRUST_REASON_DHT_IDENTITY_EXCHANGE_FAILED: &str = "dht_identity_exchange_failed";
 
@@ -3561,10 +3567,21 @@ impl DhtNetworkManager {
     }
 
     async fn record_peer_failure(&self, peer_id: &PeerId, reason: &'static str) {
+        self.record_peer_failure_weighted(peer_id, reason, 1.0)
+            .await;
+    }
+
+    async fn record_peer_failure_weighted(
+        &self,
+        peer_id: &PeerId,
+        reason: &'static str,
+        weight: f64,
+    ) {
         if let Some(ref engine) = self.trust_engine {
-            engine.update_node_stats_with_reason(
+            engine.update_node_stats_weighted_with_reason(
                 peer_id,
                 NodeStatisticsUpdate::FailedResponse,
+                weight,
                 reason,
             );
         }
@@ -3777,8 +3794,12 @@ impl DhtNetworkManager {
                 peer_hex,
                 candidates.len()
             );
-            self.record_peer_failure(peer_id, TRUST_REASON_DHT_DIAL_FAILED)
-                .await;
+            self.record_peer_failure_weighted(
+                peer_id,
+                TRUST_REASON_DHT_DIAL_FAILED,
+                DHT_DIAL_FAILURE_TRUST_WEIGHT,
+            )
+            .await;
             return PendingDialOutcome::DialFailed {
                 candidates_count: candidates.len(),
             };
@@ -5778,6 +5799,32 @@ mod tests {
         assert_eq!(
             STALE_REVALIDATION_BUDGET,
             IDENTITY_EXCHANGE_TIMEOUT + STALE_REVALIDATION_PING_RTT,
+        );
+    }
+
+    #[tokio::test]
+    async fn dial_failure_weight_avoids_neutral_peer_after_four_failures_in_six_hours() {
+        let engine = TrustEngine::new();
+        let peer = pid(42);
+        let threshold = AdaptiveDhtConfig::default().quarantine_threshold;
+        let spacing = Duration::from_secs(2 * 60 * 60);
+
+        for failure_index in 0..4 {
+            if failure_index > 0 {
+                engine.simulate_elapsed(&peer, spacing).await;
+            }
+            engine.update_node_stats_weighted_with_reason(
+                &peer,
+                NodeStatisticsUpdate::FailedResponse,
+                DHT_DIAL_FAILURE_TRUST_WEIGHT,
+                TRUST_REASON_DHT_DIAL_FAILED,
+            );
+        }
+
+        let score = engine.score(&peer);
+        assert!(
+            score < threshold,
+            "four weighted dial failures over six hours should avoid peer: score={score}, threshold={threshold}"
         );
     }
 
