@@ -1853,6 +1853,9 @@ pub(crate) struct ParsedMessage {
     pub(crate) authenticated_node_id: Option<PeerId>,
     /// The sender's user agent string from the wire message.
     pub(crate) user_agent: String,
+    /// Decoded payload length (bytes). Lets the rx choke point compute wire
+    /// envelope overhead (wire − payload) for V2-623 traffic accounting.
+    pub(crate) payload_len: usize,
 }
 
 /// Parse a postcard-encoded protocol message into a `P2PEvent::Message`.
@@ -1899,6 +1902,7 @@ pub(crate) fn parse_protocol_message(bytes: &[u8], source: &str) -> Option<Parse
         message.data.len()
     );
 
+    let payload_len = message.data.len();
     Some(ParsedMessage {
         event: P2PEvent::Message {
             topic: message.protocol,
@@ -1908,6 +1912,7 @@ pub(crate) fn parse_protocol_message(bytes: &[u8], source: &str) -> Option<Parse
             data: message.data,
         },
         authenticated_node_id,
+        payload_len,
         user_agent: message.user_agent,
     })
 }
