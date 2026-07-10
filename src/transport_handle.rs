@@ -380,6 +380,26 @@ pub struct TransportHandle {
     proof_eligible_peers: Arc<DashSet<IpAddr>>,
 }
 
+struct ActiveRequestGuard {
+    active_requests: Arc<DashMap<String, PendingRequest>>,
+    message_id: String,
+}
+
+impl ActiveRequestGuard {
+    fn new(active_requests: Arc<DashMap<String, PendingRequest>>, message_id: String) -> Self {
+        Self {
+            active_requests,
+            message_id,
+        }
+    }
+}
+
+impl Drop for ActiveRequestGuard {
+    fn drop(&mut self) {
+        self.active_requests.remove(&self.message_id);
+    }
+}
+
 // ============================================================================
 // Construction
 // ============================================================================
@@ -1856,6 +1876,8 @@ impl TransportHandle {
                 expected_peer: *peer_id,
             },
         );
+        let _active_request_guard =
+            ActiveRequestGuard::new(Arc::clone(&self.active_requests), message_id.clone());
 
         let envelope = RequestResponseEnvelope {
             message_id: message_id.clone(),
@@ -1865,7 +1887,6 @@ impl TransportHandle {
         let envelope_bytes = match postcard::to_allocvec(&envelope) {
             Ok(bytes) => bytes,
             Err(e) => {
-                self.active_requests.remove(&message_id);
                 return Err(P2PError::Serialization(
                     format!("Failed to serialize request envelope: {e}").into(),
                 ));
@@ -1873,15 +1894,10 @@ impl TransportHandle {
         };
 
         let wire_protocol = format!("/rr/{}", protocol);
-        if let Err(e) = self
-            .send_message(peer_id, &wire_protocol, envelope_bytes)
-            .await
-        {
-            self.active_requests.remove(&message_id);
-            return Err(e);
-        }
+        self.send_message(peer_id, &wire_protocol, envelope_bytes)
+            .await?;
 
-        let result = match tokio::time::timeout(timeout, rx).await {
+        match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(response_bytes)) => {
                 let latency = started_at.elapsed();
                 Ok(PeerResponse {
@@ -1893,19 +1909,8 @@ impl TransportHandle {
             Ok(Err(_)) => Err(P2PError::Network(NetworkError::ConnectionClosed {
                 peer_id: peer_id.to_hex().into(),
             })),
-            Err(_) => Err(P2PError::Transport(
-                crate::error::TransportError::StreamError(
-                    format!(
-                        "Request to {} on {} timed out after {:?}",
-                        peer_id, protocol, timeout
-                    )
-                    .into(),
-                ),
-            )),
-        };
-
-        self.active_requests.remove(&message_id);
-        result
+            Err(_) => Err(P2PError::Timeout(timeout)),
+        }
     }
 
     /// Send a response to a previously received request.
