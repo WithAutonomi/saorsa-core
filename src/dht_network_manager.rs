@@ -3836,30 +3836,6 @@ impl DhtNetworkManager {
         operation: DhtNetworkOperation,
         candidates: Option<&[(MultiAddr, AddressType)]>,
     ) -> Result<DhtResponseEnvelope> {
-        // V2-623: per-message-type tx counts. Matched here at the single
-        // request funnel where the operation variant is still known.
-        match &operation {
-            DhtNetworkOperation::FindNode { .. } => {
-                self.transport
-                    .traffic
-                    .find_node_tx_count
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            DhtNetworkOperation::Ping => {
-                self.transport
-                    .traffic
-                    .ping_tx_count
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            DhtNetworkOperation::PublishAddressSet { .. } => {
-                self.transport
-                    .traffic
-                    .publish_addr_tx_count
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            _ => {}
-        }
-
         // Sweep stale entries left by dropped futures before adding a new one
         self.sweep_expired_operations();
 
@@ -3967,6 +3943,30 @@ impl DhtNetworkManager {
             .await
         {
             Ok(_) => {
+                // V2-623: per-message-type tx counts, incremented only after a
+                // successful send so they share the same "confirmed sent"
+                // semantics as wire_tx_*.
+                match &message.payload {
+                    DhtNetworkOperation::FindNode { .. } => {
+                        self.transport
+                            .traffic
+                            .find_node_tx_count
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    DhtNetworkOperation::Ping => {
+                        self.transport
+                            .traffic
+                            .ping_tx_count
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    DhtNetworkOperation::PublishAddressSet { .. } => {
+                        self.transport
+                            .traffic
+                            .publish_addr_tx_count
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    _ => {}
+                }
                 debug!(
                     "[STEP 2] {} -> {}: Message sent successfully, waiting for response...",
                     self.config.peer_id.to_hex(),
@@ -4351,10 +4351,12 @@ impl DhtNetworkManager {
                     sender,
                     message.message_id
                 );
-                // V2-623: count NodesFound response payload bytes before the
-                // result is consumed. The wire envelope is accounted separately
-                // when this is later sent via `send_on_channel`.
-                let is_nodes_found = matches!(result, DhtNetworkResult::NodesFound { .. });
+                // V2-623: count encoded NodesFound responses. Unlike the
+                // request-type counters, this counts responses this node
+                // *produced* (serialised) rather than confirmed sends — the
+                // actual transmit happens later in the caller. The wire bytes
+                // are still accounted separately via wire_tx_* at send time.
+                let is_nodes_found = matches!(&result, DhtNetworkResult::NodesFound { .. });
                 let response = self.create_response_message(&message, result)?;
                 let response_bytes = postcard::to_stdvec(&response)
                     .map_err(|e| P2PError::Serialization(e.to_string().into()))?;

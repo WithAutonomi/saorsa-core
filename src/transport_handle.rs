@@ -228,21 +228,25 @@ pub(crate) struct TrafficCounters {
     pub wire_tx_count: AtomicU64,
     /// Envelope overhead sent = wire − payload.
     pub overhead_tx_bytes: AtomicU64,
-    /// Total wire bytes received.
+    /// Wire bytes received and successfully decoded. These are decoded
+    /// protocol bytes: malformed / signature-rejected frames are excluded, so
+    /// this is not raw host ingress.
     pub wire_rx_bytes: AtomicU64,
-    /// Total wire messages received.
+    /// Wire messages received and successfully decoded.
     pub wire_rx_count: AtomicU64,
-    /// Envelope overhead received = wire − payload.
+    /// Envelope overhead received = wire − payload (decoded messages only).
     pub overhead_rx_bytes: AtomicU64,
-    /// FIND_NODE requests sent.
+    /// FIND_NODE requests sent (counted only after a successful send).
     pub find_node_tx_count: AtomicU64,
-    /// `NodesFound` response payload bytes sent.
+    /// `NodesFound` response payload bytes *encoded*. Counts responses this
+    /// node produced/serialised, not confirmed sends (the transmit happens in
+    /// the caller); `wire_tx_*` covers the actual send.
     pub nodes_found_tx_bytes: AtomicU64,
-    /// `NodesFound` responses sent.
+    /// `NodesFound` responses encoded (see `nodes_found_tx_bytes`).
     pub nodes_found_tx_count: AtomicU64,
-    /// `PUBLISH_ADDRESS_SET` operations sent.
+    /// `PUBLISH_ADDRESS_SET` operations sent (counted only after a successful send).
     pub publish_addr_tx_count: AtomicU64,
-    /// Ping operations sent.
+    /// Ping operations sent (counted only after a successful send).
     pub ping_tx_count: AtomicU64,
     /// Identity-announce wire bytes sent (bypasses `send_on_channel`).
     pub identity_announce_tx_bytes: AtomicU64,
