@@ -68,9 +68,12 @@ use std::time::Duration;
 use thiserror::Error;
 
 // Constants for validation rules
+#[allow(dead_code)]
 const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024; // 16MB
 const MAX_PATH_LENGTH: usize = 4096;
+#[allow(dead_code)]
 const MAX_KEY_SIZE: usize = 1024 * 1024; // 1MB for DHT keys
+#[allow(dead_code)]
 const MAX_VALUE_SIZE: usize = 10 * 1024 * 1024; // 10MB for DHT values
 #[allow(dead_code)]
 const MAX_FILE_NAME_LENGTH: usize = 255;
