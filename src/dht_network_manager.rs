@@ -38,6 +38,7 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::{RwLock, Semaphore, broadcast, oneshot};
@@ -150,6 +151,12 @@ const MAX_CONCURRENT_REVALIDATIONS: usize = 8;
 
 /// Maximum concurrent pings within a single stale revalidation pass.
 const MAX_CONCURRENT_REVALIDATION_PINGS: usize = 4;
+
+/// Cadence of the `wire traffic summary (cumulative)` INFO line (V2-623).
+/// A `const` so testnets can drop it to 60s; 300s is the production default
+/// that keeps log volume negligible. Emitted at INFO (the shipping pipeline
+/// only carries INFO+).
+const TRAFFIC_SUMMARY_INTERVAL: Duration = Duration::from_secs(300);
 
 /// Minimum self-lookup interval (randomized between min and max).
 const SELF_LOOKUP_INTERVAL_MIN: Duration = Duration::from_secs(300); // 5 minutes
@@ -1848,9 +1855,60 @@ impl DhtNetworkManager {
         // Spawn periodic maintenance background tasks.
         self.spawn_self_lookup_task().await;
         self.spawn_bucket_refresh_task().await;
+        self.spawn_traffic_summary_task();
 
         info!("DHT Network Manager started successfully");
         Ok(())
+    }
+
+    /// Spawn the periodic wire-traffic summary task (V2-623).
+    ///
+    /// Emits one `wire traffic summary (cumulative)` INFO line per interval
+    /// carrying the cumulative counters held on the shared
+    /// [`TransportHandle`](crate::transport_handle::TransportHandle). All values
+    /// are monotonic since process start; the telegraf→Elasticsearch pipeline
+    /// parses the flat JSON fields and rates are computed as deltas at query
+    /// time. `overhead_*_bytes` is the direct before/after instrument for
+    /// V2-616 (stop embedding the ML-DSA-65 public key in every `WireMessage`).
+    ///
+    /// The task is detached (not stored): it observes `shutdown` and exits on
+    /// cancellation, so there is no handle to join.
+    fn spawn_traffic_summary_task(self: &Arc<Self>) {
+        let transport = Arc::clone(&self.transport);
+        let shutdown = self.shutdown.clone();
+
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(TRAFFIC_SUMMARY_INTERVAL);
+            ticker.tick().await; // consume the immediate first tick
+
+            loop {
+                tokio::select! {
+                    () = shutdown.cancelled() => break,
+                    _ = ticker.tick() => {
+                        let t = &transport.traffic;
+                        info!(
+                            target: "saorsa_core::traffic",
+                            wire_tx_bytes = t.wire_tx_bytes.load(Ordering::Relaxed),
+                            wire_tx_count = t.wire_tx_count.load(Ordering::Relaxed),
+                            overhead_tx_bytes = t.overhead_tx_bytes.load(Ordering::Relaxed),
+                            wire_rx_bytes = t.wire_rx_bytes.load(Ordering::Relaxed),
+                            wire_rx_count = t.wire_rx_count.load(Ordering::Relaxed),
+                            overhead_rx_bytes = t.overhead_rx_bytes.load(Ordering::Relaxed),
+                            find_node_tx_count = t.find_node_tx_count.load(Ordering::Relaxed),
+                            nodes_found_tx_bytes = t.nodes_found_tx_bytes.load(Ordering::Relaxed),
+                            nodes_found_tx_count = t.nodes_found_tx_count.load(Ordering::Relaxed),
+                            publish_addr_tx_count = t.publish_addr_tx_count.load(Ordering::Relaxed),
+                            ping_tx_count = t.ping_tx_count.load(Ordering::Relaxed),
+                            identity_announce_tx_bytes =
+                                t.identity_announce_tx_bytes.load(Ordering::Relaxed),
+                            identity_announce_tx_count =
+                                t.identity_announce_tx_count.load(Ordering::Relaxed),
+                            "wire traffic summary (cumulative)"
+                        );
+                    }
+                }
+            }
+        });
     }
 
     /// Spawn the periodic self-lookup background task.
@@ -3885,6 +3943,30 @@ impl DhtNetworkManager {
             .await
         {
             Ok(_) => {
+                // V2-623: per-message-type tx counts, incremented only after a
+                // successful send so they share the same "confirmed sent"
+                // semantics as wire_tx_*.
+                match &message.payload {
+                    DhtNetworkOperation::FindNode { .. } => {
+                        self.transport
+                            .traffic
+                            .find_node_tx_count
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    DhtNetworkOperation::Ping => {
+                        self.transport
+                            .traffic
+                            .ping_tx_count
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    DhtNetworkOperation::PublishAddressSet { .. } => {
+                        self.transport
+                            .traffic
+                            .publish_addr_tx_count
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    _ => {}
+                }
                 debug!(
                     "[STEP 2] {} -> {}: Message sent successfully, waiting for response...",
                     self.config.peer_id.to_hex(),
@@ -4269,10 +4351,26 @@ impl DhtNetworkManager {
                     sender,
                     message.message_id
                 );
+                // V2-623: count encoded NodesFound responses. Unlike the
+                // request-type counters, this counts responses this node
+                // *produced* (serialised) rather than confirmed sends — the
+                // actual transmit happens later in the caller. The wire bytes
+                // are still accounted separately via wire_tx_* at send time.
+                let is_nodes_found = matches!(&result, DhtNetworkResult::NodesFound { .. });
                 let response = self.create_response_message(&message, result)?;
-                Ok(Some(postcard::to_stdvec(&response).map_err(|e| {
-                    P2PError::Serialization(e.to_string().into())
-                })?))
+                let response_bytes = postcard::to_stdvec(&response)
+                    .map_err(|e| P2PError::Serialization(e.to_string().into()))?;
+                if is_nodes_found {
+                    self.transport
+                        .traffic
+                        .nodes_found_tx_count
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.transport
+                        .traffic
+                        .nodes_found_tx_bytes
+                        .fetch_add(response_bytes.len() as u64, Ordering::Relaxed);
+                }
+                Ok(Some(response_bytes))
             }
             DhtMessageType::Response => {
                 debug!(

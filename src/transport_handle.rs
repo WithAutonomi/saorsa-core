@@ -207,6 +207,53 @@ impl TransportConfig {
     }
 }
 
+/// Cumulative wire-traffic counters (V2-623).
+///
+/// Plain relaxed `AtomicU64`s bumped at the transport tx/rx choke points, in
+/// the same lock-free style as the sharded dispatcher's `drop_counter`. All
+/// values are monotonic since process start; a periodic task in
+/// [`DhtNetworkManager`](crate::dht_network_manager::DhtNetworkManager) emits
+/// them as a `wire traffic summary (cumulative)` INFO line, and rates are
+/// computed as deltas at query time.
+///
+/// `overhead_*` = wire − payload, i.e. the per-message envelope cost
+/// (signature + ML-DSA-65 public key + framing). This is the direct
+/// before/after instrument for V2-616 (stop embedding the ML-DSA-65 public key
+/// in every `WireMessage`).
+#[derive(Debug, Default)]
+pub(crate) struct TrafficCounters {
+    /// Total wire bytes sent (signed+serialised `WireMessage`s).
+    pub wire_tx_bytes: AtomicU64,
+    /// Total wire messages sent.
+    pub wire_tx_count: AtomicU64,
+    /// Envelope overhead sent = wire − payload.
+    pub overhead_tx_bytes: AtomicU64,
+    /// Wire bytes received and successfully decoded. These are decoded
+    /// protocol bytes: malformed / signature-rejected frames are excluded, so
+    /// this is not raw host ingress.
+    pub wire_rx_bytes: AtomicU64,
+    /// Wire messages received and successfully decoded.
+    pub wire_rx_count: AtomicU64,
+    /// Envelope overhead received = wire − payload (decoded messages only).
+    pub overhead_rx_bytes: AtomicU64,
+    /// FIND_NODE requests sent (counted only after a successful send).
+    pub find_node_tx_count: AtomicU64,
+    /// `NodesFound` response payload bytes *encoded*. Counts responses this
+    /// node produced/serialised, not confirmed sends (the transmit happens in
+    /// the caller); `wire_tx_*` covers the actual send.
+    pub nodes_found_tx_bytes: AtomicU64,
+    /// `NodesFound` responses encoded (see `nodes_found_tx_bytes`).
+    pub nodes_found_tx_count: AtomicU64,
+    /// `PUBLISH_ADDRESS_SET` operations sent (counted only after a successful send).
+    pub publish_addr_tx_count: AtomicU64,
+    /// Ping operations sent (counted only after a successful send).
+    pub ping_tx_count: AtomicU64,
+    /// Identity-announce wire bytes sent (bypasses `send_on_channel`).
+    pub identity_announce_tx_bytes: AtomicU64,
+    /// Identity announces sent.
+    pub identity_announce_tx_count: AtomicU64,
+}
+
 /// Encapsulates transport-level concerns: QUIC connections, peer registry,
 /// message I/O, and network events.
 ///
@@ -227,6 +274,10 @@ pub struct TransportHandle {
     listen_addrs: RwLock<Vec<MultiAddr>>,
     rate_limiter: Arc<RateLimiter>,
     active_requests: Arc<DashMap<String, PendingRequest>>,
+    /// Cumulative wire-traffic counters (V2-623). Shared (via the enclosing
+    /// `Arc<TransportHandle>`) with the DHT manager's summary-emitting task and
+    /// with the rx/monitor background tasks that receive a clone.
+    pub(crate) traffic: Arc<TrafficCounters>,
     // Held to keep the Arc alive for background tasks that captured a clone.
     #[allow(dead_code)]
     geo_provider: Arc<BgpGeoProvider>,
@@ -522,6 +573,8 @@ impl TransportHandle {
         let peer_user_agents: Arc<DashMap<PeerId, String>> = Arc::new(DashMap::new());
         // (peer_addr_update_tx removed — dedicated forwarder creates its own)
 
+        let traffic = Arc::new(TrafficCounters::default());
+
         let connection_monitor_handle = {
             let active_conns = Arc::clone(&active_connections);
             let peers_map = Arc::clone(&peers);
@@ -534,6 +587,7 @@ impl TransportHandle {
             let pua = Arc::clone(&peer_user_agents);
             let identity_clone = config.node_identity.clone();
             let user_agent_clone = config.user_agent.clone();
+            let traffic_clone = Arc::clone(&traffic);
 
             let handle = tokio::spawn(async move {
                 Self::connection_lifecycle_monitor_with_rx(
@@ -549,6 +603,7 @@ impl TransportHandle {
                     pua,
                     identity_clone,
                     user_agent_clone,
+                    traffic_clone,
                 )
                 .await;
             });
@@ -563,6 +618,7 @@ impl TransportHandle {
             listen_addrs: RwLock::new(Vec::new()),
             rate_limiter,
             active_requests: Arc::new(DashMap::new()),
+            traffic,
             geo_provider,
             shutdown,
             peer_address_update_rx: tokio::sync::Mutex::new(peer_addr_update_rx),
@@ -644,6 +700,7 @@ impl TransportHandle {
                 ..Default::default()
             })),
             active_requests: Arc::new(DashMap::new()),
+            traffic: Arc::new(TrafficCounters::default()),
             geo_provider: Arc::new(BgpGeoProvider::new()),
             shutdown: CancellationToken::new(),
             peer_address_update_rx: {
@@ -1723,6 +1780,18 @@ impl TransportHandle {
         });
 
         if result.is_ok() {
+            // V2-623: cumulative wire-traffic accounting. Count only bytes we
+            // actually put on the wire. `overhead` is the signature + ML-DSA-65
+            // public-key + framing cost (wire − payload).
+            let wire_len = message_data.len() as u64;
+            let overhead = wire_len.saturating_sub(raw_data_len as u64);
+            self.traffic
+                .wire_tx_bytes
+                .fetch_add(wire_len, Ordering::Relaxed);
+            self.traffic.wire_tx_count.fetch_add(1, Ordering::Relaxed);
+            self.traffic
+                .overhead_tx_bytes
+                .fetch_add(overhead, Ordering::Relaxed);
             debug!(
                 "Successfully sent {} bytes to channel {}",
                 message_data.len(),
@@ -2273,6 +2342,7 @@ impl TransportHandle {
             let peer_user_agents = Arc::clone(&self.peer_user_agents);
             let self_peer_id = *self.node_identity.peer_id();
             let dual_node_for_peer_reg = Arc::clone(&self.dual_node);
+            let traffic = Arc::clone(&self.traffic);
 
             handles.push(tokio::spawn(async move {
                 Self::run_shard_consumer(
@@ -2287,6 +2357,7 @@ impl TransportHandle {
                     peer_user_agents,
                     self_peer_id,
                     dual_node_for_peer_reg,
+                    traffic,
                 )
                 .await;
             }));
@@ -2373,6 +2444,7 @@ impl TransportHandle {
         peer_user_agents: Arc<DashMap<PeerId, String>>,
         self_peer_id: PeerId,
         dual_node_for_peer_reg: Arc<DualStackNetworkNode>,
+        traffic: Arc<TrafficCounters>,
     ) {
         info!("Message dispatch shard {shard_idx} started");
         while let Some((from_addr, bytes)) = shard_rx.recv().await {
@@ -2389,7 +2461,18 @@ impl TransportHandle {
                     event,
                     authenticated_node_id,
                     user_agent: peer_user_agent,
+                    payload_len,
                 }) => {
+                    // V2-623: cumulative wire-traffic accounting (rx). Only
+                    // successfully-decoded wire messages are counted. `overhead`
+                    // is the signature + ML-DSA-65 public-key + framing cost.
+                    let wire_len = bytes.len() as u64;
+                    let overhead = wire_len.saturating_sub(payload_len as u64);
+                    traffic.wire_rx_bytes.fetch_add(wire_len, Ordering::Relaxed);
+                    traffic.wire_rx_count.fetch_add(1, Ordering::Relaxed);
+                    traffic
+                        .overhead_rx_bytes
+                        .fetch_add(overhead, Ordering::Relaxed);
                     // If the message was signed, record the app↔channel mapping.
                     // A peer may be reachable over multiple channels simultaneously
                     // (e.g. QUIC + Bluetooth), so we add to the set — never replace.
@@ -2626,6 +2709,7 @@ impl TransportHandle {
         peer_user_agents: Arc<DashMap<PeerId, String>>,
         node_identity: Arc<NodeIdentity>,
         user_agent: String,
+        traffic: Arc<TrafficCounters>,
     ) {
         info!("Connection lifecycle monitor started (pre-subscribed receiver)");
 
@@ -2668,6 +2752,11 @@ impl TransportHandle {
                                     Ok(announce_bytes) => {
                                         let dual_node = Arc::clone(&dual_node);
                                         let channel_id_for_send = channel_id.clone();
+                                        // V2-623: identity announce bypasses
+                                        // `send_on_channel`, so account for it
+                                        // here. Counted on successful send.
+                                        let traffic = Arc::clone(&traffic);
+                                        let announce_len = announce_bytes.len() as u64;
                                         tokio::spawn(async move {
                                             if let Err(e) = dual_node
                                                 .send_to_peer_optimized(&remote_address, &announce_bytes)
@@ -2680,6 +2769,22 @@ impl TransportHandle {
                                                 warn!(
                                                     "Failed to send identity announce to {channel_id_for_send}: {e:#}"
                                                 );
+                                            } else {
+                                                traffic
+                                                    .identity_announce_tx_bytes
+                                                    .fetch_add(announce_len, Ordering::Relaxed);
+                                                traffic
+                                                    .identity_announce_tx_count
+                                                    .fetch_add(1, Ordering::Relaxed);
+                                                // Also fold into the wire totals — this send
+                                                // bypasses `send_on_channel` and would otherwise
+                                                // be invisible to the reconciliation line.
+                                                traffic
+                                                    .wire_tx_bytes
+                                                    .fetch_add(announce_len, Ordering::Relaxed);
+                                                traffic
+                                                    .wire_tx_count
+                                                    .fetch_add(1, Ordering::Relaxed);
                                             }
                                         });
                                     }
