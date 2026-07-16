@@ -1003,19 +1003,26 @@ impl P2PNode {
     }
 
     // =========================================================================
-    // Request/Response API — Automatic Trust Feedback
+    // Request/Response API — Trust-Neutral Transport
     // =========================================================================
 
-    /// Send a request to a peer and wait for a response with automatic trust penalty reporting.
+    /// Send a request to a peer and wait for a response.
     ///
     /// Unlike fire-and-forget `send_message()`, this method:
     /// 1. Wraps the payload in a `RequestResponseEnvelope` with a unique message ID
     /// 2. Sends it on the `/rr/<protocol>` protocol prefix
     /// 3. Waits for a matching response (or timeout)
-    /// 4. Automatically reports failure to the trust engine (success is the expected baseline)
     ///
     /// The remote peer's handler should call `send_response()` with the
     /// incoming message ID to route the response back.
+    ///
+    /// # Trust neutrality
+    ///
+    /// Request transport errors (timeouts, connection failures) are
+    /// trust-neutral: this method never reports trust events on its own.
+    /// Application-aware callers that can judge whether a failure reflects
+    /// peer misbehaviour must explicitly call
+    /// [`Self::report_trust_event`] when a penalty (or reward) is justified.
     ///
     /// # Arguments
     ///
@@ -1041,18 +1048,8 @@ impl P2PNode {
         data: Vec<u8>,
         timeout: Duration,
     ) -> Result<PeerResponse> {
-        let result = self
-            .send_request_reconnecting(peer_id, protocol, data, timeout)
-            .await;
-        if let Err(ref e) = result {
-            let event = if matches!(e, P2PError::Timeout(_)) {
-                TrustEvent::ConnectionTimeout
-            } else {
-                TrustEvent::ConnectionFailed
-            };
-            self.report_trust_event(peer_id, event).await;
-        }
-        result
+        self.send_request_reconnecting(peer_id, protocol, data, timeout)
+            .await
     }
 
     /// Request/response send with reconnect-on-demand.
