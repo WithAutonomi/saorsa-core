@@ -37,9 +37,10 @@ if trust < 0.3 {
 
 ### `report_trust_event(peer_id, event)`
 
-Report a trust event for a peer. Core penalties (connection failures) are
-recorded automatically by the DHT layer. Consumers use this API to report
-application-level outcomes (rewards and additional penalties).
+Report a trust event for a peer. DHT-specific penalties are recorded by the
+DHT layer where the failure phase and operation are known. Generic
+`P2PNode::send_request` transport errors are trust-neutral. Consumers use this
+API to report application-level outcomes (rewards and justified penalties).
 
 ```rust
 pub async fn report_trust_event(&self, peer_id: &PeerId, event: TrustEvent)
@@ -69,12 +70,15 @@ are not rewarded.
 
 | Event | Severity | Description | Where it fires |
 |-------|----------|-------------|----------------|
-| `ConnectionFailed` | 1x penalty (core) | Could not establish connection | `send_request()` error, `send_dht_request()` RPC failure |
-| `ConnectionTimeout` | 1x penalty (core) | Connection attempt timed out | `send_request()` timeout, `send_dht_request()` RPC timeout |
+| `ConnectionFailed` | 1x penalty | Could not establish connection | Explicit `report_trust_event` callers |
+| `ConnectionTimeout` | 1x penalty | Connection attempt timed out | Explicit `report_trust_event` callers |
 | `ApplicationSuccess(w)` | Weighted reward (consumer) | Peer completed an application-level task | Consumer code |
 | `ApplicationFailure(w)` | Weighted penalty (consumer) | Peer failed an application-level task | Consumer code |
 
 Note: Peer disconnects are normal connection lifecycle — they do not affect trust.
+Generic `P2PNode::send_request` errors are also trust-neutral because that layer
+cannot distinguish remote misbehaviour from network failure, application delay,
+or local overload. Application-aware callers report trust events explicitly.
 
 ## Trust Thresholds
 
