@@ -252,13 +252,13 @@ pub struct NodeConfig {
     #[serde(default)]
     pub allow_loopback: bool,
 
-    /// Adaptive DHT configuration (trust-based swap-out).
+    /// Adaptive DHT configuration for trust-based routing enforcement.
     ///
-    /// Controls whether peers with low trust scores are eligible for
-    /// swap-out from the routing table when better candidates arrive. Use
-    /// `NodeConfigBuilder::trust_enforcement` for a simple on/off toggle.
+    /// Controls lazy swap-out, automatic lookup avoidance, and
+    /// new-peer/readmission trust thresholds. Use
+    /// [`NodeConfigBuilder::trust_enforcement`] for a simple on/off toggle.
     ///
-    /// Default: enabled with a swap threshold of 0.35.
+    /// Default: enabled with the default [`AdaptiveDhtConfig`] thresholds.
     #[serde(default)]
     pub adaptive_dht_config: AdaptiveDhtConfig,
 
@@ -502,27 +502,30 @@ impl NodeConfigBuilder {
         self
     }
 
-    /// Enable or disable trust-based peer swap-out.
+    /// Enable or disable trust-based routing-table enforcement.
     ///
-    /// When `false`, peers are never swapped out of the routing table
-    /// based on trust scores. Trust scores are still tracked but have
-    /// no enforcement effect.
+    /// When `false`, trust scores are still tracked but have no routing-table
+    /// enforcement effect.
     ///
-    /// When `true` (the default), peers whose trust score falls below the
-    /// swap threshold (0.35) become eligible for replacement when a
-    /// better candidate arrives.
+    /// When `true` (the default), the default adaptive DHT policy applies:
+    /// peers below the swap threshold (0.35) become eligible for replacement,
+    /// peers below the quarantine threshold (0.20) are avoided by automatic
+    /// lookup/dial paths, and new routing-table peers must meet the readmission
+    /// threshold (0.45).
     ///
-    /// For fine-grained control over the threshold, use
+    /// For fine-grained control over these thresholds, use
     /// [`adaptive_dht_config`](Self::adaptive_dht_config) instead.
     pub fn trust_enforcement(mut self, enabled: bool) -> Self {
-        let threshold = if enabled {
-            AdaptiveDhtConfig::default().swap_threshold
+        let adaptive_config = if enabled {
+            AdaptiveDhtConfig::default()
         } else {
-            0.0
+            AdaptiveDhtConfig {
+                swap_threshold: 0.0,
+                quarantine_threshold: 0.0,
+                quarantine_readmit_threshold: 0.0,
+            }
         };
-        self.adaptive_dht_config = Some(AdaptiveDhtConfig {
-            swap_threshold: threshold,
-        });
+        self.adaptive_dht_config = Some(adaptive_config);
         self
     }
 
@@ -889,6 +892,8 @@ impl P2PNode {
             max_concurrent_operations: MAX_ACTIVE_REQUESTS,
             enable_security: true,
             swap_threshold: 0.0, // Set by AdaptiveDHT::new() from AdaptiveDhtConfig
+            quarantine_threshold: 0.0, // Set by AdaptiveDHT::new() from AdaptiveDhtConfig
+            quarantine_readmit_threshold: 0.0, // Set by AdaptiveDHT::new()
         };
         let adaptive_dht = AdaptiveDHT::new(
             transport.clone(),
@@ -998,19 +1003,26 @@ impl P2PNode {
     }
 
     // =========================================================================
-    // Request/Response API — Automatic Trust Feedback
+    // Request/Response API — Trust-Neutral Transport
     // =========================================================================
 
-    /// Send a request to a peer and wait for a response with automatic trust penalty reporting.
+    /// Send a request to a peer and wait for a response.
     ///
     /// Unlike fire-and-forget `send_message()`, this method:
     /// 1. Wraps the payload in a `RequestResponseEnvelope` with a unique message ID
     /// 2. Sends it on the `/rr/<protocol>` protocol prefix
     /// 3. Waits for a matching response (or timeout)
-    /// 4. Automatically reports failure to the trust engine (success is the expected baseline)
     ///
     /// The remote peer's handler should call `send_response()` with the
     /// incoming message ID to route the response back.
+    ///
+    /// # Trust neutrality
+    ///
+    /// Request transport errors (timeouts, connection failures) are
+    /// trust-neutral: this method never reports trust events on its own.
+    /// Application-aware callers that can judge whether a failure reflects
+    /// peer misbehaviour must explicitly call
+    /// [`Self::report_trust_event`] when a penalty (or reward) is justified.
     ///
     /// # Arguments
     ///
@@ -1036,18 +1048,8 @@ impl P2PNode {
         data: Vec<u8>,
         timeout: Duration,
     ) -> Result<PeerResponse> {
-        let result = self
-            .send_request_reconnecting(peer_id, protocol, data, timeout)
-            .await;
-        if let Err(ref e) = result {
-            let event = if matches!(e, P2PError::Timeout(_)) {
-                TrustEvent::ConnectionTimeout
-            } else {
-                TrustEvent::ConnectionFailed
-            };
-            self.report_trust_event(peer_id, event).await;
-        }
-        result
+        self.send_request_reconnecting(peer_id, protocol, data, timeout)
+            .await
     }
 
     /// Request/response send with reconnect-on-demand.

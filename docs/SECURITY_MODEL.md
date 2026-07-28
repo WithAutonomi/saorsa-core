@@ -80,32 +80,41 @@ pub struct NodeLivenessState {
 - Periodic health pings (configurable interval)
 - Validation responses
 
-### Eviction Criteria
+### Routing-Table Trust Criteria
 
-Nodes are automatically evicted when any threshold is exceeded:
+Trust affects routing-table membership in two stages:
 
-| Eviction Reason | Default Threshold | Configuration |
+| Reason | Default Threshold | Configuration |
 |-----------------|-------------------|---------------|
-| Consecutive Failures | 3 failures | `max_consecutive_failures` |
-| Low Trust Score | < 0.15 | `min_trust_threshold` |
-| Close Group Rejection | Consensus | BFT threshold |
+| Lazy swap eligibility | < 0.35 | `swap_threshold` |
+| Close-group quarantine / lookup avoidance | < 0.20 | `quarantine_threshold` |
+| New peer admission / quarantine readmission | >= 0.45 | `quarantine_readmit_threshold` |
 | Staleness | Configurable | `stale_timeout` |
 
-### Eviction Manager
+Peers outside the K-closest set are not globally evicted solely for low trust.
+They are omitted from local lookup results, FIND_NODE responses, and automatic
+lookup paths below the quarantine threshold, and can be lazily replaced when
+better candidates need the slot.
+Peers already in the routing table at or above the quarantine threshold but
+below the readmission threshold may remain in the table, including after moving
+into the K-closest set. New routing-table admissions and quarantined
+readmissions require the readmission threshold.
 
-The `EvictionManager` coordinates all eviction decisions:
+### Quarantine Reasons
+
+Routing-table quarantine decisions are represented by events such as:
 
 ```rust
-pub enum EvictionReason {
-    ConsecutiveFailures(u32),    // Communication failures
-    LowTrust(String),            // EigenTrust score below threshold
-    FailedAttestation,           // Data challenge failure
-    CloseGroupRejection,         // Consensus-based removal
-    Stale,                       // No activity timeout
+pub enum QuarantineReason {
+    LowTrustCloseGroup,          // Close-group trust below threshold
+    Stale,                       // No activity timeout during revalidation
+    IdentityMismatch,            // Address authenticated as another peer
 }
 ```
 
-**Recovery Mechanism:** A single successful interaction resets the consecutive failure counter, allowing nodes to recover from transient issues.
+**Recovery Mechanism:** Quarantined peers recover by trust decay toward neutral.
+They are not manually probed; they must be rediscovered through the normal
+admission path after reaching the readmission threshold.
 
 ---
 

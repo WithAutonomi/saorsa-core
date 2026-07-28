@@ -21,7 +21,7 @@
 use crate::{
     P2PError, PeerId, Result,
     adaptive::trust::DEFAULT_NEUTRAL_TRUST,
-    adaptive::{NodeStatisticsUpdate, TrustEngine},
+    adaptive::{AdaptiveDhtConfig, NodeStatisticsUpdate, TrustEngine},
     address::{MultiAddr, is_lan_ip},
     dht::core_engine::{AddressType, AtomicInstant, BucketRefreshCandidate, NodeInfo},
     dht::{AdmissionResult, DhtCoreEngine, DhtKey, Key, RoutingTableEvent},
@@ -249,6 +249,12 @@ const DIAL_FAILURE_PUBLISH_EXEMPTION_TTL: Duration = Duration::from_secs(2 * 60)
 
 /// Trust-score log reason for a failed pre-request dial.
 const TRUST_REASON_DHT_DIAL_FAILED: &str = "dht_dial_failed";
+
+/// Trust weight for failed pre-request dials.
+///
+/// At the current trust EMA and decay rate, four evenly-spaced dial failures
+/// over six hours take a neutral peer below the 0.20 lookup-avoid threshold.
+const DHT_DIAL_FAILURE_TRUST_WEIGHT: f64 = 2.25;
 
 /// Trust-score log reason for a failed post-dial identity exchange.
 const TRUST_REASON_DHT_IDENTITY_EXCHANGE_FAILED: &str = "dht_identity_exchange_failed";
@@ -623,8 +629,17 @@ pub struct DhtNetworkConfig {
     pub enable_security: bool,
     /// Trust score below which a peer is eligible for swap-out from the
     /// routing table when a better candidate is available.
-    /// Default: 0.0 (disabled).
+    /// Default: [`AdaptiveDhtConfig::default`].
     pub swap_threshold: f64,
+    /// Trust score below which automatic lookup/dial paths avoid a peer.
+    /// Immediate close-group eviction is temporarily disabled until trust
+    /// scoring is stable.
+    /// Default: [`AdaptiveDhtConfig::default`].
+    pub quarantine_threshold: f64,
+    /// Trust score required before a new peer can enter the routing table,
+    /// and before a quarantined peer can be admitted again.
+    /// Default: [`AdaptiveDhtConfig::default`].
+    pub quarantine_readmit_threshold: f64,
 }
 
 /// DHT network operation types
@@ -1726,6 +1741,12 @@ impl DhtNetworkManager {
             config.swap_threshold,
         )
         .map_err(|e| P2PError::Dht(DhtError::OperationFailed(e.to_string().into())))?;
+        dht_instance
+            .set_trust_quarantine_thresholds(
+                config.quarantine_threshold,
+                config.quarantine_readmit_threshold,
+            )
+            .map_err(|e| P2PError::Dht(DhtError::OperationFailed(e.to_string().into())))?;
 
         // Propagate IP diversity settings from the node config into the DHT
         // core engine so diversity overrides take effect on routing table
@@ -2027,6 +2048,16 @@ impl DhtNetworkManager {
                                                 if dht_node.peer_id == this.config.peer_id {
                                                     continue;
                                                 }
+                                                if this
+                                                    .should_avoid_automatic_peer(&dht_node.peer_id)
+                                                    .await
+                                                {
+                                                    trace!(
+                                                        "Bucket refresh[{bucket_idx}]: skipping quarantined peer {}",
+                                                        dht_node.peer_id.to_hex()
+                                                    );
+                                                    continue;
+                                                }
                                                 this.dial_addresses(
                                                     &dht_node.peer_id,
                                                     &dht_node.typed_addresses(),
@@ -2081,6 +2112,13 @@ impl DhtNetworkManager {
                 debug!("Self-lookup discovered {} peers", nodes.len());
                 for dht_node in nodes {
                     if dht_node.peer_id == self_id {
+                        continue;
+                    }
+                    if self.should_avoid_automatic_peer(&dht_node.peer_id).await {
+                        trace!(
+                            "Self-lookup skipping quarantined peer {}",
+                            dht_node.peer_id.to_hex()
+                        );
                         continue;
                     }
                     // Dial if not already connected — try every advertised
@@ -2209,6 +2247,10 @@ impl DhtNetworkManager {
         // entirely for clients. Node-mode dials are issued serially below.
         let mut to_dial: Vec<(PeerId, Vec<(MultiAddr, AddressType)>)> = Vec::new();
         for peer_id in peers {
+            if self.should_avoid_automatic_peer(peer_id).await {
+                trace!("Bootstrap skipping quarantined peer {}", peer_id.to_hex());
+                continue;
+            }
             let op = DhtNetworkOperation::FindNode { key };
             match self
                 .send_dht_request_with_response_context(peer_id, op, None)
@@ -2243,6 +2285,16 @@ impl DhtNetworkManager {
                         // routing table; upgrade-only on existing entries.
                         self.merge_trusted_gossiped_typed_addresses(&trusted_node)
                             .await;
+                        if self
+                            .should_avoid_automatic_peer(&trusted_node.peer_id)
+                            .await
+                        {
+                            trace!(
+                                "DHT bootstrap: skipping quarantined gossiped peer {}",
+                                trusted_node.peer_id.to_hex()
+                            );
+                            continue;
+                        }
                         if seen.insert(trusted_node.peer_id) && dialable_count > 0 {
                             to_dial.push((trusted_node.peer_id, typed));
                         }
@@ -2577,8 +2629,9 @@ impl DhtNetworkManager {
     /// Find closest nodes to a key using ONLY the local routing table.
     ///
     /// No network requests are made — safe to call from request handlers.
-    /// Only returns peers that passed the `is_dht_participant` security gate
-    /// and were added to the Kademlia routing table.
+    /// Only returns peers that passed the `is_dht_participant` security gate,
+    /// were added to the Kademlia routing table, and are not locally
+    /// quarantined by trust policy.
     ///
     /// Results are sorted by XOR distance to the key.
     pub async fn find_closest_nodes_local(&self, key: &Key, count: usize) -> Vec<DHTNode> {
@@ -2589,26 +2642,45 @@ impl DhtNetworkManager {
         );
 
         let dht_guard = self.dht.read().await;
+        let dht_key = DhtKey::from_bytes(*key);
+        let local_peer_id = self.config.peer_id;
+        let trust_score = |peer_id: &PeerId| self.peer_trust_score(peer_id);
         match dht_guard
-            .find_nodes_with_publish_seq(&DhtKey::from_bytes(*key), count)
+            .find_nodes_with_publish_seq_filtered(&dht_key, count, |node| {
+                if node.id == local_peer_id {
+                    return false;
+                }
+                let score = trust_score(&node.id);
+                !dht_guard.should_avoid_for_lookup(&node.id, score)
+            })
             .await
         {
-            Ok(nodes) => nodes
-                .into_iter()
-                .filter(|(node, _)| !self.is_local_peer_id(&node.id))
-                .map(|(node, publish_seq)| DHTNode {
-                    peer_id: node.id,
-                    address_types: node.address_types,
-                    addresses: node.addresses,
-                    distance: encode_publish_seq_distance(publish_seq),
-                    reliability: SELF_RELIABILITY_SCORE,
-                })
-                .collect(),
+            Ok(nodes) => Self::lookup_results_from_routing_nodes(nodes, count),
             Err(e) => {
                 warn!("find_nodes failed for key {}: {e}", hex::encode(key));
                 Vec::new()
             }
         }
+    }
+
+    fn lookup_results_from_routing_nodes(
+        nodes: Vec<(NodeInfo, u64)>,
+        count: usize,
+    ) -> Vec<DHTNode> {
+        nodes
+            .into_iter()
+            .take(count)
+            .map(|(node, publish_seq)| DHTNode {
+                peer_id: node.id,
+                address_types: node.address_types,
+                addresses: node.addresses,
+                distance: encode_publish_seq_distance(publish_seq),
+                // Keep the legacy wire value stable. Trust is local policy
+                // used for filtering and should not change DHTNode wire
+                // semantics for older nodes.
+                reliability: SELF_RELIABILITY_SCORE,
+            })
+            .collect()
     }
 
     /// Find closest nodes to a key using the local routing table, including
@@ -2723,6 +2795,13 @@ impl DhtNetworkManager {
         // Start with local knowledge
         let initial = self.find_closest_nodes_local(key, count).await;
         for node in initial {
+            if self.should_avoid_automatic_peer(&node.peer_id).await {
+                trace!(
+                    "[NETWORK] Skipping {}: peer is below trust quarantine/admission threshold",
+                    node.peer_id.to_hex()
+                );
+                continue;
+            }
             if peer_states.is_contactable(&node.peer_id) {
                 if self.lookup_candidate_dial_plan_is_exhausted(&node).await {
                     // Cache exhaustion is a transient, address-view-local
@@ -2760,6 +2839,14 @@ impl DhtNetworkManager {
                 };
                 let node = entry.remove();
                 if !peer_states.is_contactable(&node.peer_id) {
+                    continue;
+                }
+                if self.should_avoid_automatic_peer(&node.peer_id).await {
+                    peer_states.mark_failed(node.peer_id);
+                    trace!(
+                        "[NETWORK] Skipping {}: peer is below trust quarantine/admission threshold",
+                        node.peer_id.to_hex()
+                    );
                     continue;
                 }
                 if self.lookup_candidate_dial_plan_is_exhausted(&node).await {
@@ -2865,6 +2952,14 @@ impl DhtNetworkManager {
                             if !peer_states.is_contactable(&node.peer_id) {
                                 continue;
                             }
+                            if self.should_avoid_automatic_peer(&node.peer_id).await {
+                                peer_states.mark_failed(node.peer_id);
+                                trace!(
+                                    "[NETWORK] Skipping gossiped {}: peer is below trust quarantine/admission threshold",
+                                    node.peer_id.to_hex()
+                                );
+                                continue;
+                            }
                             if self.lookup_candidate_dial_plan_is_exhausted(&node).await {
                                 // Transient skip, not a terminal failure: a
                                 // single responder's stale/suppressed (e.g.
@@ -2954,7 +3049,8 @@ impl DhtNetworkManager {
                         let mut dht = self.dht.write().await;
                         let rt_events = dht.remove_node_by_id(&peer_id).await;
                         drop(dht);
-                        self.broadcast_routing_events(&rt_events);
+                        self.broadcast_routing_events_with_quarantine(rt_events)
+                            .await;
                         let _ = self.transport.disconnect_peer(&peer_id).await;
                     }
                     Ok(_) => {
@@ -3529,13 +3625,57 @@ impl DhtNetworkManager {
     }
 
     async fn record_peer_failure(&self, peer_id: &PeerId, reason: &'static str) {
+        self.record_peer_failure_weighted(peer_id, reason, 1.0)
+            .await;
+    }
+
+    async fn record_peer_failure_weighted(
+        &self,
+        peer_id: &PeerId,
+        reason: &'static str,
+        weight: f64,
+    ) {
         if let Some(ref engine) = self.trust_engine {
-            engine.update_node_stats_with_reason(
+            engine.update_node_stats_weighted_with_reason(
                 peer_id,
                 NodeStatisticsUpdate::FailedResponse,
+                weight,
                 reason,
             );
         }
+        self.enforce_trust_quarantine(peer_id).await;
+    }
+
+    pub(crate) async fn enforce_trust_quarantine(&self, peer_id: &PeerId) -> bool {
+        let Some(ref engine) = self.trust_engine else {
+            return false;
+        };
+        let trust_score = engine.score(peer_id);
+        let rt_events = self.enforce_close_group_trust_gate().await;
+        if rt_events.is_empty() {
+            return false;
+        }
+        info!(
+            "Evicted quarantined close-group peer(s) after trust update for {} with trust {:.3}",
+            peer_id.to_hex(),
+            trust_score
+        );
+        self.broadcast_routing_events(&rt_events);
+        true
+    }
+
+    fn peer_trust_score(&self, peer_id: &PeerId) -> f64 {
+        self.trust_engine
+            .as_ref()
+            .map(|engine| engine.score(peer_id))
+            .unwrap_or(DEFAULT_NEUTRAL_TRUST)
+    }
+
+    async fn should_avoid_automatic_peer(&self, peer_id: &PeerId) -> bool {
+        let trust_score = self.peer_trust_score(peer_id);
+        let dht = self.dht.read().await;
+        dht.should_avoid_automatic_candidate(peer_id, trust_score)
+            .await
     }
 
     /// Ensure an identity-authenticated channel to `peer_id` exists,
@@ -3669,7 +3809,8 @@ impl DhtNetworkManager {
                 let mut dht = self.dht.write().await;
                 dht.remove_node_by_id(peer_id).await
             };
-            self.broadcast_routing_events(&rt_events);
+            self.broadcast_routing_events_with_quarantine(rt_events)
+                .await;
         }
 
         // Broadcast and clear. Remove BEFORE sending so any task
@@ -3711,8 +3852,12 @@ impl DhtNetworkManager {
                 peer_hex,
                 candidates.len()
             );
-            self.record_peer_failure(peer_id, TRUST_REASON_DHT_DIAL_FAILED)
-                .await;
+            self.record_peer_failure_weighted(
+                peer_id,
+                TRUST_REASON_DHT_DIAL_FAILED,
+                DHT_DIAL_FAILURE_TRUST_WEIGHT,
+            )
+            .await;
             return PendingDialOutcome::DialFailed {
                 candidates_count: candidates.len(),
             };
@@ -4804,7 +4949,8 @@ impl DhtNetworkManager {
             match add_result {
                 Ok(AdmissionResult::Admitted(rt_events)) => {
                     info!("Added peer {} to DHT routing table", app_peer_id_hex);
-                    self.broadcast_routing_events(&rt_events);
+                    self.broadcast_routing_events_with_quarantine(rt_events)
+                        .await;
                 }
                 Ok(AdmissionResult::StaleRevalidationNeeded {
                     candidate,
@@ -4887,12 +5033,20 @@ impl DhtNetworkManager {
             };
 
             match result {
-                Ok(rt_events) => {
-                    info!(
-                        "Added peer {} to DHT routing table after stale revalidation",
-                        app_peer_id_hex
-                    );
-                    this.broadcast_routing_events(&rt_events);
+                Ok((rt_events, candidate_admitted)) => {
+                    if candidate_admitted {
+                        info!(
+                            "Added peer {} to DHT routing table after stale revalidation",
+                            app_peer_id_hex
+                        );
+                    } else {
+                        info!(
+                            "Stale revalidation removed stale peers; peer {} was not admitted",
+                            app_peer_id_hex
+                        );
+                    }
+                    this.broadcast_routing_events_with_quarantine(rt_events)
+                        .await;
                 }
                 Err(e) => {
                     warn!(
@@ -5061,7 +5215,7 @@ impl DhtNetworkManager {
         bucket_idx: usize,
         stale_peers: Vec<(PeerId, usize)>,
         trust_fn: &impl Fn(&PeerId) -> f64,
-    ) -> anyhow::Result<Vec<RoutingTableEvent>> {
+    ) -> anyhow::Result<(Vec<RoutingTableEvent>, bool)> {
         if stale_peers.is_empty() {
             return Err(anyhow::anyhow!("no stale peers to revalidate"));
         }
@@ -5136,12 +5290,27 @@ impl DhtNetworkManager {
             all_events.extend(removal_events);
         }
 
-        let admission_events = dht
+        let candidate_id = candidate.id;
+        let candidate_admitted = match dht
             .re_evaluate_admission(candidate, &candidate_ips, trust_fn)
-            .await?;
-        all_events.extend(admission_events);
+            .await
+        {
+            Ok(admission_events) => {
+                all_events.extend(admission_events);
+                true
+            }
+            Err(err) if !all_events.is_empty() => {
+                warn!(
+                    "Candidate {} was not admitted after stale-peer eviction: {}; broadcasting committed removal events",
+                    candidate_id.to_hex(),
+                    err
+                );
+                false
+            }
+            Err(err) => return Err(err),
+        };
 
-        Ok(all_events)
+        Ok((all_events, candidate_admitted))
     }
 
     /// Ping a peer to check liveness.
@@ -5247,8 +5416,87 @@ impl DhtNetworkManager {
             events
         };
 
-        self.broadcast_routing_events(&all_events);
+        self.broadcast_routing_events_with_quarantine(all_events)
+            .await;
         info!("Evicted {} offline K-closest peer(s)", non_responders.len());
+    }
+
+    fn routing_events_can_enable_quarantine_eviction(events: &[RoutingTableEvent]) -> bool {
+        events.iter().any(|event| {
+            matches!(
+                event,
+                RoutingTableEvent::PeerAdded(_) | RoutingTableEvent::KClosestPeersChanged { .. }
+            )
+        })
+    }
+
+    async fn enforce_close_group_trust_gate(&self) -> Vec<RoutingTableEvent> {
+        let Some(ref engine) = self.trust_engine else {
+            return Vec::new();
+        };
+        let trust_score = |peer_id: &PeerId| engine.score(peer_id);
+        let rt_events = {
+            let mut dht = self.dht.write().await;
+            dht.enforce_close_group_trust_gate(&trust_score).await
+        };
+        if !rt_events.is_empty() {
+            let removed: Vec<String> = rt_events
+                .iter()
+                .filter_map(|event| match event {
+                    RoutingTableEvent::PeerRemoved(peer_id) => Some(peer_id.to_hex()),
+                    _ => None,
+                })
+                .collect();
+            info!("Removed close-group trust-gated peer(s): {:?}", removed);
+        }
+        rt_events
+    }
+
+    async fn broadcast_routing_events_with_quarantine(&self, mut events: Vec<RoutingTableEvent>) {
+        if !Self::routing_events_can_enable_quarantine_eviction(&events) {
+            self.broadcast_routing_events(&events);
+            return;
+        }
+
+        let original_old_close_group = events.iter().find_map(|event| match event {
+            RoutingTableEvent::KClosestPeersChanged { old, .. } => Some(old.clone()),
+            _ => None,
+        });
+        let quarantine_events = self.enforce_close_group_trust_gate().await;
+        if quarantine_events.is_empty() {
+            self.broadcast_routing_events(&events);
+            return;
+        }
+
+        if let Some(original_old_close_group) = original_old_close_group {
+            let final_new_close_group =
+                quarantine_events
+                    .iter()
+                    .rev()
+                    .find_map(|event| match event {
+                        RoutingTableEvent::KClosestPeersChanged { new, .. } => Some(new.clone()),
+                        _ => None,
+                    });
+
+            events.retain(|event| !matches!(event, RoutingTableEvent::KClosestPeersChanged { .. }));
+            events.extend(
+                quarantine_events.into_iter().filter(|event| {
+                    !matches!(event, RoutingTableEvent::KClosestPeersChanged { .. })
+                }),
+            );
+            if let Some(new) = final_new_close_group
+                && original_old_close_group != new
+            {
+                events.push(RoutingTableEvent::KClosestPeersChanged {
+                    old: original_old_close_group,
+                    new,
+                });
+            }
+        } else {
+            events.extend(quarantine_events);
+        }
+
+        self.broadcast_routing_events(&events);
     }
 
     /// Translate core engine routing table events into network events and broadcast them.
@@ -5614,13 +5862,16 @@ const DEFAULT_MAX_CONCURRENT_OPS: usize = 100;
 
 impl Default for DhtNetworkConfig {
     fn default() -> Self {
+        let adaptive_config = AdaptiveDhtConfig::default();
         Self {
             peer_id: PeerId::from_bytes([0u8; 32]),
             node_config: NodeConfig::default(),
             request_timeout: Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS),
             max_concurrent_operations: DEFAULT_MAX_CONCURRENT_OPS,
             enable_security: true,
-            swap_threshold: 0.0,
+            swap_threshold: adaptive_config.swap_threshold,
+            quarantine_threshold: adaptive_config.quarantine_threshold,
+            quarantine_readmit_threshold: adaptive_config.quarantine_readmit_threshold,
         }
     }
 }
@@ -5649,6 +5900,32 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn dial_failure_weight_avoids_neutral_peer_after_four_failures_in_six_hours() {
+        let engine = TrustEngine::new();
+        let peer = pid(42);
+        let threshold = AdaptiveDhtConfig::default().quarantine_threshold;
+        let spacing = Duration::from_secs(2 * 60 * 60);
+
+        for failure_index in 0..4 {
+            if failure_index > 0 {
+                engine.simulate_elapsed(&peer, spacing).await;
+            }
+            engine.update_node_stats_weighted_with_reason(
+                &peer,
+                NodeStatisticsUpdate::FailedResponse,
+                DHT_DIAL_FAILURE_TRUST_WEIGHT,
+                TRUST_REASON_DHT_DIAL_FAILED,
+            );
+        }
+
+        let score = engine.score(&peer);
+        assert!(
+            score < threshold,
+            "four weighted dial failures over six hours should avoid peer: score={score}, threshold={threshold}"
+        );
+    }
+
     fn bucket_refresh_candidate(index: usize, refresh_debt_secs: u64) -> BucketRefreshCandidate {
         let refresh_debt = Duration::from_secs(refresh_debt_secs);
         BucketRefreshCandidate {
@@ -5659,13 +5936,14 @@ mod tests {
         }
     }
 
+    const _: () = assert!(
+        MAX_BUCKET_REFRESH_LOOKUPS_PER_PASS > 0,
+        "bucket refresh budget must allow at least one lookup"
+    );
+
     #[test]
     fn bucket_refresh_selection_keeps_all_stale_buckets_within_budget() {
         let refresh_budget = MAX_BUCKET_REFRESH_LOOKUPS_PER_PASS;
-        assert!(
-            refresh_budget > 0,
-            "bucket refresh budget must allow at least one lookup"
-        );
 
         let candidates: Vec<_> = (0..refresh_budget)
             .map(|idx| bucket_refresh_candidate(idx, 3_600 + idx as u64))
@@ -5679,10 +5957,6 @@ mod tests {
     #[test]
     fn bucket_refresh_selection_caps_large_stale_sets_by_debt() {
         let refresh_budget = MAX_BUCKET_REFRESH_LOOKUPS_PER_PASS;
-        assert!(
-            refresh_budget > 0,
-            "bucket refresh budget must allow at least one lookup"
-        );
 
         let candidate_count = refresh_budget * 3;
         let candidates: Vec<_> = (0..candidate_count)
@@ -5787,6 +6061,53 @@ mod tests {
         )
         .await
         .expect("lagged receiver should conservatively wake the waiter");
+    }
+
+    #[tokio::test]
+    async fn lookup_results_do_not_hand_out_quarantined_peers() {
+        let local_peer = pid(0);
+        let quarantined_peer = pid(1);
+        let below_threshold_peer = pid(2);
+        let healthy_peer = pid(3);
+        let mut dht =
+            DhtCoreEngine::new(local_peer, 4, false, DEFAULT_NEUTRAL_TRUST - 0.15).unwrap();
+        dht.set_trust_quarantine_thresholds(0.20, 0.45).unwrap();
+
+        for byte in 1..=5u8 {
+            dht.add_node_no_trust(routing_test_node(byte))
+                .await
+                .unwrap();
+        }
+        dht.remember_quarantined_peer(quarantined_peer, &|_| 0.30);
+
+        let trust_score = |peer_id: &PeerId| {
+            if *peer_id == quarantined_peer {
+                0.30
+            } else if *peer_id == below_threshold_peer {
+                0.10
+            } else {
+                DEFAULT_NEUTRAL_TRUST
+            }
+        };
+
+        let lookup_key = DhtKey::from_bytes(*local_peer.as_bytes());
+        let nodes = dht
+            .find_nodes_with_publish_seq_filtered(&lookup_key, 4, |node| {
+                let score = trust_score(&node.id);
+                node.id != local_peer && !dht.should_avoid_for_lookup(&node.id, score)
+            })
+            .await
+            .unwrap();
+        let results = DhtNetworkManager::lookup_results_from_routing_nodes(nodes, 4);
+        let result_ids: Vec<PeerId> = results.iter().map(|node| node.peer_id).collect();
+
+        assert_eq!(result_ids, vec![healthy_peer, pid(4), pid(5)]);
+        assert!(
+            results
+                .iter()
+                .all(|node| (node.reliability - SELF_RELIABILITY_SCORE).abs() < f64::EPSILON),
+            "trust filtering must not change the legacy DHTNode reliability wire value"
+        );
     }
 
     #[test]
@@ -7446,6 +7767,15 @@ mod tests {
     /// the identity-failure cache only keys on peer ID.
     fn pid(byte: u8) -> PeerId {
         PeerId::from_bytes([byte; 32])
+    }
+
+    fn routing_test_node(byte: u8) -> NodeInfo {
+        NodeInfo {
+            id: pid(byte),
+            addresses: vec![MultiAddr::quic(sock(&format!("203.0.{byte}.1:9000")))],
+            address_types: vec![AddressType::Direct],
+            last_seen: AtomicInstant::now(),
+        }
     }
 
     #[test]

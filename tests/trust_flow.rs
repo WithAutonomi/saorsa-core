@@ -18,10 +18,15 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use std::time::Duration;
+
 use saorsa_core::{AdaptiveDhtConfig, NodeConfig, P2PNode, PeerId, TrustEvent};
 
 /// Default neutral trust score for unknown peers.
 const NEUTRAL_TRUST: f64 = 0.5;
+
+/// Response wait bound for request/response tests against unreachable peers.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Default trust threshold below which peers become eligible for swap-out.
 const SWAP_THRESHOLD: f64 = 0.35;
@@ -87,6 +92,33 @@ async fn failures_lower_trust_below_neutral() {
         score < NEUTRAL_TRUST,
         "After 20 failures, trust {score} should be below neutral {NEUTRAL_TRUST}"
     );
+}
+
+/// A `send_request` that fails at the transport layer leaves the target
+/// peer's trust unchanged — request transport errors are trust-neutral.
+#[tokio::test]
+async fn failed_send_request_leaves_trust_unchanged() {
+    let node = P2PNode::new(test_node_config()).await.unwrap();
+    node.start().await.unwrap();
+    let unreachable_peer = PeerId::random();
+
+    let result = node
+        .send_request(
+            &unreachable_peer,
+            "test/echo",
+            vec![1, 2, 3],
+            REQUEST_TIMEOUT,
+        )
+        .await;
+    assert!(result.is_err(), "request to a nonexistent peer must fail");
+
+    let score = node.peer_trust(&unreachable_peer);
+    assert!(
+        (score - NEUTRAL_TRUST).abs() < f64::EPSILON,
+        "Request transport errors must be trust-neutral; expected {NEUTRAL_TRUST}, got {score}"
+    );
+
+    node.stop().await.unwrap();
 }
 
 // ---------------------------------------------------------------------------
@@ -310,6 +342,7 @@ async fn custom_swap_threshold_respected() {
         .ipv6(false)
         .adaptive_dht_config(AdaptiveDhtConfig {
             swap_threshold: custom_threshold,
+            ..Default::default()
         })
         .build()
         .unwrap();
@@ -401,6 +434,7 @@ async fn invalid_swap_threshold_rejected() {
             .ipv6(false)
             .adaptive_dht_config(AdaptiveDhtConfig {
                 swap_threshold: bad_threshold,
+                ..Default::default()
             })
             .build();
 
