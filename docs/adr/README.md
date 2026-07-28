@@ -32,9 +32,10 @@ An Architecture Decision Record (ADR) is a document that captures an important a
 | ADR | Title | Status | Summary |
 |-----|-------|--------|---------|
 | [ADR-005](./ADR-005-skademlia-witness-protocol.md) | S/Kademlia Witness Protocol | Accepted | Byzantine fault-tolerant DHT operations |
-| [ADR-006](./ADR-006-eigentrust-reputation.md) | EigenTrust Reputation System | Accepted | Iterative trust computation for Sybil resistance |
+| [ADR-006](./ADR-006-eigentrust-reputation.md) | EigenTrust Reputation System | Accepted, narrowed by [ADR-016](./ADR-016-local-response-rate-trust-quarantine.md) | Historical/future distributed reputation design; not the production trust contract |
 | [ADR-009](./ADR-009-sybil-protection.md) | Sybil Protection Mechanisms | Accepted | Multi-layered defense against identity attacks |
 | [ADR-010](./ADR-010-entangled-attestation.md) | Entangled Attestation System | Accepted | Software integrity verification via attestation chains |
+| [ADR-016](./ADR-016-local-response-rate-trust-quarantine.md) | Local Response-Rate Trust Quarantine for DHT Routing | Accepted | Local EMA/quarantine trust semantics for DHT routing |
 
 ### Network Intelligence
 
