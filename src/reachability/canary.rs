@@ -31,7 +31,7 @@ use tracing::{debug, info, warn};
 
 use crate::address::is_lan_ip;
 use crate::dht::AddressType;
-use crate::dht_network_manager::{DHTNode, DhtNetworkManager, IDENTITY_EXCHANGE_TIMEOUT};
+use crate::dht_network_manager::{DHTNode, DhtNetworkManager};
 use crate::error::P2PError;
 use crate::rate_limit::EngineConfig;
 use crate::security::canonicalize_ip;
@@ -47,8 +47,22 @@ pub(crate) const RELAY_CANARY_WIRE_TOPIC: &str = "/rr/relay-canary-v1";
 /// Number of independent non-close witnesses to ask for a relay proof.
 const RELAY_CANARY_WITNESS_TARGET: usize = 3;
 
-/// Minimum successful witness probes needed before a relay is publishable.
-const RELAY_CANARY_REQUIRED_SUCCESSES: usize = 2;
+/// Successful witness probes needed before a relay is publishable.
+///
+/// Publication is unanimous across the selected independent witnesses. A
+/// 2-of-3 quorum can knowingly publish a relay after the third path has failed,
+/// which violates the established-relay reachability invariant.
+const RELAY_CANARY_ADMISSION_SUCCESSES: usize = RELAY_CANARY_WITNESS_TARGET;
+
+/// One explicit canary-capable dial failure is enough to reject a provisional
+/// relay. Established relays confirm that result in a second maintenance round
+/// before withdrawal.
+const RELAY_CANARY_ADMISSION_FAILURES: usize = 1;
+
+/// Established relays use majority evidence so one witness-specific network
+/// failure cannot withdraw a relay that two other witnesses just reached.
+const RELAY_CANARY_MAINTENANCE_SUCCESSES: usize = 2;
+const RELAY_CANARY_MAINTENANCE_FAILURES: usize = 2;
 
 /// Witness-side handler budget for answering one relay canary request.
 ///
@@ -69,10 +83,7 @@ const RELAY_CANARY_REQUEST_TIMEOUT: Duration = Duration::from_secs(12);
 /// A relay that cannot establish a transport connection within this window is
 /// a failed probe, not an ineligible witness. Keeping this below the handler
 /// budget leaves room for the identity check and response.
-const RELAY_CANARY_CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
-
-/// Cold-dial identity budget spent by a witness when probing a relay address.
-const RELAY_CANARY_DIAL_TIMEOUT: Duration = IDENTITY_EXCHANGE_TIMEOUT;
+const RELAY_CANARY_CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Sliding window for per-source relay canary rate limiting.
 const RELAY_CANARY_RATE_WINDOW: Duration = Duration::from_secs(10);
@@ -243,9 +254,44 @@ fn validate_relay_canary_address(
 /// Aggregate decision for a just-acquired relay.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RelayCanaryVerdict {
-    Verified { successes: usize, attempts: usize },
-    Rejected { successes: usize, attempts: usize },
-    InsufficientWitnesses { available: usize, required: usize },
+    Verified {
+        successes: usize,
+        attempts: usize,
+    },
+    Rejected {
+        successes: usize,
+        attempts: usize,
+    },
+    Inconclusive {
+        successes: usize,
+        failures: usize,
+        unavailable: usize,
+    },
+}
+
+/// Evidence policy for a relay canary round.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RelayCanaryPolicy {
+    /// A provisional relay must pass every selected witness before publication.
+    Admission,
+    /// An established relay is retained or rejected by a completed majority.
+    Maintenance,
+}
+
+impl RelayCanaryPolicy {
+    fn required_successes(self) -> usize {
+        match self {
+            Self::Admission => RELAY_CANARY_ADMISSION_SUCCESSES,
+            Self::Maintenance => RELAY_CANARY_MAINTENANCE_SUCCESSES,
+        }
+    }
+
+    fn required_failures(self) -> usize {
+        match self {
+            Self::Admission => RELAY_CANARY_ADMISSION_FAILURES,
+            Self::Maintenance => RELAY_CANARY_MAINTENANCE_FAILURES,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -255,15 +301,8 @@ enum RelayCanaryProbeDisposition {
     Ineligible,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RelayCanaryProgressDecision {
-    Continue,
-    Verified { successes: usize, attempts: usize },
-    Rejected { successes: usize, attempts: usize },
-}
-
 #[derive(Debug, Clone)]
-struct RelayCanaryProgress {
+struct RelayCanarySummary {
     total: usize,
     responses: usize,
     eligible_attempts: usize,
@@ -271,7 +310,7 @@ struct RelayCanaryProgress {
     ineligible: usize,
 }
 
-impl RelayCanaryProgress {
+impl RelayCanarySummary {
     fn new(total: usize) -> Self {
         Self {
             total,
@@ -282,7 +321,7 @@ impl RelayCanaryProgress {
         }
     }
 
-    fn record(&mut self, disposition: RelayCanaryProbeDisposition) -> RelayCanaryProgressDecision {
+    fn record(&mut self, disposition: RelayCanaryProbeDisposition) {
         self.responses += 1;
         match disposition {
             RelayCanaryProbeDisposition::Success => {
@@ -296,37 +335,26 @@ impl RelayCanaryProgress {
                 self.ineligible += 1;
             }
         }
-
-        if self.successes >= RELAY_CANARY_REQUIRED_SUCCESSES {
-            return RelayCanaryProgressDecision::Verified {
-                successes: self.successes,
-                attempts: self.eligible_attempts,
-            };
-        }
-
-        let remaining = self.total.saturating_sub(self.responses);
-        if self.successes + remaining < RELAY_CANARY_REQUIRED_SUCCESSES
-            && self.eligible_attempts >= RELAY_CANARY_REQUIRED_SUCCESSES
-        {
-            return RelayCanaryProgressDecision::Rejected {
-                successes: self.successes,
-                attempts: self.eligible_attempts,
-            };
-        }
-
-        RelayCanaryProgressDecision::Continue
     }
 
-    fn final_verdict(&self) -> RelayCanaryVerdict {
-        if self.eligible_attempts < RELAY_CANARY_REQUIRED_SUCCESSES {
-            RelayCanaryVerdict::InsufficientWitnesses {
-                available: self.eligible_attempts,
-                required: RELAY_CANARY_REQUIRED_SUCCESSES,
+    fn verdict(&self, policy: RelayCanaryPolicy) -> RelayCanaryVerdict {
+        let failures = self.eligible_attempts.saturating_sub(self.successes);
+        if self.successes >= policy.required_successes() {
+            RelayCanaryVerdict::Verified {
+                successes: self.successes,
+                attempts: self.eligible_attempts,
             }
-        } else {
+        } else if failures >= policy.required_failures() {
             RelayCanaryVerdict::Rejected {
                 successes: self.successes,
                 attempts: self.eligible_attempts,
+            }
+        } else {
+            RelayCanaryVerdict::Inconclusive {
+                successes: self.successes,
+                failures,
+                unavailable: self.ineligible
+                    + RELAY_CANARY_WITNESS_TARGET.saturating_sub(self.total),
             }
         }
     }
@@ -350,6 +378,7 @@ pub(crate) async fn verify_relay_with_canaries(
     dht: &Arc<DhtNetworkManager>,
     relayer: PeerId,
     relay_addr: SocketAddr,
+    policy: RelayCanaryPolicy,
 ) -> RelayCanaryVerdict {
     let target_peer_id = *dht.peer_id();
     let request = RelayCanaryRequest::new(target_peer_id, relayer, relay_addr);
@@ -385,19 +414,21 @@ pub(crate) async fn verify_relay_with_canaries(
         &mut rand::thread_rng(),
     );
 
-    if witnesses.len() < RELAY_CANARY_REQUIRED_SUCCESSES {
+    if witnesses.len() < policy.required_successes() {
         warn!(
             relayer = %relayer.to_hex(),
             relay = %relay_addr,
             available = witnesses.len(),
-            required = RELAY_CANARY_REQUIRED_SUCCESSES,
+            required = policy.required_successes(),
+            ?policy,
             close_group_excluded = close_group_ids.len(),
             routing_table_size,
             "relay canary: insufficient random non-close witnesses, refusing to publish relay"
         );
-        return RelayCanaryVerdict::InsufficientWitnesses {
-            available: witnesses.len(),
-            required: RELAY_CANARY_REQUIRED_SUCCESSES,
+        return RelayCanaryVerdict::Inconclusive {
+            successes: 0,
+            failures: 0,
+            unavailable: RELAY_CANARY_WITNESS_TARGET.saturating_sub(witnesses.len()),
         };
     }
 
@@ -410,7 +441,7 @@ pub(crate) async fn verify_relay_with_canaries(
         "relay canary: probing random non-close witnesses"
     );
 
-    let mut progress = RelayCanaryProgress::new(witnesses.len());
+    let mut summary = RelayCanarySummary::new(witnesses.len());
     let mut probes = FuturesUnordered::new();
     for witness in witnesses {
         let dht = Arc::clone(dht);
@@ -419,79 +450,83 @@ pub(crate) async fn verify_relay_with_canaries(
     }
 
     while let Some(report) = probes.next().await {
-        let decision = progress.record(report.disposition);
+        summary.record(report.disposition);
         if report.disposition == RelayCanaryProbeDisposition::Success {
             debug!(
                 witness = %report.witness.to_hex(),
-                successes = progress.successes,
-                eligible_attempts = progress.eligible_attempts,
-                responses = progress.responses,
+                successes = summary.successes,
+                eligible_attempts = summary.eligible_attempts,
+                responses = summary.responses,
                 "relay canary: witness confirmed relay"
             );
         } else if report.disposition == RelayCanaryProbeDisposition::Ineligible {
             debug!(
                 witness = %report.witness.to_hex(),
                 detail = %report.detail,
-                ineligible = progress.ineligible,
-                eligible_attempts = progress.eligible_attempts,
-                responses = progress.responses,
+                ineligible = summary.ineligible,
+                eligible_attempts = summary.eligible_attempts,
+                responses = summary.responses,
                 "relay canary: witness could not evaluate relay"
             );
         } else {
             debug!(
                 witness = %report.witness.to_hex(),
                 detail = %report.detail,
-                successes = progress.successes,
-                eligible_attempts = progress.eligible_attempts,
-                responses = progress.responses,
+                successes = summary.successes,
+                eligible_attempts = summary.eligible_attempts,
+                responses = summary.responses,
                 "relay canary: witness failed relay probe"
             );
         }
-
-        match decision {
-            RelayCanaryProgressDecision::Verified {
-                successes,
-                attempts,
-            } => {
-                info!(
-                    relayer = %relayer.to_hex(),
-                    relay = %relay_addr,
-                    successes,
-                    attempts,
-                    responses = progress.responses,
-                    ineligible = progress.ineligible,
-                    available_witnesses = progress.total,
-                    "relay canary: quorum verified relay"
-                );
-                return RelayCanaryVerdict::Verified {
-                    successes,
-                    attempts,
-                };
-            }
-            RelayCanaryProgressDecision::Rejected {
-                successes,
-                attempts,
-            } => {
-                warn!(
-                    relayer = %relayer.to_hex(),
-                    relay = %relay_addr,
-                    successes,
-                    attempts,
-                    responses = progress.responses,
-                    total = progress.total,
-                    ineligible = progress.ineligible,
-                    "relay canary: quorum failed relay"
-                );
-                return RelayCanaryVerdict::Rejected {
-                    successes,
-                    attempts,
-                };
-            }
-            RelayCanaryProgressDecision::Continue => {}
-        }
     }
 
-    progress.final_verdict()
+    let verdict = summary.verdict(policy);
+    match &verdict {
+        RelayCanaryVerdict::Verified {
+            successes,
+            attempts,
+        } => info!(
+            relayer = %relayer.to_hex(),
+            relay = %relay_addr,
+            successes,
+            attempts,
+            responses = summary.responses,
+            ineligible = summary.ineligible,
+            available_witnesses = summary.total,
+            ?policy,
+            "relay canary: completed witness round verified relay"
+        ),
+        RelayCanaryVerdict::Rejected {
+            successes,
+            attempts,
+        } => warn!(
+            relayer = %relayer.to_hex(),
+            relay = %relay_addr,
+            successes,
+            attempts,
+            responses = summary.responses,
+            ineligible = summary.ineligible,
+            available_witnesses = summary.total,
+            ?policy,
+            "relay canary: completed witness round rejected relay"
+        ),
+        RelayCanaryVerdict::Inconclusive {
+            successes,
+            failures,
+            unavailable,
+        } => warn!(
+            relayer = %relayer.to_hex(),
+            relay = %relay_addr,
+            successes,
+            failures,
+            unavailable,
+            responses = summary.responses,
+            available_witnesses = summary.total,
+            ?policy,
+            "relay canary: completed witness round was inconclusive"
+        ),
+    }
+    verdict
 }
 
 /// Probe `request.relay_addr` from this witness node and return the result.
@@ -502,41 +537,29 @@ pub(crate) async fn answer_relay_canary_request(
     let relay_address = MultiAddr::quic(request.relay_addr);
     let dial = tokio::time::timeout(
         RELAY_CANARY_CONNECT_TIMEOUT,
-        // The address type is an informational hint for logging/classification;
-        // correctness comes from dialing the allocated socket and checking the
-        // authenticated target identity below.
-        transport.connect_peer_typed(&relay_address, AddressType::Relay),
+        // Keep prospective canary probes separately identifiable in structured
+        // logs. Correctness comes from dialing the allocated socket and checking
+        // the authenticated target identity below.
+        transport.connect_peer_relay_canary_authenticated(&relay_address),
     )
     .await;
 
     let result = match dial {
-        Ok(Ok(channel_id)) => {
-            let identity = transport
-                .wait_for_peer_identity(&channel_id, RELAY_CANARY_DIAL_TIMEOUT)
-                .await;
-            let result = match identity {
-                Ok(authenticated) if authenticated == request.target_peer_id => {
-                    RelayCanaryProbeResult::Success
-                }
-                Ok(authenticated) => {
-                    debug!(
-                        expected = %request.target_peer_id.to_hex(),
-                        actual = %authenticated.to_hex(),
-                        relay = %request.relay_addr,
-                        "relay canary witness: identity mismatch"
-                    );
-                    RelayCanaryProbeResult::IdentityMismatch
-                }
-                Err(e) => {
-                    debug!(
-                        relay = %request.relay_addr,
-                        error = %e,
-                        "relay canary witness: identity exchange failed"
-                    );
-                    RelayCanaryProbeResult::IdentityExchangeFailed
-                }
+        Ok(Ok(authenticated_channel)) => {
+            let result = if authenticated_channel.peer_id == request.target_peer_id {
+                RelayCanaryProbeResult::Success
+            } else {
+                debug!(
+                    expected = %request.target_peer_id.to_hex(),
+                    actual = %authenticated_channel.peer_id.to_hex(),
+                    relay = %request.relay_addr,
+                    "relay canary witness: identity mismatch"
+                );
+                RelayCanaryProbeResult::IdentityMismatch
             };
-            transport.disconnect_channel(&channel_id).await;
+            transport
+                .disconnect_channel(&authenticated_channel.channel_id)
+                .await;
             result
         }
         Ok(Err(e)) => {
@@ -769,42 +792,97 @@ mod tests {
     }
 
     #[test]
-    fn ineligible_witnesses_produce_insufficient_witnesses() {
-        let mut progress = RelayCanaryProgress::new(RELAY_CANARY_WITNESS_TARGET);
+    fn ineligible_witnesses_produce_inconclusive_verdict() {
+        let mut summary = RelayCanarySummary::new(RELAY_CANARY_WITNESS_TARGET);
 
+        summary.record(RelayCanaryProbeDisposition::Success);
+        summary.record(RelayCanaryProbeDisposition::Ineligible);
+        summary.record(RelayCanaryProbeDisposition::Ineligible);
         assert_eq!(
-            progress.record(RelayCanaryProbeDisposition::Success),
-            RelayCanaryProgressDecision::Continue
-        );
-        assert_eq!(
-            progress.record(RelayCanaryProbeDisposition::Ineligible),
-            RelayCanaryProgressDecision::Continue
-        );
-        assert_eq!(
-            progress.record(RelayCanaryProbeDisposition::Ineligible),
-            RelayCanaryProgressDecision::Continue
-        );
-        assert_eq!(
-            progress.final_verdict(),
-            RelayCanaryVerdict::InsufficientWitnesses {
-                available: 1,
-                required: RELAY_CANARY_REQUIRED_SUCCESSES
+            summary.verdict(RelayCanaryPolicy::Admission),
+            RelayCanaryVerdict::Inconclusive {
+                successes: 1,
+                failures: 0,
+                unavailable: 2
             }
         );
     }
 
     #[test]
-    fn two_eligible_failures_reject_relay() {
-        let mut progress = RelayCanaryProgress::new(RELAY_CANARY_WITNESS_TARGET);
+    fn one_failure_rejects_admission_but_not_healthy_maintenance_majority() {
+        let mut summary = RelayCanarySummary::new(RELAY_CANARY_WITNESS_TARGET);
 
+        summary.record(RelayCanaryProbeDisposition::Failure);
+        summary.record(RelayCanaryProbeDisposition::Success);
+        summary.record(RelayCanaryProbeDisposition::Success);
         assert_eq!(
-            progress.record(RelayCanaryProbeDisposition::Failure),
-            RelayCanaryProgressDecision::Continue
+            summary.verdict(RelayCanaryPolicy::Admission),
+            RelayCanaryVerdict::Rejected {
+                successes: 2,
+                attempts: 3
+            }
         );
         assert_eq!(
-            progress.record(RelayCanaryProbeDisposition::Failure),
-            RelayCanaryProgressDecision::Rejected {
-                successes: 0,
+            summary.verdict(RelayCanaryPolicy::Maintenance),
+            RelayCanaryVerdict::Verified {
+                successes: 2,
+                attempts: 3
+            }
+        );
+    }
+
+    #[test]
+    fn two_failures_reject_maintenance_round() {
+        let mut summary = RelayCanarySummary::new(RELAY_CANARY_WITNESS_TARGET);
+
+        summary.record(RelayCanaryProbeDisposition::Failure);
+        summary.record(RelayCanaryProbeDisposition::Success);
+        summary.record(RelayCanaryProbeDisposition::Failure);
+        assert_eq!(
+            summary.verdict(RelayCanaryPolicy::Maintenance),
+            RelayCanaryVerdict::Rejected {
+                successes: 1,
+                attempts: 3
+            }
+        );
+    }
+
+    #[test]
+    fn split_maintenance_evidence_is_inconclusive() {
+        let mut summary = RelayCanarySummary::new(RELAY_CANARY_WITNESS_TARGET);
+
+        summary.record(RelayCanaryProbeDisposition::Success);
+        summary.record(RelayCanaryProbeDisposition::Failure);
+        summary.record(RelayCanaryProbeDisposition::Ineligible);
+        assert_eq!(
+            summary.verdict(RelayCanaryPolicy::Maintenance),
+            RelayCanaryVerdict::Inconclusive {
+                successes: 1,
+                failures: 1,
+                unavailable: 1
+            }
+        );
+    }
+
+    #[test]
+    fn two_successes_and_one_ineligible_verify_only_maintenance() {
+        let mut summary = RelayCanarySummary::new(RELAY_CANARY_WITNESS_TARGET);
+
+        summary.record(RelayCanaryProbeDisposition::Success);
+        summary.record(RelayCanaryProbeDisposition::Success);
+        summary.record(RelayCanaryProbeDisposition::Ineligible);
+        assert_eq!(
+            summary.verdict(RelayCanaryPolicy::Admission),
+            RelayCanaryVerdict::Inconclusive {
+                successes: 2,
+                failures: 0,
+                unavailable: 1
+            }
+        );
+        assert_eq!(
+            summary.verdict(RelayCanaryPolicy::Maintenance),
+            RelayCanaryVerdict::Verified {
+                successes: 2,
                 attempts: 2
             }
         );

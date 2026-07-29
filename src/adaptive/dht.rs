@@ -277,6 +277,21 @@ impl AdaptiveDHT {
             .peer_addresses_for_dial_typed(peer_id)
             .await
     }
+
+    /// Ensure the shared DHT dial coordinator has an authenticated channel.
+    ///
+    /// Keeping application reconnects on the same path as iterative lookups
+    /// means both callers share address-failure suppression and never create
+    /// independent retry loops against a known-bad relay.
+    pub(crate) async fn ensure_peer_channel(
+        &self,
+        peer_id: &PeerId,
+        candidates: &[(MultiAddr, AddressType)],
+    ) -> Result<()> {
+        self.dht_manager
+            .ensure_peer_channel(peer_id, candidates)
+            .await
+    }
 }
 
 #[cfg(test)]

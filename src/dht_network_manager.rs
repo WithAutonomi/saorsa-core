@@ -1099,18 +1099,19 @@ impl DialFailureCache {
 }
 
 /// ADR-011 self-heal: when a newer authoritative `PublishAddressSet` from
-/// `publisher` is applied, clear any stale dial-failure suppression for its
-/// freshly published socket addresses. A recovered address — for example a relay
-/// that now hands a reconnecting peer back its previous stable port — is
-/// otherwise kept suppressed for up to [`DIAL_FAILURE_CACHE_TTL`] even though the
-/// owner has just re-attested it. The exemption it grants is keyed by
-/// `(publisher, socket)` so only a dial *to that publisher* benefits. Returns the
-/// number of addresses cleared; a no-op when the publish was not applied (stale
-/// or duplicate sequence).
+/// `publisher` is applied, clear stale dial-failure suppression only for socket
+/// addresses absent from `previous_addresses`.
+///
+/// This immediately retries a genuinely withdrawn then recovered address
+/// without treating a sequence-only refresh of an unchanged bad relay as proof
+/// of recovery. The exemption is keyed by `(publisher, socket)` so only a dial
+/// *to that publisher* benefits. Returns the number of addresses cleared; a
+/// no-op when the publish was not applied (stale or duplicate sequence).
 fn clear_dial_failures_for_published(
     cache: &DialFailureCache,
     publisher: &PeerId,
     applied: bool,
+    previous_addresses: &[(crate::MultiAddr, AddressType)],
     addresses: &[(crate::MultiAddr, AddressType)],
 ) -> usize {
     if !applied {
@@ -1118,6 +1119,12 @@ fn clear_dial_failures_for_published(
     }
     let mut cleared = 0;
     for (addr, _ty) in addresses {
+        if previous_addresses
+            .iter()
+            .any(|(previous, _)| previous == addr)
+        {
+            continue;
+        }
         if let Some(socket_addr) = addr.dialable_socket_addr() {
             // Clears this address's own failure and grants (publisher, socket) a
             // short exemption from IP suppression — but never lifts IP-level relay
@@ -3574,7 +3581,7 @@ impl DhtNetworkManager {
     /// broadcast and translate the shared outcome back into a
     /// caller-facing [`P2PError`] — they do not duplicate the
     /// owner's side effects.
-    async fn ensure_peer_channel(
+    pub(crate) async fn ensure_peer_channel(
         &self,
         peer_id: &PeerId,
         candidates: &[(MultiAddr, AddressType)],
@@ -4468,13 +4475,15 @@ impl DhtNetworkManager {
                     );
                 }
                 let dht = self.dht.read().await;
+                let previous_addresses = dht.get_node_addresses_typed(authenticated_sender).await;
                 let applied = dht
                     .replace_node_addresses(authenticated_sender, filtered_addresses.clone(), *seq)
                     .await;
-                // ADR-011: a newer authoritative address set just landed — lift
-                // stale dial-failure suppression for its addresses so a
-                // self-healed (e.g. reclaimed stable relay) address is retried
-                // immediately instead of staying suppressed for the cache TTL.
+                // ADR-011: a newer authoritative address set just landed. Lift
+                // stale dial-failure suppression only for addresses that were
+                // absent from the previous record and have genuinely
+                // reappeared (for example a reclaimed stable relay). Refreshing
+                // an unchanged failed address must not create a redial loop.
                 //
                 // Race guard: only exempt addresses that are STILL the peer's
                 // current record after the apply (read back under the same lock
@@ -4493,6 +4502,7 @@ impl DhtNetworkManager {
                         self.dial_failure_cache.as_ref(),
                         authenticated_sender,
                         true,
+                        &previous_addresses,
                         &still_current,
                     )
                 } else {
@@ -5664,12 +5674,14 @@ impl DhtNetworkManager {
         &self,
         typed_addresses: Vec<(crate::MultiAddr, AddressType)>,
         peers: &[DHTNode],
-    ) {
+    ) -> Vec<PeerId> {
         let seq = Self::next_publish_seq();
         let op = DhtNetworkOperation::PublishAddressSet {
             seq,
             addresses: typed_addresses.clone(),
         };
+        let mut confirmed = Vec::new();
+        let mut publishes = FuturesUnordered::new();
         for peer in peers {
             if peer.peer_id == self.config.peer_id {
                 continue; // Skip self
@@ -5677,28 +5689,49 @@ impl DhtNetworkManager {
             // Pass the peer's typed addresses through directly so
             // send_dht_request avoids a redundant routing-table read for
             // a peer we already have in hand.
+            let peer_id = peer.peer_id;
             let peer_typed = peer.typed_addresses();
-            match self
-                .send_dht_request(&peer.peer_id, op.clone(), Some(&peer_typed))
-                .await
-            {
-                Ok(_) => {
+            let op = op.clone();
+            publishes.push(async move {
+                (
+                    peer_id,
+                    self.send_dht_request(&peer_id, op, Some(&peer_typed)).await,
+                )
+            });
+        }
+
+        // A withdrawal must not spend one full request timeout per unavailable
+        // peer while the rest of the network continues dialing the old relay.
+        // Fan the full replacement out concurrently and retain the exact
+        // acknowledgers so the driver can retry only missing replicas.
+        while let Some((peer_id, result)) = publishes.next().await {
+            match result {
+                Ok(DhtNetworkResult::PublishAddressAck) => {
+                    confirmed.push(peer_id);
                     debug!(
-                        peer = %peer.peer_id.to_hex(),
+                        peer = %peer_id.to_hex(),
                         addrs = typed_addresses.len(),
                         seq,
                         "published address set to peer",
                     );
                 }
+                Ok(other) => {
+                    debug!(
+                        peer = %peer_id.to_hex(),
+                        result = ?other,
+                        "Peer returned an unexpected address publication response"
+                    );
+                }
                 Err(e) => {
                     debug!(
                         "Failed to publish address set to peer {}: {}",
-                        peer.peer_id.to_hex(),
+                        peer_id.to_hex(),
                         e
                     );
                 }
             }
         }
+        confirmed
     }
 
     /// Generate the next monotonic publish sequence number.
@@ -7257,7 +7290,7 @@ mod tests {
 
         // A stale/duplicate publish (not applied) must NOT lift suppression.
         assert_eq!(
-            clear_dial_failures_for_published(&cache, &peer, false, &addrs),
+            clear_dial_failures_for_published(&cache, &peer, false, &[], &addrs),
             0
         );
         assert!(cache.is_failed(&relay_sa, AddressType::Relay));
@@ -7266,11 +7299,51 @@ mod tests {
         // A newer applied publish clears the per-address failures (neither IP is
         // over the suppression threshold here, so both become dialable).
         assert_eq!(
-            clear_dial_failures_for_published(&cache, &peer, true, &addrs),
+            clear_dial_failures_for_published(&cache, &peer, true, &[], &addrs),
             2
         );
         assert!(!cache.is_failed(&relay_sa, AddressType::Relay));
         assert!(!cache.is_failed(&direct_sa, AddressType::Direct));
+    }
+
+    #[test]
+    fn repeated_unchanged_publish_does_not_clear_fresh_dial_failure() {
+        let cache = DialFailureCache::new();
+        let peer = PeerId::from_bytes([1; 32]);
+        let relay = crate::MultiAddr::quic(sock("203.0.113.7:9000"));
+        let relay_sa = relay.dialable_socket_addr().expect("dialable");
+        let addrs = vec![(relay, AddressType::Relay)];
+
+        cache.record_failure(relay_sa, AddressType::Relay);
+        assert_eq!(
+            clear_dial_failures_for_published(&cache, &peer, true, &addrs, &addrs),
+            0
+        );
+        assert!(
+            cache.is_failed_for_dial(&peer, &relay_sa, AddressType::Relay),
+            "refreshing an unchanged bad relay must not create a retry loop"
+        );
+    }
+
+    #[test]
+    fn relay_reappearing_after_withdrawal_clears_old_dial_failure() {
+        let cache = DialFailureCache::new();
+        let peer = PeerId::from_bytes([1; 32]);
+        let relay = crate::MultiAddr::quic(sock("203.0.113.7:9000"));
+        let direct = crate::MultiAddr::quic(sock("203.0.113.8:9000"));
+        let relay_sa = relay.dialable_socket_addr().expect("dialable");
+        let previous = vec![(direct.clone(), AddressType::Direct)];
+        let current = vec![(relay, AddressType::Relay), (direct, AddressType::Direct)];
+
+        cache.record_failure(relay_sa, AddressType::Relay);
+        assert_eq!(
+            clear_dial_failures_for_published(&cache, &peer, true, &previous, &current),
+            1
+        );
+        assert!(
+            !cache.is_failed_for_dial(&peer, &relay_sa, AddressType::Relay),
+            "a genuinely withdrawn then re-acquired relay should be retried"
+        );
     }
 
     #[test]
@@ -7293,7 +7366,7 @@ mod tests {
         // The owner re-attests one of those addresses via an applied publish.
         let addrs = vec![(crate::MultiAddr::quic(socks[0]), AddressType::Relay)];
         assert_eq!(
-            clear_dial_failures_for_published(&cache, &peer, true, &addrs),
+            clear_dial_failures_for_published(&cache, &peer, true, &[], &addrs),
             1
         );
 
@@ -7334,7 +7407,7 @@ mod tests {
         // Its owner reclaims and re-attests it via an applied publish.
         let addrs = vec![(crate::MultiAddr::quic(socks[0]), AddressType::Relay)];
         assert_eq!(
-            clear_dial_failures_for_published(&cache, &owner, true, &addrs),
+            clear_dial_failures_for_published(&cache, &owner, true, &[], &addrs),
             1
         );
 

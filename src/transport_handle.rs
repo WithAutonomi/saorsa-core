@@ -21,8 +21,10 @@ use crate::MultiAddr;
 use crate::PeerId;
 use crate::bgp_geo_provider::BgpGeoProvider;
 use crate::dht::core_engine::AddressType;
-use crate::error::{NetworkError, P2PError, P2pResult as Result, SendFailureKind, TransportError};
-use crate::identity::node_identity::NodeIdentity;
+use crate::error::{
+    IdentityError, NetworkError, P2PError, P2pResult as Result, SendFailureKind, TransportError,
+};
+use crate::identity::node_identity::{NodeIdentity, peer_id_from_public_key_spki};
 use crate::network::{
     ConnectionStatus, MAX_ACTIVE_REQUESTS, MAX_REQUEST_TIMEOUT, MESSAGE_RECV_CHANNEL_CAPACITY,
     NetworkSender, P2PEvent, ParsedMessage, PeerInfo, PeerResponse, PendingRequest,
@@ -38,6 +40,7 @@ use crate::validation::{RateLimitConfig, RateLimiter};
 
 use dashmap::mapref::entry::Entry as DashEntry;
 use dashmap::{DashMap, DashSet};
+use saorsa_transport::nat_traversal_api::PreparedRelay;
 use std::collections::HashSet;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -429,6 +432,14 @@ pub struct TransportHandle {
     /// background tasks, not through this field directly.
     #[allow(dead_code)]
     proof_eligible_peers: Arc<DashSet<IpAddr>>,
+}
+
+/// Result of a canary dial authenticated by its exact QUIC/TLS connection.
+pub(crate) struct AuthenticatedChannel {
+    /// Transport-level channel identifier used for cleanup.
+    pub(crate) channel_id: String,
+    /// Peer identity derived from the TLS-authenticated ML-DSA public key.
+    pub(crate) peer_id: PeerId,
 }
 
 struct ActiveRequestGuard {
@@ -1388,12 +1399,60 @@ impl TransportHandle {
         self.connect_peer_inner(address, Some(kind)).await
     }
 
+    /// Connect to a prospective relay during third-party canary validation.
+    ///
+    /// The transport semantics remain [`AddressType::Relay`], but the
+    /// dedicated structured log kind keeps a failed pre-publication probe
+    /// distinguishable from a failed dial of an already-published relay.
+    pub(crate) async fn connect_peer_relay_canary_authenticated(
+        &self,
+        address: &MultiAddr,
+    ) -> Result<AuthenticatedChannel> {
+        let (channel_id, peer_public_key_spki) = self
+            .connect_peer_inner_authenticated(
+                address,
+                Some(AddressType::Relay),
+                Some("RelayCanary"),
+            )
+            .await?;
+        let peer_id = match peer_public_key_spki {
+            Some(spki) => peer_id_from_public_key_spki(&spki),
+            None => Err(P2PError::Identity(IdentityError::NotFound(
+                "QUIC/TLS connection did not expose an authenticated peer public key"
+                    .to_string()
+                    .into(),
+            ))),
+        };
+
+        match peer_id {
+            Ok(peer_id) => Ok(AuthenticatedChannel {
+                channel_id,
+                peer_id,
+            }),
+            Err(error) => {
+                self.disconnect_channel(&channel_id).await;
+                Err(error)
+            }
+        }
+    }
+
     async fn connect_peer_inner(
         &self,
         address: &MultiAddr,
         kind: Option<AddressType>,
     ) -> Result<String> {
-        let kind_label = address_kind_label(kind);
+        self.connect_peer_inner_authenticated(address, kind, None)
+            .await
+            .map(|(channel_id, _)| channel_id)
+    }
+
+    async fn connect_peer_inner_authenticated(
+        &self,
+        address: &MultiAddr,
+        kind: Option<AddressType>,
+        log_kind: Option<&'static str>,
+    ) -> Result<(String, Option<Vec<u8>>)> {
+        let kind_label = log_kind.unwrap_or_else(|| address_kind_label(kind));
 
         // Require a dialable (QUIC) transport.
         let socket_addr = address.dialable_socket_addr().ok_or_else(|| {
@@ -1426,8 +1485,13 @@ impl TransportHandle {
             dial_target_normalized.ip(),
         ));
 
-        let peer_id = match self.dual_node.connect_happy_eyeballs(&addr_list).await {
-            Ok(addr) => {
+        let (peer_id, peer_public_key_spki) = match self
+            .dual_node
+            .connect_happy_eyeballs_authenticated(&addr_list)
+            .await
+        {
+            Ok(dialed_peer) => {
+                let addr = dialed_peer.remote_addr;
                 let connected_peer_id = canonical_channel_id(addr);
 
                 // Prevent self-connections by comparing against all listen
@@ -1455,7 +1519,7 @@ impl TransportHandle {
                     channel_id = %connected_peer_id,
                     "Successfully connected to channel"
                 );
-                connected_peer_id
+                (connected_peer_id, dialed_peer.peer_public_key_spki)
             }
             Err(e) => {
                 warn!(
@@ -1488,7 +1552,7 @@ impl TransportHandle {
 
         // PeerConnected is emitted later when the peer's identity is
         // authenticated via a signed message — not at transport level.
-        Ok(peer_id)
+        Ok((peer_id, peer_public_key_spki))
     }
 
     /// Check if the proactive relay session is still alive.
@@ -1496,8 +1560,8 @@ impl TransportHandle {
     /// Returns `true` if no relay was established or the relay is healthy.
     /// Returns `false` if a relay was established but the QUIC connection
     /// has closed. Used by the relayer monitor (ADR-014 item 6).
-    pub fn is_relay_healthy(&self) -> bool {
-        self.dual_node.is_relay_healthy()
+    pub async fn is_relay_healthy(&self) -> bool {
+        self.dual_node.is_relay_healthy().await
     }
 
     /// Enable or disable relay serving on this node's MASQUE relay servers.
@@ -1509,15 +1573,15 @@ impl TransportHandle {
         self.dual_node.set_relay_serving_enabled(enabled);
     }
 
-    /// Establish a proactive MASQUE relay session with the peer reachable at
-    /// `relay_addr`, returning the relay-allocated public socket address on
-    /// success.
+    /// Prepare a proactive MASQUE relay session with the peer reachable at
+    /// `relay_addr`, returning its provisional public socket address.
     ///
     /// This is the caller-driven entry point for ADR-014 relay acquisition.
-    /// It delegates through [`DualStackNetworkNode::setup_proactive_relay`]
-    /// to saorsa-transport's `NatTraversalEndpoint::setup_proactive_relay`,
-    /// which establishes the MASQUE `CONNECT-UDP` session and rebinds the
-    /// local Quinn endpoint onto the tunnel.
+    /// It delegates through [`DualStackNetworkNode::prepare_proactive_relay`]
+    /// to saorsa-transport's `NatTraversalEndpoint::prepare_proactive_relay`,
+    /// which establishes the MASQUE `CONNECT-UDP` session and a relay-backed
+    /// Quinn endpoint without advertising the address. The reachability driver
+    /// publishes or aborts the allocation after the canary verdict.
     ///
     /// Error conversion: saorsa-transport's `RelayAtCapacity` variant is
     /// mapped to [`RelaySessionEstablishError::AtCapacity`] so the acquisition
@@ -1527,7 +1591,7 @@ impl TransportHandle {
     pub async fn setup_proactive_relay_session(
         &self,
         relay_addr: SocketAddr,
-    ) -> std::result::Result<SocketAddr, RelaySessionEstablishError> {
+    ) -> std::result::Result<PreparedRelay, RelaySessionEstablishError> {
         use saorsa_transport::nat_traversal_api::NatTraversalError;
         use saorsa_transport::p2p_endpoint::EndpointError;
 
@@ -1536,12 +1600,12 @@ impl TransportHandle {
             "requesting proactive MASQUE relay session from transport layer"
         );
 
-        match self.dual_node.setup_proactive_relay(relay_addr).await {
+        match self.dual_node.prepare_proactive_relay(relay_addr).await {
             Ok(allocated) => {
                 info!(
                     relay = %relay_addr,
-                    allocated = %allocated,
-                    "proactive relay established"
+                    allocated = %allocated.public_addr(),
+                    "proactive relay prepared for canary verification"
                 );
                 Ok(allocated)
             }
@@ -1562,6 +1626,33 @@ impl TransportHandle {
                 Err(RelaySessionEstablishError::Unreachable(other.to_string()))
             }
         }
+    }
+
+    /// Commit a canary-verified proactive relay and advertise it to peers.
+    pub async fn publish_proactive_relay_session(&self, allocation: PreparedRelay) -> Result<()> {
+        let relay_public_addr = allocation.public_addr();
+        self.dual_node
+            .publish_proactive_relay(allocation)
+            .await
+            .map_err(|error| {
+                P2PError::Transport(TransportError::SetupFailed(
+                    format!("Failed to publish proactive relay {relay_public_addr}: {error}")
+                        .into(),
+                ))
+            })
+    }
+
+    /// Abort a proactive relay allocation and release its MASQUE resources.
+    pub async fn abort_proactive_relay_session(&self, allocation: PreparedRelay) -> Result<()> {
+        let relay_public_addr = allocation.public_addr();
+        self.dual_node
+            .abort_proactive_relay(allocation)
+            .await
+            .map_err(|error| {
+                P2PError::Transport(TransportError::SetupFailed(
+                    format!("Failed to abort proactive relay {relay_public_addr}: {error}").into(),
+                ))
+            })
     }
 
     /// Disconnect from a peer, closing the underlying QUIC connection only
@@ -2911,7 +3002,7 @@ impl RelaySessionEstablisher for TransportHandle {
     async fn establish(
         &self,
         relay_addr: SocketAddr,
-    ) -> std::result::Result<SocketAddr, RelaySessionEstablishError> {
+    ) -> std::result::Result<PreparedRelay, RelaySessionEstablishError> {
         self.setup_proactive_relay_session(relay_addr).await
     }
 }
@@ -2921,7 +3012,7 @@ impl RelaySessionEstablisher for Arc<TransportHandle> {
     async fn establish(
         &self,
         relay_addr: SocketAddr,
-    ) -> std::result::Result<SocketAddr, RelaySessionEstablishError> {
+    ) -> std::result::Result<PreparedRelay, RelaySessionEstablishError> {
         self.setup_proactive_relay_session(relay_addr).await
     }
 }

@@ -2585,8 +2585,7 @@ dependencies = [
 [[package]]
 name = "saorsa-transport"
 version = "0.35.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0dbc31faa4bd1f51807dd3815950212005613e512f6b400715067b78c2fb9603"
+source = "git+https://github.com/WithAutonomi/saorsa-transport.git?branch=fix%2Fpr136-provisional-relay#4a2ceb96c424f12d76422b06674a45c2472cda71"
 dependencies = [
  "anyhow",
  "async-trait",

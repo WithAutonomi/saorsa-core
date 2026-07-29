@@ -54,6 +54,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, trace};
 
 // Import saorsa-transport types using the new LinkTransport API (0.14+)
+use saorsa_transport::nat_traversal_api::PreparedRelay;
 use saorsa_transport::{
     LinkConn, LinkEvent, LinkTransport, NatConfig, P2pConfig, P2pLinkTransport, ProtocolId, Side,
     StrategyConfig,
@@ -95,6 +96,16 @@ pub enum ConnectionEvent {
         peer_addr: SocketAddr,
         advertised_addr: SocketAddr,
     },
+}
+
+/// Result of an outbound dial, including the identity authenticated by the
+/// exact QUIC/TLS connection.
+#[derive(Debug, Clone)]
+pub(crate) struct DialedPeer {
+    /// Normalized remote socket address.
+    pub(crate) remote_addr: SocketAddr,
+    /// Authenticated ML-DSA-65 SubjectPublicKeyInfo from the TLS handshake.
+    pub(crate) peer_public_key_spki: Option<Vec<u8>>,
 }
 
 /// Native saorsa-transport network node using LinkTransport abstraction
@@ -160,7 +171,7 @@ const HAPPY_EYEBALLS_V4_STAGGER: Duration = Duration::from_millis(50);
 /// Keep this short because DHT lookups expect to encounter unreachable
 /// candidates on live networks and should move on quickly, but leave enough
 /// room for one QUIC initial-flight retransmission on slower relay paths.
-const DIRECT_CONNECT_TIMEOUT: Duration = Duration::from_millis(1250);
+const DIRECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Per-attempt direct handshake timeout after connection progress is observed.
 const DIRECT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(4);
@@ -837,6 +848,16 @@ impl<T: LinkTransport + Send + Sync + 'static> P2PNetworkNode<T> {
 
     /// Connect to a peer by address
     pub async fn connect_to_peer(&self, peer_addr: SocketAddr) -> Result<SocketAddr> {
+        self.connect_to_peer_authenticated(peer_addr)
+            .await
+            .map(|peer| peer.remote_addr)
+    }
+
+    /// Connect to a peer and retain the identity authenticated by this dial.
+    pub(crate) async fn connect_to_peer_authenticated(
+        &self,
+        peer_addr: SocketAddr,
+    ) -> Result<DialedPeer> {
         // saorsa-core publishes typed addresses (Direct or Relay-allocated)
         // and is responsible for picking the right one before reaching the
         // transport. Direct addresses are self-asserted by the publisher,
@@ -855,6 +876,7 @@ impl<T: LinkTransport + Send + Sync + 'static> P2PNetworkNode<T> {
             .map_err(|e| anyhow::anyhow!("Failed to connect to peer {}: {}", peer_addr, e))?;
 
         let remote_addr = conn.remote_addr();
+        let peer_public_key_spki = conn.peer_public_key();
 
         // Register the peer with geographic validation
         self.add_peer(remote_addr).await;
@@ -863,7 +885,10 @@ impl<T: LinkTransport + Send + Sync + 'static> P2PNetworkNode<T> {
         // to avoid duplicate events
 
         info!("Connected to peer at {}", remote_addr);
-        Ok(remote_addr)
+        Ok(DialedPeer {
+            remote_addr,
+            peer_public_key_spki,
+        })
     }
 
     /// Try to accept one incoming connection.
@@ -1375,10 +1400,10 @@ impl DualStackNetworkNode<P2pLinkTransport> {
     /// Returns `true` if no relay was established or the relay is healthy.
     /// Returns `false` if a relay was established but the QUIC connection
     /// has closed — the relayer monitor should trigger rebinding.
-    pub fn is_relay_healthy(&self) -> bool {
+    pub async fn is_relay_healthy(&self) -> bool {
         // If ANY stack reports an unhealthy relay, the relay is dead.
         for node in [&self.v6, &self.v4].into_iter().flatten() {
-            if !node.transport.endpoint().is_relay_healthy() {
+            if !node.transport.endpoint().is_relay_healthy().await {
                 return false;
             }
         }
@@ -1417,6 +1442,20 @@ impl DualStackNetworkNode<P2pLinkTransport> {
         &self,
         relay_addr: SocketAddr,
     ) -> std::result::Result<SocketAddr, saorsa_transport::p2p_endpoint::EndpointError> {
+        let allocated = self.prepare_proactive_relay(relay_addr).await?;
+        if let Err(error) = self.publish_proactive_relay(allocated).await {
+            let _ = self.abort_proactive_relay(allocated).await;
+            return Err(error);
+        }
+        Ok(allocated.public_addr())
+    }
+
+    /// Prepare a proactive MASQUE relay without advertising its allocated
+    /// address. The relay endpoint is live for inbound canary probes.
+    pub async fn prepare_proactive_relay(
+        &self,
+        relay_addr: SocketAddr,
+    ) -> std::result::Result<PreparedRelay, saorsa_transport::p2p_endpoint::EndpointError> {
         let node = if relay_addr.is_ipv4() {
             self.v4.as_ref().or(self.v6.as_ref())
         } else {
@@ -1431,7 +1470,55 @@ impl DualStackNetworkNode<P2pLinkTransport> {
 
         node.transport
             .endpoint()
-            .setup_proactive_relay(relay_addr)
+            .prepare_proactive_relay(relay_addr)
+            .await
+    }
+
+    /// Publish a previously prepared proactive relay.
+    pub async fn publish_proactive_relay(
+        &self,
+        allocation: PreparedRelay,
+    ) -> std::result::Result<(), saorsa_transport::p2p_endpoint::EndpointError> {
+        let relay_public_addr = allocation.public_addr();
+        let node = if relay_public_addr.is_ipv4() {
+            self.v4.as_ref().or(self.v6.as_ref())
+        } else {
+            self.v6.as_ref().or(self.v4.as_ref())
+        }
+        .ok_or_else(|| {
+            saorsa_transport::p2p_endpoint::EndpointError::Config(format!(
+                "no transport stack available for relay address family {}",
+                relay_public_addr
+            ))
+        })?;
+
+        node.transport
+            .endpoint()
+            .publish_proactive_relay(allocation)
+            .await
+    }
+
+    /// Abort a proactive relay allocation and release its transport resources.
+    pub async fn abort_proactive_relay(
+        &self,
+        allocation: PreparedRelay,
+    ) -> std::result::Result<(), saorsa_transport::p2p_endpoint::EndpointError> {
+        let relay_public_addr = allocation.public_addr();
+        let node = if relay_public_addr.is_ipv4() {
+            self.v4.as_ref().or(self.v6.as_ref())
+        } else {
+            self.v6.as_ref().or(self.v4.as_ref())
+        }
+        .ok_or_else(|| {
+            saorsa_transport::p2p_endpoint::EndpointError::Config(format!(
+                "no transport stack available for relay address family {}",
+                relay_public_addr
+            ))
+        })?;
+
+        node.transport
+            .endpoint()
+            .abort_proactive_relay(allocation)
             .await
     }
 
@@ -2105,13 +2192,26 @@ impl<T: LinkTransport + Send + Sync + 'static> DualStackNetworkNode<T> {
     ///
     /// The returned address is always normalised (plain IPv4).
     pub async fn connect_happy_eyeballs(&self, targets: &[SocketAddr]) -> Result<SocketAddr> {
+        self.connect_happy_eyeballs_authenticated(targets)
+            .await
+            .map(|peer| peer.remote_addr)
+    }
+
+    /// Happy Eyeballs connect retaining the winning connection's TLS identity.
+    pub(crate) async fn connect_happy_eyeballs_authenticated(
+        &self,
+        targets: &[SocketAddr],
+    ) -> Result<DialedPeer> {
         if self.is_dual_stack {
             let dial_list = to_dual_stack_dial_list(targets);
             if dial_list.is_empty() {
                 return Err(anyhow::anyhow!("No suitable transport available"));
             }
-            let addr = self.connect_sequential(&self.v6, &dial_list).await?;
-            return Ok(self.normalize(addr));
+            let mut peer = self
+                .connect_sequential_authenticated(&self.v6, &dial_list)
+                .await?;
+            peer.remote_addr = self.normalize(peer.remote_addr);
+            return Ok(peer);
         }
 
         let (v6_targets, v4_targets) = bucket_targets(targets);
@@ -2119,12 +2219,18 @@ impl<T: LinkTransport + Send + Sync + 'static> DualStackNetworkNode<T> {
         let (v6_node, v4_node) = match (&self.v6, &self.v4) {
             (Some(v6), Some(v4)) if !v6_targets.is_empty() && !v4_targets.is_empty() => (v6, v4),
             (Some(_), _) if !v6_targets.is_empty() => {
-                let addr = self.connect_sequential(&self.v6, &v6_targets).await?;
-                return Ok(self.normalize(addr));
+                let mut peer = self
+                    .connect_sequential_authenticated(&self.v6, &v6_targets)
+                    .await?;
+                peer.remote_addr = self.normalize(peer.remote_addr);
+                return Ok(peer);
             }
             (_, Some(_)) if !v4_targets.is_empty() => {
-                let addr = self.connect_sequential(&self.v4, &v4_targets).await?;
-                return Ok(self.normalize(addr));
+                let mut peer = self
+                    .connect_sequential_authenticated(&self.v4, &v4_targets)
+                    .await?;
+                peer.remote_addr = self.normalize(peer.remote_addr);
+                return Ok(peer);
             }
             _ => return Err(anyhow::anyhow!("No suitable transport available")),
         };
@@ -2134,8 +2240,8 @@ impl<T: LinkTransport + Send + Sync + 'static> DualStackNetworkNode<T> {
 
         let v6_fut = async {
             for addr in v6_targets_clone {
-                if let Ok(connected_addr) = v6_node.connect_to_peer(addr).await {
-                    return Ok(connected_addr);
+                if let Ok(peer) = v6_node.connect_to_peer_authenticated(addr).await {
+                    return Ok(peer);
                 }
             }
             Err(anyhow::anyhow!("IPv6 connect attempts failed"))
@@ -2144,8 +2250,8 @@ impl<T: LinkTransport + Send + Sync + 'static> DualStackNetworkNode<T> {
         let v4_fut = async {
             sleep(HAPPY_EYEBALLS_V4_STAGGER).await;
             for addr in v4_targets_clone {
-                if let Ok(connected_addr) = v4_node.connect_to_peer(addr).await {
-                    return Ok(connected_addr);
+                if let Ok(peer) = v4_node.connect_to_peer_authenticated(addr).await {
+                    return Ok(peer);
                 }
             }
             Err(anyhow::anyhow!("IPv4 connect attempts failed"))
@@ -2153,22 +2259,22 @@ impl<T: LinkTransport + Send + Sync + 'static> DualStackNetworkNode<T> {
 
         tokio::select! {
             res6 = v6_fut => match res6 {
-                Ok(connected_addr) => Ok(connected_addr),
+                Ok(peer) => Ok(peer),
                 Err(_) => {
                     for addr in v4_targets {
-                        if let Ok(connected_addr) = v4_node.connect_to_peer(addr).await {
-                            return Ok(connected_addr);
+                        if let Ok(peer) = v4_node.connect_to_peer_authenticated(addr).await {
+                            return Ok(peer);
                         }
                     }
                     Err(anyhow::anyhow!("All connect attempts failed"))
                 }
             },
             res4 = v4_fut => match res4 {
-                Ok(connected_addr) => Ok(connected_addr),
+                Ok(peer) => Ok(peer),
                 Err(_) => {
                     for addr in v6_targets {
-                        if let Ok(connected_addr) = v6_node.connect_to_peer(addr).await {
-                            return Ok(connected_addr);
+                        if let Ok(peer) = v6_node.connect_to_peer_authenticated(addr).await {
+                            return Ok(peer);
                         }
                     }
                     Err(anyhow::anyhow!("All connect attempts failed"))
@@ -2188,6 +2294,22 @@ impl<T: LinkTransport + Send + Sync + 'static> DualStackNetworkNode<T> {
         for &addr in targets {
             if let Ok(connected_addr) = node.connect_to_peer(addr).await {
                 return Ok(connected_addr);
+            }
+        }
+        Err(anyhow::anyhow!("All connect attempts failed"))
+    }
+
+    async fn connect_sequential_authenticated(
+        &self,
+        node: &Option<P2PNetworkNode<T>>,
+        targets: &[SocketAddr],
+    ) -> Result<DialedPeer> {
+        let node = node
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("node not available"))?;
+        for &addr in targets {
+            if let Ok(peer) = node.connect_to_peer_authenticated(addr).await {
+                return Ok(peer);
             }
         }
         Err(anyhow::anyhow!("All connect attempts failed"))

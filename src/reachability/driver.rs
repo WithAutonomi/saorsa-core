@@ -16,14 +16,17 @@
 //! Owns every state transition for this node's MASQUE relay: the initial
 //! acquisition at startup, the backoff retry when no candidate accepts,
 //! the republish-then-reacquire sequence when an existing relay is lost,
-//! and the K-closest-eviction watcher that forces a rebind when the
-//! chosen relayer drops out of the close group.
+//! and the health checks that retain a verified relay until there is positive
+//! evidence that it is no longer usable.
 //!
 //! ## State machine
 //!
-//! The driver runs as a single tokio task and cycles through three states:
+//! The driver runs as a single tokio task and cycles through five states:
 //!
-//! 1. **Acquiring**: call [`run_relay_acquisition`]. On success, run
+//! 1. **Starting**: publish a newer relay-free address set before the first
+//!    acquisition walk. This withdraws any relay allocation left in DHT
+//!    replicas by a previous process incarnation before peers can dial it.
+//! 2. **Acquiring**: call [`run_relay_acquisition`]. On success, run
 //!    third-party relay canaries before publishing. Only a canary-verified
 //!    relay is written to the full typed self-record (relay-allocated
 //!    address tagged [`AddressType::Relay`] first, then one best non-relay
@@ -33,18 +36,21 @@
 //!    quorum. On failure, publish the direct-only address set so the node
 //!    remains as reachable as possible, arm the exponential backoff timer,
 //!    and enter the **Backoff** state.
-//! 2. **Holding**: subscribe to `KClosestPeersChanged` events, republish
-//!    when a pinned external address is promoted to
+//! 3. **Holding**: republish when a pinned external address is promoted to
 //!    [`AddressType::Direct`], and poll
 //!    [`TransportHandle::is_relay_healthy`] every
-//!    [`HEALTH_POLL_INTERVAL`]. On relayer-evicted or unhealthy-tunnel,
-//!    transition to **Lost**; on shutdown, exit the driver.
-//! 3. **Lost**: run the `republish-direct-only → reacquire` sequence.
+//!    [`HEALTH_POLL_INTERVAL`]. The driver also repeats the independent
+//!    third-party canary quorum every [`RELAY_REVALIDATION_INTERVAL`], so
+//!    external reachability remains a maintained invariant rather than a
+//!    one-time admission check. K-closest churn does not invalidate an already
+//!    verified relay. On unhealthy-tunnel or repeatedly failed revalidation,
+//!    transition to **Lost**; on shutdown, exit.
+//! 4. **Lost**: run the `republish-direct-only → reacquire` sequence.
 //!    The republish MUST happen **before** the acquisition walk starts,
 //!    so the network stops dialing the dead relay address during the
 //!    1–10 s acquisition window. After republishing, loop back to
 //!    **Acquiring**.
-//! 4. **Backoff**: wait for the current backoff window or a
+//! 5. **Backoff**: wait for the current backoff window or a
 //!    `KClosestPeersChanged` event (whichever comes first), republishing
 //!    if a pinned external is promoted to [`AddressType::Direct`] while
 //!    waiting, then loop back to **Acquiring**. Successful acquisition
@@ -66,18 +72,42 @@ use tracing::{debug, info, trace, warn};
 
 use crate::dht::AddressType;
 use crate::dht_network_manager::{DhtNetworkEvent, DhtNetworkManager};
-use crate::reachability::canary::{RelayCanaryVerdict, verify_relay_with_canaries};
+use crate::reachability::canary::{
+    RelayCanaryPolicy, RelayCanaryVerdict, verify_relay_with_canaries,
+};
 use crate::reachability::session::{RelayAcquisitionOutcome, run_relay_acquisition};
 use crate::self_address::build_self_address_set;
 use crate::transport_handle::TransportHandle;
 use crate::{MultiAddr, PeerId};
+use saorsa_transport::nat_traversal_api::PreparedRelay;
 
 /// How often to poll the transport for tunnel health while holding a relay.
 ///
 /// 5 seconds fits inside the 10–30 s failover-window budget and keeps the
-/// wake rate low (the poll is non-blocking and only reads an atomic
-/// counter inside saorsa-transport).
+/// wake rate low.
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How often an established relay must again pass a third-party canary quorum.
+///
+/// Local task health only proves that this process still has a tunnel. A
+/// relay-server forwarding regression or expired public allocation can leave
+/// that tunnel locally alive but externally unreachable. Revalidating once a
+/// minute bounds that otherwise-undetectable state and keeps probe traffic
+/// comfortably below the witness rate limit.
+const RELAY_REVALIDATION_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Delay before confirming an inconclusive or failed maintenance canary.
+///
+/// This remains above the witness's ten-second per-source rate-limit window.
+const RELAY_REVALIDATION_RETRY_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Maximum deterministic per-peer offset added before the first maintenance
+/// canary. This avoids a fleet-wide probe burst after a rolling deployment.
+const RELAY_REVALIDATION_JITTER_MAX: Duration = Duration::from_secs(30);
+
+/// Retry interval for authoritative address publications that were not
+/// acknowledged by every current close peer.
+const PUBLISH_RETRY_INTERVAL: Duration = Duration::from_secs(15);
 
 /// Initial delay before the first retry after a failed acquisition walk.
 const BACKOFF_INITIAL: Duration = Duration::from_secs(30);
@@ -138,7 +168,29 @@ struct AcquisitionDriver {
 #[derive(Clone, Debug, PartialEq)]
 struct PublishedTypedSet {
     typed_addresses: Vec<(MultiAddr, AddressType)>,
-    peers: Vec<PeerId>,
+    target_peers: HashSet<PeerId>,
+    pending_peers: HashSet<PeerId>,
+}
+
+fn pending_publication_targets(
+    previous: Option<&PublishedTypedSet>,
+    typed_addresses: &[(MultiAddr, AddressType)],
+    target_peers: &HashSet<PeerId>,
+    force: bool,
+) -> HashSet<PeerId> {
+    let Some(previous) = previous
+        .filter(|previous| !force && previous.typed_addresses.as_slice() == typed_addresses)
+    else {
+        return target_peers.clone();
+    };
+
+    let mut pending: HashSet<_> = previous
+        .pending_peers
+        .intersection(target_peers)
+        .copied()
+        .collect();
+    pending.extend(target_peers.difference(&previous.target_peers).copied());
+    pending
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -181,6 +233,16 @@ fn apply_canary_rejection_event(
 impl AcquisitionDriver {
     async fn run(&mut self) {
         info!("relay acquisition driver starting");
+
+        // A process restart invalidates every relay allocation owned by the
+        // previous process, while DHT replicas can still retain its last
+        // sequenced self-record. Publish a newer relay-free full replacement
+        // before attempting to acquire another relay. Without this startup
+        // tombstone, peers can keep dialing an allocation whose tunnel died
+        // with the old process.
+        self.transport.clear_relay_address();
+        self.force_publish_typed_set(None).await;
+
         loop {
             if self.shutdown.is_cancelled() {
                 debug!("relay acquisition driver: shutdown, exiting");
@@ -195,10 +257,12 @@ impl AcquisitionDriver {
             .await;
             match outcome {
                 RelayAcquisitionOutcome::Acquired(relay) => {
+                    let relay_addr = relay.allocation.public_addr();
                     match verify_relay_with_canaries(
                         &self.dht,
                         relay.relayer,
-                        relay.allocated_public_addr,
+                        relay_addr,
+                        RelayCanaryPolicy::Admission,
                     )
                     .await
                     {
@@ -206,20 +270,41 @@ impl AcquisitionDriver {
                             successes,
                             attempts,
                         } => {
+                            if let Err(error) = self
+                                .transport
+                                .publish_proactive_relay_session(relay.allocation)
+                                .await
+                            {
+                                warn!(
+                                    relayer = ?relay.relayer,
+                                    allocated = %relay_addr,
+                                    %error,
+                                    "driver: failed to commit canary-verified relay"
+                                );
+                                apply_canary_rejection_event(
+                                    &mut self.canary_rejected_relayers,
+                                    CanaryRejectionEvent::AcquisitionFailed,
+                                );
+                                self.clear_unpublished_relay_state(relay.allocation).await;
+                                self.publish_typed_set(None).await;
+                                if self.wait_backoff_or_event().await {
+                                    return;
+                                }
+                                self.advance_backoff();
+                                continue;
+                            }
                             apply_canary_rejection_event(
                                 &mut self.canary_rejected_relayers,
                                 CanaryRejectionEvent::Verified,
                             );
                             self.current_backoff = BACKOFF_INITIAL;
                             *self.relayer_peer_id.write().await = Some(relay.relayer);
-                            *self.relay_address.write().await = Some(relay.allocated_public_addr);
-                            self.transport
-                                .set_relay_address(relay.allocated_public_addr);
-                            self.force_publish_typed_set(Some(relay.allocated_public_addr))
-                                .await;
+                            *self.relay_address.write().await = Some(relay_addr);
+                            self.transport.set_relay_address(relay_addr);
+                            self.force_publish_typed_set(Some(relay_addr)).await;
                             info!(
                                 relayer = ?relay.relayer,
-                                allocated = %relay.allocated_public_addr,
+                                allocated = %relay_addr,
                                 successes,
                                 attempts,
                                 "driver: relay canary verified and published"
@@ -233,7 +318,7 @@ impl AcquisitionDriver {
                             // Fall through: hold_until_lost() returned false, the
                             // relay is considered lost, we need to republish
                             // direct-only BEFORE re-trying acquisition.
-                            self.lose_relay_and_republish().await;
+                            self.lose_relay_and_republish(relay.allocation).await;
                         }
                         RelayCanaryVerdict::Rejected {
                             successes,
@@ -241,7 +326,7 @@ impl AcquisitionDriver {
                         } => {
                             warn!(
                                 relayer = ?relay.relayer,
-                                allocated = %relay.allocated_public_addr,
+                                allocated = %relay_addr,
                                 successes,
                                 attempts,
                                 "driver: relay failed canary quorum, entering backoff before trying next candidate"
@@ -250,29 +335,31 @@ impl AcquisitionDriver {
                                 &mut self.canary_rejected_relayers,
                                 CanaryRejectionEvent::Rejected(relay.relayer),
                             );
-                            self.clear_unpublished_relay_state().await;
+                            self.clear_unpublished_relay_state(relay.allocation).await;
                             self.publish_typed_set(None).await;
                             if self.wait_backoff_or_event().await {
                                 return; // shutdown
                             }
                             self.advance_backoff();
                         }
-                        RelayCanaryVerdict::InsufficientWitnesses {
-                            available,
-                            required,
+                        RelayCanaryVerdict::Inconclusive {
+                            successes,
+                            failures,
+                            unavailable,
                         } => {
                             warn!(
                                 relayer = ?relay.relayer,
-                                allocated = %relay.allocated_public_addr,
-                                available,
-                                required,
-                                "driver: insufficient relay canary witnesses, entering backoff without publishing relay"
+                                allocated = %relay_addr,
+                                successes,
+                                failures,
+                                unavailable,
+                                "driver: relay canary evidence inconclusive, entering backoff without publishing relay"
                             );
                             apply_canary_rejection_event(
                                 &mut self.canary_rejected_relayers,
                                 CanaryRejectionEvent::InsufficientWitnesses,
                             );
-                            self.clear_unpublished_relay_state().await;
+                            self.clear_unpublished_relay_state(relay.allocation).await;
                             self.publish_typed_set(None).await;
                             if self.wait_backoff_or_event().await {
                                 return; // shutdown
@@ -337,15 +424,20 @@ impl AcquisitionDriver {
         self.publish_typed_set_with_policy(relay, true).await;
     }
 
-    /// Clear core advertisement state for a relay that never passed canary.
-    ///
-    /// This prevents DHT publication. Core also ignores peer ADD_ADDRESS relay
-    /// hints, so unverified relays cannot enter DHT gossip through the legacy
-    /// transport bridge. A future saorsa-transport API still needs to defer
-    /// outbound ADD_ADDRESS and tear down rejected MASQUE sessions for a fully
-    /// airtight transport-layer gate. Tracked in
-    /// <https://github.com/WithAutonomi/saorsa-core/issues/138>.
-    async fn clear_unpublished_relay_state(&mut self) {
+    /// Tear down and clear a relay allocation that never passed canary.
+    async fn clear_unpublished_relay_state(&mut self, allocation: PreparedRelay) {
+        let relay_public_addr = allocation.public_addr();
+        if let Err(error) = self
+            .transport
+            .abort_proactive_relay_session(allocation)
+            .await
+        {
+            warn!(
+                relay_addr = %relay_public_addr,
+                %error,
+                "driver: failed to abort unpublished relay"
+            );
+        }
         *self.relayer_peer_id.write().await = None;
         *self.relay_address.write().await = None;
         self.transport.clear_relay_address();
@@ -366,59 +458,101 @@ impl AcquisitionDriver {
             self.transport.is_external_proven(sa)
         });
 
-        if self_addresses.is_empty() {
+        if self_addresses.is_empty() && !force {
             debug!("driver: publish skipped, no dialable self addresses");
             return;
         }
 
         let typed = self_addresses.into_typed_vec();
+        if typed.is_empty() {
+            info!(
+                "driver: publishing empty authoritative address set to withdraw stale relay state"
+            );
+        }
 
         let own_key = *self.dht.peer_id().to_bytes();
         let all_peers = self
             .dht
             .find_closest_nodes_local(&own_key, self.dht.k_value())
             .await;
-        let peers = all_peers.iter().map(|node| node.peer_id).collect();
-        let publish_snapshot = PublishedTypedSet {
-            typed_addresses: typed.clone(),
-            peers,
-        };
-        if !force && self.last_published_typed_set.as_ref() == Some(&publish_snapshot) {
+        let target_peers: HashSet<PeerId> = all_peers
+            .iter()
+            .map(|node| node.peer_id)
+            .filter(|peer| peer != self.dht.peer_id())
+            .collect();
+        let mut pending_peers = pending_publication_targets(
+            self.last_published_typed_set.as_ref(),
+            &typed,
+            &target_peers,
+            force,
+        );
+        if pending_peers.is_empty() {
             debug!(
                 peers = all_peers.len(),
                 typed_addresses = ?typed,
                 relay = ?relay,
                 "driver: publish skipped, typed self address set unchanged"
             );
+            self.last_published_typed_set = Some(PublishedTypedSet {
+                typed_addresses: typed,
+                target_peers,
+                pending_peers,
+            });
             return;
         }
 
+        let peers_to_publish: Vec<_> = all_peers
+            .into_iter()
+            .filter(|peer| pending_peers.contains(&peer.peer_id))
+            .collect();
+
         debug!(
-            peers = all_peers.len(),
+            peers = peers_to_publish.len(),
             typed_addresses = ?typed,
             relay = ?relay,
             "driver: publishing typed self address set"
         );
         trace!(
-            peers = all_peers.len(),
+            peers = peers_to_publish.len(),
             addrs = typed.len(),
             relay = ?relay,
             "driver: publishing typed address set to all routing table peers"
         );
-        self.dht
-            .publish_address_set_to_peers(typed, &all_peers)
+        let confirmed = self
+            .dht
+            .publish_address_set_to_peers(typed.clone(), &peers_to_publish)
             .await;
-        self.last_published_typed_set = Some(publish_snapshot);
+        for peer in confirmed {
+            pending_peers.remove(&peer);
+        }
+        let missing = pending_peers.len();
+        if missing > 0 {
+            debug!(
+                missing,
+                targets = target_peers.len(),
+                relay = ?relay,
+                "driver: address publication incomplete; unacknowledged peers will be retried"
+            );
+        }
+        self.last_published_typed_set = Some(PublishedTypedSet {
+            typed_addresses: typed,
+            target_peers,
+            pending_peers,
+        });
     }
 
-    /// Hold the acquired relay until an eviction or death event forces a
-    /// rebind. Returns `true` on shutdown (caller should exit), `false`
-    /// when the relay is considered lost and a republish+reacquire is
-    /// needed.
+    /// Hold the acquired relay until positive failure evidence forces a rebind.
+    ///
+    /// Returns `true` on shutdown (caller should exit), `false` when the relay
+    /// is considered lost and a republish+reacquire is needed.
     async fn hold_until_lost(&mut self) -> bool {
         let mut events = self.dht.subscribe_events();
         let mut health = tokio::time::interval(HEALTH_POLL_INTERVAL);
         health.tick().await; // drop the immediate first tick
+        let first_revalidation =
+            tokio::time::Instant::now() + relay_revalidation_initial_delay(self.dht.peer_id());
+        let revalidation = tokio::time::sleep_until(first_revalidation);
+        tokio::pin!(revalidation);
 
         loop {
             tokio::select! {
@@ -486,11 +620,13 @@ impl AcquisitionDriver {
                 }
                 event = events.recv() => {
                     match event {
-                        Ok(DhtNetworkEvent::KClosestPeersChanged { ref new, .. }) => {
-                            if self.relayer_evicted_from_k_closest(new).await {
-                                info!("driver: relayer evicted from K-closest, rebinding");
-                                return false;
-                            }
+                        Ok(DhtNetworkEvent::KClosestPeersChanged { .. }) => {
+                            self.last_published_typed_set = None;
+                            let relay = *self.relay_address.read().await;
+                            self.publish_typed_set(relay).await;
+                            debug!(
+                                "driver: K-closest changed; refreshed relay publication targets"
+                            );
                         }
                         Ok(_) => continue,
                         // `RecvError::Lagged` is recoverable — the broadcast
@@ -499,27 +635,88 @@ impl AcquisitionDriver {
                         // terminal (the DHT manager is dropping); treat it
                         // the same as shutdown.
                         Err(RecvError::Closed) => return true,
-                        Err(_) => continue,
+                        Err(RecvError::Lagged(skipped)) => {
+                            self.last_published_typed_set = None;
+                            let relay = *self.relay_address.read().await;
+                            self.publish_typed_set(relay).await;
+                            debug!(
+                                skipped,
+                                "driver: refreshed publication after lagging DHT events"
+                            );
+                        }
                     }
                 }
                 _ = health.tick() => {
-                    if !self.transport.is_relay_healthy() {
+                    if !self.transport.is_relay_healthy().await {
                         info!("driver: relay tunnel unhealthy, rebinding");
                         return false;
                     }
+                    // Also retries any peers that did not acknowledge the
+                    // latest full address-set publication.
+                    let relay = *self.relay_address.read().await;
+                    self.publish_typed_set(relay).await;
+                }
+                _ = &mut revalidation => {
+                    let relayer = *self.relayer_peer_id.read().await;
+                    let relay = *self.relay_address.read().await;
+                    let (Some(relayer), Some(relay)) = (relayer, relay) else {
+                        warn!("driver: relay state disappeared before revalidation");
+                        return false;
+                    };
+                    let verdict = verify_relay_with_canaries(
+                        &self.dht,
+                        relayer,
+                        relay,
+                        RelayCanaryPolicy::Maintenance,
+                    )
+                    .await;
+                    let retry_delay = match verdict {
+                        RelayCanaryVerdict::Verified { successes, attempts } => {
+                            info!(
+                                relayer = %relayer.to_hex(),
+                                relay = %relay,
+                                successes,
+                                attempts,
+                                "driver: established relay passed periodic canary revalidation"
+                            );
+                            RELAY_REVALIDATION_INTERVAL
+                        }
+                        RelayCanaryVerdict::Rejected { successes, attempts } => {
+                            warn!(
+                                relayer = %relayer.to_hex(),
+                                relay = %relay,
+                                successes,
+                                attempts,
+                                "driver: established relay failed periodic canary revalidation; withdrawing"
+                            );
+                            apply_canary_rejection_event(
+                                &mut self.canary_rejected_relayers,
+                                CanaryRejectionEvent::Rejected(relayer),
+                            );
+                            return false;
+                        }
+                        RelayCanaryVerdict::Inconclusive {
+                            successes,
+                            failures,
+                            unavailable,
+                        } => {
+                            warn!(
+                                relayer = %relayer.to_hex(),
+                                relay = %relay,
+                                successes,
+                                failures,
+                                unavailable,
+                                "driver: established relay canary evidence inconclusive; retaining relay and retrying"
+                            );
+                            RELAY_REVALIDATION_RETRY_INTERVAL
+                        }
+                    };
+                    revalidation
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + retry_delay);
                 }
             }
         }
-    }
-
-    /// Returns `true` if the currently-chosen relayer is no longer in the
-    /// new K-closest set.
-    async fn relayer_evicted_from_k_closest(&self, new_k_closest: &[PeerId]) -> bool {
-        let guard = self.relayer_peer_id.read().await;
-        let Some(relayer) = guard.as_ref() else {
-            return false;
-        };
-        !new_k_closest.contains(relayer)
     }
 
     /// Transition out of the Holding state: republish direct-only and
@@ -527,9 +724,20 @@ impl AcquisitionDriver {
     /// pre-retry publish is critical — without it, other peers would
     /// continue dialing the dead relay address during the 1–10 s
     /// acquisition walk.
-    async fn lose_relay_and_republish(&mut self) {
+    async fn lose_relay_and_republish(&mut self, allocation: PreparedRelay) {
+        let relay_public_addr = self.relay_address.write().await.take();
         *self.relayer_peer_id.write().await = None;
-        *self.relay_address.write().await = None;
+        if let Err(error) = self
+            .transport
+            .abort_proactive_relay_session(allocation)
+            .await
+        {
+            warn!(
+                relay_addr = ?relay_public_addr,
+                %error,
+                "driver: failed to tear down lost or evicted relay"
+            );
+        }
         self.transport.clear_relay_address();
         self.force_publish_typed_set(None).await;
     }
@@ -541,6 +749,8 @@ impl AcquisitionDriver {
         let mut events = self.dht.subscribe_events();
         let sleep = tokio::time::sleep(self.current_backoff);
         tokio::pin!(sleep);
+        let mut publish_retry = tokio::time::interval(PUBLISH_RETRY_INTERVAL);
+        publish_retry.tick().await;
 
         loop {
             tokio::select! {
@@ -549,6 +759,9 @@ impl AcquisitionDriver {
                 _ = &mut sleep => {
                     trace!(window = ?self.current_backoff, "driver: backoff window expired");
                     return false;
+                }
+                _ = publish_retry.tick() => {
+                    self.publish_typed_set(None).await;
                 }
                 promoted = self.transport.recv_direct_address_promoted() => {
                     match promoted {
@@ -583,12 +796,20 @@ impl AcquisitionDriver {
                 event = events.recv() => {
                     match event {
                         Ok(DhtNetworkEvent::KClosestPeersChanged { .. }) => {
+                            self.last_published_typed_set = None;
                             debug!("driver: K-closest changed, retrying early");
                             return false;
                         }
                         Ok(_) => continue,
                         Err(RecvError::Closed) => return true,
-                        Err(_) => continue,
+                        Err(RecvError::Lagged(skipped)) => {
+                            self.last_published_typed_set = None;
+                            self.publish_typed_set(None).await;
+                            debug!(
+                                skipped,
+                                "driver: refreshed publication after lagging DHT events during backoff"
+                            );
+                        }
                     }
                 }
             }
@@ -602,6 +823,14 @@ impl AcquisitionDriver {
     }
 }
 
+fn relay_revalidation_initial_delay(peer_id: &PeerId) -> Duration {
+    let mut prefix = [0u8; std::mem::size_of::<u64>()];
+    prefix.copy_from_slice(&peer_id.to_bytes()[..std::mem::size_of::<u64>()]);
+    let jitter_bound = RELAY_REVALIDATION_JITTER_MAX.as_secs().saturating_add(1);
+    let jitter = u64::from_be_bytes(prefix) % jitter_bound;
+    RELAY_REVALIDATION_INTERVAL.saturating_add(Duration::from_secs(jitter))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -612,6 +841,60 @@ mod tests {
 
     fn peer_id(seed: u8) -> PeerId {
         PeerId::from_bytes([seed; PEER_ID_BYTES])
+    }
+
+    #[test]
+    fn publication_targets_only_retry_pending_and_new_peers() {
+        let departed = peer_id(1);
+        let retained = peer_id(2);
+        let joined = peer_id(3);
+        let previous = PublishedTypedSet {
+            typed_addresses: Vec::new(),
+            target_peers: HashSet::from([departed, retained]),
+            pending_peers: HashSet::from([departed]),
+        };
+        let current = HashSet::from([retained, joined]);
+
+        assert_eq!(
+            pending_publication_targets(Some(&previous), &[], &current, false),
+            HashSet::from([joined])
+        );
+    }
+
+    #[test]
+    fn invalidated_publication_retries_rejoined_peer_id() {
+        let peer = peer_id(1);
+        let current = HashSet::from([peer]);
+
+        assert_eq!(
+            pending_publication_targets(None, &[], &current, false),
+            current
+        );
+    }
+
+    #[test]
+    fn changed_or_forced_publication_targets_every_current_peer() {
+        let first = peer_id(1);
+        let second = peer_id(2);
+        let previous = PublishedTypedSet {
+            typed_addresses: Vec::new(),
+            target_peers: HashSet::from([first, second]),
+            pending_peers: HashSet::new(),
+        };
+        let current = HashSet::from([first, second]);
+        let changed = [(
+            MultiAddr::from_ipv4(std::net::Ipv4Addr::new(203, 0, 113, 7), 9000),
+            AddressType::Direct,
+        )];
+
+        assert_eq!(
+            pending_publication_targets(Some(&previous), &changed, &current, false),
+            current
+        );
+        assert_eq!(
+            pending_publication_targets(Some(&previous), &[], &current, true),
+            current
+        );
     }
 
     #[test]
@@ -664,5 +947,15 @@ mod tests {
         );
 
         assert!(rejected_relayers.contains(&relayer));
+    }
+
+    #[test]
+    fn relay_revalidation_delay_is_bounded_and_peer_stable() {
+        let peer = peer_id(REJECTED_RELAYER_SEED);
+        let delay = relay_revalidation_initial_delay(&peer);
+
+        assert_eq!(delay, relay_revalidation_initial_delay(&peer));
+        assert!(delay >= RELAY_REVALIDATION_INTERVAL);
+        assert!(delay <= RELAY_REVALIDATION_INTERVAL.saturating_add(RELAY_REVALIDATION_JITTER_MAX));
     }
 }

@@ -44,6 +44,7 @@
 use std::net::SocketAddr;
 
 use async_trait::async_trait;
+use saorsa_transport::nat_traversal_api::PreparedRelay;
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
@@ -81,15 +82,16 @@ impl RelayCandidate {
 ///
 /// 1. Remember `relayer` so the monitor can rebind if that peer drops out of
 ///    the K closest set.
-/// 2. Publish `allocated_public_addr` (tagged `AddressType::Relay`) as its
+/// 2. Publish `allocation.public_addr()` (tagged `AddressType::Relay`) as its
 ///    contact address in the DHT self-record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcquiredRelay {
     /// Peer ID of the node running the MASQUE relay we are now using.
     pub relayer: PeerId,
-    /// The public socket address the relay allocated for inbound traffic to
-    /// us. This is what the private peer publishes as its contact address.
-    pub allocated_public_addr: SocketAddr,
+    /// Opaque transport allocation. Its public address is what the private
+    /// peer publishes after the canary gate accepts it; its identity ensures a
+    /// late verdict cannot act on a replacement allocation at the same address.
+    pub allocation: PreparedRelay,
 }
 
 /// Per-candidate establishment error returned by a [`RelaySessionEstablisher`].
@@ -130,26 +132,26 @@ pub enum RelayAcquisitionError {
 /// Establishes a proactive MASQUE relay session against a candidate relay.
 ///
 /// A production implementation of this trait wraps saorsa-transport's
-/// `NatTraversalEndpoint::setup_proactive_relay()`, which establishes the
-/// MASQUE `CONNECT-UDP` session, rebinds the local Quinn endpoint onto the
-/// tunnel, and returns the allocated public address. Test implementations
-/// return canned results to exercise the coordinator's walk logic.
+/// `NatTraversalEndpoint::prepare_proactive_relay()`, which establishes the
+/// MASQUE `CONNECT-UDP` session and a provisional Quinn endpoint without
+/// advertising the allocated address. The reachability driver publishes or
+/// aborts that allocation after its canary verdict. Test implementations return
+/// canned results to exercise the coordinator's walk logic.
 #[async_trait]
 pub trait RelaySessionEstablisher: Send + Sync + 'static {
     /// Attempt to establish a proactive relay session with the peer reachable
     /// at `relay_addr`.
     ///
-    /// - Returns `Ok(allocated_public_addr)` when the MASQUE session is
-    ///   established and the local endpoint has been rebound onto the tunnel.
-    ///   The returned socket address is the relay-allocated public address
-    ///   the caller should publish.
+    /// - Returns `Ok(allocation)` when the provisional MASQUE
+    ///   session and relay endpoint are ready for an inbound canary. The
+    ///   returned socket address is not advertised until the caller commits it.
     /// - Returns `Err(AtCapacity(_))` when the relay refused because its
     ///   client slots are full.
     /// - Returns `Err(Unreachable(_))` for any network-level failure.
     async fn establish(
         &self,
         relay_addr: SocketAddr,
-    ) -> Result<SocketAddr, RelaySessionEstablishError>;
+    ) -> Result<PreparedRelay, RelaySessionEstablishError>;
 }
 
 /// XOR-closest relay acquisition coordinator.
@@ -206,13 +208,13 @@ impl<E: RelaySessionEstablisher> RelayAcquisition<E> {
                 Ok(allocated) => {
                     info!(
                         relayer = ?candidate.peer_id,
-                        allocated = %allocated,
+                        allocated = %allocated.public_addr(),
                         index = index,
                         "acquired proactive relay session"
                     );
                     return Ok(AcquiredRelay {
                         relayer: candidate.peer_id,
-                        allocated_public_addr: allocated,
+                        allocation: allocated,
                     });
                 }
                 Err(RelaySessionEstablishError::AtCapacity(reason)) => {
@@ -266,12 +268,12 @@ mod tests {
     /// `calls` atomic tracks the number of invocations so tests can verify
     /// the coordinator walked exactly as far as expected and no further.
     struct ScriptedEstablisher {
-        outcomes: std::sync::Mutex<Vec<Result<SocketAddr, RelaySessionEstablishError>>>,
+        outcomes: std::sync::Mutex<Vec<Result<PreparedRelay, RelaySessionEstablishError>>>,
         calls: Arc<AtomicUsize>,
     }
 
     impl ScriptedEstablisher {
-        fn new(outcomes: Vec<Result<SocketAddr, RelaySessionEstablishError>>) -> Self {
+        fn new(outcomes: Vec<Result<PreparedRelay, RelaySessionEstablishError>>) -> Self {
             Self {
                 outcomes: std::sync::Mutex::new(outcomes),
                 calls: Arc::new(AtomicUsize::new(0)),
@@ -284,7 +286,7 @@ mod tests {
         async fn establish(
             &self,
             _relay_addr: SocketAddr,
-        ) -> Result<SocketAddr, RelaySessionEstablishError> {
+        ) -> Result<PreparedRelay, RelaySessionEstablishError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let mut guard = self.outcomes.lock().expect("mutex poisoned in test");
             if guard.is_empty() {
@@ -294,8 +296,11 @@ mod tests {
         }
     }
 
-    fn allocated(port: u16) -> SocketAddr {
-        SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)), port)
+    fn allocated(port: u16) -> PreparedRelay {
+        PreparedRelay::detached(SocketAddr::new(
+            std::net::IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)),
+            port,
+        ))
     }
 
     #[tokio::test]
@@ -317,7 +322,7 @@ mod tests {
             .await
             .expect("should succeed");
         assert_eq!(result.relayer, peer_id(1));
-        assert_eq!(result.allocated_public_addr, allocated(9000));
+        assert_eq!(result.allocation.public_addr().port(), 9000);
         assert_eq!(
             calls.load(Ordering::SeqCst),
             1,
@@ -339,7 +344,7 @@ mod tests {
             .await
             .expect("should succeed");
         assert_eq!(result.relayer, peer_id(2));
-        assert_eq!(result.allocated_public_addr, allocated(9001));
+        assert_eq!(result.allocation.public_addr().port(), 9001);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 

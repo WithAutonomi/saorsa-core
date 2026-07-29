@@ -149,7 +149,7 @@ pub(crate) async fn run_relay_acquisition(
         Ok(relay) => {
             info!(
                 relayer = ?relay.relayer,
-                allocated = %relay.allocated_public_addr,
+                allocated = %relay.allocation.public_addr(),
                 "relay acquisition: session established"
             );
             RelayAcquisitionOutcome::Acquired(relay)
