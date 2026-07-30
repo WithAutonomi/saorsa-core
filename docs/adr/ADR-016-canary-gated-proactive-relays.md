@@ -48,11 +48,19 @@ ordinary peer, address, or dial-deduplication maps. The witness closes only that
 owned probe connection and reports whether the authenticated target identity
 matched.
 
-Admission requires three successful witness results. One explicit eligible
-failure rejects the provisional allocation. Missing, legacy, or rate-limited
-witnesses are ineligible rather than evidence that the relay failed. The
-current implementation intentionally has no sparse-network threshold or
-capability-based replacement sampling; this is a known deferred limitation.
+Admission requires three positive witness results. One explicit
+canary-capable failure rejects the provisional allocation.
+
+During the mixed-version rollout, a request that was successfully sent to a
+selected witness but receives no canary-protocol response before the response
+deadline counts as an assumed positive result. This preserves the pre-canary
+behavior until that witness upgrades. This compatibility rule is deliberately
+limited to the response stage: failure to connect to a selected witness and an
+explicit rate-limit response remain ineligible; neither is promoted to
+success. An assumed result is logged separately from a confirmed probe.
+
+The implementation still requires three selectable non-close witnesses and
+intentionally has no sparse-network threshold or replacement sampling.
 
 Canary work has its own concurrency semaphore, plus per-source, node-wide, and
 per-destination rate limits. It does not consume the general DHT handler
@@ -62,10 +70,11 @@ budget.
 
 The node polls local tunnel health every five seconds and repeats independent
 third-party canary verification every minute, with deterministic initial
-jitter. Maintenance accepts two successful witnesses and rejects on two
-explicit failures. An inconclusive maintenance round retains the relay and
-retries after fifteen seconds. A rejected round withdraws the relay
-immediately; it is not confirmed by a second round.
+jitter. Maintenance accepts two positive witness results, including temporary
+assumed-positive legacy results, and rejects on two explicit canary-capable
+failures. An inconclusive maintenance round retains the relay and retries after
+fifteen seconds. A rejected round withdraws the relay immediately; it is not
+confirmed by a second round.
 
 Tunnel death, explicit canary rejection, or an explicit trust/quality decision
 may replace a relay. A healthy established relay remains in place when the
@@ -102,14 +111,19 @@ release process and are not decided here.
 
 ## Consequences
 
-- Published relay addresses have independent external evidence and are bound
-  to allocations actually issued to the requester.
+- Published relay addresses are bound to allocations actually issued to the
+  requester. They have independent external evidence when selected witnesses
+  support canaries; during mixed-version rollout an unsupported selected
+  witness temporarily contributes assumed-positive compatibility credit.
 - Canary traffic cannot tear down shared application/DHT connections.
 - Sybil identities alone cannot turn witnesses into arbitrary reflected
   dialers, and canary work cannot exhaust the general handler pool.
 - Healthy relay sessions avoid churn when routing-table responsibility moves.
 - DHT withdrawal begins without waiting for local transport shutdown.
-- Tiny and mixed-version routing tables can still produce inconclusive
-  admission until capability-aware witness sampling is designed.
+- Mixed-version witnesses do not block admission merely because they lack the
+  canary protocol; their missing protocol response is temporarily counted as
+  positive.
+- Routing tables with fewer than three selectable non-close witnesses can
+  still produce inconclusive admission.
 - The signed receipt adds several kilobytes of ML-DSA public-key and signature
   material to each canary request.

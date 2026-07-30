@@ -47,11 +47,12 @@ pub(crate) const RELAY_CANARY_WIRE_TOPIC: &str = "/rr/relay-canary-v2";
 /// Number of independent non-close witnesses to ask for a relay proof.
 const RELAY_CANARY_WITNESS_TARGET: usize = 3;
 
-/// Successful witness probes needed before a relay is publishable.
+/// Positive witness results needed before a relay is publishable.
 ///
-/// Publication is unanimous across the selected independent witnesses. A
-/// 2-of-3 quorum can knowingly publish a relay after the third path has failed,
-/// which violates the established-relay reachability invariant.
+/// Publication is unanimous across the selected independent witnesses. During
+/// the mixed-version rollout, a request that was delivered but received no
+/// canary-protocol response counts as a positive result so legacy nodes do not
+/// make relay availability worse than before the canary gate.
 const RELAY_CANARY_ADMISSION_SUCCESSES: usize = RELAY_CANARY_WITNESS_TARGET;
 
 /// One explicit canary-capable dial failure is enough to reject a provisional
@@ -159,6 +160,15 @@ impl RelayCanaryRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct RelayCanaryResponse {
     pub(crate) result: RelayCanaryProbeResult,
+}
+
+/// Request-level outcome after the requester has contacted a selected witness.
+#[derive(Debug)]
+pub(crate) enum RelayCanaryRequestOutcome {
+    /// The witness supports the canary protocol and returned a typed result.
+    Response(RelayCanaryResponse),
+    /// The request was sent, but no canary-protocol response arrived.
+    NoProtocolResponse,
 }
 
 /// Result of one witness's relay probe.
@@ -313,7 +323,7 @@ pub(crate) enum RelayCanaryVerdict {
 /// Evidence policy for a relay canary round.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RelayCanaryPolicy {
-    /// A provisional relay must pass every selected witness before publication.
+    /// A provisional relay needs a positive result from every selected witness.
     Admission,
     /// An established relay is retained or rejected by a completed majority.
     Maintenance,
@@ -338,6 +348,7 @@ impl RelayCanaryPolicy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RelayCanaryProbeDisposition {
     Success,
+    AssumedSuccess,
     Failure,
     Ineligible,
 }
@@ -348,6 +359,7 @@ struct RelayCanarySummary {
     responses: usize,
     eligible_attempts: usize,
     successes: usize,
+    assumed_successes: usize,
     ineligible: usize,
 }
 
@@ -358,6 +370,7 @@ impl RelayCanarySummary {
             responses: 0,
             eligible_attempts: 0,
             successes: 0,
+            assumed_successes: 0,
             ineligible: 0,
         }
     }
@@ -368,6 +381,11 @@ impl RelayCanarySummary {
             RelayCanaryProbeDisposition::Success => {
                 self.eligible_attempts += 1;
                 self.successes += 1;
+            }
+            RelayCanaryProbeDisposition::AssumedSuccess => {
+                self.eligible_attempts += 1;
+                self.successes += 1;
+                self.assumed_successes += 1;
             }
             RelayCanaryProbeDisposition::Failure => {
                 self.eligible_attempts += 1;
@@ -503,32 +521,47 @@ pub(crate) async fn verify_relay_with_canaries(
 
     while let Some(report) = probes.next().await {
         summary.record(report.disposition);
-        if report.disposition == RelayCanaryProbeDisposition::Success {
-            debug!(
-                witness = %report.witness.to_hex(),
-                successes = summary.successes,
-                eligible_attempts = summary.eligible_attempts,
-                responses = summary.responses,
-                "relay canary: witness confirmed relay"
-            );
-        } else if report.disposition == RelayCanaryProbeDisposition::Ineligible {
-            debug!(
-                witness = %report.witness.to_hex(),
-                detail = %report.detail,
-                ineligible = summary.ineligible,
-                eligible_attempts = summary.eligible_attempts,
-                responses = summary.responses,
-                "relay canary: witness could not evaluate relay"
-            );
-        } else {
-            debug!(
-                witness = %report.witness.to_hex(),
-                detail = %report.detail,
-                successes = summary.successes,
-                eligible_attempts = summary.eligible_attempts,
-                responses = summary.responses,
-                "relay canary: witness failed relay probe"
-            );
+        match report.disposition {
+            RelayCanaryProbeDisposition::Success => {
+                debug!(
+                    witness = %report.witness.to_hex(),
+                    successes = summary.successes,
+                    eligible_attempts = summary.eligible_attempts,
+                    responses = summary.responses,
+                    "relay canary: witness confirmed relay"
+                );
+            }
+            RelayCanaryProbeDisposition::AssumedSuccess => {
+                debug!(
+                    witness = %report.witness.to_hex(),
+                    detail = %report.detail,
+                    successes = summary.successes,
+                    assumed_successes = summary.assumed_successes,
+                    eligible_attempts = summary.eligible_attempts,
+                    responses = summary.responses,
+                    "relay canary: assuming positive result from legacy witness"
+                );
+            }
+            RelayCanaryProbeDisposition::Ineligible => {
+                debug!(
+                    witness = %report.witness.to_hex(),
+                    detail = %report.detail,
+                    ineligible = summary.ineligible,
+                    eligible_attempts = summary.eligible_attempts,
+                    responses = summary.responses,
+                    "relay canary: witness could not evaluate relay"
+                );
+            }
+            RelayCanaryProbeDisposition::Failure => {
+                debug!(
+                    witness = %report.witness.to_hex(),
+                    detail = %report.detail,
+                    successes = summary.successes,
+                    eligible_attempts = summary.eligible_attempts,
+                    responses = summary.responses,
+                    "relay canary: witness failed relay probe"
+                );
+            }
         }
     }
 
@@ -543,6 +576,7 @@ pub(crate) async fn verify_relay_with_canaries(
             successes,
             attempts,
             responses = summary.responses,
+            assumed_successes = summary.assumed_successes,
             ineligible = summary.ineligible,
             available_witnesses = summary.total,
             ?policy,
@@ -557,6 +591,7 @@ pub(crate) async fn verify_relay_with_canaries(
             successes,
             attempts,
             responses = summary.responses,
+            assumed_successes = summary.assumed_successes,
             ineligible = summary.ineligible,
             available_witnesses = summary.total,
             ?policy,
@@ -573,6 +608,7 @@ pub(crate) async fn verify_relay_with_canaries(
             failures,
             unavailable,
             responses = summary.responses,
+            assumed_successes = summary.assumed_successes,
             available_witnesses = summary.total,
             ?policy,
             "relay canary: completed witness round was inconclusive"
@@ -694,33 +730,38 @@ async fn request_relay_canary(
     request: RelayCanaryRequest,
 ) -> RelayCanaryProbeReport {
     let witness_peer_id = witness.peer_id;
-    match dht
+    let outcome = dht
         .send_relay_canary_request(
             &witness_peer_id,
             &witness.typed_addresses,
             request,
             RELAY_CANARY_REQUEST_TIMEOUT,
         )
-        .await
-    {
-        Ok(response) => RelayCanaryProbeReport {
-            witness: witness_peer_id,
+        .await;
+    relay_canary_probe_report(witness_peer_id, outcome)
+}
+
+fn relay_canary_probe_report(
+    witness: PeerId,
+    outcome: std::result::Result<RelayCanaryRequestOutcome, P2PError>,
+) -> RelayCanaryProbeReport {
+    match outcome {
+        Ok(RelayCanaryRequestOutcome::Response(response)) => RelayCanaryProbeReport {
+            witness,
             disposition: response.result.disposition(),
             detail: response.result.summary(),
         },
-        Err(e) => RelayCanaryProbeReport {
-            witness: witness_peer_id,
-            disposition: canary_request_error_disposition(&e),
-            detail: e.to_string(),
+        Ok(RelayCanaryRequestOutcome::NoProtocolResponse) => RelayCanaryProbeReport {
+            witness,
+            disposition: RelayCanaryProbeDisposition::AssumedSuccess,
+            detail: "no canary-protocol response; treating selected witness as legacy".to_string(),
+        },
+        Err(error) => RelayCanaryProbeReport {
+            witness,
+            disposition: RelayCanaryProbeDisposition::Ineligible,
+            detail: error.to_string(),
         },
     }
-}
-
-fn canary_request_error_disposition(_error: &P2PError) -> RelayCanaryProbeDisposition {
-    // Request-level failures do not prove the relay is bad: in mixed-version
-    // networks the witness may simply not implement the relay canary protocol.
-    // Only typed canary responses count as eligible probe attempts.
-    RelayCanaryProbeDisposition::Ineligible
 }
 
 #[cfg(test)]
@@ -955,23 +996,57 @@ mod tests {
     }
 
     #[test]
-    fn request_timeout_is_ineligible_for_mixed_version_witness() {
+    fn missing_canary_response_counts_as_legacy_success() {
         assert_eq!(
-            canary_request_error_disposition(&P2PError::Timeout(RELAY_CANARY_REQUEST_TIMEOUT)),
+            relay_canary_probe_report(
+                peer_id(FIRST_WITNESS_SEED),
+                Ok(RelayCanaryRequestOutcome::NoProtocolResponse)
+            )
+            .disposition,
+            RelayCanaryProbeDisposition::AssumedSuccess
+        );
+    }
+
+    #[test]
+    fn witness_network_timeout_is_ineligible() {
+        assert_eq!(
+            relay_canary_probe_report(
+                peer_id(FIRST_WITNESS_SEED),
+                Err(P2PError::Network(NetworkError::Timeout))
+            )
+            .disposition,
             RelayCanaryProbeDisposition::Ineligible
         );
+    }
+
+    #[test]
+    fn assumed_legacy_successes_satisfy_admission_threshold() {
+        let mut summary = RelayCanarySummary::new(RELAY_CANARY_WITNESS_TARGET);
+
+        summary.record(RelayCanaryProbeDisposition::Success);
+        summary.record(RelayCanaryProbeDisposition::AssumedSuccess);
+        summary.record(RelayCanaryProbeDisposition::AssumedSuccess);
+
+        assert_eq!(summary.assumed_successes, 2);
         assert_eq!(
-            canary_request_error_disposition(&P2PError::Network(NetworkError::Timeout)),
-            RelayCanaryProbeDisposition::Ineligible
+            summary.verdict(RelayCanaryPolicy::Admission),
+            RelayCanaryVerdict::Verified {
+                successes: 3,
+                attempts: 3
+            }
         );
     }
 
     #[test]
     fn witness_contact_failure_is_ineligible() {
         assert_eq!(
-            canary_request_error_disposition(&P2PError::Network(NetworkError::PeerNotFound(
-                "witness".into()
-            ))),
+            relay_canary_probe_report(
+                peer_id(FIRST_WITNESS_SEED),
+                Err(P2PError::Network(NetworkError::PeerNotFound(
+                    "witness".into()
+                )))
+            )
+            .disposition,
             RelayCanaryProbeDisposition::Ineligible
         );
     }

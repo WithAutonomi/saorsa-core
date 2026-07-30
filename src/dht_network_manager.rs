@@ -30,7 +30,7 @@ use crate::{
     rate_limit::{Engine, SharedEngine},
     reachability::canary::{
         RELAY_CANARY_HANDLER_TIMEOUT, RELAY_CANARY_PROTOCOL, RELAY_CANARY_WIRE_TOPIC,
-        RelayCanaryProbeResult, RelayCanaryRequest, RelayCanaryResponse,
+        RelayCanaryProbeResult, RelayCanaryRequest, RelayCanaryRequestOutcome, RelayCanaryResponse,
         answer_relay_canary_request, relay_canary_destination_rate_limit_config,
         relay_canary_global_rate_limit_config, relay_canary_rate_limit_config,
         validate_relay_canary_request,
@@ -4565,16 +4565,27 @@ impl DhtNetworkManager {
         candidates: &[(MultiAddr, AddressType)],
         request: RelayCanaryRequest,
         timeout: Duration,
-    ) -> Result<RelayCanaryResponse> {
+    ) -> Result<RelayCanaryRequestOutcome> {
         self.ensure_peer_channel(peer_id, candidates).await?;
 
         let request_bytes = postcard::to_stdvec(&request)
             .map_err(|e| P2PError::Serialization(e.to_string().into()))?;
-        let response = self
+        let response = match self
             .transport
             .send_request(peer_id, RELAY_CANARY_PROTOCOL, request_bytes, timeout)
-            .await?;
+            .await
+        {
+            Ok(response) => response,
+            // The peer channel was established and the request send completed,
+            // but no canary response arrived. This is how a selected legacy
+            // witness presents during a mixed-version rollout.
+            Err(P2PError::Timeout(_)) => {
+                return Ok(RelayCanaryRequestOutcome::NoProtocolResponse);
+            }
+            Err(error) => return Err(error),
+        };
         postcard::from_bytes(&response.data)
+            .map(RelayCanaryRequestOutcome::Response)
             .map_err(|e| P2PError::Serialization(e.to_string().into()))
     }
 
