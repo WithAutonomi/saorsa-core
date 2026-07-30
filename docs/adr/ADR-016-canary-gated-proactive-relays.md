@@ -63,8 +63,10 @@ The implementation still requires three selectable non-close witnesses and
 intentionally has no sparse-network threshold or replacement sampling.
 
 Canary work has its own concurrency semaphore, plus per-source, node-wide, and
-per-destination rate limits. It does not consume the general DHT handler
-budget.
+per-destination rate limits. These budgets are consumed after inexpensive
+source/address validation but before ML-DSA receipt verification, so invalid
+receipts cannot create unmetered cryptographic work. Canary work does not
+consume the general DHT handler budget.
 
 ### Established-relay maintenance
 
@@ -88,7 +90,10 @@ transport teardown then run concurrently, so neither waits for the other.
 Relay allocation resources are owned by a small lifecycle actor. The actor
 serializes short state transitions; relay acquisition and teardown awaits run
 outside it. Generation numbers prevent a late acquisition or canary verdict
-from acting on a superseding allocation.
+from acting on a superseding allocation. Every owned allocation carries a
+synchronous cleanup guard: if a lifecycle reply or graceful teardown future is
+cancelled, dropping the owner closes the endpoint, aborts the tunnel tasks, and
+removes the matching relay session.
 
 Candidate `ADD_ADDRESS` advertisements are allowed while an allocation is
 absent or provisional and suppressed only after the relay reaches the

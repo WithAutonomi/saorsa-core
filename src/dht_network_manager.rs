@@ -33,7 +33,7 @@ use crate::{
         RelayCanaryProbeResult, RelayCanaryRequest, RelayCanaryRequestOutcome, RelayCanaryResponse,
         answer_relay_canary_request, relay_canary_destination_rate_limit_config,
         relay_canary_global_rate_limit_config, relay_canary_rate_limit_config,
-        validate_relay_canary_request,
+        validate_relay_canary_request_fields, verify_relay_canary_receipt,
     },
     security::canonicalize_ip,
     self_address::build_self_address_set,
@@ -4628,7 +4628,7 @@ impl DhtNetworkManager {
                 return Ok(());
             }
         };
-        if let Err(reason) = validate_relay_canary_request(&source_peer, &request) {
+        if let Err(reason) = validate_relay_canary_request_fields(&source_peer, &request) {
             debug!(
                 peer = %source_peer.to_hex(),
                 reason = %reason.summary(),
@@ -4636,9 +4636,10 @@ impl DhtNetworkManager {
             );
             return Ok(());
         }
-        // Answering this request makes us cold-dial `relay_addr`, so throttle
-        // each authenticated source to stop a peer using this node as a
-        // reflection/amplification dialer toward an address of its choosing.
+        // Consume abuse budgets before verifying the allocation receipt. Both
+        // ML-DSA verification and the eventual cold dial are attacker-triggered
+        // work; authenticated identities are cheap enough that the global limit
+        // must protect the cryptographic step as well as network acquisition.
         let destination = saorsa_transport::shared::normalize_socket_addr(request.relay_addr);
         if !self.relay_canary_rate_limiter.try_consume_key(&source_peer)
             || !self
@@ -4659,6 +4660,15 @@ impl DhtNetworkManager {
             return self
                 .send_relay_canary_response(&source_peer, &message_id, response)
                 .await;
+        }
+
+        if let Err(reason) = verify_relay_canary_receipt(&request) {
+            debug!(
+                peer = %source_peer.to_hex(),
+                reason = %reason.summary(),
+                "Rejecting relay canary request"
+            );
+            return Ok(());
         }
 
         let response = answer_relay_canary_request(self.transport.as_ref(), request).await;

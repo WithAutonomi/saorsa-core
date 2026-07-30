@@ -252,6 +252,18 @@ pub(crate) fn validate_relay_canary_request(
     source_peer_id: &PeerId,
     request: &RelayCanaryRequest,
 ) -> std::result::Result<(), RelayCanaryRequestRejection> {
+    validate_relay_canary_request_fields(source_peer_id, request)?;
+    verify_relay_canary_receipt(request)
+}
+
+/// Apply only inexpensive request checks before consuming witness budgets.
+///
+/// Receipt verification is intentionally separate so untrusted requests cannot
+/// perform ML-DSA work before the per-source, global, and destination limits.
+pub(crate) fn validate_relay_canary_request_fields(
+    source_peer_id: &PeerId,
+    request: &RelayCanaryRequest,
+) -> std::result::Result<(), RelayCanaryRequestRejection> {
     if request.target_peer_id != *source_peer_id {
         return Err(RelayCanaryRequestRejection::SourceMismatch {
             source_peer_id: *source_peer_id,
@@ -264,7 +276,13 @@ pub(crate) fn validate_relay_canary_request(
         });
     }
 
-    validate_relay_canary_address(request.relay_addr)?;
+    validate_relay_canary_address(request.relay_addr)
+}
+
+/// Verify the relay-signed allocation receipt after witness budgets are held.
+pub(crate) fn verify_relay_canary_receipt(
+    request: &RelayCanaryRequest,
+) -> std::result::Result<(), RelayCanaryRequestRejection> {
     request
         .allocation_receipt
         .verify(
@@ -1091,6 +1109,21 @@ mod tests {
         assert!(matches!(
             error,
             RelayCanaryRequestRejection::InvalidAllocationReceipt(_)
+        ));
+    }
+
+    #[test]
+    fn cheap_canary_validation_defers_receipt_verification() {
+        let target = peer_id(TARGET_SEED);
+        let signed_addr = SocketAddr::from((Ipv4Addr::new(203, 0, 113, 7), TEST_PORT));
+        let requested_addr = SocketAddr::from((Ipv4Addr::new(203, 0, 113, 8), TEST_PORT));
+        let (relayer, receipt) = signed_receipt(target, signed_addr);
+        let request = RelayCanaryRequest::new(target, relayer, requested_addr, receipt);
+
+        assert!(validate_relay_canary_request_fields(&target, &request).is_ok());
+        assert!(matches!(
+            verify_relay_canary_receipt(&request),
+            Err(RelayCanaryRequestRejection::InvalidAllocationReceipt(_))
         ));
     }
 
