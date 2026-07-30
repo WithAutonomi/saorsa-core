@@ -102,7 +102,7 @@ pub struct AcquiredRelay {
 pub enum RelaySessionEstablishError {
     /// The relay refused because its relay-client slots are full. See the
     /// saorsa-transport `NatTraversalError::RelayAtCapacity` variant and
-    /// ADR-014's 2-client-per-public-peer cap.
+    /// ADR-016's four-client-per-public-peer cap.
     #[error("relay at client capacity: {0}")]
     AtCapacity(String),
     /// The relay could not be reached at all (timeout, refused, protocol

@@ -43,7 +43,7 @@
 //!    third-party canary quorum every [`RELAY_REVALIDATION_INTERVAL`], so
 //!    external reachability remains a maintained invariant rather than a
 //!    one-time admission check. K-closest churn does not invalidate an already
-//!    verified relay. On unhealthy-tunnel or repeatedly failed revalidation,
+//!    verified relay. On an unhealthy tunnel or failed revalidation,
 //!    transition to **Lost**; on shutdown, exit.
 //! 4. **Lost**: run the `republish-direct-only → reacquire` sequence.
 //!    The republish MUST happen **before** the acquisition walk starts,
@@ -258,10 +258,33 @@ impl AcquisitionDriver {
             match outcome {
                 RelayAcquisitionOutcome::Acquired(relay) => {
                     let relay_addr = relay.allocation.public_addr();
+                    let Some(allocation_receipt) = self
+                        .transport
+                        .proactive_relay_receipt(relay.allocation)
+                        .await
+                    else {
+                        warn!(
+                            relayer = ?relay.relayer,
+                            allocated = %relay_addr,
+                            "driver: relay did not provide a signed allocation receipt"
+                        );
+                        apply_canary_rejection_event(
+                            &mut self.canary_rejected_relayers,
+                            CanaryRejectionEvent::AcquisitionFailed,
+                        );
+                        self.clear_unpublished_relay_state(relay.allocation).await;
+                        self.publish_typed_set(None).await;
+                        if self.wait_backoff_or_event().await {
+                            return;
+                        }
+                        self.advance_backoff();
+                        continue;
+                    };
                     match verify_relay_with_canaries(
                         &self.dht,
                         relay.relayer,
                         relay_addr,
+                        allocation_receipt.clone(),
                         RelayCanaryPolicy::Admission,
                     )
                     .await
@@ -311,7 +334,7 @@ impl AcquisitionDriver {
                             );
                             // Hold the relay until an eviction or tunnel-death
                             // event forces us back into the acquisition loop.
-                            if self.hold_until_lost().await {
+                            if self.hold_until_lost(allocation_receipt).await {
                                 // shutdown
                                 return;
                             }
@@ -545,7 +568,10 @@ impl AcquisitionDriver {
     ///
     /// Returns `true` on shutdown (caller should exit), `false` when the relay
     /// is considered lost and a republish+reacquire is needed.
-    async fn hold_until_lost(&mut self) -> bool {
+    async fn hold_until_lost(
+        &mut self,
+        allocation_receipt: saorsa_transport::RelayAllocationReceipt,
+    ) -> bool {
         let mut events = self.dht.subscribe_events();
         let mut health = tokio::time::interval(HEALTH_POLL_INTERVAL);
         health.tick().await; // drop the immediate first tick
@@ -620,12 +646,17 @@ impl AcquisitionDriver {
                 }
                 event = events.recv() => {
                     match event {
-                        Ok(DhtNetworkEvent::KClosestPeersChanged { .. }) => {
-                            self.last_published_typed_set = None;
+                        Ok(DhtNetworkEvent::KClosestPeersChanged {
+                            added,
+                            removed,
+                            ..
+                        }) => {
                             let relay = *self.relay_address.read().await;
                             self.publish_typed_set(relay).await;
                             debug!(
-                                "driver: K-closest changed; refreshed relay publication targets"
+                                added = added.len(),
+                                removed = removed.len(),
+                                "driver: K-closest changed; published current relay state only to new targets"
                             );
                         }
                         Ok(_) => continue,
@@ -667,6 +698,7 @@ impl AcquisitionDriver {
                         &self.dht,
                         relayer,
                         relay,
+                        allocation_receipt.clone(),
                         RelayCanaryPolicy::Maintenance,
                     )
                     .await;
@@ -727,19 +759,21 @@ impl AcquisitionDriver {
     async fn lose_relay_and_republish(&mut self, allocation: PreparedRelay) {
         let relay_public_addr = self.relay_address.write().await.take();
         *self.relayer_peer_id.write().await = None;
-        if let Err(error) = self
-            .transport
-            .abort_proactive_relay_session(allocation)
-            .await
-        {
+        self.transport.clear_relay_address();
+
+        // Withdrawal and transport teardown start together. Peers are told to
+        // stop using the allocation without waiting for local QUIC/MASQUE
+        // shutdown, while teardown does not wait on DHT acknowledgements.
+        let transport = Arc::clone(&self.transport);
+        let teardown = async move { transport.abort_proactive_relay_session(allocation).await };
+        let (teardown_result, ()) = tokio::join!(teardown, self.force_publish_typed_set(None));
+        if let Err(error) = teardown_result {
             warn!(
                 relay_addr = ?relay_public_addr,
                 %error,
                 "driver: failed to tear down lost or evicted relay"
             );
         }
-        self.transport.clear_relay_address();
-        self.force_publish_typed_set(None).await;
     }
 
     /// Wait out the current backoff window, or short-circuit on a

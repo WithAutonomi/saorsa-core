@@ -22,7 +22,7 @@
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use futures::stream::{FuturesUnordered, StreamExt};
 use rand::{Rng, seq::SliceRandom};
@@ -39,10 +39,10 @@ use crate::transport_handle::TransportHandle;
 use crate::{MultiAddr, PeerId};
 
 /// Request/response protocol name used with `TransportHandle::send_request`.
-pub(crate) const RELAY_CANARY_PROTOCOL: &str = "relay-canary-v1";
+pub(crate) const RELAY_CANARY_PROTOCOL: &str = "relay-canary-v2";
 
 /// Wire topic emitted by the request/response wrapper for canary requests.
-pub(crate) const RELAY_CANARY_WIRE_TOPIC: &str = "/rr/relay-canary-v1";
+pub(crate) const RELAY_CANARY_WIRE_TOPIC: &str = "/rr/relay-canary-v2";
 
 /// Number of independent non-close witnesses to ask for a relay proof.
 const RELAY_CANARY_WITNESS_TARGET: usize = 3;
@@ -55,8 +55,7 @@ const RELAY_CANARY_WITNESS_TARGET: usize = 3;
 const RELAY_CANARY_ADMISSION_SUCCESSES: usize = RELAY_CANARY_WITNESS_TARGET;
 
 /// One explicit canary-capable dial failure is enough to reject a provisional
-/// relay. Established relays confirm that result in a second maintenance round
-/// before withdrawal.
+/// relay.
 const RELAY_CANARY_ADMISSION_FAILURES: usize = 1;
 
 /// Established relays use majority evidence so one witness-specific network
@@ -90,6 +89,10 @@ const RELAY_CANARY_RATE_WINDOW: Duration = Duration::from_secs(10);
 
 /// Maximum canary-triggered cold dials a single source may request per window.
 const RELAY_CANARY_RATE_MAX_PER_WINDOW: u32 = 1;
+const RELAY_CANARY_GLOBAL_RATE_WINDOW: Duration = Duration::from_secs(10);
+const RELAY_CANARY_GLOBAL_RATE_MAX_PER_WINDOW: u32 = 16;
+const RELAY_CANARY_DESTINATION_RATE_WINDOW: Duration = Duration::from_secs(10);
+const RELAY_CANARY_DESTINATION_RATE_MAX_PER_WINDOW: u32 = 2;
 
 /// Per-source throttle applied to inbound relay canary requests.
 ///
@@ -106,6 +109,24 @@ pub(crate) fn relay_canary_rate_limit_config() -> EngineConfig {
     }
 }
 
+/// Node-wide cap on accepted canary work, independent of requester identity.
+pub(crate) fn relay_canary_global_rate_limit_config() -> EngineConfig {
+    EngineConfig {
+        window: RELAY_CANARY_GLOBAL_RATE_WINDOW,
+        max_requests: RELAY_CANARY_GLOBAL_RATE_MAX_PER_WINDOW,
+        burst_size: RELAY_CANARY_GLOBAL_RATE_MAX_PER_WINDOW,
+    }
+}
+
+/// Cap repeated canary work aimed at the same signed relay allocation.
+pub(crate) fn relay_canary_destination_rate_limit_config() -> EngineConfig {
+    EngineConfig {
+        window: RELAY_CANARY_DESTINATION_RATE_WINDOW,
+        max_requests: RELAY_CANARY_DESTINATION_RATE_MAX_PER_WINDOW,
+        burst_size: RELAY_CANARY_DESTINATION_RATE_MAX_PER_WINDOW,
+    }
+}
+
 /// Socket port zero is not a routable service endpoint.
 const UNSPECIFIED_PORT: u16 = 0;
 
@@ -115,14 +136,21 @@ pub(crate) struct RelayCanaryRequest {
     pub(crate) target_peer_id: PeerId,
     pub(crate) relayer_peer_id: PeerId,
     pub(crate) relay_addr: SocketAddr,
+    pub(crate) allocation_receipt: saorsa_transport::RelayAllocationReceipt,
 }
 
 impl RelayCanaryRequest {
-    fn new(target_peer_id: PeerId, relayer_peer_id: PeerId, relay_addr: SocketAddr) -> Self {
+    fn new(
+        target_peer_id: PeerId,
+        relayer_peer_id: PeerId,
+        relay_addr: SocketAddr,
+        allocation_receipt: saorsa_transport::RelayAllocationReceipt,
+    ) -> Self {
         Self {
             target_peer_id,
             relayer_peer_id,
             relay_addr,
+            allocation_receipt,
         }
     }
 }
@@ -180,6 +208,7 @@ pub(crate) enum RelayCanaryRequestRejection {
     LocalScopeIp(IpAddr),
     MulticastIp(IpAddr),
     BroadcastIp(Ipv4Addr),
+    InvalidAllocationReceipt(String),
 }
 
 impl RelayCanaryRequestRejection {
@@ -201,6 +230,9 @@ impl RelayCanaryRequestRejection {
             Self::LocalScopeIp(ip) => format!("relay address uses local-scope IP {ip}"),
             Self::MulticastIp(ip) => format!("relay address uses multicast IP {ip}"),
             Self::BroadcastIp(ip) => format!("relay address uses broadcast IP {ip}"),
+            Self::InvalidAllocationReceipt(reason) => {
+                format!("invalid relay allocation receipt: {reason}")
+            }
         }
     }
 }
@@ -222,7 +254,16 @@ pub(crate) fn validate_relay_canary_request(
         });
     }
 
-    validate_relay_canary_address(request.relay_addr)
+    validate_relay_canary_address(request.relay_addr)?;
+    request
+        .allocation_receipt
+        .verify(
+            *request.target_peer_id.to_bytes(),
+            *request.relayer_peer_id.to_bytes(),
+            request.relay_addr,
+            SystemTime::now(),
+        )
+        .map_err(|error| RelayCanaryRequestRejection::InvalidAllocationReceipt(error.to_string()))
 }
 
 fn validate_relay_canary_address(
@@ -378,10 +419,16 @@ pub(crate) async fn verify_relay_with_canaries(
     dht: &Arc<DhtNetworkManager>,
     relayer: PeerId,
     relay_addr: SocketAddr,
+    allocation_receipt: saorsa_transport::RelayAllocationReceipt,
     policy: RelayCanaryPolicy,
 ) -> RelayCanaryVerdict {
     let target_peer_id = *dht.peer_id();
-    let request = RelayCanaryRequest::new(target_peer_id, relayer, relay_addr);
+    let request = RelayCanaryRequest::new(
+        target_peer_id,
+        relayer,
+        relay_addr,
+        allocation_receipt.clone(),
+    );
     if let Err(reason) = validate_relay_canary_request(&target_peer_id, &request) {
         warn!(
             relayer = %relayer.to_hex(),
@@ -445,7 +492,12 @@ pub(crate) async fn verify_relay_with_canaries(
     let mut probes = FuturesUnordered::new();
     for witness in witnesses {
         let dht = Arc::clone(dht);
-        let request = RelayCanaryRequest::new(target_peer_id, relayer, relay_addr);
+        let request = RelayCanaryRequest::new(
+            target_peer_id,
+            relayer,
+            relay_addr,
+            allocation_receipt.clone(),
+        );
         probes.push(async move { request_relay_canary(dht, witness, request).await });
     }
 
@@ -540,27 +592,23 @@ pub(crate) async fn answer_relay_canary_request(
         // Keep prospective canary probes separately identifiable in structured
         // logs. Correctness comes from dialing the allocated socket and checking
         // the authenticated target identity below.
-        transport.connect_peer_relay_canary_authenticated(&relay_address),
+        transport.probe_relay_canary_authenticated(&relay_address),
     )
     .await;
 
     let result = match dial {
-        Ok(Ok(authenticated_channel)) => {
-            let result = if authenticated_channel.peer_id == request.target_peer_id {
+        Ok(Ok(authenticated_peer)) => {
+            if authenticated_peer == request.target_peer_id {
                 RelayCanaryProbeResult::Success
             } else {
                 debug!(
                     expected = %request.target_peer_id.to_hex(),
-                    actual = %authenticated_channel.peer_id.to_hex(),
+                    actual = %authenticated_peer.to_hex(),
                     relay = %request.relay_addr,
                     "relay canary witness: identity mismatch"
                 );
                 RelayCanaryProbeResult::IdentityMismatch
-            };
-            transport
-                .disconnect_channel(&authenticated_channel.channel_id)
-                .await;
-            result
+            }
         }
         Ok(Err(e)) => {
             debug!(
@@ -700,6 +748,24 @@ mod tests {
 
     fn peer_id(seed: u8) -> PeerId {
         PeerId::from_bytes([seed; 32])
+    }
+
+    fn signed_receipt(
+        target: PeerId,
+        relay_addr: SocketAddr,
+    ) -> (PeerId, saorsa_transport::RelayAllocationReceipt) {
+        let (public_key, secret_key) =
+            saorsa_transport::generate_ml_dsa_keypair().expect("test keypair");
+        let relayer = PeerId::from_bytes(saorsa_transport::fingerprint_public_key(&public_key));
+        let receipt = saorsa_transport::RelayAllocationReceipt::issue(
+            &public_key,
+            &secret_key,
+            *target.to_bytes(),
+            relay_addr,
+            1,
+        )
+        .expect("test allocation receipt");
+        (relayer, receipt)
     }
 
     fn node(seed: u8, ip: Ipv4Addr) -> DHTNode {
@@ -913,8 +979,9 @@ mod tests {
     #[test]
     fn canary_request_rejects_source_mismatch() {
         let relay_addr = SocketAddr::from((Ipv4Addr::new(203, 0, 113, 7), TEST_PORT));
-        let request =
-            RelayCanaryRequest::new(peer_id(TARGET_SEED), peer_id(RELAYER_SEED), relay_addr);
+        let target = peer_id(TARGET_SEED);
+        let (relayer, receipt) = signed_receipt(target, relay_addr);
+        let request = RelayCanaryRequest::new(target, relayer, relay_addr, receipt);
 
         let err = validate_relay_canary_request(&peer_id(FIRST_WITNESS_SEED), &request)
             .expect_err("source mismatch must be rejected");
@@ -926,12 +993,38 @@ mod tests {
     }
 
     #[test]
+    fn canary_request_accepts_valid_signed_allocation() {
+        let target = peer_id(TARGET_SEED);
+        let relay_addr = SocketAddr::from((Ipv4Addr::new(203, 0, 113, 7), TEST_PORT));
+        let (relayer, receipt) = signed_receipt(target, relay_addr);
+        let request = RelayCanaryRequest::new(target, relayer, relay_addr, receipt);
+
+        assert!(validate_relay_canary_request(&target, &request).is_ok());
+    }
+
+    #[test]
+    fn canary_request_rejects_receipt_for_another_address() {
+        let target = peer_id(TARGET_SEED);
+        let signed_addr = SocketAddr::from((Ipv4Addr::new(203, 0, 113, 7), TEST_PORT));
+        let requested_addr = SocketAddr::from((Ipv4Addr::new(203, 0, 113, 8), TEST_PORT));
+        let (relayer, receipt) = signed_receipt(target, signed_addr);
+        let request = RelayCanaryRequest::new(target, relayer, requested_addr, receipt);
+
+        let error = validate_relay_canary_request(&target, &request)
+            .expect_err("receipt must bind the exact requested allocation");
+
+        assert!(matches!(
+            error,
+            RelayCanaryRequestRejection::InvalidAllocationReceipt(_)
+        ));
+    }
+
+    #[test]
     fn canary_request_rejects_local_scope_relay_address() {
-        let request = RelayCanaryRequest::new(
-            peer_id(TARGET_SEED),
-            peer_id(RELAYER_SEED),
-            SocketAddr::from((Ipv4Addr::new(192, 168, 1, 10), TEST_PORT)),
-        );
+        let target = peer_id(TARGET_SEED);
+        let relay_addr = SocketAddr::from((Ipv4Addr::new(192, 168, 1, 10), TEST_PORT));
+        let (relayer, receipt) = signed_receipt(target, relay_addr);
+        let request = RelayCanaryRequest::new(target, relayer, relay_addr, receipt);
 
         let err = validate_relay_canary_request(&peer_id(TARGET_SEED), &request)
             .expect_err("private relay address must be rejected");
@@ -941,11 +1034,10 @@ mod tests {
 
     #[test]
     fn canary_request_rejects_unspecified_port() {
-        let request = RelayCanaryRequest::new(
-            peer_id(TARGET_SEED),
-            peer_id(RELAYER_SEED),
-            SocketAddr::from((Ipv4Addr::new(203, 0, 113, 8), UNSPECIFIED_PORT)),
-        );
+        let target = peer_id(TARGET_SEED);
+        let relay_addr = SocketAddr::from((Ipv4Addr::new(203, 0, 113, 8), UNSPECIFIED_PORT));
+        let (relayer, receipt) = signed_receipt(target, relay_addr);
+        let request = RelayCanaryRequest::new(target, relayer, relay_addr, receipt);
 
         let err = validate_relay_canary_request(&peer_id(TARGET_SEED), &request)
             .expect_err("port zero must be rejected");
@@ -955,13 +1047,21 @@ mod tests {
 
     #[test]
     fn canary_request_rejects_self_as_relayer() {
-        let request = RelayCanaryRequest::new(
-            peer_id(TARGET_SEED),
-            peer_id(TARGET_SEED),
-            SocketAddr::from((Ipv4Addr::new(203, 0, 113, 9), TEST_PORT)),
-        );
+        let relay_addr = SocketAddr::from((Ipv4Addr::new(203, 0, 113, 9), TEST_PORT));
+        let (public_key, secret_key) =
+            saorsa_transport::generate_ml_dsa_keypair().expect("test keypair");
+        let target = PeerId::from_bytes(saorsa_transport::fingerprint_public_key(&public_key));
+        let receipt = saorsa_transport::RelayAllocationReceipt::issue(
+            &public_key,
+            &secret_key,
+            *target.to_bytes(),
+            relay_addr,
+            1,
+        )
+        .expect("test allocation receipt");
+        let request = RelayCanaryRequest::new(target, target, relay_addr, receipt);
 
-        let err = validate_relay_canary_request(&peer_id(TARGET_SEED), &request)
+        let err = validate_relay_canary_request(&target, &request)
             .expect_err("target must not be its own relayer");
 
         assert!(matches!(

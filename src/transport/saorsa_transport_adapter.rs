@@ -171,7 +171,7 @@ const HAPPY_EYEBALLS_V4_STAGGER: Duration = Duration::from_millis(50);
 /// Keep this short because DHT lookups expect to encounter unreachable
 /// candidates on live networks and should move on quickly, but leave enough
 /// room for one QUIC initial-flight retransmission on slower relay paths.
-const DIRECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const DIRECT_CONNECT_TIMEOUT: Duration = Duration::from_millis(1250);
 
 /// Per-attempt direct handshake timeout after connection progress is observed.
 const DIRECT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(4);
@@ -180,7 +180,7 @@ const DIRECT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(4);
 /// forwarder fails to push into a bounded channel.
 ///
 /// Used by the forwarder loop in
-/// [`DualStackNetworkNode::spawn_peer_address_update_forwarder`] when the
+/// [`DualStackNetworkNode::spawn_address_event_forwarder`] when the
 /// downstream consumer is too slow to drain. Drops are coalesced to one
 /// warning per [`ADDRESS_EVENT_DROP_LOG_INTERVAL`] events to avoid log
 /// floods under sustained backpressure; the very first drop in any burst
@@ -1468,10 +1468,25 @@ impl DualStackNetworkNode<P2pLinkTransport> {
             ))
         })?;
 
-        node.transport
+        let allocation = node
+            .transport
             .endpoint()
             .prepare_proactive_relay(relay_addr)
-            .await
+            .await?;
+        if allocation.public_addr().is_ipv4() != relay_addr.is_ipv4() {
+            let allocated_addr = allocation.public_addr();
+            let _ = node
+                .transport
+                .endpoint()
+                .abort_proactive_relay(allocation)
+                .await;
+            return Err(saorsa_transport::p2p_endpoint::EndpointError::Config(
+                format!(
+                    "relay allocation address family mismatch: requested {relay_addr}, allocated {allocated_addr}"
+                ),
+            ));
+        }
+        Ok(allocation)
     }
 
     /// Publish a previously prepared proactive relay.
@@ -1495,6 +1510,44 @@ impl DualStackNetworkNode<P2pLinkTransport> {
         node.transport
             .endpoint()
             .publish_proactive_relay(allocation)
+            .await
+    }
+
+    /// Return the signed receipt for a live proactive relay allocation.
+    pub async fn proactive_relay_receipt(
+        &self,
+        allocation: PreparedRelay,
+    ) -> Option<saorsa_transport::RelayAllocationReceipt> {
+        let relay_public_addr = allocation.public_addr();
+        let node = if relay_public_addr.is_ipv4() {
+            self.v4.as_ref().or(self.v6.as_ref())
+        } else {
+            self.v6.as_ref().or(self.v4.as_ref())
+        }?;
+        node.transport
+            .endpoint()
+            .proactive_relay_receipt(allocation)
+            .await
+    }
+
+    /// Open one isolated authenticated QUIC probe on the matching stack.
+    pub async fn probe_fresh_authenticated(
+        &self,
+        target: SocketAddr,
+    ) -> std::result::Result<Vec<u8>, saorsa_transport::p2p_endpoint::EndpointError> {
+        let node = if target.is_ipv4() {
+            self.v4.as_ref().or(self.v6.as_ref())
+        } else {
+            self.v6.as_ref().or(self.v4.as_ref())
+        }
+        .ok_or_else(|| {
+            saorsa_transport::p2p_endpoint::EndpointError::Config(format!(
+                "no transport stack available for probe address family {target}"
+            ))
+        })?;
+        node.transport
+            .endpoint()
+            .probe_fresh_authenticated(target)
             .await
     }
 
@@ -1540,21 +1593,17 @@ impl DualStackNetworkNode<P2pLinkTransport> {
     /// Spawn background tasks that forward address-related `P2pEvent`s from
     /// each stack's `P2pEndpoint` to the upper layers.
     ///
-    /// Four transport event flavours are bridged, and direct-address
+    /// Three transport event flavours are bridged, and direct-address
     /// promotion notifications are emitted when the classifier state crosses
     /// its proof threshold:
     ///
-    /// - **`PeerAddressUpdated`**: a connected peer advertised a new
-    ///   reachable address via an ADD_ADDRESS frame (typically a relay).
-    ///   Returned via the first mpsc receiver as
-    ///   `(peer_connection_addr, advertised_addr)`.
     /// - **`RelayEstablished`**: this node set up a MASQUE relay and now
     ///   needs to publish the relay address to the K closest peers.
-    ///   Returned via the second mpsc receiver.
+    ///   Returned via the first mpsc receiver.
     /// - **`RelayLost`**: a previously-advertised MASQUE relay address is
     ///   no longer reachable. The reachability driver republishes the
     ///   address set without the relay entry on receipt.  Returned via
-    ///   the third mpsc receiver.
+    ///   the second mpsc receiver.
     /// - **`ExternalAddressDiscovered`**: saorsa-transport's observed
     ///   address quorum cleared. The address is pinned into the supplied
     ///   [`ExternalAddresses`] store and a self-address update is emitted
@@ -1566,7 +1615,7 @@ impl DualStackNetworkNode<P2pLinkTransport> {
     ///
     /// Other `P2pEvent` variants are not consumed by saorsa-core and are
     /// silently ignored.
-    pub fn spawn_peer_address_update_forwarder(
+    pub fn spawn_address_event_forwarder(
         &self,
         external_addresses: Arc<parking_lot::Mutex<ExternalAddresses>>,
         peer_observations: Arc<DashMap<IpAddr, HashSet<SocketAddr>>>,
@@ -1575,18 +1624,15 @@ impl DualStackNetworkNode<P2pLinkTransport> {
         direct_promoted_events: AddressEventPublisher,
         self_address_updated_events: AddressEventPublisher,
     ) -> (
-        tokio::sync::mpsc::Receiver<(SocketAddr, SocketAddr)>,
         tokio::sync::mpsc::Receiver<SocketAddr>,
         tokio::sync::mpsc::Receiver<SocketAddr>,
     ) {
-        let (tx, rx) = tokio::sync::mpsc::channel(ADDRESS_EVENT_CHANNEL_CAPACITY);
         let (relay_tx, relay_rx) = tokio::sync::mpsc::channel(ADDRESS_EVENT_CHANNEL_CAPACITY);
         let (relay_lost_tx, relay_lost_rx) =
             tokio::sync::mpsc::channel(ADDRESS_EVENT_CHANNEL_CAPACITY);
         let drop_counter = Arc::new(AtomicU64::new(0));
         for node in [&self.v6, &self.v4].into_iter().flatten() {
             let mut p2p_rx = node.transport.endpoint().subscribe();
-            let tx_clone = tx.clone();
             let relay_tx_clone = relay_tx.clone();
             let relay_lost_tx_clone = relay_lost_tx.clone();
             let ext_clone = Arc::clone(&external_addresses);
@@ -1604,23 +1650,6 @@ impl DualStackNetworkNode<P2pLinkTransport> {
                 );
                 loop {
                     match p2p_rx.recv().await {
-                        Ok(saorsa_transport::P2pEvent::PeerAddressUpdated {
-                            peer_addr,
-                            advertised_addr,
-                        }) => {
-                            tracing::debug!(
-                                "ADDR_FWD: received PeerAddressUpdated peer={} addr={}",
-                                peer_addr,
-                                advertised_addr
-                            );
-                            let payload = (
-                                saorsa_transport::shared::normalize_socket_addr(peer_addr),
-                                saorsa_transport::shared::normalize_socket_addr(advertised_addr),
-                            );
-                            if let Err(err) = tx_clone.try_send(payload) {
-                                handle_address_event_drop(&drops, "PeerAddressUpdated", &err);
-                            }
-                        }
                         Ok(saorsa_transport::P2pEvent::RelayEstablished { relay_addr }) => {
                             tracing::info!(
                                 "ADDR_FWD: received RelayEstablished relay_addr={}",
@@ -1706,7 +1735,7 @@ impl DualStackNetworkNode<P2pLinkTransport> {
                 }
             });
         }
-        (rx, relay_rx, relay_lost_rx)
+        (relay_rx, relay_lost_rx)
     }
 
     /// Spawn one background task per bound stack (v4, v6) to classify

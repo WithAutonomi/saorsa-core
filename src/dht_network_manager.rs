@@ -31,7 +31,9 @@ use crate::{
     reachability::canary::{
         RELAY_CANARY_HANDLER_TIMEOUT, RELAY_CANARY_PROTOCOL, RELAY_CANARY_WIRE_TOPIC,
         RelayCanaryProbeResult, RelayCanaryRequest, RelayCanaryResponse,
-        answer_relay_canary_request, relay_canary_rate_limit_config, validate_relay_canary_request,
+        answer_relay_canary_request, relay_canary_destination_rate_limit_config,
+        relay_canary_global_rate_limit_config, relay_canary_rate_limit_config,
+        validate_relay_canary_request,
     },
     security::canonicalize_ip,
     self_address::build_self_address_set,
@@ -68,6 +70,7 @@ const MAX_MESSAGE_SIZE: usize = 64 * 1024;
 /// Prevents long-running handlers from starving the semaphore permit pool
 /// SEC-001: DoS mitigation via timeout enforcement on concurrent operations
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_CONCURRENT_RELAY_CANARY_PROBES: usize = 8;
 
 /// Reliability score assigned to the local node in K-closest results.
 /// The local node is always considered fully reliable for its own lookups.
@@ -748,6 +751,8 @@ pub struct DhtNetworkManager {
     stats: Arc<RwLock<DhtNetworkStats>>,
     /// Semaphore for limiting concurrent message handlers (backpressure)
     message_handler_semaphore: Arc<Semaphore>,
+    /// Isolated concurrency budget for canary-triggered network dials.
+    relay_canary_semaphore: Arc<Semaphore>,
     /// Global semaphore limiting concurrent stale revalidation passes.
     /// Prevents a flood of revalidation attempts from consuming excessive
     /// resources when many buckets have stale peers simultaneously.
@@ -768,6 +773,10 @@ pub struct DhtNetworkManager {
     /// authenticated source is throttled (see [`relay_canary_rate_limit_config`])
     /// to stop a peer using this node as a reflection/amplification dialer.
     relay_canary_rate_limiter: SharedEngine<PeerId>,
+    /// Node-wide canary work limiter that cannot be bypassed with new IDs.
+    relay_canary_global_rate_limiter: SharedEngine<&'static str>,
+    /// Repeated-work limiter for one relay allocation address.
+    relay_canary_destination_rate_limiter: SharedEngine<SocketAddr>,
     /// Shutdown token for background tasks
     shutdown: CancellationToken,
     /// Handle for the network event handler task
@@ -1281,6 +1290,10 @@ pub enum DhtNetworkEvent {
         old: Vec<PeerId>,
         /// K-closest peer IDs after the mutation.
         new: Vec<PeerId>,
+        /// Peers newly entering the K-closest set.
+        added: Vec<PeerId>,
+        /// Peers leaving the K-closest set.
+        removed: Vec<PeerId>,
     },
     /// New peer added to the routing table.
     PeerAdded { peer_id: PeerId },
@@ -1771,6 +1784,7 @@ impl DhtNetworkManager {
             event_tx,
             stats: Arc::new(RwLock::new(DhtNetworkStats::default())),
             message_handler_semaphore,
+            relay_canary_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_RELAY_CANARY_PROBES)),
             revalidation_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_REVALIDATIONS)),
             bucket_revalidation_active: Arc::new(parking_lot::Mutex::new(HashSet::new())),
             bucket_refresh_lookup_semaphore: Arc::new(Semaphore::new(
@@ -1786,6 +1800,12 @@ impl DhtNetworkManager {
             pending_peer_dials: Arc::new(DashMap::new()),
             lookup_failures: Arc::new(LookupFailureCoordinator::new()),
             relay_canary_rate_limiter: Arc::new(Engine::new(relay_canary_rate_limit_config())),
+            relay_canary_global_rate_limiter: Arc::new(Engine::new(
+                relay_canary_global_rate_limit_config(),
+            )),
+            relay_canary_destination_rate_limiter: Arc::new(Engine::new(
+                relay_canary_destination_rate_limit_config(),
+            )),
         })
     }
 
@@ -4608,9 +4628,18 @@ impl DhtNetworkManager {
         // Answering this request makes us cold-dial `relay_addr`, so throttle
         // each authenticated source to stop a peer using this node as a
         // reflection/amplification dialer toward an address of its choosing.
-        if !self.relay_canary_rate_limiter.try_consume_key(&source_peer) {
+        let destination = saorsa_transport::shared::normalize_socket_addr(request.relay_addr);
+        if !self.relay_canary_rate_limiter.try_consume_key(&source_peer)
+            || !self
+                .relay_canary_global_rate_limiter
+                .try_consume_key(&"global")
+            || !self
+                .relay_canary_destination_rate_limiter
+                .try_consume_key(&destination)
+        {
             debug!(
                 peer = %source_peer.to_hex(),
+                relay = %destination,
                 "Throttling relay canary request from source"
             );
             let response = RelayCanaryResponse {
@@ -5166,15 +5195,16 @@ impl DhtNetworkManager {
                                             continue;
                                         };
                                         let manager_clone = Arc::clone(&self_arc);
-                                        let semaphore = Arc::clone(&self_arc.message_handler_semaphore);
+                                        let semaphore = Arc::clone(&self_arc.relay_canary_semaphore);
+                                        let Ok(permit) = semaphore.try_acquire_owned() else {
+                                            warn!(
+                                                peer = %source_peer.to_hex(),
+                                                "Dropping relay canary request: isolated probe budget exhausted"
+                                            );
+                                            continue;
+                                        };
                                         tokio::spawn(async move {
-                                            let _permit = match semaphore.acquire().await {
-                                                Ok(permit) => permit,
-                                                Err(_) => {
-                                                    warn!("Message handler semaphore closed");
-                                                    return;
-                                                }
-                                            };
+                                            let _permit = permit;
 
                                             match tokio::time::timeout(
                                                 RELAY_CANARY_HANDLER_TIMEOUT,
@@ -5444,9 +5474,21 @@ impl DhtNetworkManager {
                         .send(DhtNetworkEvent::PeerRemoved { peer_id: *id });
                 }
                 RoutingTableEvent::KClosestPeersChanged { old, new } => {
+                    let old_set: HashSet<_> = old.iter().copied().collect();
+                    let new_set: HashSet<_> = new.iter().copied().collect();
                     let _ = self.event_tx.send(DhtNetworkEvent::KClosestPeersChanged {
                         old: old.clone(),
                         new: new.clone(),
+                        added: new
+                            .iter()
+                            .filter(|peer| !old_set.contains(peer))
+                            .copied()
+                            .collect(),
+                        removed: old
+                            .iter()
+                            .filter(|peer| !new_set.contains(peer))
+                            .copied()
+                            .collect(),
                     });
                 }
             }
@@ -7812,14 +7854,28 @@ mod tests {
         let event = DhtNetworkEvent::KClosestPeersChanged {
             old: old.clone(),
             new: new.clone(),
+            added: new
+                .iter()
+                .filter(|peer| !old.contains(peer))
+                .copied()
+                .collect(),
+            removed: old
+                .iter()
+                .filter(|peer| !new.contains(peer))
+                .copied()
+                .collect(),
         };
         match event {
             DhtNetworkEvent::KClosestPeersChanged {
                 old: got_old,
                 new: got_new,
+                added,
+                removed,
             } => {
                 assert_eq!(got_old, old);
                 assert_eq!(got_new, new);
+                assert_eq!(added, new);
+                assert_eq!(removed, old);
             }
             _ => panic!("expected KClosestPeersChanged"),
         }

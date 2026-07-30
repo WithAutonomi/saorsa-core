@@ -1305,51 +1305,6 @@ impl P2PNode {
             info!("client mode — skipping relay acquisition driver");
         }
 
-        // Drain peer-advertised ADD_ADDRESS updates from the transport layer.
-        //
-        // Relay-looking ADD_ADDRESS frames are intentionally not merged into
-        // DHT records. Relay reachability must arrive through the sequenced
-        // self-record path owned by `reachability::driver`, after the relay
-        // canary quorum has passed. Accepting transport hints here would let
-        // an unverified relay allocation leak into routing-table gossip before
-        // the canary gate has made a verdict.
-        {
-            let transport = Arc::clone(&self.transport);
-            let shutdown = self.shutdown.clone();
-            tokio::spawn(async move {
-                loop {
-                    tokio::select! {
-                        biased;
-                        _ = shutdown.cancelled() => break,
-                        update = transport.recv_peer_address_update() => {
-                            let Some((peer_addr, advertised_addr)) = update else { break };
-                            let normalized_peer =
-                                saorsa_transport::shared::normalize_socket_addr(peer_addr);
-                            let normalized_adv =
-                                saorsa_transport::shared::normalize_socket_addr(advertised_addr);
-                            // Same-IP updates are just different NATted ports,
-                            // which are useless for symmetric NAT. Different
-                            // IPs are relay-like hints and must not bypass the
-                            // canary-gated DHT publish path.
-                            if normalized_peer.ip() == normalized_adv.ip() {
-                                debug!(
-                                    "DHT_BRIDGE: dropping same-IP update peer={} addr={}",
-                                    normalized_peer,
-                                    normalized_adv
-                                );
-                                continue;
-                            }
-                            debug!(
-                                "DHT_BRIDGE: ignoring relay ADD_ADDRESS update pending sequenced canary publish peer={} addr={}",
-                                normalized_peer,
-                                normalized_adv
-                            );
-                        }
-                    }
-                }
-            });
-        }
-
         self.is_started
             .store(true, std::sync::atomic::Ordering::Release);
 
