@@ -829,7 +829,7 @@ mod tests {
     ) -> (PeerId, saorsa_transport::RelayAllocationReceipt) {
         let (public_key, secret_key) =
             saorsa_transport::generate_ml_dsa_keypair().expect("test keypair");
-        let relayer = PeerId::from_bytes(saorsa_transport::fingerprint_public_key(&public_key));
+        let relayer = PeerId::from_bytes(saorsa_transport::relay_receipt_peer_id(&public_key));
         let receipt = saorsa_transport::RelayAllocationReceipt::issue(
             &public_key,
             &secret_key,
@@ -839,6 +839,18 @@ mod tests {
         )
         .expect("test allocation receipt");
         (relayer, receipt)
+    }
+
+    #[test]
+    fn relay_receipt_identity_matches_overlay_peer_id() {
+        let (public_key, _) = saorsa_transport::generate_ml_dsa_keypair().expect("test keypair");
+        let overlay_peer_id = crate::identity::node_identity::peer_id_from_public_key(&public_key);
+
+        assert_eq!(
+            saorsa_transport::relay_receipt_peer_id(&public_key),
+            *overlay_peer_id.to_bytes(),
+            "relay receipts and DHT canary requests must bind the same identity"
+        );
     }
 
     fn node(seed: u8, ip: Ipv4Addr) -> DHTNode {
@@ -1172,7 +1184,7 @@ mod tests {
         let relay_addr = SocketAddr::from((Ipv4Addr::new(203, 0, 113, 9), TEST_PORT));
         let (public_key, secret_key) =
             saorsa_transport::generate_ml_dsa_keypair().expect("test keypair");
-        let target = PeerId::from_bytes(saorsa_transport::fingerprint_public_key(&public_key));
+        let target = PeerId::from_bytes(saorsa_transport::relay_receipt_peer_id(&public_key));
         let receipt = saorsa_transport::RelayAllocationReceipt::issue(
             &public_key,
             &secret_key,
