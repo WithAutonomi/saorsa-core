@@ -40,10 +40,12 @@
 //!    [`AddressType::Direct`], and poll
 //!    [`TransportHandle::is_relay_healthy`] every
 //!    [`HEALTH_POLL_INTERVAL`]. The driver also repeats the independent
-//!    third-party canary quorum every [`RELAY_REVALIDATION_INTERVAL`], so
-//!    external reachability remains a maintained invariant rather than a
-//!    one-time admission check. K-closest churn does not invalidate an already
-//!    verified relay. On an unhealthy tunnel or failed revalidation,
+//!    third-party canary quorum every [`RELAY_REVALIDATION_INTERVAL`]. The
+//!    maintenance cadence is deliberately much slower than local health
+//!    polling: admission already proved external reachability, while each
+//!    maintenance round creates six network operations (three witness requests
+//!    and three fresh relay dials). K-closest churn does not invalidate an
+//!    already verified relay. On an unhealthy tunnel or failed revalidation,
 //!    transition to **Lost**; on shutdown, exit.
 //! 4. **Lost**: run the `republish-direct-only → reacquire` sequence.
 //!    The republish MUST happen **before** the acquisition walk starts,
@@ -91,19 +93,16 @@ const HEALTH_POLL_INTERVAL: Duration = Duration::from_secs(5);
 ///
 /// Local task health only proves that this process still has a tunnel. A
 /// relay-server forwarding regression or expired public allocation can leave
-/// that tunnel locally alive but externally unreachable. Revalidating once a
-/// minute bounds that otherwise-undetectable state and keeps probe traffic
-/// comfortably below the witness rate limit.
-const RELAY_REVALIDATION_INTERVAL: Duration = Duration::from_secs(60);
-
-/// Delay before confirming an inconclusive or failed maintenance canary.
-///
-/// This remains above the witness's ten-second per-source rate-limit window.
-const RELAY_REVALIDATION_RETRY_INTERVAL: Duration = Duration::from_secs(15);
+/// that tunnel locally alive but externally unreachable, so retain a periodic
+/// external check. Two hours keeps twelve independent checks inside the
+/// allocation receipt's 24-hour lifetime without turning a 990-node fleet into
+/// a continuous source of witness dials and one-shot PQC handshakes.
+const RELAY_REVALIDATION_INTERVAL: Duration = Duration::from_secs(2 * 60 * 60);
 
 /// Maximum deterministic per-peer offset added before the first maintenance
-/// canary. This avoids a fleet-wide probe burst after a rolling deployment.
-const RELAY_REVALIDATION_JITTER_MAX: Duration = Duration::from_secs(30);
+/// canary. Spreading the first round across a full interval avoids a fleet-wide
+/// probe burst after a rolling deployment.
+const RELAY_REVALIDATION_JITTER_MAX: Duration = RELAY_REVALIDATION_INTERVAL;
 
 /// Retry interval for authoritative address publications that were not
 /// acknowledged by every current close peer.
@@ -732,15 +731,21 @@ impl AcquisitionDriver {
                             failures,
                             unavailable,
                         } => {
-                            warn!(
+                            info!(
                                 relayer = %relayer.to_hex(),
                                 relay = %relay,
                                 successes,
                                 failures,
                                 unavailable,
-                                "driver: established relay canary evidence inconclusive; retaining relay and retrying"
+                                "driver: established relay canary evidence inconclusive; retaining relay until the next scheduled check"
                             );
-                            RELAY_REVALIDATION_RETRY_INTERVAL
+                            // Missing witnesses and transient request failures
+                            // are not evidence that the established relay is
+                            // bad. Retain it and wait for the ordinary cadence;
+                            // retrying a three-witness round after 15 seconds
+                            // amplified partial outages into sustained dial
+                            // storms.
+                            RELAY_REVALIDATION_INTERVAL
                         }
                     };
                     revalidation

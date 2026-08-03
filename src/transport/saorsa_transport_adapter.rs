@@ -633,8 +633,14 @@ impl P2PNetworkNode<P2pLinkTransport> {
     /// and abort the per-connection reader task, then removes the peer from
     /// the local registry.
     pub async fn disconnect_peer_quic(&self, addr: &SocketAddr) {
-        if let Err(e) = self.transport.endpoint().disconnect(addr).await {
-            tracing::warn!("QUIC disconnect for peer {}: {}", addr, e);
+        match self.transport.endpoint().disconnect(addr).await {
+            Ok(()) => {}
+            Err(saorsa_transport::p2p_endpoint::EndpointError::PeerNotFound(_)) => {
+                // Connection-loss handling and explicit cleanup race by
+                // design. If the loss path won, disconnect is already done.
+                tracing::debug!("QUIC peer {} was already disconnected", addr);
+            }
+            Err(e) => tracing::warn!("QUIC disconnect for peer {}: {}", addr, e),
         }
         // Also clean up from generic adapter state
         P2PNetworkNode::<P2pLinkTransport>::disconnect_peer_inner(

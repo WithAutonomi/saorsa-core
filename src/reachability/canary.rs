@@ -619,18 +619,32 @@ pub(crate) async fn verify_relay_with_canaries(
             successes,
             failures,
             unavailable,
-        } => warn!(
-            relayer = %relayer.to_hex(),
-            relay = %relay_addr,
-            successes,
-            failures,
-            unavailable,
-            responses = summary.responses,
-            assumed_successes = summary.assumed_successes,
-            available_witnesses = summary.total,
-            ?policy,
-            "relay canary: completed witness round was inconclusive"
-        ),
+        } => match policy {
+            RelayCanaryPolicy::Admission => warn!(
+                relayer = %relayer.to_hex(),
+                relay = %relay_addr,
+                successes,
+                failures,
+                unavailable,
+                responses = summary.responses,
+                assumed_successes = summary.assumed_successes,
+                available_witnesses = summary.total,
+                ?policy,
+                "relay canary: completed witness round was inconclusive"
+            ),
+            RelayCanaryPolicy::Maintenance => info!(
+                relayer = %relayer.to_hex(),
+                relay = %relay_addr,
+                successes,
+                failures,
+                unavailable,
+                responses = summary.responses,
+                assumed_successes = summary.assumed_successes,
+                available_witnesses = summary.total,
+                ?policy,
+                "relay canary: completed maintenance round was inconclusive"
+            ),
+        },
     }
     verdict
 }

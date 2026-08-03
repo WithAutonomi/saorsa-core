@@ -5235,6 +5235,17 @@ impl DhtNetworkManager {
                                             .await
                                             {
                                                 Ok(Ok(())) => {}
+                                                Ok(Err(e)) if e.is_stale_channel_send_failure() => {
+                                                    // The requester may disconnect while this
+                                                    // witness is completing its isolated probe.
+                                                    // That is a normal request-cancellation race,
+                                                    // not a canary-handler failure.
+                                                    debug!(
+                                                        peer = %source_peer.to_hex(),
+                                                        error = %e,
+                                                        "Relay canary response recipient disconnected"
+                                                    );
+                                                }
                                                 Ok(Err(e)) => {
                                                     warn!(
                                                         peer = %source_peer.to_hex(),

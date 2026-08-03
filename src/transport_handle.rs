@@ -2788,6 +2788,23 @@ impl TransportHandle {
                                                 .send_to_peer_optimized(&remote_address, &announce_bytes)
                                                 .await
                                             {
+                                                if e
+                                                    .downcast_ref::<saorsa_transport::p2p_endpoint::EndpointError>()
+                                                    .is_some_and(|error| matches!(
+                                                        error,
+                                                        saorsa_transport::p2p_endpoint::EndpointError::PeerNotFound(_)
+                                                    ))
+                                                {
+                                                    // A one-shot reachability probe closes as
+                                                    // soon as TLS exposes the target identity.
+                                                    // Its inbound Established event can race this
+                                                    // ordinary identity hook; by the time the send
+                                                    // runs there is intentionally no peer left.
+                                                    debug!(
+                                                        "Skipping identity announce for closed channel {channel_id_for_send}"
+                                                    );
+                                                    return;
+                                                }
                                                 // {e:#} prints the full anyhow cause chain so we
                                                 // can see the underlying reason (e.g. "peer did
                                                 // not acknowledge stream data within 1s",

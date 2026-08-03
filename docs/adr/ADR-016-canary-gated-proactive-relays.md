@@ -71,12 +71,20 @@ consume the general DHT handler budget.
 ### Established-relay maintenance
 
 The node polls local tunnel health every five seconds and repeats independent
-third-party canary verification every minute, with deterministic initial
-jitter. Maintenance accepts two positive witness results, including temporary
+third-party canary verification every two hours, with deterministic initial
+jitter spread across a full interval. The slower external cadence is
+intentional: admission already proved reachability, tunnel loss is detected by
+the cheap local health path, and every canary round creates three witness
+requests plus three fresh PQC relay handshakes. At two hours, twelve external
+checks still fit inside the allocation receipt's 24-hour lifetime without
+creating continuous fleet-wide dial pressure.
+
+Maintenance accepts two positive witness results, including temporary
 assumed-positive legacy results, and rejects on two explicit canary-capable
-failures. An inconclusive maintenance round retains the relay and retries after
-fifteen seconds. A rejected round withdraws the relay immediately; it is not
-confirmed by a second round.
+failures. An inconclusive maintenance round retains the relay and waits for the
+ordinary two-hour interval; immediately retrying unavailable witnesses would
+amplify a partial outage. A rejected round withdraws the relay immediately; it
+is not confirmed by a second round.
 
 Tunnel death, explicit canary rejection, or an explicit trust/quality decision
 may replace a relay. A healthy established relay remains in place when the
