@@ -13,8 +13,9 @@ several important ways:
 
 - a relay allocation must not be published merely because the requesting node
   can establish it;
-- a canary witness must not be allowed to dial an arbitrary requester-chosen
-  address;
+- the canary protocol is necessarily a bounded public dial service, so its
+  abuse controls must not depend on a requester-supplied proof that the
+  requester can mint for itself;
 - a canary dial must not reuse or disconnect a live application connection;
 - relay state changes and network teardown must not block one another behind a
   lifecycle mutex; and
@@ -33,20 +34,28 @@ proactive MASQUE allocation. Preparation creates a dedicated relay control
 connection and a separate Quinn endpoint, but the allocation remains
 provisional and absent from the node's published address set.
 
-The relay signs an allocation receipt over:
-
-- the authenticated target peer ID;
-- the authenticated relayer peer ID;
-- the allocated public socket address;
-- the relay-server allocation identifier; and
-- an expiry time.
-
 The target asks three randomized, non-close witnesses to probe the provisional
-address. A witness first verifies the signed receipt and all request bindings.
-It then opens a fresh one-shot authenticated QUIC connection which never enters
-ordinary peer, address, or dial-deduplication maps. The witness closes only that
-owned probe connection and reports whether the authenticated target identity
-matched.
+address using the unreleased `relay-canary-v1` request/response protocol. The
+request contains the target peer ID, public relay socket, and an hourly witness
+eligibility epoch. Its ordinary signed transport envelope must authenticate as
+the same target peer ID, so a node can request a probe only for its own
+identity.
+
+Witness eligibility is deterministic and independent of the requested
+address. A domain-separated BLAKE3 hash of the target peer ID, witness peer ID,
+and eligibility epoch must have its first two bits clear. This assigns roughly
+one quarter of witnesses to a target for an hour and prevents a requester from
+recruiting the whole routing table for one identity. A witness accepts the
+current or immediately previous epoch to tolerate an hour boundary; requesters
+use the current epoch and filter candidates before selecting three randomized,
+non-close witnesses.
+
+After validating the request, an eligible witness opens a fresh one-shot
+authenticated QUIC connection which never enters ordinary peer, address, or
+dial-deduplication maps. The witness closes only that owned probe connection.
+The wire response is deliberately coarse: success, failure, or rate limited.
+Detailed dial and identity failures remain local debug information rather than
+turning the protocol into a richer port-scanning oracle.
 
 Admission requires three positive witness results. One explicit
 canary-capable failure rejects the provisional allocation.
@@ -62,11 +71,22 @@ success. An assumed result is logged separately from a confirmed probe.
 The implementation still requires three selectable non-close witnesses and
 intentionally has no sparse-network threshold or replacement sampling.
 
-Canary work has its own concurrency semaphore, plus per-source, node-wide, and
-per-destination rate limits. These budgets are consumed after inexpensive
-source/address validation but before ML-DSA receipt verification, so invalid
-receipts cannot create unmetered cryptographic work. Canary work does not
-consume the general DHT handler budget.
+Canary work has its own four-permit concurrency semaphore and hourly limits.
+Before starting a dial, each witness consumes all of these budgets:
+
+- at most 4 probes per authenticated target peer ID;
+- at most 20 probes per transport source IPv4 address or IPv6 `/64` prefix;
+- at most 4 probes per destination socket;
+- at most 20 probes per destination IP address; and
+- at most 60 probes in total on that witness.
+
+The limits are intentionally redundant. Ephemeral identities cannot bypass the
+source-network or witness-wide limits, while rotating destination ports cannot
+bypass the destination-IP limit. The source IP is taken from the authenticated
+transport connection, never from request data. Validation and budgets happen
+before any canary-triggered network acquisition. Canary work does not consume
+the general DHT handler budget and does not retry a failed cold dial. Replayed
+requests consume the same hourly budgets as new requests.
 
 ### Established-relay maintenance
 
@@ -75,9 +95,9 @@ third-party canary verification every two hours, with deterministic initial
 jitter spread across a full interval. The slower external cadence is
 intentional: admission already proved reachability, tunnel loss is detected by
 the cheap local health path, and every canary round creates three witness
-requests plus three fresh PQC relay handshakes. At two hours, twelve external
-checks still fit inside the allocation receipt's 24-hour lifetime without
-creating continuous fleet-wide dial pressure.
+requests plus three fresh PQC relay handshakes. The two-hour interval avoids
+continuous fleet-wide dial pressure and remains comfortably inside the hourly
+witness budgets.
 
 Maintenance accepts two positive witness results, including temporary
 assumed-positive legacy results, and rejects on two explicit canary-capable
@@ -124,13 +144,16 @@ release process and are not decided here.
 
 ## Consequences
 
-- Published relay addresses are bound to allocations actually issued to the
-  requester. They have independent external evidence when selected witnesses
-  support canaries; during mixed-version rollout an unsupported selected
-  witness temporarily contributes assumed-positive compatibility credit.
+- Published relay addresses have independent external reachability evidence
+  when selected witnesses support canaries; during mixed-version rollout an
+  unsupported selected witness temporarily contributes assumed-positive
+  compatibility credit.
 - Canary traffic cannot tear down shared application/DHT connections.
-- Sybil identities alone cannot turn witnesses into arbitrary reflected
-  dialers, and canary work cannot exhaust the general handler pool.
+- A malicious node can ask eligible witnesses to attempt a connection to an
+  unrelated public address, but the authenticated-self rule, deterministic
+  witness assignment, hourly peer/source/destination/global limits, and
+  isolated concurrency budget strictly bound that service. Canary work cannot
+  exhaust the general handler pool.
 - Healthy relay sessions avoid churn when routing-table responsibility moves.
 - DHT withdrawal begins without waiting for local transport shutdown.
 - Mixed-version witnesses do not block admission merely because they lack the
@@ -138,5 +161,6 @@ release process and are not decided here.
   positive.
 - Routing tables with fewer than three selectable non-close witnesses can
   still produce inconclusive admission.
-- The signed receipt adds several kilobytes of ML-DSA public-key and signature
-  material to each canary request.
+- Canary requests carry no allocation receipt. This removes untrusted
+  self-signed proof material and several kilobytes of redundant ML-DSA key and
+  signature data from every request.

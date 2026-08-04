@@ -1550,14 +1550,6 @@ impl TransportHandle {
         }
     }
 
-    /// Return the relay-signed receipt for a live proactive allocation.
-    pub async fn proactive_relay_receipt(
-        &self,
-        allocation: PreparedRelay,
-    ) -> Option<saorsa_transport::RelayAllocationReceipt> {
-        self.dual_node.proactive_relay_receipt(allocation).await
-    }
-
     /// Commit a canary-verified proactive relay and advertise it to peers.
     pub async fn publish_proactive_relay_session(&self, allocation: PreparedRelay) -> Result<()> {
         let relay_public_addr = allocation.public_addr();

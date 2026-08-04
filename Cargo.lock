@@ -2585,7 +2585,7 @@ dependencies = [
 [[package]]
 name = "saorsa-transport"
 version = "0.35.2"
-source = "git+https://github.com/WithAutonomi/saorsa-transport.git?branch=fix%2Fpr136-provisional-relay#e24989f21a0bc90cd42bf45ffbdb0bc1700048eb"
+source = "git+https://github.com/WithAutonomi/saorsa-transport.git?branch=fix%2Fpr136-provisional-relay#4b1ed67973763e4636694a9d9c0601ff41b9e933"
 dependencies = [
  "anyhow",
  "async-trait",

@@ -31,9 +31,10 @@ use crate::{
     reachability::canary::{
         RELAY_CANARY_HANDLER_TIMEOUT, RELAY_CANARY_PROTOCOL, RELAY_CANARY_WIRE_TOPIC,
         RelayCanaryProbeResult, RelayCanaryRequest, RelayCanaryRequestOutcome, RelayCanaryResponse,
-        answer_relay_canary_request, relay_canary_destination_rate_limit_config,
-        relay_canary_global_rate_limit_config, relay_canary_rate_limit_config,
-        validate_relay_canary_request_fields, verify_relay_canary_receipt,
+        answer_relay_canary_request, relay_canary_destination_ip_rate_limit_config,
+        relay_canary_destination_rate_limit_config, relay_canary_global_rate_limit_config,
+        relay_canary_rate_limit_config, relay_canary_source_network,
+        relay_canary_source_network_rate_limit_config, validate_relay_canary_request,
     },
     security::canonicalize_ip,
     self_address::build_self_address_set,
@@ -70,7 +71,7 @@ const MAX_MESSAGE_SIZE: usize = 64 * 1024;
 /// Prevents long-running handlers from starving the semaphore permit pool
 /// SEC-001: DoS mitigation via timeout enforcement on concurrent operations
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-const MAX_CONCURRENT_RELAY_CANARY_PROBES: usize = 8;
+const MAX_CONCURRENT_RELAY_CANARY_PROBES: usize = 4;
 
 /// Reliability score assigned to the local node in K-closest results.
 /// The local node is always considered fully reliable for its own lookups.
@@ -773,10 +774,14 @@ pub struct DhtNetworkManager {
     /// authenticated source is throttled (see [`relay_canary_rate_limit_config`])
     /// to stop a peer using this node as a reflection/amplification dialer.
     relay_canary_rate_limiter: SharedEngine<PeerId>,
+    /// Per-source-network canary limiter that survives peer-ID rotation.
+    relay_canary_source_network_rate_limiter: SharedEngine<IpAddr>,
     /// Node-wide canary work limiter that cannot be bypassed with new IDs.
     relay_canary_global_rate_limiter: SharedEngine<&'static str>,
-    /// Repeated-work limiter for one relay allocation address.
+    /// Repeated-work limiter for one destination socket.
     relay_canary_destination_rate_limiter: SharedEngine<SocketAddr>,
+    /// Repeated-work limiter for one destination IP across rotated ports.
+    relay_canary_destination_ip_rate_limiter: SharedEngine<IpAddr>,
     /// Shutdown token for background tasks
     shutdown: CancellationToken,
     /// Handle for the network event handler task
@@ -1800,11 +1805,17 @@ impl DhtNetworkManager {
             pending_peer_dials: Arc::new(DashMap::new()),
             lookup_failures: Arc::new(LookupFailureCoordinator::new()),
             relay_canary_rate_limiter: Arc::new(Engine::new(relay_canary_rate_limit_config())),
+            relay_canary_source_network_rate_limiter: Arc::new(Engine::new(
+                relay_canary_source_network_rate_limit_config(),
+            )),
             relay_canary_global_rate_limiter: Arc::new(Engine::new(
                 relay_canary_global_rate_limit_config(),
             )),
             relay_canary_destination_rate_limiter: Arc::new(Engine::new(
                 relay_canary_destination_rate_limit_config(),
+            )),
+            relay_canary_destination_ip_rate_limiter: Arc::new(Engine::new(
+                relay_canary_destination_ip_rate_limit_config(),
             )),
         })
     }
@@ -4589,7 +4600,12 @@ impl DhtNetworkManager {
             .map_err(|e| P2PError::Serialization(e.to_string().into()))
     }
 
-    async fn handle_relay_canary_message(&self, source_peer: PeerId, data: Vec<u8>) -> Result<()> {
+    async fn handle_relay_canary_message(
+        &self,
+        source_peer: PeerId,
+        source_addr: Option<SocketAddr>,
+        data: Vec<u8>,
+    ) -> Result<()> {
         if data.len() > MAX_MESSAGE_SIZE {
             debug!(
                 "Ignoring oversized relay canary message from {source_peer}: {} bytes (max: {MAX_MESSAGE_SIZE})",
@@ -4628,29 +4644,62 @@ impl DhtNetworkManager {
                 return Ok(());
             }
         };
-        if let Err(reason) = validate_relay_canary_request_fields(&source_peer, &request) {
+        if let Err(reason) =
+            validate_relay_canary_request(&source_peer, self.peer_id(), &request, SystemTime::now())
+        {
             debug!(
                 peer = %source_peer.to_hex(),
                 reason = %reason.summary(),
                 "Rejecting relay canary request"
             );
-            return Ok(());
+            let response = RelayCanaryResponse {
+                result: RelayCanaryProbeResult::WitnessRateLimited,
+            };
+            return self
+                .send_relay_canary_response(&source_peer, &message_id, response)
+                .await;
         }
-        // Consume abuse budgets before verifying the allocation receipt. Both
-        // ML-DSA verification and the eventual cold dial are attacker-triggered
-        // work; authenticated identities are cheap enough that the global limit
-        // must protect the cryptographic step as well as network acquisition.
+        let Some(source_addr) = source_addr else {
+            debug!(
+                peer = %source_peer.to_hex(),
+                "Throttling relay canary request without transport provenance"
+            );
+            let response = RelayCanaryResponse {
+                result: RelayCanaryProbeResult::WitnessRateLimited,
+            };
+            return self
+                .send_relay_canary_response(&source_peer, &message_id, response)
+                .await;
+        };
+
+        // Consume every independent abuse budget before any network
+        // acquisition. Evaluate them separately so a denial in one dimension
+        // cannot be used to avoid consuming the others.
         let destination = saorsa_transport::shared::normalize_socket_addr(request.relay_addr);
-        if !self.relay_canary_rate_limiter.try_consume_key(&source_peer)
-            || !self
-                .relay_canary_global_rate_limiter
-                .try_consume_key(&"global")
-            || !self
-                .relay_canary_destination_rate_limiter
-                .try_consume_key(&destination)
+        let source_network = relay_canary_source_network(source_addr.ip());
+        let destination_ip = canonicalize_ip(destination.ip());
+        let peer_allowed = self.relay_canary_rate_limiter.try_consume_key(&source_peer);
+        let source_network_allowed = self
+            .relay_canary_source_network_rate_limiter
+            .try_consume_key(&source_network);
+        let global_allowed = self
+            .relay_canary_global_rate_limiter
+            .try_consume_key(&"global");
+        let destination_allowed = self
+            .relay_canary_destination_rate_limiter
+            .try_consume_key(&destination);
+        let destination_ip_allowed = self
+            .relay_canary_destination_ip_rate_limiter
+            .try_consume_key(&destination_ip);
+        if !(peer_allowed
+            && source_network_allowed
+            && global_allowed
+            && destination_allowed
+            && destination_ip_allowed)
         {
             debug!(
                 peer = %source_peer.to_hex(),
+                source_network = %source_network,
                 relay = %destination,
                 "Throttling relay canary request from source"
             );
@@ -4662,14 +4711,18 @@ impl DhtNetworkManager {
                 .await;
         }
 
-        if let Err(reason) = verify_relay_canary_receipt(&request) {
+        let Ok(_permit) = self.relay_canary_semaphore.try_acquire() else {
             debug!(
                 peer = %source_peer.to_hex(),
-                reason = %reason.summary(),
-                "Rejecting relay canary request"
+                "Throttling relay canary request: isolated probe budget exhausted"
             );
-            return Ok(());
-        }
+            let response = RelayCanaryResponse {
+                result: RelayCanaryProbeResult::WitnessRateLimited,
+            };
+            return self
+                .send_relay_canary_response(&source_peer, &message_id, response)
+                .await;
+        };
 
         let response = answer_relay_canary_request(self.transport.as_ref(), request).await;
         self.send_relay_canary_response(&source_peer, &message_id, response)
@@ -5215,22 +5268,19 @@ impl DhtNetworkManager {
                                             warn!("Ignoring unsigned relay canary request");
                                             continue;
                                         };
+                                        let source_addr = transport_source
+                                            .as_ref()
+                                            .and_then(MultiAddr::socket_addr);
                                         let manager_clone = Arc::clone(&self_arc);
-                                        let semaphore = Arc::clone(&self_arc.relay_canary_semaphore);
-                                        let Ok(permit) = semaphore.try_acquire_owned() else {
-                                            warn!(
-                                                peer = %source_peer.to_hex(),
-                                                "Dropping relay canary request: isolated probe budget exhausted"
-                                            );
-                                            continue;
-                                        };
                                         tokio::spawn(async move {
-                                            let _permit = permit;
-
                                             match tokio::time::timeout(
                                                 RELAY_CANARY_HANDLER_TIMEOUT,
                                                 manager_clone
-                                                    .handle_relay_canary_message(source_peer, data),
+                                                    .handle_relay_canary_message(
+                                                        source_peer,
+                                                        source_addr,
+                                                        data,
+                                                    ),
                                             )
                                             .await
                                             {

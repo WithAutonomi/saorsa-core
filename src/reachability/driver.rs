@@ -94,9 +94,8 @@ const HEALTH_POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// Local task health only proves that this process still has a tunnel. A
 /// relay-server forwarding regression or expired public allocation can leave
 /// that tunnel locally alive but externally unreachable, so retain a periodic
-/// external check. Two hours keeps twelve independent checks inside the
-/// allocation receipt's 24-hour lifetime without turning a 990-node fleet into
-/// a continuous source of witness dials and one-shot PQC handshakes.
+/// external check. Two hours avoids turning a large fleet into a continuous
+/// source of witness dials and one-shot PQC handshakes.
 const RELAY_REVALIDATION_INTERVAL: Duration = Duration::from_secs(2 * 60 * 60);
 
 /// Maximum deterministic per-peer offset added before the first maintenance
@@ -257,33 +256,10 @@ impl AcquisitionDriver {
             match outcome {
                 RelayAcquisitionOutcome::Acquired(relay) => {
                     let relay_addr = relay.allocation.public_addr();
-                    let Some(allocation_receipt) = self
-                        .transport
-                        .proactive_relay_receipt(relay.allocation)
-                        .await
-                    else {
-                        warn!(
-                            relayer = ?relay.relayer,
-                            allocated = %relay_addr,
-                            "driver: relay did not provide a signed allocation receipt"
-                        );
-                        apply_canary_rejection_event(
-                            &mut self.canary_rejected_relayers,
-                            CanaryRejectionEvent::AcquisitionFailed,
-                        );
-                        self.clear_unpublished_relay_state(relay.allocation).await;
-                        self.publish_typed_set(None).await;
-                        if self.wait_backoff_or_event().await {
-                            return;
-                        }
-                        self.advance_backoff();
-                        continue;
-                    };
                     match verify_relay_with_canaries(
                         &self.dht,
                         relay.relayer,
                         relay_addr,
-                        allocation_receipt.clone(),
                         RelayCanaryPolicy::Admission,
                     )
                     .await
@@ -333,7 +309,7 @@ impl AcquisitionDriver {
                             );
                             // Hold the relay until an eviction or tunnel-death
                             // event forces us back into the acquisition loop.
-                            if self.hold_until_lost(allocation_receipt).await {
+                            if self.hold_until_lost().await {
                                 // shutdown
                                 return;
                             }
@@ -567,10 +543,7 @@ impl AcquisitionDriver {
     ///
     /// Returns `true` on shutdown (caller should exit), `false` when the relay
     /// is considered lost and a republish+reacquire is needed.
-    async fn hold_until_lost(
-        &mut self,
-        allocation_receipt: saorsa_transport::RelayAllocationReceipt,
-    ) -> bool {
+    async fn hold_until_lost(&mut self) -> bool {
         let mut events = self.dht.subscribe_events();
         let mut health = tokio::time::interval(HEALTH_POLL_INTERVAL);
         health.tick().await; // drop the immediate first tick
@@ -697,7 +670,6 @@ impl AcquisitionDriver {
                         &self.dht,
                         relayer,
                         relay,
-                        allocation_receipt.clone(),
                         RelayCanaryPolicy::Maintenance,
                     )
                     .await;

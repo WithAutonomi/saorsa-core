@@ -1519,23 +1519,6 @@ impl DualStackNetworkNode<P2pLinkTransport> {
             .await
     }
 
-    /// Return the signed receipt for a live proactive relay allocation.
-    pub async fn proactive_relay_receipt(
-        &self,
-        allocation: PreparedRelay,
-    ) -> Option<saorsa_transport::RelayAllocationReceipt> {
-        let relay_public_addr = allocation.public_addr();
-        let node = if relay_public_addr.is_ipv4() {
-            self.v4.as_ref().or(self.v6.as_ref())
-        } else {
-            self.v6.as_ref().or(self.v4.as_ref())
-        }?;
-        node.transport
-            .endpoint()
-            .proactive_relay_receipt(allocation)
-            .await
-    }
-
     /// Open one isolated authenticated QUIC probe on the matching stack.
     pub async fn probe_fresh_authenticated(
         &self,
