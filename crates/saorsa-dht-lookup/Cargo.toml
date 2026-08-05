@@ -1,0 +1,13 @@
+[package]
+name = "saorsa-dht-lookup"
+version = "0.1.0"
+edition = "2024"
+authors = ["Saorsa Labs Limited <david@saorsalabs.com>"]
+license = "AGPL-3.0"
+repository = "https://github.com/WithAutonomi/saorsa-core"
+description = "Transport-independent Kademlia iterative lookup engine"
+keywords = ["p2p", "kademlia", "dht", "wasm"]
+categories = ["network-programming", "algorithms", "wasm"]
+
+[dev-dependencies]
+futures = "0.3"
