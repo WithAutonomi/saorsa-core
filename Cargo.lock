@@ -2585,12 +2585,11 @@ dependencies = [
 [[package]]
 name = "saorsa-transport"
 version = "0.35.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e3284026c300f642077315b782462b22558e24d621265a8deeae23287b1c5542"
 dependencies = [
  "anyhow",
  "async-trait",
  "aws-lc-rs",
+ "base64",
  "blake3",
  "bytes",
  "chrono",

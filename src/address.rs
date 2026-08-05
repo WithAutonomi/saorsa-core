@@ -22,6 +22,8 @@
 //! ```text
 //! /ip4/<ipv4>/udp/<port>/quic[/p2p/<peer-id>]
 //! /ip6/<ipv6>/udp/<port>/quic[/p2p/<peer-id>]
+//! /ip4/<ipv4>/udp/<port>/quic-v1/webtransport/certhash/<multihash>/p2p/<peer-id>
+//! /dns/<hostname>/udp/<port>/quic-v1/webtransport/certhash/<multihash>/p2p/<peer-id>
 //! /ip4/<ipv4>/tcp/<port>[/p2p/<peer-id>]
 //! /ip6/<ipv6>/tcp/<port>[/p2p/<peer-id>]
 //! /ip4/<ipv4>/udp/<port>[/p2p/<peer-id>]
@@ -38,7 +40,9 @@ use std::str::FromStr;
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 
-pub use saorsa_transport::transport::TransportAddr;
+pub use saorsa_transport::transport::{
+    TransportAddr, WebTransportAddr, WebTransportCertificateHash, WebTransportHost,
+};
 
 use crate::identity::peer_id::PeerId;
 
@@ -111,6 +115,12 @@ impl MultiAddr {
         Self::new(TransportAddr::Tcp(addr))
     }
 
+    /// Create a browser-compatible WebTransport multiaddress.
+    #[must_use]
+    pub fn webtransport(addr: WebTransportAddr) -> Self {
+        Self::new(TransportAddr::WebTransport(addr))
+    }
+
     /// Builder: attach a [`PeerId`] to this address.
     #[must_use]
     pub fn with_peer_id(mut self, peer_id: PeerId) -> Self {
@@ -152,6 +162,21 @@ impl MultiAddr {
         self.peer_id.as_ref()
     }
 
+    /// Return the WebTransport endpoint components when this address uses WebTransport.
+    #[must_use]
+    pub fn webtransport_addr(&self) -> Option<&WebTransportAddr> {
+        match &self.transport {
+            TransportAddr::WebTransport(address) => Some(address),
+            _ => None,
+        }
+    }
+
+    /// Whether this address describes a browser-compatible WebTransport endpoint.
+    #[must_use]
+    pub fn is_webtransport(&self) -> bool {
+        self.webtransport_addr().is_some()
+    }
+
     /// `true` when this address uses the QUIC transport — the only transport
     /// currently supported for dialing. When additional transports are added,
     /// update this method (and [`Self::dialable_socket_addr`]) accordingly.
@@ -178,7 +203,10 @@ impl MultiAddr {
     /// `Udp`), `None` for non-IP transports.
     #[must_use]
     pub fn socket_addr(&self) -> Option<SocketAddr> {
-        self.transport.as_socket_addr()
+        match &self.transport {
+            TransportAddr::WebTransport(address) => address.socket_addr(),
+            _ => self.transport.as_socket_addr(),
+        }
     }
 
     /// Returns the IP address for IP-based transports, `None` otherwise.
@@ -190,7 +218,10 @@ impl MultiAddr {
     /// Returns the port for IP-based transports, `None` otherwise.
     #[must_use]
     pub fn port(&self) -> Option<u16> {
-        self.socket_addr().map(|a| a.port())
+        match &self.transport {
+            TransportAddr::WebTransport(address) => Some(address.port()),
+            _ => self.socket_addr().map(|a| a.port()),
+        }
     }
 
     /// `true` for IP-based transports with IPv4 addressing.
@@ -385,6 +416,50 @@ mod tests {
         assert_eq!(addr.ip(), Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
         assert_eq!(addr.port(), Some(9000));
         assert!(matches!(addr.transport(), TransportAddr::Quic(_)));
+    }
+
+    #[test]
+    fn test_multiaddr_webtransport_roundtrip_with_peer_id() {
+        let peer_id = PeerId::from_bytes([0x55; 32]);
+        let current = WebTransportCertificateHash::new([0x11; 32]);
+        let next = WebTransportCertificateHash::new([0x22; 32]);
+        let endpoint = WebTransportAddr::new(
+            WebTransportHost::Dns("node.example".to_string()),
+            443,
+            vec![current, next],
+        )
+        .unwrap();
+        let address = MultiAddr::webtransport(endpoint).with_peer_id(peer_id);
+
+        let encoded = address.to_string();
+        assert_eq!(encoded.matches("/certhash/").count(), 2);
+        assert!(encoded.ends_with(&format!("/p2p/{}", peer_id.to_hex())));
+        let parsed = encoded.parse::<MultiAddr>().unwrap();
+        assert_eq!(parsed, address);
+        assert_eq!(parsed.peer_id(), Some(&peer_id));
+        assert!(parsed.is_webtransport());
+        assert!(!parsed.is_quic());
+        assert_eq!(parsed.port(), Some(443));
+        assert_eq!(
+            parsed.webtransport_addr().unwrap().certificate_hashes(),
+            &[current, next]
+        );
+    }
+
+    #[test]
+    fn test_webtransport_multiaddr_postcard_roundtrip() {
+        let peer_id = PeerId::from_bytes([0x66; 32]);
+        let endpoint = WebTransportAddr::new(
+            WebTransportHost::Ip4(Ipv4Addr::LOCALHOST),
+            443,
+            vec![WebTransportCertificateHash::new([0x33; 32])],
+        )
+        .unwrap();
+        let address = MultiAddr::webtransport(endpoint).with_peer_id(peer_id);
+
+        let bytes = postcard::to_stdvec(&address).unwrap();
+        let decoded: MultiAddr = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded, address);
     }
 
     #[test]
