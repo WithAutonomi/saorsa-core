@@ -2485,6 +2485,7 @@ dependencies = [
  "parking_lot",
  "postcard",
  "rand 0.8.6",
+ "saorsa-dht-lookup",
  "saorsa-pqc 0.5.1",
  "saorsa-transport",
  "serde",
@@ -2497,6 +2498,13 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "wyz",
+]
+
+[[package]]
+name = "saorsa-dht-lookup"
+version = "0.1.0"
+dependencies = [
+ "futures",
 ]
 
 [[package]]
