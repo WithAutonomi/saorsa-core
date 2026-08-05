@@ -43,8 +43,12 @@ use dashmap::DashMap;
 use dashmap::mapref::entry::Entry as DashEntry;
 use futures::stream::{FuturesUnordered, StreamExt};
 use rand::Rng;
+use saorsa_dht_lookup::{
+    IterativeLookup, LookupConfig, LookupNode, LookupQuery, LookupQueryOutcome, LookupRunError,
+    LookupTermination, run_iterative_lookup,
+};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
@@ -56,11 +60,6 @@ use uuid::Uuid;
 
 /// Minimum concurrent operations for semaphore backpressure
 const MIN_CONCURRENT_OPERATIONS: usize = 10;
-
-/// Maximum candidate nodes queue size to prevent memory exhaustion attacks.
-/// Candidates are sorted by XOR distance to the lookup target (closest first).
-/// When at capacity, a closer newcomer evicts the farthest existing candidate.
-const MAX_CANDIDATE_NODES: usize = 200;
 
 /// Maximum size for incoming DHT messages (64 KB) to prevent memory exhaustion DoS
 /// Messages larger than this are rejected before deserialization
@@ -454,6 +453,12 @@ pub struct DHTNode {
     /// fresher address records without changing the wire shape for older nodes.
     pub distance: Option<Vec<u8>>,
     pub reliability: f64,
+}
+
+impl LookupNode for DHTNode {
+    fn lookup_peer_id(&self) -> [u8; 32] {
+        *self.peer_id.as_bytes()
+    }
 }
 
 /// Witnessed close-group selection result for a target key.
@@ -1431,48 +1436,21 @@ impl LookupFailureCoordinator {
     }
 }
 
-/// Per-lookup state for peers in an iterative FIND_NODE query.
-///
-/// Mirrors rust-libp2p's closest-peer iterator model: peers move from
-/// "not contacted" (absence from the map) to `Waiting`, then to a final
-/// outcome. Final states are not selected again by the same lookup, so a
-/// failed or abandoned alpha probe cannot be reintroduced by later gossip.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LookupPeerState {
-    Waiting,
-    Succeeded,
-    Failed,
-    Unresponsive,
+fn map_iterative_lookup_error(error: saorsa_dht_lookup::LookupError) -> P2PError {
+    P2PError::Dht(DhtError::RoutingError(error.to_string().into()))
 }
 
-#[derive(Debug, Default)]
-struct LookupPeerStates {
-    states: HashMap<PeerId, LookupPeerState>,
-}
-
-impl LookupPeerStates {
-    fn mark_waiting(&mut self, peer_id: PeerId) {
-        self.states.insert(peer_id, LookupPeerState::Waiting);
-    }
-
-    fn mark_succeeded(&mut self, peer_id: PeerId) {
-        self.states.insert(peer_id, LookupPeerState::Succeeded);
-    }
-
-    fn mark_failed(&mut self, peer_id: PeerId) {
-        self.states.insert(peer_id, LookupPeerState::Failed);
-    }
-
-    fn mark_unresponsive(&mut self, peer_id: PeerId) {
-        self.states.insert(peer_id, LookupPeerState::Unresponsive);
-    }
-
-    fn is_contactable(&self, peer_id: &PeerId) -> bool {
-        !self.states.contains_key(peer_id)
-    }
-
-    fn state(&self, peer_id: &PeerId) -> Option<LookupPeerState> {
-        self.states.get(peer_id).copied()
+fn map_iterative_lookup_run_error(error: LookupRunError<P2PError>) -> P2PError {
+    match error {
+        LookupRunError::Query(error) => error,
+        LookupRunError::Lookup(error) => map_iterative_lookup_error(error),
+        LookupRunError::UnexpectedResponder(peer) => P2PError::Dht(DhtError::RoutingError(
+            format!(
+                "lookup adapter returned unexpected responder {}",
+                hex::encode(peer)
+            )
+            .into(),
+        )),
     }
 }
 
@@ -1751,6 +1729,159 @@ fn split_witnessed_transcript_views(
     }
 
     (responder_node_views, missing_responders)
+}
+
+struct NativeFindNodeQuery<'a> {
+    manager: &'a DhtNetworkManager,
+    transcript_view_count: Option<usize>,
+    transcript: FindNodeLookupTranscript,
+    subject_reports: HashMap<PeerId, SubjectReports>,
+    contacted: HashSet<PeerId>,
+}
+
+impl<'a> NativeFindNodeQuery<'a> {
+    fn new(manager: &'a DhtNetworkManager, transcript_view_count: Option<usize>) -> Self {
+        Self {
+            manager,
+            transcript_view_count,
+            transcript: FindNodeLookupTranscript::default(),
+            subject_reports: HashMap::new(),
+            contacted: HashSet::from([manager.config.peer_id]),
+        }
+    }
+}
+
+impl LookupQuery<DHTNode> for NativeFindNodeQuery<'_> {
+    type Error = P2PError;
+
+    async fn is_candidate_eligible(
+        &mut self,
+        candidate: &DHTNode,
+    ) -> std::result::Result<bool, Self::Error> {
+        Ok(!self
+            .manager
+            .lookup_candidate_dial_plan_is_exhausted(candidate)
+            .await)
+    }
+
+    async fn query_batch(
+        &mut self,
+        target: [u8; 32],
+        _count: usize,
+        iteration: usize,
+        batch: Vec<DHTNode>,
+    ) -> std::result::Result<Vec<LookupQueryOutcome<DHTNode>>, Self::Error> {
+        info!(
+            "[NETWORK] Iteration {}: querying {} nodes",
+            iteration,
+            batch.len()
+        );
+
+        self.contacted.extend(batch.iter().map(|node| node.peer_id));
+        let manager = self.manager;
+        let query_stream: FuturesUnordered<_> = batch
+            .iter()
+            .map(|node| {
+                let peer_id = node.peer_id;
+                let typed = node.typed_addresses();
+                let failure_rx = manager.lookup_failures.subscribe();
+                async move {
+                    manager
+                        .send_find_node_lookup_request(peer_id, typed, target, failure_rx)
+                        .await
+                }
+            })
+            .collect();
+
+        let results = DhtNetworkManager::collect_iteration_results(query_stream).await;
+        let mut outcomes = Vec::with_capacity(results.len());
+
+        for (peer_id, result) in results {
+            match result {
+                Ok(DhtResponseEnvelope {
+                    result: DhtNetworkResult::NodesFound { nodes, .. },
+                    transport_source,
+                    ..
+                }) => {
+                    let (candidate_nodes, responder_view) = manager
+                        .trusted_find_node_response_nodes(
+                            nodes,
+                            transport_source.as_ref(),
+                            &target,
+                            manager.k_value(),
+                            self.transcript_view_count.unwrap_or(0),
+                        )
+                        .await;
+                    if self.transcript_view_count.is_some() {
+                        self.transcript
+                            .record_responder_view(peer_id, responder_view);
+                    }
+
+                    let mut candidates = Vec::new();
+                    for node in candidate_nodes {
+                        if self.contacted.contains(&node.peer_id) {
+                            continue;
+                        }
+                        if manager.lookup_candidate_dial_plan_is_exhausted(&node).await {
+                            trace!(
+                                "[NETWORK] Skipping gossiped {} this round: all dial candidates currently in the failure cache (peer left contactable)",
+                                node.peer_id.to_hex()
+                            );
+                            continue;
+                        }
+
+                        manager.merge_trusted_gossiped_typed_addresses(&node).await;
+                        let subject_id = node.peer_id;
+                        let reports = self.subject_reports.entry(subject_id).or_default();
+                        reports.insert(peer_id, node);
+
+                        if let Some((_, winner)) = compute_winner(&subject_id, reports) {
+                            candidates.push(winner.clone());
+                        }
+                    }
+
+                    outcomes.push(LookupQueryOutcome::Succeeded {
+                        responder: *peer_id.as_bytes(),
+                        candidates,
+                    });
+                }
+                Ok(DhtResponseEnvelope {
+                    result: DhtNetworkResult::PeerRejected,
+                    ..
+                }) => {
+                    info!(
+                        "[NETWORK] Peer {} rejected us — removing from routing table",
+                        peer_id.to_hex()
+                    );
+                    let mut dht = manager.dht.write().await;
+                    let rt_events = dht.remove_node_by_id(&peer_id).await;
+                    drop(dht);
+                    manager.broadcast_routing_events(&rt_events);
+                    let _ = manager.transport.disconnect_peer(&peer_id).await;
+                    outcomes.push(LookupQueryOutcome::Failed {
+                        responder: *peer_id.as_bytes(),
+                    });
+                }
+                Ok(_) => outcomes.push(LookupQueryOutcome::Succeeded {
+                    responder: *peer_id.as_bytes(),
+                    candidates: Vec::new(),
+                }),
+                Err(error) => {
+                    trace!("[NETWORK] Query to {} failed: {}", peer_id.to_hex(), error);
+                    outcomes.push(LookupQueryOutcome::Failed {
+                        responder: *peer_id.as_bytes(),
+                    });
+                }
+            }
+        }
+
+        Ok(outcomes)
+    }
+
+    async fn candidate_evicted(&mut self, peer: [u8; 32]) -> std::result::Result<(), Self::Error> {
+        self.subject_reports.remove(&PeerId::from_bytes(peer));
+        Ok(())
+    }
 }
 
 impl DhtNetworkManager {
@@ -2805,42 +2936,25 @@ impl DhtNetworkManager {
         count: usize,
         transcript_view_count: Option<usize>,
     ) -> Result<FindNodeLookupOutcome> {
-        const MAX_ITERATIONS: usize = 20;
-        const ALPHA: usize = 3; // Parallel queries per iteration
-
         debug!(
             "[NETWORK] Finding {} closest nodes to key: {}",
             count,
             hex::encode(key)
         );
 
-        let target_key = DhtKey::from_bytes(*key);
-        let mut peer_states = LookupPeerStates::default();
-        let mut best_nodes: Vec<DHTNode> = Vec::new();
+        let mut lookup = IterativeLookup::new(*key, LookupConfig::saorsa(count))
+            .map_err(map_iterative_lookup_error)?;
 
         // Kademlia correctness: the local node must compete on distance in the
         // final K-closest result, but we must never send an RPC to ourselves.
-        // Seed best_nodes with self and mark self as "queried" so the iterative
-        // loop never tries to contact us.
-        best_nodes.push(self.local_dht_node().await);
-        self.mark_self_queried(&mut peer_states);
-
-        // Candidates sorted by XOR distance to target (closest first).
-        // Composite key (distance, peer_id) ensures uniqueness when two peers
-        // share the same distance.
-        let mut candidates: BTreeMap<(Key, PeerId), DHTNode> = BTreeMap::new();
-        // All reports collected per subject peer across the lookup,
-        // keyed by responder. `compute_winner` consults this every time
-        // a new report arrives so a quorum that emerges only after the
-        // third close-XOR responder has replied can supersede a
-        // previously-stored single-source pick.
-        let mut subject_reports: HashMap<PeerId, SubjectReports> = HashMap::new();
-        let mut transcript = FindNodeLookupTranscript::default();
+        // Register it as a known result so the shared engine orders it but
+        // never emits it through the transport query interface.
+        lookup.add_known_result(self.local_dht_node().await);
 
         // Start with local knowledge
         let initial = self.find_closest_nodes_local(key, count).await;
         for node in initial {
-            if peer_states.is_contactable(&node.peer_id) {
+            if lookup.is_contactable(node.peer_id.as_bytes()) {
                 if self.lookup_candidate_dial_plan_is_exhausted(&node).await {
                     // Cache exhaustion is a transient, address-view-local
                     // decision — not a terminal peer failure. Skip this view
@@ -2848,285 +2962,30 @@ impl DhtNetworkManager {
                     // still revive it with a usable (e.g. Direct) address.
                     continue;
                 }
-                let dist = node.peer_id.distance(&target_key);
-                candidates.entry((dist, node.peer_id)).or_insert(node);
+                let _ = lookup.add_candidate(node);
             }
         }
 
-        // Snapshot of the top-K peer IDs from the previous iteration.
-        // Stagnation = the entire top-K set is unchanged AND no unqueried
-        // candidate is closer than the current worst member of top-K.
-        let mut previous_top_k: Vec<PeerId> = Vec::new();
-
-        for iteration in 0..MAX_ITERATIONS {
-            if candidates.is_empty() {
-                debug!(
-                    "[NETWORK] No more candidates after {} iterations",
-                    iteration
-                );
-                break;
-            }
-
-            // Select up to ALPHA closest unqueried nodes to query.
-            // BTreeMap is sorted by (distance, peer_id), so first_entry()
-            // always yields the closest candidate.
-            let mut batch: Vec<DHTNode> = Vec::new();
-            while batch.len() < ALPHA {
-                let Some(entry) = candidates.first_entry() else {
-                    break;
-                };
-                let node = entry.remove();
-                if !peer_states.is_contactable(&node.peer_id) {
-                    continue;
-                }
-                if self.lookup_candidate_dial_plan_is_exhausted(&node).await {
-                    // Transient skip, not a terminal failure: keep the peer
-                    // contactable so a better address from a later responder
-                    // can re-admit it (it may have become exhausted only
-                    // because of a coarse relay-IP suppression).
-                    trace!(
-                        "[NETWORK] Skipping {} this round: all dial candidates currently in the failure cache (peer left contactable)",
-                        node.peer_id.to_hex()
-                    );
-                    continue;
-                }
-                peer_states.mark_waiting(node.peer_id);
-                batch.push(node);
-            }
-
-            if batch.is_empty() {
-                debug!(
-                    "[NETWORK] All candidates queried after {} iterations",
-                    iteration
-                );
-                break;
-            }
-
+        let mut query = NativeFindNodeQuery::new(self, transcript_view_count);
+        let termination = run_iterative_lookup(&mut lookup, &mut query)
+            .await
+            .map_err(map_iterative_lookup_run_error)?;
+        if termination == LookupTermination::Converged {
             info!(
-                "[NETWORK] Iteration {}: querying {} nodes",
-                iteration,
-                batch.len()
+                "[NETWORK] {}: Top-K converged after {} iterations",
+                self.config.peer_id.to_hex(),
+                lookup.iterations()
             );
-
-            // Query nodes in parallel.
-            //
-            // saorsa-transport connection multiplexing lets us keep a single
-            // transport socket while still querying multiple peers
-            // concurrently.
-            //
-            // We drive the α queries through `FuturesUnordered` so we can
-            // advance the lookup as soon as there's *something* to work
-            // with. Waiting for every query (`join_all`) lets a single dead
-            // peer — whose dial cascade can take 20–30s — block the whole
-            // iteration; instead, once the first response arrives, we bound
-            // the wait on the stragglers to `ITERATION_GRACE_TIMEOUT_SECS`
-            // and move on with whatever responses came in by then. Any
-            // still-pending queries are dropped (and their futures cancelled)
-            // when the stream goes out of scope.
-            let query_stream: FuturesUnordered<_> = batch
-                .iter()
-                .map(|node| {
-                    let peer_id = node.peer_id;
-                    let typed = node.typed_addresses();
-                    let lookup_key = *key;
-                    let failure_rx = self.lookup_failures.subscribe();
-                    async move {
-                        self.send_find_node_lookup_request(peer_id, typed, lookup_key, failure_rx)
-                            .await
-                    }
-                })
-                .collect();
-
-            let results = Self::collect_iteration_results(query_stream).await;
-            let responded: HashSet<PeerId> = results.iter().map(|(peer_id, _)| *peer_id).collect();
-
-            // Queries still pending after the grace window are dropped. Treat
-            // them like libp2p's `Unresponsive`: they free alpha capacity and
-            // are skipped for the rest of this lookup, preventing later gossip
-            // from reintroducing the same abandoned probe.
-            for node in &batch {
-                if !responded.contains(&node.peer_id)
-                    && peer_states.state(&node.peer_id) == Some(LookupPeerState::Waiting)
-                {
-                    peer_states.mark_unresponsive(node.peer_id);
-                }
-            }
-
-            for (peer_id, result) in results {
-                match result {
-                    Ok(DhtResponseEnvelope {
-                        result: DhtNetworkResult::NodesFound { nodes, .. },
-                        transport_source,
-                        ..
-                    }) => {
-                        peer_states.mark_succeeded(peer_id);
-                        // Add successful node to best_nodes
-                        if let Some(queried_node) = batch.iter().find(|n| n.peer_id == peer_id) {
-                            best_nodes.push(queried_node.clone());
-                        }
-
-                        let (candidate_nodes, responder_view) = self
-                            .trusted_find_node_response_nodes(
-                                nodes,
-                                transport_source.as_ref(),
-                                key,
-                                self.k_value(),
-                                transcript_view_count.unwrap_or(0),
-                            )
-                            .await;
-                        if transcript_view_count.is_some() {
-                            transcript.record_responder_view(peer_id, responder_view);
-                        }
-
-                        for node in candidate_nodes {
-                            if !peer_states.is_contactable(&node.peer_id) {
-                                continue;
-                            }
-                            if self.lookup_candidate_dial_plan_is_exhausted(&node).await {
-                                // Transient skip, not a terminal failure: a
-                                // single responder's stale/suppressed (e.g.
-                                // relay-only) view of this peer must not poison
-                                // it for the rest of the lookup. Leave it
-                                // contactable so another responder's usable
-                                // (e.g. Direct) address can still win.
-                                trace!(
-                                    "[NETWORK] Skipping gossiped {} this round: all dial candidates currently in the failure cache (peer left contactable)",
-                                    node.peer_id.to_hex()
-                                );
-                                continue;
-                            }
-                            // Ingest the responder's typed view into our
-                            // routing table (upgrade-only on existing
-                            // entries) so `Direct` and `Relay` tags
-                            // propagate beyond the publisher's K-closest
-                            // PublishAddressSet fan-out. Without this, a
-                            // peer that isn't in any open node's top-K
-                            // never learns which of its neighbours expose
-                            // a dialable Direct address and fails relay
-                            // acquisition.
-                            self.merge_trusted_gossiped_typed_addresses(&node).await;
-                            let subject_id = node.peer_id;
-                            let dist = subject_id.distance(&target_key);
-                            let cand_key = (dist, subject_id);
-
-                            // Accumulate the report, then recompute the
-                            // winner across all responders that have
-                            // reported this subject so far. The winner
-                            // may change as later responses arrive — e.g.
-                            // a quorum that only forms after the third
-                            // close-XOR responder replies supersedes the
-                            // first single-source pick.
-                            let reports = subject_reports.entry(subject_id).or_default();
-                            reports.insert(peer_id, node);
-
-                            let winner_node = match compute_winner(&subject_id, reports) {
-                                Some((_, node)) => node.clone(),
-                                None => continue,
-                            };
-
-                            // Already present at the same cand_key? Replace
-                            // in place — no capacity change.
-                            if let std::collections::btree_map::Entry::Occupied(mut e) =
-                                candidates.entry(cand_key)
-                            {
-                                e.insert(winner_node);
-                                continue;
-                            }
-
-                            if candidates.len() >= MAX_CANDIDATE_NODES {
-                                // At capacity — evict the farthest candidate if the
-                                // new one is closer, otherwise drop the new one.
-                                let farthest_key = candidates.keys().next_back().copied();
-                                match farthest_key {
-                                    Some(fk) if cand_key < fk => {
-                                        candidates.remove(&fk);
-                                        subject_reports.remove(&fk.1);
-                                    }
-                                    _ => {
-                                        trace!(
-                                            "[NETWORK] Candidate queue at capacity ({}), dropping {}",
-                                            MAX_CANDIDATE_NODES,
-                                            subject_id.to_hex()
-                                        );
-                                        continue;
-                                    }
-                                }
-                            }
-                            candidates.insert(cand_key, winner_node);
-                        }
-                    }
-                    Ok(DhtResponseEnvelope {
-                        result: DhtNetworkResult::PeerRejected,
-                        ..
-                    }) => {
-                        peer_states.mark_failed(peer_id);
-                        // Remote peer rejected us (e.g. older node with blocking) —
-                        // remove them from our routing table (no point retrying) but
-                        // do NOT penalise their trust score; the rejection is an
-                        // honest signal, not misbehaviour.
-                        info!(
-                            "[NETWORK] Peer {} rejected us — removing from routing table",
-                            peer_id.to_hex()
-                        );
-                        let mut dht = self.dht.write().await;
-                        let rt_events = dht.remove_node_by_id(&peer_id).await;
-                        drop(dht);
-                        self.broadcast_routing_events(&rt_events);
-                        let _ = self.transport.disconnect_peer(&peer_id).await;
-                    }
-                    Ok(_) => {
-                        peer_states.mark_succeeded(peer_id);
-                        // Add successful node to best_nodes
-                        if let Some(queried_node) = batch.iter().find(|n| n.peer_id == peer_id) {
-                            best_nodes.push(queried_node.clone());
-                        }
-                    }
-                    Err(e) => {
-                        peer_states.mark_failed(peer_id);
-                        trace!("[NETWORK] Query to {} failed: {}", peer_id.to_hex(), e);
-                        // Trust failure is recorded inside send_dht_request —
-                        // no additional recording needed here.
-                    }
-                }
-            }
-
-            // Sort, deduplicate, and truncate once per iteration instead of per result
-            best_nodes.sort_by(|a, b| Self::compare_node_distance(a, b, key));
-            best_nodes.dedup_by_key(|n| n.peer_id);
-            best_nodes.truncate(count);
-
-            // Stagnation: compare the entire top-K set, not just closest distance.
-            let current_top_k: Vec<PeerId> = best_nodes.iter().map(|n| n.peer_id).collect();
-            if current_top_k == previous_top_k {
-                // If we haven't filled K slots yet, any remaining candidate
-                // could improve the result — keep going.
-                if best_nodes.len() < count && !candidates.is_empty() {
-                    previous_top_k = current_top_k;
-                    continue;
-                }
-                // Top-K didn't change, but don't stop if a queued candidate is
-                // closer than the farthest member of top-K — it could still
-                // improve the result once queried.
-                let has_promising_candidate = best_nodes.last().is_some_and(|worst| {
-                    let worst_dist = worst.peer_id.distance(&target_key);
-                    candidates
-                        .keys()
-                        .next()
-                        .is_some_and(|(dist, _)| *dist < worst_dist)
-                });
-                if !has_promising_candidate {
-                    info!(
-                        "[NETWORK] {}: Top-K converged after {} iterations",
-                        self.config.peer_id.to_hex(),
-                        iteration + 1
-                    );
-                    break;
-                }
-            }
-            previous_top_k = current_top_k;
+        } else {
+            debug!(
+                "[NETWORK] Lookup stopped after {} iterations: {:?}",
+                lookup.iterations(),
+                termination
+            );
         }
 
-        best_nodes = apply_lookup_report_winners(best_nodes, &subject_reports, key, count);
+        let best_nodes =
+            apply_lookup_report_winners(lookup.results(), &query.subject_reports, key, count);
 
         info!(
             "[NETWORK] Found {} closest nodes: {:?}",
@@ -3142,7 +3001,7 @@ impl DhtNetworkManager {
 
         Ok(FindNodeLookupOutcome {
             closest_nodes: best_nodes,
-            transcript,
+            transcript: query.transcript,
         })
     }
 
@@ -3362,12 +3221,6 @@ impl DhtNetworkManager {
             distance: None,
             reliability: SELF_RELIABILITY_SCORE,
         }
-    }
-
-    /// Add the local app-level peer ID to the per-lookup state map so that
-    /// iterative lookups never send RPCs to the local node.
-    fn mark_self_queried(&self, peer_states: &mut LookupPeerStates) {
-        peer_states.mark_succeeded(self.config.peer_id);
     }
 
     /// Return the first dialable `Direct`-tagged address from a [`DHTNode`].
@@ -6084,47 +5937,6 @@ mod tests {
 
         assert_eq!(selected.len(), refresh_budget);
         assert_eq!(selected, expected);
-    }
-
-    #[test]
-    fn lookup_peer_states_only_absent_peers_are_contactable() {
-        let mut states = LookupPeerStates::default();
-        let waiting = pid(1);
-        let succeeded = pid(2);
-        let failed = pid(3);
-        let unresponsive = pid(4);
-        let fresh = pid(5);
-
-        states.mark_waiting(waiting);
-        states.mark_succeeded(succeeded);
-        states.mark_failed(failed);
-        states.mark_unresponsive(unresponsive);
-
-        assert!(!states.is_contactable(&waiting));
-        assert!(!states.is_contactable(&succeeded));
-        assert!(!states.is_contactable(&failed));
-        assert!(!states.is_contactable(&unresponsive));
-        assert!(states.is_contactable(&fresh));
-    }
-
-    #[test]
-    fn lookup_peer_states_failure_and_unresponsive_are_final_for_lookup() {
-        let mut states = LookupPeerStates::default();
-        let failed = pid(7);
-        let unresponsive = pid(8);
-
-        states.mark_waiting(failed);
-        states.mark_failed(failed);
-        states.mark_waiting(unresponsive);
-        states.mark_unresponsive(unresponsive);
-
-        assert_eq!(states.state(&failed), Some(LookupPeerState::Failed));
-        assert_eq!(
-            states.state(&unresponsive),
-            Some(LookupPeerState::Unresponsive)
-        );
-        assert!(!states.is_contactable(&failed));
-        assert!(!states.is_contactable(&unresponsive));
     }
 
     #[tokio::test]

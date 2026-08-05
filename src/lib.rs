@@ -64,6 +64,11 @@ pub use network::{NodeConfig, NodeMode, P2PEvent, P2PNode};
 // DHT types — peer discovery, routing, and network events
 pub use dht::Key;
 pub use dht_network_manager::{DHTNode, DhtNetworkEvent, ResponderView, WitnessedCloseGroup};
+pub use saorsa_dht_lookup::{
+    CandidateInsertion, IterativeLookup, LookupConfig, LookupError, LookupKey, LookupNode,
+    LookupPeerState, LookupProgress, LookupQuery, LookupQueryOutcome, LookupRunError,
+    LookupTermination, run_iterative_lookup, xor_distance,
+};
 
 // Close-group cache
 pub use bootstrap::{CachedCloseGroupPeer, CloseGroupCache};
