@@ -23,6 +23,7 @@ use crate::address::MultiAddr;
 use serde::{Deserialize, Serialize};
 use std::io::Write as _;
 use std::path::Path;
+use std::time::Duration;
 
 /// Filename used for the close group cache inside the configured directory.
 const CACHE_FILENAME: &str = "close_group_cache.json";
@@ -40,9 +41,11 @@ pub struct CachedCloseGroupPeer {
 
 /// Persisted close group snapshot with trust scores.
 ///
-/// Saved periodically and on shutdown. Loaded on startup to reconnect
-/// to the same trusted close group peers, preserving close group
-/// consistency across restarts.
+/// Saved periodically during normal operation, after initial bootstrap,
+/// and on shutdown. Loaded on startup to reconnect to the same trusted
+/// close group peers, preserving close group consistency across restarts.
+/// Stale snapshots are skipped as Priority-0 bootstrap material according
+/// to the node's configured maximum cache age.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CloseGroupCache {
     /// Close group peers with their trust scores
@@ -52,6 +55,19 @@ pub struct CloseGroupCache {
 }
 
 impl CloseGroupCache {
+    /// Return whether this snapshot is older than `max_age` relative to
+    /// `now_epoch_secs`.
+    ///
+    /// `None` disables age enforcement. A snapshot timestamp in the future is
+    /// treated as age zero through saturating subtraction rather than being
+    /// rejected because of local clock skew.
+    #[must_use]
+    pub fn is_stale(&self, now_epoch_secs: u64, max_age: Option<Duration>) -> bool {
+        max_age.is_some_and(|max_age| {
+            now_epoch_secs.saturating_sub(self.saved_at_epoch_secs) > max_age.as_secs()
+        })
+    }
+
     /// Save the cache to `{dir}/close_group_cache.json`.
     ///
     /// Uses [`tempfile::NamedTempFile::persist`] for atomicity: the temp file
@@ -175,5 +191,43 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(loaded.peers.is_empty());
+    }
+
+    #[test]
+    fn cache_staleness_respects_age_limit_and_clock_skew() {
+        let now = 10_000;
+        let max_age = Duration::from_secs(3_600);
+        let mut cache = CloseGroupCache {
+            peers: vec![],
+            saved_at_epoch_secs: now,
+        };
+
+        assert!(!cache.is_stale(now, Some(max_age)));
+        cache.saved_at_epoch_secs = now - 3_600;
+        assert!(!cache.is_stale(now, Some(max_age)));
+        cache.saved_at_epoch_secs = now - 3_601;
+        assert!(cache.is_stale(now, Some(max_age)));
+        assert!(!cache.is_stale(now, None));
+
+        cache.saved_at_epoch_secs = now + 60;
+        assert!(!cache.is_stale(now, Some(max_age)));
+    }
+
+    #[tokio::test]
+    async fn stale_age_survives_save_load_roundtrip() {
+        let now = 10_000;
+        let cache = CloseGroupCache {
+            peers: vec![],
+            saved_at_epoch_secs: now - 7_200,
+        };
+        let dir = tempfile::tempdir().unwrap();
+
+        cache.save_to_dir(dir.path()).await.unwrap();
+        let loaded = CloseGroupCache::load_from_dir(dir.path())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(loaded.is_stale(now, Some(Duration::from_secs(3_600))));
     }
 }
