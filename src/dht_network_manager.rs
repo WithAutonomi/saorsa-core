@@ -26,6 +26,15 @@ use crate::{
     dht::{AdmissionResult, DhtCoreEngine, DhtKey, Key, RoutingTableEvent},
     error::{DhtError, IdentityError, NetworkError},
     network::{NodeConfig, NodeMode},
+    rate_limit::{Engine, SharedEngine},
+    reachability::canary::{
+        RELAY_CANARY_HANDLER_TIMEOUT, RELAY_CANARY_PROTOCOL, RELAY_CANARY_WIRE_TOPIC,
+        RelayCanaryProbeResult, RelayCanaryRequest, RelayCanaryRequestOutcome, RelayCanaryResponse,
+        answer_relay_canary_request, relay_canary_destination_ip_rate_limit_config,
+        relay_canary_destination_rate_limit_config, relay_canary_global_rate_limit_config,
+        relay_canary_rate_limit_config, relay_canary_source_network,
+        relay_canary_source_network_rate_limit_config, validate_relay_canary_request,
+    },
     security::canonicalize_ip,
     self_address::build_self_address_set,
 };
@@ -61,6 +70,7 @@ const MAX_MESSAGE_SIZE: usize = 64 * 1024;
 /// Prevents long-running handlers from starving the semaphore permit pool
 /// SEC-001: DoS mitigation via timeout enforcement on concurrent operations
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_CONCURRENT_RELAY_CANARY_PROBES: usize = 4;
 
 /// Reliability score assigned to the local node in K-closest results.
 /// The local node is always considered fully reliable for its own lookups.
@@ -741,6 +751,8 @@ pub struct DhtNetworkManager {
     stats: Arc<RwLock<DhtNetworkStats>>,
     /// Semaphore for limiting concurrent message handlers (backpressure)
     message_handler_semaphore: Arc<Semaphore>,
+    /// Isolated concurrency budget for canary-triggered network dials.
+    relay_canary_semaphore: Arc<Semaphore>,
     /// Global semaphore limiting concurrent stale revalidation passes.
     /// Prevents a flood of revalidation attempts from consuming excessive
     /// resources when many buckets have stale peers simultaneously.
@@ -755,6 +767,20 @@ pub struct DhtNetworkManager {
     /// Self-lookups and foreground/payment/user lookup calls do not use this
     /// semaphore.
     bucket_refresh_lookup_semaphore: Arc<Semaphore>,
+    /// Per-source relay canary rate limiter.
+    ///
+    /// Answering a canary request triggers a cold relay dial, so each
+    /// authenticated source is throttled (see [`relay_canary_rate_limit_config`])
+    /// to stop a peer using this node as a reflection/amplification dialer.
+    relay_canary_rate_limiter: SharedEngine<PeerId>,
+    /// Per-source-network canary limiter that survives peer-ID rotation.
+    relay_canary_source_network_rate_limiter: SharedEngine<IpAddr>,
+    /// Node-wide canary work limiter that cannot be bypassed with new IDs.
+    relay_canary_global_rate_limiter: SharedEngine<&'static str>,
+    /// Repeated-work limiter for one destination socket.
+    relay_canary_destination_rate_limiter: SharedEngine<SocketAddr>,
+    /// Repeated-work limiter for one destination IP across rotated ports.
+    relay_canary_destination_ip_rate_limiter: SharedEngine<IpAddr>,
     /// Shutdown token for background tasks
     shutdown: CancellationToken,
     /// Handle for the network event handler task
@@ -1086,18 +1112,19 @@ impl DialFailureCache {
 }
 
 /// ADR-011 self-heal: when a newer authoritative `PublishAddressSet` from
-/// `publisher` is applied, clear any stale dial-failure suppression for its
-/// freshly published socket addresses. A recovered address — for example a relay
-/// that now hands a reconnecting peer back its previous stable port — is
-/// otherwise kept suppressed for up to [`DIAL_FAILURE_CACHE_TTL`] even though the
-/// owner has just re-attested it. The exemption it grants is keyed by
-/// `(publisher, socket)` so only a dial *to that publisher* benefits. Returns the
-/// number of addresses cleared; a no-op when the publish was not applied (stale
-/// or duplicate sequence).
+/// `publisher` is applied, clear stale dial-failure suppression only for socket
+/// addresses absent from `previous_addresses`.
+///
+/// This immediately retries a genuinely withdrawn then recovered address
+/// without treating a sequence-only refresh of an unchanged bad relay as proof
+/// of recovery. The exemption is keyed by `(publisher, socket)` so only a dial
+/// *to that publisher* benefits. Returns the number of addresses cleared; a
+/// no-op when the publish was not applied (stale or duplicate sequence).
 fn clear_dial_failures_for_published(
     cache: &DialFailureCache,
     publisher: &PeerId,
     applied: bool,
+    previous_addresses: &[(crate::MultiAddr, AddressType)],
     addresses: &[(crate::MultiAddr, AddressType)],
 ) -> usize {
     if !applied {
@@ -1105,6 +1132,12 @@ fn clear_dial_failures_for_published(
     }
     let mut cleared = 0;
     for (addr, _ty) in addresses {
+        if previous_addresses
+            .iter()
+            .any(|(previous, _)| previous == addr)
+        {
+            continue;
+        }
         if let Some(socket_addr) = addr.dialable_socket_addr() {
             // Clears this address's own failure and grants (publisher, socket) a
             // short exemption from IP suppression — but never lifts IP-level relay
@@ -1261,6 +1294,10 @@ pub enum DhtNetworkEvent {
         old: Vec<PeerId>,
         /// K-closest peer IDs after the mutation.
         new: Vec<PeerId>,
+        /// Peers newly entering the K-closest set.
+        added: Vec<PeerId>,
+        /// Peers leaving the K-closest set.
+        removed: Vec<PeerId>,
     },
     /// New peer added to the routing table.
     PeerAdded { peer_id: PeerId },
@@ -1751,6 +1788,7 @@ impl DhtNetworkManager {
             event_tx,
             stats: Arc::new(RwLock::new(DhtNetworkStats::default())),
             message_handler_semaphore,
+            relay_canary_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_RELAY_CANARY_PROBES)),
             revalidation_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_REVALIDATIONS)),
             bucket_revalidation_active: Arc::new(parking_lot::Mutex::new(HashSet::new())),
             bucket_refresh_lookup_semaphore: Arc::new(Semaphore::new(
@@ -1765,6 +1803,19 @@ impl DhtNetworkManager {
             identity_failure_cache: Arc::new(IdentityFailureCache::new()),
             pending_peer_dials: Arc::new(DashMap::new()),
             lookup_failures: Arc::new(LookupFailureCoordinator::new()),
+            relay_canary_rate_limiter: Arc::new(Engine::new(relay_canary_rate_limit_config())),
+            relay_canary_source_network_rate_limiter: Arc::new(Engine::new(
+                relay_canary_source_network_rate_limit_config(),
+            )),
+            relay_canary_global_rate_limiter: Arc::new(Engine::new(
+                relay_canary_global_rate_limit_config(),
+            )),
+            relay_canary_destination_rate_limiter: Arc::new(Engine::new(
+                relay_canary_destination_rate_limit_config(),
+            )),
+            relay_canary_destination_ip_rate_limiter: Arc::new(Engine::new(
+                relay_canary_destination_ip_rate_limit_config(),
+            )),
         })
     }
 
@@ -3560,7 +3611,7 @@ impl DhtNetworkManager {
     /// broadcast and translate the shared outcome back into a
     /// caller-facing [`P2PError`] — they do not duplicate the
     /// owner's side effects.
-    async fn ensure_peer_channel(
+    pub(crate) async fn ensure_peer_channel(
         &self,
         peer_id: &PeerId,
         candidates: &[(MultiAddr, AddressType)],
@@ -4454,13 +4505,15 @@ impl DhtNetworkManager {
                     );
                 }
                 let dht = self.dht.read().await;
+                let previous_addresses = dht.get_node_addresses_typed(authenticated_sender).await;
                 let applied = dht
                     .replace_node_addresses(authenticated_sender, filtered_addresses.clone(), *seq)
                     .await;
-                // ADR-011: a newer authoritative address set just landed — lift
-                // stale dial-failure suppression for its addresses so a
-                // self-healed (e.g. reclaimed stable relay) address is retried
-                // immediately instead of staying suppressed for the cache TTL.
+                // ADR-011: a newer authoritative address set just landed. Lift
+                // stale dial-failure suppression only for addresses that were
+                // absent from the previous record and have genuinely
+                // reappeared (for example a reclaimed stable relay). Refreshing
+                // an unchanged failed address must not create a redial loop.
                 //
                 // Race guard: only exempt addresses that are STILL the peer's
                 // current record after the apply (read back under the same lock
@@ -4479,6 +4532,7 @@ impl DhtNetworkManager {
                         self.dial_failure_cache.as_ref(),
                         authenticated_sender,
                         true,
+                        &previous_addresses,
                         &still_current,
                     )
                 } else {
@@ -4508,6 +4562,188 @@ impl DhtNetworkManager {
         operation: DhtNetworkOperation,
     ) -> Result<DhtNetworkResult> {
         self.send_dht_request(peer_id, operation, None).await
+    }
+
+    /// Ask a peer to cold-dial a freshly acquired relay address.
+    ///
+    /// This intentionally uses the generic request/response transport rather
+    /// than adding a DHT operation: the canary is a reachability proof for the
+    /// acquisition driver, not routing-table state.
+    pub(crate) async fn send_relay_canary_request(
+        &self,
+        peer_id: &PeerId,
+        candidates: &[(MultiAddr, AddressType)],
+        request: RelayCanaryRequest,
+        timeout: Duration,
+    ) -> Result<RelayCanaryRequestOutcome> {
+        self.ensure_peer_channel(peer_id, candidates).await?;
+
+        let request_bytes = postcard::to_stdvec(&request)
+            .map_err(|e| P2PError::Serialization(e.to_string().into()))?;
+        let response = match self
+            .transport
+            .send_request(peer_id, RELAY_CANARY_PROTOCOL, request_bytes, timeout)
+            .await
+        {
+            Ok(response) => response,
+            // The peer channel was established and the request send completed,
+            // but no canary response arrived. This is how a selected legacy
+            // witness presents during a mixed-version rollout.
+            Err(P2PError::Timeout(_)) => {
+                return Ok(RelayCanaryRequestOutcome::NoProtocolResponse);
+            }
+            Err(error) => return Err(error),
+        };
+        postcard::from_bytes(&response.data)
+            .map(RelayCanaryRequestOutcome::Response)
+            .map_err(|e| P2PError::Serialization(e.to_string().into()))
+    }
+
+    async fn handle_relay_canary_message(
+        &self,
+        source_peer: PeerId,
+        source_addr: Option<SocketAddr>,
+        data: Vec<u8>,
+    ) -> Result<()> {
+        if data.len() > MAX_MESSAGE_SIZE {
+            debug!(
+                "Ignoring oversized relay canary message from {source_peer}: {} bytes (max: {MAX_MESSAGE_SIZE})",
+                data.len()
+            );
+            return Ok(());
+        }
+
+        let Some((message_id, is_response, payload)) =
+            crate::transport_handle::TransportHandle::parse_request_envelope(&data)
+        else {
+            debug!(
+                peer = %source_peer.to_hex(),
+                "Ignoring malformed relay canary request envelope"
+            );
+            return Ok(());
+        };
+
+        if is_response {
+            trace!(
+                message_id = %message_id,
+                peer = %source_peer.to_hex(),
+                "Ignoring relay canary response in request handler"
+            );
+            return Ok(());
+        }
+
+        let request: RelayCanaryRequest = match postcard::from_bytes(&payload) {
+            Ok(request) => request,
+            Err(e) => {
+                debug!(
+                    peer = %source_peer.to_hex(),
+                    error = %e,
+                    "Ignoring malformed relay canary request payload"
+                );
+                return Ok(());
+            }
+        };
+        if let Err(reason) =
+            validate_relay_canary_request(&source_peer, self.peer_id(), &request, SystemTime::now())
+        {
+            debug!(
+                peer = %source_peer.to_hex(),
+                reason = %reason.summary(),
+                "Rejecting relay canary request"
+            );
+            let response = RelayCanaryResponse {
+                result: RelayCanaryProbeResult::WitnessRateLimited,
+            };
+            return self
+                .send_relay_canary_response(&source_peer, &message_id, response)
+                .await;
+        }
+        let Some(source_addr) = source_addr else {
+            debug!(
+                peer = %source_peer.to_hex(),
+                "Throttling relay canary request without transport provenance"
+            );
+            let response = RelayCanaryResponse {
+                result: RelayCanaryProbeResult::WitnessRateLimited,
+            };
+            return self
+                .send_relay_canary_response(&source_peer, &message_id, response)
+                .await;
+        };
+
+        // Consume every independent abuse budget before any network
+        // acquisition. Evaluate them separately so a denial in one dimension
+        // cannot be used to avoid consuming the others.
+        let destination = saorsa_transport::shared::normalize_socket_addr(request.relay_addr);
+        let source_network = relay_canary_source_network(source_addr.ip());
+        let destination_ip = canonicalize_ip(destination.ip());
+        let peer_allowed = self.relay_canary_rate_limiter.try_consume_key(&source_peer);
+        let source_network_allowed = self
+            .relay_canary_source_network_rate_limiter
+            .try_consume_key(&source_network);
+        let global_allowed = self
+            .relay_canary_global_rate_limiter
+            .try_consume_key(&"global");
+        let destination_allowed = self
+            .relay_canary_destination_rate_limiter
+            .try_consume_key(&destination);
+        let destination_ip_allowed = self
+            .relay_canary_destination_ip_rate_limiter
+            .try_consume_key(&destination_ip);
+        if !(peer_allowed
+            && source_network_allowed
+            && global_allowed
+            && destination_allowed
+            && destination_ip_allowed)
+        {
+            debug!(
+                peer = %source_peer.to_hex(),
+                source_network = %source_network,
+                relay = %destination,
+                "Throttling relay canary request from source"
+            );
+            let response = RelayCanaryResponse {
+                result: RelayCanaryProbeResult::WitnessRateLimited,
+            };
+            return self
+                .send_relay_canary_response(&source_peer, &message_id, response)
+                .await;
+        }
+
+        let Ok(_permit) = self.relay_canary_semaphore.try_acquire() else {
+            debug!(
+                peer = %source_peer.to_hex(),
+                "Throttling relay canary request: isolated probe budget exhausted"
+            );
+            let response = RelayCanaryResponse {
+                result: RelayCanaryProbeResult::WitnessRateLimited,
+            };
+            return self
+                .send_relay_canary_response(&source_peer, &message_id, response)
+                .await;
+        };
+
+        let response = answer_relay_canary_request(self.transport.as_ref(), request).await;
+        self.send_relay_canary_response(&source_peer, &message_id, response)
+            .await
+    }
+
+    async fn send_relay_canary_response(
+        &self,
+        source_peer: &PeerId,
+        message_id: &str,
+        response: RelayCanaryResponse,
+    ) -> Result<()> {
+        let response_bytes = postcard::to_stdvec(&response)
+            .map_err(|e| P2PError::Serialization(e.to_string().into()))?;
+        self.transport
+            .send_response(
+                source_peer,
+                RELAY_CANARY_PROTOCOL,
+                message_id,
+                response_bytes,
+            )
+            .await
     }
 
     /// Handle DHT response message
@@ -5024,6 +5260,57 @@ impl DhtNetworkManager {
                                             }
                                             // _permit dropped here, releasing semaphore slot
                                         });
+                                    } else if topic == RELAY_CANARY_WIRE_TOPIC {
+                                        // Relay canary requests must be authenticated so the
+                                        // response can be routed back through request/response.
+                                        let Some(source_peer) = source else {
+                                            warn!("Ignoring unsigned relay canary request");
+                                            continue;
+                                        };
+                                        let source_addr = transport_source
+                                            .as_ref()
+                                            .and_then(MultiAddr::socket_addr);
+                                        let manager_clone = Arc::clone(&self_arc);
+                                        tokio::spawn(async move {
+                                            match tokio::time::timeout(
+                                                RELAY_CANARY_HANDLER_TIMEOUT,
+                                                manager_clone
+                                                    .handle_relay_canary_message(
+                                                        source_peer,
+                                                        source_addr,
+                                                        data,
+                                                    ),
+                                            )
+                                            .await
+                                            {
+                                                Ok(Ok(())) => {}
+                                                Ok(Err(e)) if e.is_stale_channel_send_failure() => {
+                                                    // The requester may disconnect while this
+                                                    // witness is completing its isolated probe.
+                                                    // That is a normal request-cancellation race,
+                                                    // not a canary-handler failure.
+                                                    debug!(
+                                                        peer = %source_peer.to_hex(),
+                                                        error = %e,
+                                                        "Relay canary response recipient disconnected"
+                                                    );
+                                                }
+                                                Ok(Err(e)) => {
+                                                    warn!(
+                                                        peer = %source_peer.to_hex(),
+                                                        error = %e,
+                                                        "Failed to handle relay canary request"
+                                                    );
+                                                }
+                                                Err(_) => {
+                                                    warn!(
+                                                        timeout = ?RELAY_CANARY_HANDLER_TIMEOUT,
+                                                        peer = %source_peer.to_hex(),
+                                                        "Relay canary request handler timed out"
+                                                    );
+                                                }
+                                            }
+                                        });
                                     }
                                 }
                             },
@@ -5268,9 +5555,21 @@ impl DhtNetworkManager {
                         .send(DhtNetworkEvent::PeerRemoved { peer_id: *id });
                 }
                 RoutingTableEvent::KClosestPeersChanged { old, new } => {
+                    let old_set: HashSet<_> = old.iter().copied().collect();
+                    let new_set: HashSet<_> = new.iter().copied().collect();
                     let _ = self.event_tx.send(DhtNetworkEvent::KClosestPeersChanged {
                         old: old.clone(),
                         new: new.clone(),
+                        added: new
+                            .iter()
+                            .filter(|peer| !old_set.contains(peer))
+                            .copied()
+                            .collect(),
+                        removed: old
+                            .iter()
+                            .filter(|peer| !new_set.contains(peer))
+                            .copied()
+                            .collect(),
                     });
                 }
             }
@@ -5498,12 +5797,14 @@ impl DhtNetworkManager {
         &self,
         typed_addresses: Vec<(crate::MultiAddr, AddressType)>,
         peers: &[DHTNode],
-    ) {
+    ) -> Vec<PeerId> {
         let seq = Self::next_publish_seq();
         let op = DhtNetworkOperation::PublishAddressSet {
             seq,
             addresses: typed_addresses.clone(),
         };
+        let mut confirmed = Vec::new();
+        let mut publishes = FuturesUnordered::new();
         for peer in peers {
             if peer.peer_id == self.config.peer_id {
                 continue; // Skip self
@@ -5511,28 +5812,49 @@ impl DhtNetworkManager {
             // Pass the peer's typed addresses through directly so
             // send_dht_request avoids a redundant routing-table read for
             // a peer we already have in hand.
+            let peer_id = peer.peer_id;
             let peer_typed = peer.typed_addresses();
-            match self
-                .send_dht_request(&peer.peer_id, op.clone(), Some(&peer_typed))
-                .await
-            {
-                Ok(_) => {
+            let op = op.clone();
+            publishes.push(async move {
+                (
+                    peer_id,
+                    self.send_dht_request(&peer_id, op, Some(&peer_typed)).await,
+                )
+            });
+        }
+
+        // A withdrawal must not spend one full request timeout per unavailable
+        // peer while the rest of the network continues dialing the old relay.
+        // Fan the full replacement out concurrently and retain the exact
+        // acknowledgers so the driver can retry only missing replicas.
+        while let Some((peer_id, result)) = publishes.next().await {
+            match result {
+                Ok(DhtNetworkResult::PublishAddressAck) => {
+                    confirmed.push(peer_id);
                     debug!(
-                        peer = %peer.peer_id.to_hex(),
+                        peer = %peer_id.to_hex(),
                         addrs = typed_addresses.len(),
                         seq,
                         "published address set to peer",
                     );
                 }
+                Ok(other) => {
+                    debug!(
+                        peer = %peer_id.to_hex(),
+                        result = ?other,
+                        "Peer returned an unexpected address publication response"
+                    );
+                }
                 Err(e) => {
                     debug!(
                         "Failed to publish address set to peer {}: {}",
-                        peer.peer_id.to_hex(),
+                        peer_id.to_hex(),
                         e
                     );
                 }
             }
         }
+        confirmed
     }
 
     /// Generate the next monotonic publish sequence number.
@@ -7091,7 +7413,7 @@ mod tests {
 
         // A stale/duplicate publish (not applied) must NOT lift suppression.
         assert_eq!(
-            clear_dial_failures_for_published(&cache, &peer, false, &addrs),
+            clear_dial_failures_for_published(&cache, &peer, false, &[], &addrs),
             0
         );
         assert!(cache.is_failed(&relay_sa, AddressType::Relay));
@@ -7100,11 +7422,51 @@ mod tests {
         // A newer applied publish clears the per-address failures (neither IP is
         // over the suppression threshold here, so both become dialable).
         assert_eq!(
-            clear_dial_failures_for_published(&cache, &peer, true, &addrs),
+            clear_dial_failures_for_published(&cache, &peer, true, &[], &addrs),
             2
         );
         assert!(!cache.is_failed(&relay_sa, AddressType::Relay));
         assert!(!cache.is_failed(&direct_sa, AddressType::Direct));
+    }
+
+    #[test]
+    fn repeated_unchanged_publish_does_not_clear_fresh_dial_failure() {
+        let cache = DialFailureCache::new();
+        let peer = PeerId::from_bytes([1; 32]);
+        let relay = crate::MultiAddr::quic(sock("203.0.113.7:9000"));
+        let relay_sa = relay.dialable_socket_addr().expect("dialable");
+        let addrs = vec![(relay, AddressType::Relay)];
+
+        cache.record_failure(relay_sa, AddressType::Relay);
+        assert_eq!(
+            clear_dial_failures_for_published(&cache, &peer, true, &addrs, &addrs),
+            0
+        );
+        assert!(
+            cache.is_failed_for_dial(&peer, &relay_sa, AddressType::Relay),
+            "refreshing an unchanged bad relay must not create a retry loop"
+        );
+    }
+
+    #[test]
+    fn relay_reappearing_after_withdrawal_clears_old_dial_failure() {
+        let cache = DialFailureCache::new();
+        let peer = PeerId::from_bytes([1; 32]);
+        let relay = crate::MultiAddr::quic(sock("203.0.113.7:9000"));
+        let direct = crate::MultiAddr::quic(sock("203.0.113.8:9000"));
+        let relay_sa = relay.dialable_socket_addr().expect("dialable");
+        let previous = vec![(direct.clone(), AddressType::Direct)];
+        let current = vec![(relay, AddressType::Relay), (direct, AddressType::Direct)];
+
+        cache.record_failure(relay_sa, AddressType::Relay);
+        assert_eq!(
+            clear_dial_failures_for_published(&cache, &peer, true, &previous, &current),
+            1
+        );
+        assert!(
+            !cache.is_failed_for_dial(&peer, &relay_sa, AddressType::Relay),
+            "a genuinely withdrawn then re-acquired relay should be retried"
+        );
     }
 
     #[test]
@@ -7127,7 +7489,7 @@ mod tests {
         // The owner re-attests one of those addresses via an applied publish.
         let addrs = vec![(crate::MultiAddr::quic(socks[0]), AddressType::Relay)];
         assert_eq!(
-            clear_dial_failures_for_published(&cache, &peer, true, &addrs),
+            clear_dial_failures_for_published(&cache, &peer, true, &[], &addrs),
             1
         );
 
@@ -7168,7 +7530,7 @@ mod tests {
         // Its owner reclaims and re-attests it via an applied publish.
         let addrs = vec![(crate::MultiAddr::quic(socks[0]), AddressType::Relay)];
         assert_eq!(
-            clear_dial_failures_for_published(&cache, &owner, true, &addrs),
+            clear_dial_failures_for_published(&cache, &owner, true, &[], &addrs),
             1
         );
 
@@ -7573,14 +7935,28 @@ mod tests {
         let event = DhtNetworkEvent::KClosestPeersChanged {
             old: old.clone(),
             new: new.clone(),
+            added: new
+                .iter()
+                .filter(|peer| !old.contains(peer))
+                .copied()
+                .collect(),
+            removed: old
+                .iter()
+                .filter(|peer| !new.contains(peer))
+                .copied()
+                .collect(),
         };
         match event {
             DhtNetworkEvent::KClosestPeersChanged {
                 old: got_old,
                 new: got_new,
+                added,
+                removed,
             } => {
                 assert_eq!(got_old, old);
                 assert_eq!(got_new, new);
+                assert_eq!(added, new);
+                assert_eq!(removed, old);
             }
             _ => panic!("expected KClosestPeersChanged"),
         }
