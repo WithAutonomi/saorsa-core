@@ -45,6 +45,10 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, trace, warn};
 
+fn bootstrap_peer_identity_matches(expected: Option<PeerId>, actual: PeerId) -> bool {
+    expected.is_none_or(|expected| expected == actual)
+}
+
 /// Wire protocol message format for P2P communication.
 ///
 /// Serialized with postcard for compact binary encoding.
@@ -2122,7 +2126,7 @@ impl P2PNode {
         // peers are dialed serially to preserve trust-priority ordering;
         // configured bootstrap peers are dialed concurrently to cut cold-start
         // latency when some peers are slow or dead.
-        let mut serial_addr_sets: Vec<Vec<MultiAddr>> = Vec::new();
+        let mut serial_addr_sets: Vec<(PeerId, Vec<MultiAddr>)> = Vec::new();
         let mut parallel_addr_sets: Vec<Vec<MultiAddr>> = Vec::new();
         let mut seen_addresses = std::collections::HashSet::new();
 
@@ -2172,7 +2176,7 @@ impl P2PNode {
                             seen_addresses.insert(sa);
                         }
                     }
-                    serial_addr_sets.push(new_addresses);
+                    serial_addr_sets.push((peer.peer_id, new_addresses));
                     added_from_close_group += 1;
                 }
             }
@@ -2217,9 +2221,9 @@ impl P2PNode {
 
         // Phase A: serial close-group dials to preserve trust-priority ordering.
         let client_mode = matches!(self.config.mode, NodeMode::Client);
-        for addrs in &serial_addr_sets {
+        for (expected_peer_id, addrs) in &serial_addr_sets {
             if let Some(peer_id) = self
-                .dial_bootstrap_addr_set(addrs, identity_timeout, "cache")
+                .dial_bootstrap_addr_set(addrs, identity_timeout, "cache", Some(*expected_peer_id))
                 .await
             {
                 successful_connections += 1;
@@ -2241,7 +2245,7 @@ impl P2PNode {
         if !client_mode || successful_connections < CLIENT_BOOTSTRAP_TARGET {
             let mut parallel_stream =
                 futures::stream::iter(parallel_addr_sets.into_iter().map(|addrs| async move {
-                    self.dial_bootstrap_addr_set(&addrs, identity_timeout, "configured")
+                    self.dial_bootstrap_addr_set(&addrs, identity_timeout, "configured", None)
                         .await
                 }))
                 .buffer_unordered(MAX_CONCURRENT_BOOTSTRAP_DIALS);
@@ -2360,6 +2364,7 @@ impl P2PNode {
         addrs: &[MultiAddr],
         identity_timeout: Duration,
         source: &'static str,
+        expected_peer_id: Option<PeerId>,
     ) -> Option<PeerId> {
         for addr in addrs {
             // Bootstrap addresses come from operator-supplied seeds (CLI
@@ -2377,6 +2382,17 @@ impl P2PNode {
                     .await
                 {
                     Ok(real_peer_id) => {
+                        if !bootstrap_peer_identity_matches(expected_peer_id, real_peer_id) {
+                            warn!(
+                                bootstrap_source = source,
+                                address = %addr,
+                                expected_peer_id = ?expected_peer_id,
+                                actual_peer_id = %real_peer_id,
+                                "Bootstrap cache identity mismatch; rejecting connection"
+                            );
+                            self.disconnect_channel(&channel_id).await;
+                            continue;
+                        }
                         info!(
                             bootstrap_source = source,
                             outcome = "ok",
@@ -2451,11 +2467,6 @@ async fn save_close_group_cache_snapshot(
 ) -> anyhow::Result<()> {
     let key: crate::dht::Key = *peer_id.as_bytes();
     let close_group = dht_manager.find_closest_nodes_local(&key, k_value).await;
-
-    if close_group.is_empty() {
-        debug!("No close group peers to save");
-        return Ok(());
-    }
 
     let now_epoch = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2576,6 +2587,16 @@ mod tests {
 
     /// 2 MiB — used in builder tests to verify max_message_size configuration.
     const TEST_MAX_MESSAGE_SIZE: usize = 2 * 1024 * 1024;
+
+    #[test]
+    fn cached_bootstrap_identity_must_match_handshake_peer() {
+        let expected = PeerId::from_bytes([1; 32]);
+        let other = PeerId::from_bytes([2; 32]);
+
+        assert!(bootstrap_peer_identity_matches(Some(expected), expected));
+        assert!(!bootstrap_peer_identity_matches(Some(expected), other));
+        assert!(bootstrap_peer_identity_matches(None, other));
+    }
 
     // Test tool handler for network tests
 
