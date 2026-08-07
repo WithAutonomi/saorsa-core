@@ -45,6 +45,10 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, trace, warn};
 
+fn bootstrap_peer_identity_matches(expected: Option<PeerId>, actual: PeerId) -> bool {
+    expected.is_none_or(|expected| expected == actual)
+}
+
 /// Wire protocol message format for P2P communication.
 ///
 /// Serialized with postcard for compact binary encoding.
@@ -135,6 +139,14 @@ const DEFAULT_MAX_CONNECTIONS: usize = 10_000;
 /// multi-stage connection strategies and identity exchange while preserving
 /// the historical API default.
 const DEFAULT_CONNECTION_TIMEOUT_SECS: u64 = 25;
+
+/// Default maximum age of a close-group cache snapshot before it is skipped
+/// as Priority-0 bootstrap material.
+const DEFAULT_CLOSE_GROUP_CACHE_MAX_AGE_SECS: u64 = 60 * 60;
+
+/// Lower bound for periodic close-group-cache saves. Prevents a very short DHT
+/// refresh interval from turning cache persistence into a hot write loop.
+const MIN_CLOSE_GROUP_CACHE_SAVE_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Timeout in seconds for waiting on a bootstrap peer's identity exchange.
 ///
@@ -267,13 +279,24 @@ pub struct NodeConfig {
     /// Directory for persisting the close group cache.
     ///
     /// When set, the node saves its close group peers and their trust
-    /// scores to `{dir}/close_group_cache.json` on shutdown and after
-    /// bootstrap. On startup, cached peers are loaded and contacted
-    /// first, preserving close group consistency across restarts.
+    /// scores to `{dir}/close_group_cache.json` periodically, on shutdown,
+    /// and after bootstrap. On startup, fresh cached peers are loaded and
+    /// contacted first, preserving close group consistency across restarts.
     ///
     /// When `None`, no close group cache is used.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub close_group_cache_dir: Option<PathBuf>,
+
+    /// Maximum age for using a close-group cache snapshot as Priority-0
+    /// bootstrap material. Older snapshots are logged and skipped so the node
+    /// falls through to configured bootstrap peers. `None` disables the age
+    /// check. Default: one hour.
+    #[serde(default = "default_close_group_cache_max_age")]
+    pub close_group_cache_max_age: Option<Duration>,
+}
+
+fn default_close_group_cache_max_age() -> Option<Duration> {
+    Some(Duration::from_secs(DEFAULT_CLOSE_GROUP_CACHE_MAX_AGE_SECS))
 }
 
 /// DHT-specific configuration
@@ -404,6 +427,9 @@ pub struct NodeConfigBuilder {
     allow_loopback: Option<bool>,
     adaptive_dht_config: Option<AdaptiveDhtConfig>,
     close_group_cache_dir: Option<PathBuf>,
+    /// Outer `None` means the builder setter was not called; inner `None`
+    /// explicitly disables age enforcement.
+    close_group_cache_max_age: Option<Option<Duration>>,
 }
 
 impl Default for NodeConfigBuilder {
@@ -422,6 +448,7 @@ impl Default for NodeConfigBuilder {
             allow_loopback: None,
             adaptive_dht_config: None,
             close_group_cache_dir: None,
+            close_group_cache_max_age: None,
         }
     }
 }
@@ -543,6 +570,13 @@ impl NodeConfigBuilder {
         self
     }
 
+    /// Set the maximum age for using a close-group cache as Priority-0
+    /// bootstrap material. `None` disables the age check.
+    pub fn close_group_cache_max_age(mut self, max_age: Option<Duration>) -> Self {
+        self.close_group_cache_max_age = Some(max_age);
+        self
+    }
+
     /// Build the [`NodeConfig`].
     ///
     /// # Errors
@@ -570,6 +604,9 @@ impl NodeConfigBuilder {
             allow_loopback,
             adaptive_dht_config: self.adaptive_dht_config.unwrap_or_default(),
             close_group_cache_dir: self.close_group_cache_dir,
+            close_group_cache_max_age: self
+                .close_group_cache_max_age
+                .unwrap_or_else(default_close_group_cache_max_age),
         })
     }
 }
@@ -592,6 +629,7 @@ impl Default for NodeConfig {
             allow_loopback: false,
             adaptive_dht_config: AdaptiveDhtConfig::default(),
             close_group_cache_dir: None,
+            close_group_cache_max_age: default_close_group_cache_max_age(),
         }
     }
 }
@@ -786,6 +824,14 @@ pub struct P2PNode {
     /// Shutdown token — cancelled when the node should stop
     shutdown: CancellationToken,
 
+    /// Dedicated cancellation token for periodic close-group-cache saves.
+    /// Cancelled and joined before the authoritative shutdown snapshot.
+    close_group_cache_save_shutdown: CancellationToken,
+
+    /// Periodic close-group-cache task, retained so shutdown can prevent a
+    /// late periodic write from replacing the final snapshot.
+    close_group_cache_save_handle: TokioMutex<Option<tokio::task::JoinHandle<()>>>,
+
     /// Adaptive DHT layer — owns both the DHT manager and the trust engine.
     /// All DHT operations and trust signals go through this component.
     adaptive_dht: AdaptiveDHT,
@@ -903,6 +949,8 @@ impl P2PNode {
             transport,
             start_time: Instant::now(),
             shutdown: CancellationToken::new(),
+            close_group_cache_save_shutdown: CancellationToken::new(),
+            close_group_cache_save_handle: TokioMutex::new(None),
             adaptive_dht,
             is_bootstrapped: Arc::new(AtomicBool::new(false)),
             is_started: Arc::new(AtomicBool::new(false)),
@@ -1212,39 +1260,56 @@ impl P2PNode {
         let close_group_cache = if let Some(ref dir) = self.config.close_group_cache_dir {
             match CloseGroupCache::load_from_dir(dir).await {
                 Ok(Some(cache)) => {
-                    // Filter out peers with non-finite trust scores (NaN/Inf)
-                    // that could corrupt trust engine state or sort ordering.
-                    let original_count = cache.peers.len();
-                    let cache = CloseGroupCache {
-                        peers: cache
-                            .peers
-                            .into_iter()
-                            .filter(|p| p.trust.score.is_finite())
-                            .collect(),
-                        ..cache
-                    };
-                    let filtered_count = original_count - cache.peers.len();
-                    if filtered_count > 0 {
+                    let now_epoch = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map_or(0, |duration| duration.as_secs());
+                    if cache.is_stale(now_epoch, self.config.close_group_cache_max_age) {
                         warn!(
-                            "Filtered {filtered_count} peers with non-finite trust scores from close group cache"
+                            cache_age_secs = now_epoch.saturating_sub(cache.saved_at_epoch_secs),
+                            max_age_secs = self
+                                .config
+                                .close_group_cache_max_age
+                                .map(|age| age.as_secs()),
+                            "Close group cache is stale; skipping cached trust and Priority-0 peers"
                         );
-                    }
+                        None
+                    } else {
+                        // Filter out peers with non-finite trust scores (NaN/Inf)
+                        // that could corrupt trust engine state or sort ordering.
+                        let original_count = cache.peers.len();
+                        let cache = CloseGroupCache {
+                            peers: cache
+                                .peers
+                                .into_iter()
+                                .filter(|p| p.trust.score.is_finite())
+                                .collect(),
+                            ..cache
+                        };
+                        let filtered_count = original_count - cache.peers.len();
+                        if filtered_count > 0 {
+                            warn!(
+                                "Filtered {filtered_count} peers with non-finite trust scores from close group cache"
+                            );
+                        }
 
-                    let trust_snapshot = TrustSnapshot {
-                        peers: cache
-                            .peers
-                            .iter()
-                            .map(|p| (p.peer_id, p.trust.clone()))
-                            .collect(),
-                    };
-                    self.adaptive_dht
-                        .trust_engine()
-                        .import_snapshot(&trust_snapshot);
-                    info!(
-                        "Loaded {} peers from close group cache (trust scores imported)",
-                        cache.peers.len()
-                    );
-                    Some(cache)
+                        let trust_snapshot = TrustSnapshot {
+                            peers: cache
+                                .peers
+                                .iter()
+                                .map(|p| (p.peer_id, p.trust.clone()))
+                                .collect(),
+                        };
+                        self.adaptive_dht
+                            .trust_engine()
+                            .import_snapshot(&trust_snapshot);
+                        info!(
+                            cache_age_secs = now_epoch.saturating_sub(cache.saved_at_epoch_secs),
+                            saved_at_epoch_secs = cache.saved_at_epoch_secs,
+                            "Loaded {} peers from close group cache (trust scores imported)",
+                            cache.peers.len()
+                        );
+                        Some(cache)
+                    }
                 }
                 Ok(None) => {
                     debug!(
@@ -1404,6 +1469,35 @@ impl P2PNode {
             });
         }
 
+        if let Some(dir) = self.config.close_group_cache_dir.clone() {
+            let interval = self
+                .config
+                .dht_config
+                .refresh_interval
+                .max(MIN_CLOSE_GROUP_CACHE_SAVE_INTERVAL);
+            let mut task = self.close_group_cache_save_handle.lock().await;
+            if task.is_none() {
+                let dht_manager = Arc::clone(self.adaptive_dht.dht_manager());
+                let trust_engine = Arc::clone(self.adaptive_dht.trust_engine());
+                let peer_id = self.peer_id;
+                let k_value = self.config.dht_config.k_value;
+                let shutdown = self.close_group_cache_save_shutdown.clone();
+                *task = Some(tokio::spawn(periodic_close_group_cache_save(
+                    dht_manager,
+                    trust_engine,
+                    peer_id,
+                    k_value,
+                    dir,
+                    interval,
+                    shutdown,
+                )));
+                info!(
+                    interval_secs = interval.as_secs(),
+                    "Started periodic close group cache persistence"
+                );
+            }
+        }
+
         self.is_started
             .store(true, std::sync::atomic::Ordering::Release);
 
@@ -1433,9 +1527,19 @@ impl P2PNode {
     pub async fn stop(&self) -> Result<()> {
         info!("Stopping P2P node...");
 
+        // Stop periodic cache persistence and wait for any in-flight write.
+        // The final save below is then the authoritative shutdown snapshot.
+        self.close_group_cache_save_shutdown.cancel();
+        let cache_task = self.close_group_cache_save_handle.lock().await.take();
+        if let Some(cache_task) = cache_task
+            && let Err(error) = cache_task.await
+        {
+            warn!("Periodic close group cache task failed during shutdown: {error}");
+        }
+
         // Save close group cache before tearing down the DHT and transport layers.
         if let Some(ref dir) = self.config.close_group_cache_dir
-            && let Err(e) = self.save_close_group_cache(dir).await
+            && let Err(e) = self.save_close_group_cache(dir, "shutdown").await
         {
             warn!("Failed to save close group cache on shutdown: {e}");
         }
@@ -2022,7 +2126,7 @@ impl P2PNode {
         // peers are dialed serially to preserve trust-priority ordering;
         // configured bootstrap peers are dialed concurrently to cut cold-start
         // latency when some peers are slow or dead.
-        let mut serial_addr_sets: Vec<Vec<MultiAddr>> = Vec::new();
+        let mut serial_addr_sets: Vec<(PeerId, Vec<MultiAddr>)> = Vec::new();
         let mut parallel_addr_sets: Vec<Vec<MultiAddr>> = Vec::new();
         let mut seen_addresses = std::collections::HashSet::new();
 
@@ -2072,7 +2176,7 @@ impl P2PNode {
                             seen_addresses.insert(sa);
                         }
                     }
-                    serial_addr_sets.push(new_addresses);
+                    serial_addr_sets.push((peer.peer_id, new_addresses));
                     added_from_close_group += 1;
                 }
             }
@@ -2109,13 +2213,21 @@ impl P2PNode {
         // perform DHT peer discovery using the real cryptographic PeerIds.
         let identity_timeout = Duration::from_secs(BOOTSTRAP_IDENTITY_TIMEOUT_SECS);
         let mut successful_connections = 0;
+        let cache_dial_candidates = serial_addr_sets.len();
+        let configured_dial_candidates = parallel_addr_sets.len();
+        let mut cache_dial_successes = 0usize;
+        let mut configured_dial_successes = 0usize;
         let mut connected_peer_ids: Vec<PeerId> = Vec::new();
 
         // Phase A: serial close-group dials to preserve trust-priority ordering.
         let client_mode = matches!(self.config.mode, NodeMode::Client);
-        for addrs in &serial_addr_sets {
-            if let Some(peer_id) = self.dial_bootstrap_addr_set(addrs, identity_timeout).await {
+        for (expected_peer_id, addrs) in &serial_addr_sets {
+            if let Some(peer_id) = self
+                .dial_bootstrap_addr_set(addrs, identity_timeout, "cache", Some(*expected_peer_id))
+                .await
+            {
                 successful_connections += 1;
+                cache_dial_successes += 1;
                 connected_peer_ids.push(peer_id);
                 if client_mode && successful_connections >= CLIENT_BOOTSTRAP_TARGET {
                     debug!(
@@ -2133,12 +2245,14 @@ impl P2PNode {
         if !client_mode || successful_connections < CLIENT_BOOTSTRAP_TARGET {
             let mut parallel_stream =
                 futures::stream::iter(parallel_addr_sets.into_iter().map(|addrs| async move {
-                    self.dial_bootstrap_addr_set(&addrs, identity_timeout).await
+                    self.dial_bootstrap_addr_set(&addrs, identity_timeout, "configured", None)
+                        .await
                 }))
                 .buffer_unordered(MAX_CONCURRENT_BOOTSTRAP_DIALS);
             while let Some(result) = parallel_stream.next().await {
                 if let Some(peer_id) = result {
                     successful_connections += 1;
+                    configured_dial_successes += 1;
                     connected_peer_ids.push(peer_id);
                     if client_mode && successful_connections >= CLIENT_BOOTSTRAP_TARGET {
                         debug!(
@@ -2152,6 +2266,16 @@ impl P2PNode {
             // cancelling any in-flight futures inside `buffer_unordered`
             // before we proceed to the DHT discovery phase below.
         }
+
+        info!(
+            cache_dial_candidates,
+            cache_dial_successes,
+            configured_dial_candidates,
+            configured_dial_successes,
+            outbound_bootstrap_successes = successful_connections,
+            outbound_reachable = successful_connections > 0,
+            "Bootstrap reachability summary"
+        );
 
         if successful_connections == 0 {
             // Outbound connections failed — but for nodes behind symmetric NAT,
@@ -2223,7 +2347,7 @@ impl P2PNode {
         // Save close group cache after initial bootstrap so a crash before
         // graceful shutdown still preserves the newly-discovered close group.
         if let Some(ref dir) = self.config.close_group_cache_dir
-            && let Err(e) = self.save_close_group_cache(dir).await
+            && let Err(e) = self.save_close_group_cache(dir, "post_bootstrap").await
         {
             warn!("Failed to save close group cache after bootstrap: {e}");
         }
@@ -2239,6 +2363,8 @@ impl P2PNode {
         &self,
         addrs: &[MultiAddr],
         identity_timeout: Duration,
+        source: &'static str,
+        expected_peer_id: Option<PeerId>,
     ) -> Option<PeerId> {
         for addr in addrs {
             // Bootstrap addresses come from operator-supplied seeds (CLI
@@ -2255,8 +2381,35 @@ impl P2PNode {
                     .wait_for_peer_identity(&channel_id, identity_timeout)
                     .await
                 {
-                    Ok(real_peer_id) => return Some(real_peer_id),
+                    Ok(real_peer_id) => {
+                        if !bootstrap_peer_identity_matches(expected_peer_id, real_peer_id) {
+                            warn!(
+                                bootstrap_source = source,
+                                address = %addr,
+                                expected_peer_id = ?expected_peer_id,
+                                actual_peer_id = %real_peer_id,
+                                "Bootstrap cache identity mismatch; rejecting connection"
+                            );
+                            self.disconnect_channel(&channel_id).await;
+                            continue;
+                        }
+                        info!(
+                            bootstrap_source = source,
+                            outcome = "ok",
+                            address = %addr,
+                            peer_id = %real_peer_id,
+                            "Bootstrap dial completed"
+                        );
+                        return Some(real_peer_id);
+                    }
                     Err(e) => {
+                        info!(
+                            bootstrap_source = source,
+                            outcome = "identity_timeout",
+                            address = %addr,
+                            error = %e,
+                            "Bootstrap dial failed"
+                        );
                         warn!(
                             "Timeout waiting for identity from bootstrap peer {}: {}, \
                              closing channel {}",
@@ -2266,6 +2419,13 @@ impl P2PNode {
                     }
                 },
                 Err(e) => {
+                    info!(
+                        bootstrap_source = source,
+                        outcome = "connect_error",
+                        address = %addr,
+                        error = %e,
+                        "Bootstrap dial failed"
+                    );
                     warn!("Failed to connect to bootstrap peer {}: {}", addr, e);
                 }
             }
@@ -2274,61 +2434,111 @@ impl P2PNode {
     }
 
     /// Persist the current close group peers and their trust scores to disk.
-    async fn save_close_group_cache(&self, dir: &Path) -> anyhow::Result<()> {
-        let key: crate::dht::Key = *self.peer_id.as_bytes();
-        let k_value = self.config.dht_config.k_value;
-        let close_group = self
-            .dht_manager()
-            .find_closest_nodes_local(&key, k_value)
-            .await;
-
-        if close_group.is_empty() {
-            debug!("No close group peers to save");
-            return Ok(());
-        }
-
-        let trust_engine = self.adaptive_dht.trust_engine();
-        let now_epoch = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-
-        let peers: Vec<CachedCloseGroupPeer> = close_group
-            .into_iter()
-            .filter_map(|dht_node| {
-                let score = trust_engine.score(&dht_node.peer_id);
-                // Guard against NaN/Infinity — serde_json cannot round-trip
-                // non-finite f64 values, which would corrupt the cache file.
-                if !score.is_finite() {
-                    return None;
-                }
-                Some(CachedCloseGroupPeer {
-                    peer_id: dht_node.peer_id,
-                    addresses: dht_node.addresses,
-                    trust: TrustRecord {
-                        score,
-                        last_updated_epoch_secs: now_epoch,
-                    },
-                })
-            })
-            .collect();
-
-        let peer_count = peers.len();
-        let cache = CloseGroupCache {
-            peers,
-            saved_at_epoch_secs: now_epoch,
-        };
-
-        cache.save_to_dir(dir).await?;
-        info!(
-            "Saved {} close group peers to cache in {}",
-            peer_count,
-            dir.display()
-        );
-        Ok(())
+    async fn save_close_group_cache(
+        &self,
+        dir: &Path,
+        save_reason: &'static str,
+    ) -> anyhow::Result<()> {
+        save_close_group_cache_snapshot(
+            self.dht_manager(),
+            self.adaptive_dht.trust_engine(),
+            self.peer_id,
+            self.config.dht_config.k_value,
+            dir,
+            save_reason,
+        )
+        .await
     }
 
     // disconnect_all_peers and periodic_tasks are now in TransportHandle
+}
+
+/// Persist a close-group snapshot using owned subsystem handles.
+///
+/// Keeping this separate from `P2PNode` allows the periodic task to own every
+/// dependency it needs without borrowing the node across a spawned task.
+async fn save_close_group_cache_snapshot(
+    dht_manager: &DhtNetworkManager,
+    trust_engine: &TrustEngine,
+    peer_id: PeerId,
+    k_value: usize,
+    dir: &Path,
+    save_reason: &'static str,
+) -> anyhow::Result<()> {
+    let key: crate::dht::Key = *peer_id.as_bytes();
+    let close_group = dht_manager.find_closest_nodes_local(&key, k_value).await;
+
+    let now_epoch = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs());
+    let peers: Vec<CachedCloseGroupPeer> = close_group
+        .into_iter()
+        .filter_map(|dht_node| {
+            let score = trust_engine.score(&dht_node.peer_id);
+            // Guard against NaN/Infinity — serde_json cannot round-trip
+            // non-finite f64 values, which would corrupt the cache file.
+            if !score.is_finite() {
+                return None;
+            }
+            Some(CachedCloseGroupPeer {
+                peer_id: dht_node.peer_id,
+                addresses: dht_node.addresses,
+                trust: TrustRecord {
+                    score,
+                    last_updated_epoch_secs: now_epoch,
+                },
+            })
+        })
+        .collect();
+
+    let peer_count = peers.len();
+    let cache = CloseGroupCache {
+        peers,
+        saved_at_epoch_secs: now_epoch,
+    };
+
+    cache.save_to_dir(dir).await?;
+    info!(
+        save_reason,
+        "Saved {} close group peers to cache in {}",
+        peer_count,
+        dir.display()
+    );
+    Ok(())
+}
+
+/// Periodically persist the close group until cancelled.
+async fn periodic_close_group_cache_save(
+    dht_manager: Arc<DhtNetworkManager>,
+    trust_engine: Arc<TrustEngine>,
+    peer_id: PeerId,
+    k_value: usize,
+    dir: PathBuf,
+    interval: Duration,
+    shutdown: CancellationToken,
+) {
+    let start = tokio::time::Instant::now() + interval;
+    let mut ticker = tokio::time::interval_at(start, interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        tokio::select! {
+            biased;
+            () = shutdown.cancelled() => break,
+            _ = ticker.tick() => {
+                if let Err(error) = save_close_group_cache_snapshot(
+                    &dht_manager,
+                    &trust_engine,
+                    peer_id,
+                    k_value,
+                    &dir,
+                    "periodic",
+                ).await {
+                    warn!("Periodic close group cache save failed: {error}");
+                }
+            }
+        }
+    }
 }
 
 /// Network sender trait for sending messages
@@ -2378,6 +2588,16 @@ mod tests {
     /// 2 MiB — used in builder tests to verify max_message_size configuration.
     const TEST_MAX_MESSAGE_SIZE: usize = 2 * 1024 * 1024;
 
+    #[test]
+    fn cached_bootstrap_identity_must_match_handshake_peer() {
+        let expected = PeerId::from_bytes([1; 32]);
+        let other = PeerId::from_bytes([2; 32]);
+
+        assert!(bootstrap_peer_identity_matches(Some(expected), expected));
+        assert!(!bootstrap_peer_identity_matches(Some(expected), other));
+        assert!(bootstrap_peer_identity_matches(None, other));
+    }
+
     // Test tool handler for network tests
 
     // MCP removed
@@ -2400,6 +2620,7 @@ mod tests {
             allow_loopback: true,
             adaptive_dht_config: AdaptiveDhtConfig::default(),
             close_group_cache_dir: None,
+            close_group_cache_max_age: default_close_group_cache_max_age(),
         }
     }
 
@@ -2413,6 +2634,52 @@ mod tests {
         assert_eq!(config.listen_addrs().len(), 2); // IPv4 + IPv6
         assert_eq!(config.max_connections, 10000);
         assert_eq!(config.connection_timeout, Duration::from_secs(25));
+        assert_eq!(
+            config.close_group_cache_max_age,
+            Some(Duration::from_secs(DEFAULT_CLOSE_GROUP_CACHE_MAX_AGE_SECS))
+        );
+    }
+
+    #[test]
+    fn close_group_cache_builder_default_and_explicit_disable() {
+        let defaulted = NodeConfig::builder().build().unwrap();
+        assert_eq!(
+            defaulted.close_group_cache_max_age,
+            Some(Duration::from_secs(DEFAULT_CLOSE_GROUP_CACHE_MAX_AGE_SECS))
+        );
+
+        let disabled = NodeConfig::builder()
+            .close_group_cache_max_age(None)
+            .build()
+            .unwrap();
+        assert_eq!(disabled.close_group_cache_max_age, None);
+        let disabled_json = serde_json::to_string(&disabled).unwrap();
+        let disabled_roundtrip: NodeConfig = serde_json::from_str(&disabled_json).unwrap();
+        assert_eq!(disabled_roundtrip.close_group_cache_max_age, None);
+
+        let custom = NodeConfig::builder()
+            .close_group_cache_max_age(Some(Duration::from_secs(120)))
+            .build()
+            .unwrap();
+        assert_eq!(
+            custom.close_group_cache_max_age,
+            Some(Duration::from_secs(120))
+        );
+    }
+
+    #[test]
+    fn old_serialized_config_gets_default_cache_max_age() {
+        let mut value = serde_json::to_value(NodeConfig::default()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("close_group_cache_max_age");
+
+        let decoded: NodeConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            decoded.close_group_cache_max_age,
+            Some(Duration::from_secs(DEFAULT_CLOSE_GROUP_CACHE_MAX_AGE_SECS))
+        );
     }
 
     #[tokio::test]
@@ -2481,6 +2748,22 @@ mod tests {
         // Stop the node
         node.stop().await?;
         assert!(!node.is_running());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn close_group_cache_task_is_joined_on_stop() -> Result<()> {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let mut config = create_test_node_config();
+        config.close_group_cache_dir = Some(cache_dir.path().to_path_buf());
+        let node = P2PNode::new(config).await?;
+
+        node.start().await?;
+        assert!(node.close_group_cache_save_handle.lock().await.is_some());
+
+        node.stop().await?;
+        assert!(node.close_group_cache_save_handle.lock().await.is_none());
 
         Ok(())
     }
