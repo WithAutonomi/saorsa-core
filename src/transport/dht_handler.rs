@@ -1,11 +1,10 @@
 // Copyright 2024 Saorsa Labs Limited
 //
-// This software is dual-licensed under:
-// - GNU Affero General Public License v3.0 or later (AGPL-3.0-or-later)
-// - Commercial License
-//
-// For AGPL-3.0 license, see LICENSE-AGPL-3.0
-// For commercial licensing, contact: david@saorsalabs.com
+// This software is licensed under the MIT license <LICENSE-MIT or
+// https://opensource.org/licenses/MIT> or the Apache License, Version 2.0
+// <LICENSE-APACHE or https://www.apache.org/licenses/LICENSE-2.0>, at your
+// option. This file may not be copied, modified, or distributed except
+// according to those terms.
 
 //! DHT Protocol Handler for SharedTransport
 //!

@@ -1,23 +1,14 @@
 // Copyright (c) 2025 Saorsa Labs Limited
 
-// This software is dual-licensed under:
-// - GNU Affero General Public License v3.0 or later (AGPL-3.0-or-later)
-// - Commercial License
-//
-// For AGPL-3.0 license, see LICENSE-AGPL-3.0
-// For commercial licensing, contact: david@saorsalabs.com
+// This software is licensed under the MIT license <LICENSE-MIT or
+// https://opensource.org/licenses/MIT> or the Apache License, Version 2.0
+// <LICENSE-APACHE or https://www.apache.org/licenses/LICENSE-2.0>, at your
+// option. This file may not be copied, modified, or distributed except
+// according to those terms.
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under these licenses is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 //! Comprehensive input validation framework for P2P Foundation
 //!
