@@ -1535,7 +1535,7 @@ impl P2PNode {
 
         // Save close group cache before tearing down the DHT and transport layers.
         if let Some(ref dir) = self.config.close_group_cache_dir
-            && let Err(e) = self.save_close_group_cache(dir).await
+            && let Err(e) = self.save_close_group_cache(dir, "shutdown").await
         {
             warn!("Failed to save close group cache on shutdown: {e}");
         }
@@ -2209,6 +2209,10 @@ impl P2PNode {
         // perform DHT peer discovery using the real cryptographic PeerIds.
         let identity_timeout = Duration::from_secs(BOOTSTRAP_IDENTITY_TIMEOUT_SECS);
         let mut successful_connections = 0;
+        let cache_dial_candidates = serial_addr_sets.len();
+        let configured_dial_candidates = parallel_addr_sets.len();
+        let mut cache_dial_successes = 0usize;
+        let mut configured_dial_successes = 0usize;
         let mut connected_peer_ids: Vec<PeerId> = Vec::new();
 
         // Phase A: serial close-group dials to preserve trust-priority ordering.
@@ -2219,6 +2223,7 @@ impl P2PNode {
                 .await
             {
                 successful_connections += 1;
+                cache_dial_successes += 1;
                 connected_peer_ids.push(peer_id);
                 if client_mode && successful_connections >= CLIENT_BOOTSTRAP_TARGET {
                     debug!(
@@ -2243,6 +2248,7 @@ impl P2PNode {
             while let Some(result) = parallel_stream.next().await {
                 if let Some(peer_id) = result {
                     successful_connections += 1;
+                    configured_dial_successes += 1;
                     connected_peer_ids.push(peer_id);
                     if client_mode && successful_connections >= CLIENT_BOOTSTRAP_TARGET {
                         debug!(
@@ -2256,6 +2262,16 @@ impl P2PNode {
             // cancelling any in-flight futures inside `buffer_unordered`
             // before we proceed to the DHT discovery phase below.
         }
+
+        info!(
+            cache_dial_candidates,
+            cache_dial_successes,
+            configured_dial_candidates,
+            configured_dial_successes,
+            outbound_bootstrap_successes = successful_connections,
+            outbound_reachable = successful_connections > 0,
+            "Bootstrap reachability summary"
+        );
 
         if successful_connections == 0 {
             // Outbound connections failed — but for nodes behind symmetric NAT,
@@ -2327,7 +2343,7 @@ impl P2PNode {
         // Save close group cache after initial bootstrap so a crash before
         // graceful shutdown still preserves the newly-discovered close group.
         if let Some(ref dir) = self.config.close_group_cache_dir
-            && let Err(e) = self.save_close_group_cache(dir).await
+            && let Err(e) = self.save_close_group_cache(dir, "post_bootstrap").await
         {
             warn!("Failed to save close group cache after bootstrap: {e}");
         }
@@ -2361,7 +2377,7 @@ impl P2PNode {
                     .await
                 {
                     Ok(real_peer_id) => {
-                        debug!(
+                        info!(
                             bootstrap_source = source,
                             outcome = "ok",
                             address = %addr,
@@ -2371,7 +2387,7 @@ impl P2PNode {
                         return Some(real_peer_id);
                     }
                     Err(e) => {
-                        debug!(
+                        info!(
                             bootstrap_source = source,
                             outcome = "identity_timeout",
                             address = %addr,
@@ -2387,7 +2403,7 @@ impl P2PNode {
                     }
                 },
                 Err(e) => {
-                    debug!(
+                    info!(
                         bootstrap_source = source,
                         outcome = "connect_error",
                         address = %addr,
@@ -2402,13 +2418,18 @@ impl P2PNode {
     }
 
     /// Persist the current close group peers and their trust scores to disk.
-    async fn save_close_group_cache(&self, dir: &Path) -> anyhow::Result<()> {
+    async fn save_close_group_cache(
+        &self,
+        dir: &Path,
+        save_reason: &'static str,
+    ) -> anyhow::Result<()> {
         save_close_group_cache_snapshot(
             self.dht_manager(),
             self.adaptive_dht.trust_engine(),
             self.peer_id,
             self.config.dht_config.k_value,
             dir,
+            save_reason,
         )
         .await
     }
@@ -2426,6 +2447,7 @@ async fn save_close_group_cache_snapshot(
     peer_id: PeerId,
     k_value: usize,
     dir: &Path,
+    save_reason: &'static str,
 ) -> anyhow::Result<()> {
     let key: crate::dht::Key = *peer_id.as_bytes();
     let close_group = dht_manager.find_closest_nodes_local(&key, k_value).await;
@@ -2466,6 +2488,7 @@ async fn save_close_group_cache_snapshot(
 
     cache.save_to_dir(dir).await?;
     info!(
+        save_reason,
         "Saved {} close group peers to cache in {}",
         peer_count,
         dir.display()
@@ -2498,6 +2521,7 @@ async fn periodic_close_group_cache_save(
                     peer_id,
                     k_value,
                     &dir,
+                    "periodic",
                 ).await {
                     warn!("Periodic close group cache save failed: {error}");
                 }
