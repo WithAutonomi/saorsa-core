@@ -35,6 +35,7 @@ An Architecture Decision Record (ADR) is a document that captures an important a
 | [ADR-006](./ADR-006-eigentrust-reputation.md) | EigenTrust Reputation System | Accepted | Iterative trust computation for Sybil resistance |
 | [ADR-009](./ADR-009-sybil-protection.md) | Sybil Protection Mechanisms | Accepted | Multi-layered defense against identity attacks |
 | [ADR-010](./ADR-010-entangled-attestation.md) | Entangled Attestation System | Accepted | Software integrity verification via attestation chains |
+| [ADR-016](./ADR-016-trust-quarantine-and-trust-neutral-requests.md) | Trust Quarantine Thresholds and Trust-Neutral Request Transport | Proposed | Three-threshold DHT trust quarantine (0.35 swap / 0.20 avoidance / 0.45 admission) with trust-neutral generic request transport |
 
 ### Network Intelligence
 

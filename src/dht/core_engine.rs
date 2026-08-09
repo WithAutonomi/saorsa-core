@@ -9,7 +9,8 @@ use crate::security::{IP_EXACT_LIMIT, IPDiversityConfig, canonicalize_ip, ip_sub
 use anyhow::{Result, anyhow};
 use parking_lot::Mutex as PlMutex;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -202,6 +203,52 @@ const LIVE_THRESHOLD: Duration = Duration::from_secs(900); // 15 minutes
 /// Default trust score below which a peer is eligible for swap-out.
 #[allow(dead_code)]
 const DEFAULT_SWAP_THRESHOLD: f64 = 0.35;
+
+/// Default trust score below which a close-group peer is quarantined.
+#[allow(dead_code)]
+const DEFAULT_QUARANTINE_THRESHOLD: f64 = 0.20;
+
+/// Immediate close-group eviction is disabled until trust scoring is stable.
+///
+/// Low-trust peers remain eligible for lazy swap-out through
+/// [`DhtCoreEngine::add_node`], but existing close-group peers are not evicted
+/// solely because their score drops below the quarantine threshold.
+fn close_group_immediate_eviction_enabled() -> bool {
+    false
+}
+
+/// Default trust score required for new routing-table admission/readmission.
+#[allow(dead_code)]
+const DEFAULT_QUARANTINE_READMIT_THRESHOLD: f64 = 0.45;
+
+/// Maximum number of evicted quarantine markers retained by the routing engine.
+///
+/// Markers are only semantically required while a peer has recovered above the
+/// quarantine threshold but remains below the readmit threshold; below the
+/// quarantine threshold the trust score itself keeps the peer avoided.
+const MAX_QUARANTINED_PEERS: usize = 8192;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ClosestNodeCandidate {
+    distance: [u8; 32],
+    peer_id: PeerId,
+    bucket_index: usize,
+    node_index: usize,
+}
+
+impl Ord for ClosestNodeCandidate {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.distance
+            .cmp(&other.distance)
+            .then_with(|| self.peer_id.cmp(&other.peer_id))
+    }
+}
+
+impl PartialOrd for ClosestNodeCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
 
 /// Node information for routing.
 ///
@@ -1110,42 +1157,67 @@ impl KademliaRoutingTable {
     }
 
     fn find_closest_nodes(&self, key: &DhtKey, count: usize) -> Vec<NodeInfo> {
-        // Collect ALL entries from every bucket. Bucket index correlates with
-        // distance from *self*, not from key K — peers in distant buckets can
-        // be closer to K than peers in nearby buckets. The routing table holds
-        // at most 256 * K_BUCKET_SIZE entries, so a full scan is trivially fast.
-        let mut candidates: Vec<(NodeInfo, [u8; 32])> = Vec::with_capacity(count * 2);
-
-        for bucket in &self.buckets {
-            for node in bucket.get_nodes() {
-                let distance = xor_distance_bytes(node.id.to_bytes(), key.as_bytes());
-                candidates.push((node.clone(), distance));
-            }
-        }
-
-        // Sort by distance
-        candidates.sort_by_key(|a| a.1);
-
-        // Return top `count` nodes
-        candidates
+        self.find_closest_node_candidates_filtered(key, count, |_| true)
             .into_iter()
-            .take(count)
-            .map(|(node, _)| node)
+            .map(|candidate| {
+                self.buckets[candidate.bucket_index].nodes[candidate.node_index].clone()
+            })
             .collect()
     }
 
-    fn find_closest_nodes_with_publish_seq(
+    fn find_closest_nodes_with_publish_seq_filtered(
         &self,
         key: &DhtKey,
         count: usize,
+        include: impl Fn(&NodeInfo) -> bool,
     ) -> Vec<(NodeInfo, u64)> {
-        self.find_closest_nodes(key, count)
+        self.find_closest_node_candidates_filtered(key, count, include)
             .into_iter()
-            .map(|node| {
+            .map(|candidate| {
+                let node = self.buckets[candidate.bucket_index].nodes[candidate.node_index].clone();
                 let seq = self.publish_seq_for(&node.id);
                 (node, seq)
             })
             .collect()
+    }
+
+    fn find_closest_node_candidates_filtered(
+        &self,
+        key: &DhtKey,
+        count: usize,
+        include: impl Fn(&NodeInfo) -> bool,
+    ) -> Vec<ClosestNodeCandidate> {
+        if count == 0 {
+            return Vec::new();
+        }
+
+        let mut closest = BinaryHeap::with_capacity(count);
+
+        for (bucket_index, bucket) in self.buckets.iter().enumerate() {
+            for (node_index, node) in bucket.get_nodes().iter().enumerate() {
+                if !include(node) {
+                    continue;
+                }
+
+                let candidate = ClosestNodeCandidate {
+                    distance: xor_distance_bytes(node.id.to_bytes(), key.as_bytes()),
+                    peer_id: node.id,
+                    bucket_index,
+                    node_index,
+                };
+
+                if closest.len() < count {
+                    closest.push(candidate);
+                } else if closest.peek().is_some_and(|farthest| candidate < *farthest) {
+                    closest.pop();
+                    closest.push(candidate);
+                }
+            }
+        }
+
+        let mut selected = closest.into_vec();
+        selected.sort_unstable();
+        selected
     }
 
     /// Returns the k-bucket index for a key, or `None` when the key equals
@@ -1461,6 +1533,22 @@ pub struct DhtCoreEngine {
     /// Trust score below which a peer is eligible for swap-out.
     swap_threshold: f64,
 
+    /// Trust score below which a peer is avoided for automatic lookup/dial
+    /// paths.
+    quarantine_threshold: f64,
+
+    /// Trust score required before a new peer can enter the routing table, and
+    /// before a quarantined peer can re-enter.
+    quarantine_readmit_threshold: f64,
+
+    /// Peers evicted from the close group by quarantine. Markers are bounded
+    /// to cap memory use; redundant markers are removed when direct trust-score
+    /// checks are sufficient or when the peer crosses the readmit threshold.
+    quarantined_peers: HashSet<PeerId>,
+
+    /// FIFO order used to prune the bounded quarantine marker set.
+    quarantined_peer_order: VecDeque<PeerId>,
+
     /// Duration of no contact after which a peer is considered stale.
     /// Defaults to [`LIVE_THRESHOLD`]; overridden in tests to avoid
     /// `Instant` subtraction overflow on Windows (where `Instant` starts
@@ -1506,9 +1594,333 @@ impl DhtCoreEngine {
             ip_diversity_config: IPDiversityConfig::default(),
             allow_loopback,
             swap_threshold,
+            quarantine_threshold: DEFAULT_QUARANTINE_THRESHOLD,
+            quarantine_readmit_threshold: DEFAULT_QUARANTINE_READMIT_THRESHOLD,
+            quarantined_peers: HashSet::new(),
+            quarantined_peer_order: VecDeque::new(),
             live_threshold: LIVE_THRESHOLD,
             shutdown: CancellationToken::new(),
         })
+    }
+
+    /// Configure trust quarantine thresholds.
+    ///
+    /// A `quarantine_threshold` of `0.0` disables quarantine enforcement.
+    /// Otherwise, peers below that score are avoided for automatic lookups.
+    /// Quarantined peers can only re-enter through normal admission after
+    /// their decayed trust reaches `quarantine_readmit_threshold`; new peers
+    /// must also meet that threshold before entering the routing table.
+    pub(crate) fn set_trust_quarantine_thresholds(
+        &mut self,
+        quarantine_threshold: f64,
+        quarantine_readmit_threshold: f64,
+    ) -> Result<()> {
+        if !(0.0..0.5).contains(&quarantine_threshold) || quarantine_threshold.is_nan() {
+            return Err(anyhow!(
+                "quarantine_threshold must be in [0.0, 0.5), got {quarantine_threshold}"
+            ));
+        }
+        if !(0.0..0.5).contains(&quarantine_readmit_threshold)
+            || quarantine_readmit_threshold.is_nan()
+        {
+            return Err(anyhow!(
+                "quarantine_readmit_threshold must be in [0.0, 0.5), got {quarantine_readmit_threshold}"
+            ));
+        }
+        if quarantine_threshold > 0.0 && quarantine_readmit_threshold < quarantine_threshold {
+            return Err(anyhow!(
+                "quarantine_readmit_threshold ({quarantine_readmit_threshold}) must be >= quarantine_threshold ({quarantine_threshold})"
+            ));
+        }
+        self.quarantine_threshold = quarantine_threshold;
+        self.quarantine_readmit_threshold = quarantine_readmit_threshold;
+        Ok(())
+    }
+
+    fn quarantine_enabled(&self) -> bool {
+        self.quarantine_threshold > 0.0
+    }
+
+    fn check_new_peer_admission(&mut self, peer_id: &PeerId, trust_score: f64) -> Result<()> {
+        if !self.quarantine_enabled() {
+            return Ok(());
+        }
+        if !trust_score.is_finite() {
+            return Err(anyhow!(
+                "peer {} has non-finite trust score",
+                peer_id.to_hex()
+            ));
+        }
+        if trust_score < self.quarantine_readmit_threshold {
+            if self.quarantined_peers.contains(peer_id) {
+                return Err(anyhow!(
+                    "peer {} quarantined until trust >= {:.3} (current {trust_score:.3})",
+                    peer_id.to_hex(),
+                    self.quarantine_readmit_threshold
+                ));
+            }
+            return Err(anyhow!(
+                "peer {} below new-peer admission threshold ({trust_score:.3} < {:.3})",
+                peer_id.to_hex(),
+                self.quarantine_readmit_threshold
+            ));
+        }
+        self.forget_quarantined_peer(peer_id);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn remember_quarantined_peer(
+        &mut self,
+        peer_id: PeerId,
+        trust_score: &impl Fn(&PeerId) -> f64,
+    ) {
+        let quarantine_threshold = self.quarantine_threshold;
+        let quarantine_readmit_threshold = self.quarantine_readmit_threshold;
+        Self::remember_quarantined_peer_with_trust(
+            &mut self.quarantined_peers,
+            &mut self.quarantined_peer_order,
+            quarantine_threshold,
+            quarantine_readmit_threshold,
+            peer_id,
+            trust_score,
+        );
+    }
+
+    fn quarantine_marker_required_for_score(
+        score: f64,
+        quarantine_threshold: f64,
+        quarantine_readmit_threshold: f64,
+    ) -> bool {
+        score.is_finite() && score >= quarantine_threshold && score < quarantine_readmit_threshold
+    }
+
+    fn prune_redundant_quarantined_peers(
+        quarantined_peers: &mut HashSet<PeerId>,
+        quarantined_peer_order: &mut VecDeque<PeerId>,
+        quarantine_threshold: f64,
+        quarantine_readmit_threshold: f64,
+        trust_score: &impl Fn(&PeerId) -> f64,
+    ) {
+        let mut retained_order = VecDeque::with_capacity(quarantined_peer_order.len());
+        while let Some(peer_id) = quarantined_peer_order.pop_front() {
+            if !quarantined_peers.contains(&peer_id) {
+                continue;
+            }
+
+            let score = trust_score(&peer_id);
+            if Self::quarantine_marker_required_for_score(
+                score,
+                quarantine_threshold,
+                quarantine_readmit_threshold,
+            ) {
+                retained_order.push_back(peer_id);
+            } else {
+                quarantined_peers.remove(&peer_id);
+            }
+        }
+
+        *quarantined_peer_order = retained_order;
+    }
+
+    fn remember_quarantined_peer_with_trust(
+        quarantined_peers: &mut HashSet<PeerId>,
+        quarantined_peer_order: &mut VecDeque<PeerId>,
+        quarantine_threshold: f64,
+        quarantine_readmit_threshold: f64,
+        peer_id: PeerId,
+        trust_score: &impl Fn(&PeerId) -> f64,
+    ) {
+        if quarantined_peers.contains(&peer_id) {
+            return;
+        }
+
+        if quarantined_peers.len() >= MAX_QUARANTINED_PEERS {
+            Self::prune_redundant_quarantined_peers(
+                quarantined_peers,
+                quarantined_peer_order,
+                quarantine_threshold,
+                quarantine_readmit_threshold,
+                trust_score,
+            );
+        }
+        if quarantined_peers.len() >= MAX_QUARANTINED_PEERS {
+            return;
+        }
+
+        quarantined_peers.insert(peer_id);
+        quarantined_peer_order.push_back(peer_id);
+    }
+
+    fn forget_quarantined_peer(&mut self, peer_id: &PeerId) {
+        if !self.quarantined_peers.remove(peer_id) {
+            return;
+        }
+
+        self.quarantined_peer_order
+            .retain(|quarantined_peer| quarantined_peer != peer_id);
+    }
+
+    /// Return whether automatic lookup/dial paths should avoid this peer.
+    pub(crate) fn should_avoid_for_lookup(&self, peer_id: &PeerId, trust_score: f64) -> bool {
+        if !self.quarantine_enabled() {
+            return false;
+        }
+        if !trust_score.is_finite() {
+            return true;
+        }
+        trust_score < self.quarantine_threshold
+            || (self.quarantined_peers.contains(peer_id)
+                && trust_score < self.quarantine_readmit_threshold)
+    }
+
+    /// Return whether automatic lookup/dial paths should avoid this peer when
+    /// it might become a new routing-table admission.
+    pub(crate) async fn should_avoid_automatic_candidate(
+        &self,
+        peer_id: &PeerId,
+        trust_score: f64,
+    ) -> bool {
+        if self.should_avoid_for_lookup(peer_id, trust_score) {
+            return true;
+        }
+        if !self.quarantine_enabled() || trust_score >= self.quarantine_readmit_threshold {
+            return false;
+        }
+        self.routing_table
+            .read()
+            .await
+            .find_node_by_id(peer_id)
+            .is_none()
+    }
+
+    /// Evict a quarantined peer if it currently occupies the K-closest set and
+    /// removal will not shrink the routing table below K peers.
+    ///
+    /// Temporarily disabled until trust scoring is considered stable. Low-trust
+    /// peers continue to leave through lazy swap-out when better candidates are
+    /// admitted.
+    #[cfg(test)]
+    pub(crate) async fn enforce_close_group_quarantine(
+        &mut self,
+        peer_id: &PeerId,
+        trust_score: f64,
+    ) -> Vec<RoutingTableEvent> {
+        if !close_group_immediate_eviction_enabled() {
+            return Vec::new();
+        }
+
+        if !self.quarantine_enabled()
+            || !trust_score.is_finite()
+            || trust_score >= self.quarantine_threshold
+        {
+            return Vec::new();
+        }
+
+        let mut routing = self.routing_table.write().await;
+        let k_before = routing.k_closest_ids(self.k_value);
+        if !k_before.contains(peer_id) {
+            return Vec::new();
+        }
+        if routing.find_node_by_id(peer_id).is_none() {
+            return Vec::new();
+        }
+        if routing.node_count() <= self.k_value {
+            return Vec::new();
+        }
+
+        let quarantine_threshold = self.quarantine_threshold;
+        let quarantine_readmit_threshold = self.quarantine_readmit_threshold;
+        Self::remember_quarantined_peer_with_trust(
+            &mut self.quarantined_peers,
+            &mut self.quarantined_peer_order,
+            quarantine_threshold,
+            quarantine_readmit_threshold,
+            *peer_id,
+            &|id| {
+                if id == peer_id {
+                    trust_score
+                } else {
+                    quarantine_threshold
+                }
+            },
+        );
+        routing.remove_node(peer_id);
+
+        let k_after = routing.k_closest_ids(self.k_value);
+        let mut events = vec![RoutingTableEvent::PeerRemoved(*peer_id)];
+        if k_before != k_after {
+            events.push(RoutingTableEvent::KClosestPeersChanged {
+                old: k_before,
+                new: k_after,
+            });
+        }
+        events
+    }
+
+    /// Enforce trust gates over the current K-closest set.
+    ///
+    /// Temporarily leaves close-group peers in place even when they are below
+    /// the quarantine threshold. Lazy swap-out remains responsible for
+    /// replacing low-trust peers when better candidates arrive.
+    pub(crate) async fn enforce_close_group_trust_gate(
+        &mut self,
+        trust_score: &impl Fn(&PeerId) -> f64,
+    ) -> Vec<RoutingTableEvent> {
+        if !close_group_immediate_eviction_enabled() {
+            return Vec::new();
+        }
+
+        if !self.quarantine_enabled() {
+            return Vec::new();
+        }
+
+        let mut routing = self.routing_table.write().await;
+        let k_before = routing.k_closest_ids(self.k_value);
+        let mut removed = Vec::new();
+
+        while routing.node_count() > self.k_value {
+            let Some(peer_id) = routing
+                .k_closest_ids(self.k_value)
+                .into_iter()
+                .find(|peer_id| {
+                    let score = trust_score(peer_id);
+                    score.is_finite() && score < self.quarantine_threshold
+                })
+            else {
+                break;
+            };
+
+            let quarantine_threshold = self.quarantine_threshold;
+            let quarantine_readmit_threshold = self.quarantine_readmit_threshold;
+            Self::remember_quarantined_peer_with_trust(
+                &mut self.quarantined_peers,
+                &mut self.quarantined_peer_order,
+                quarantine_threshold,
+                quarantine_readmit_threshold,
+                peer_id,
+                trust_score,
+            );
+            routing.remove_node(&peer_id);
+            removed.push(peer_id);
+        }
+
+        if removed.is_empty() {
+            return Vec::new();
+        }
+
+        let k_after = routing.k_closest_ids(self.k_value);
+        let mut events: Vec<RoutingTableEvent> = removed
+            .into_iter()
+            .map(RoutingTableEvent::PeerRemoved)
+            .collect();
+        if k_before != k_after {
+            events.push(RoutingTableEvent::KClosestPeersChanged {
+                old: k_before,
+                new: k_after,
+            });
+        }
+        events
     }
 
     /// Override the IP diversity configuration.
@@ -1646,15 +2058,16 @@ impl DhtCoreEngine {
         Ok(routing.find_closest_nodes(key, count))
     }
 
-    /// Find nodes closest to a key and include the latest authoritative
-    /// `PublishAddressSet` sequence known for each returned record.
-    pub async fn find_nodes_with_publish_seq(
+    /// Find nodes closest to a key after applying a caller-provided routing
+    /// policy filter.
+    pub(crate) async fn find_nodes_with_publish_seq_filtered(
         &self,
         key: &DhtKey,
         count: usize,
+        include: impl Fn(&NodeInfo) -> bool,
     ) -> Result<Vec<(NodeInfo, u64)>> {
         let routing = self.routing_table.read().await;
-        Ok(routing.find_closest_nodes_with_publish_seq(key, count))
+        Ok(routing.find_closest_nodes_with_publish_seq_filtered(key, count, include))
     }
 
     /// Find nodes closest to a key, including self as a candidate.
@@ -2024,6 +2437,12 @@ impl DhtCoreEngine {
             return Err(anyhow!(
                 "all addresses were wildcard / port-zero; nothing storable"
             ));
+        }
+
+        let peer_trust_score = trust_score(&peer_id);
+        let peer_already_known = self.has_node(&peer_id).await;
+        if !peer_already_known {
+            self.check_new_peer_admission(&peer_id, peer_trust_score)?;
         }
 
         // Extract ALL IP addresses from the candidate for diversity checking.
@@ -2645,6 +3064,12 @@ impl DhtCoreEngine {
         candidate_ips: &[IpAddr],
         trust_score: &impl Fn(&PeerId) -> f64,
     ) -> Result<Vec<RoutingTableEvent>> {
+        let candidate_id = candidate.id;
+        let candidate_trust_score = trust_score(&candidate_id);
+        let peer_already_known = self.has_node(&candidate_id).await;
+        if !peer_already_known {
+            self.check_new_peer_admission(&candidate_id, candidate_trust_score)?;
+        }
         let mut routing = self.routing_table.write().await;
         match self.add_with_diversity(&mut routing, candidate, candidate_ips, trust_score, false)? {
             AdmissionResult::Admitted(events) => Ok(events),
@@ -2668,6 +3093,12 @@ impl std::fmt::Debug for DhtCoreEngine {
             .field("ip_diversity_config", &self.ip_diversity_config)
             .field("allow_loopback", &self.allow_loopback)
             .field("swap_threshold", &self.swap_threshold)
+            .field("quarantine_threshold", &self.quarantine_threshold)
+            .field(
+                "quarantine_readmit_threshold",
+                &self.quarantine_readmit_threshold,
+            )
+            .field("quarantined_peers", &self.quarantined_peers.len())
             .finish()
     }
 }
@@ -2677,6 +3108,12 @@ mod tests {
     use super::*;
     use crate::address::TransportAddr;
     use std::collections::HashSet;
+
+    const SMALL_TEST_K: usize = 4;
+    const TEST_QUARANTINE_THRESHOLD: f64 = 0.20;
+    const TEST_QUARANTINE_READMIT_THRESHOLD: f64 = 0.45;
+    const TEST_QUARANTINE_LOW_SCORE: f64 = 0.10;
+    const TEST_QUARANTINE_MARKER_REQUIRED_SCORE: f64 = 0.30;
 
     #[tokio::test]
     async fn test_xor_distance() {
@@ -2696,6 +3133,14 @@ mod tests {
             address_types: vec![AddressType::Direct],
             last_seen: AtomicInstant::now(),
         }
+    }
+
+    fn peer_id_from_index(index: usize) -> PeerId {
+        let mut id = [0u8; 32];
+        let index_bytes = index.to_be_bytes();
+        let offset = id.len() - index_bytes.len();
+        id[offset..].copy_from_slice(&index_bytes);
+        PeerId::from_bytes(id)
     }
 
     // -----------------------------------------------------------------------
@@ -3600,25 +4045,24 @@ mod tests {
     const TEST_STALE_AGE: Duration = Duration::from_secs(2);
 
     // -----------------------------------------------------------------------
-    // Test 4: low-trust peer admission (lazy swap-out model)
+    // Test 4: low-trust peer admission is gated by default quarantine policy
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn test_low_trust_candidate_still_admitted() {
+    async fn test_low_trust_candidate_rejected_by_default_quarantine() {
         let mut dht = DhtCoreEngine::new_for_tests(PeerId::from_bytes([0u8; 32])).unwrap();
         let node = make_node(1, "/ip4/10.0.0.1/udp/9000/quic");
         let peer_id = node.id;
 
-        // Candidate with trust below swap threshold is still admitted
-        // (lazy swap-out model: no admission blocking)
+        // Candidate below the default readmission/admission threshold is rejected.
         let result = dht
             .add_node(node, &|id| {
                 if *id == peer_id { 0.1 } else { 0.5 }
             })
             .await;
 
-        assert!(result.is_ok(), "low-trust candidate should be admitted");
-        assert!(dht.has_node(&peer_id).await);
+        assert!(result.is_err(), "low-trust candidate should be rejected");
+        assert!(!dht.has_node(&peer_id).await);
     }
 
     // -----------------------------------------------------------------------
@@ -4096,7 +4540,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_re_evaluate_admits_low_trust_candidate() {
+    async fn test_re_evaluate_rejects_low_trust_candidate_by_default() {
         let mut dht = DhtCoreEngine::new(
             PeerId::from_bytes([0u8; 32]),
             20,
@@ -4110,14 +4554,54 @@ mod tests {
         let candidate = make_node_with_addr(id, "/ip4/10.0.0.1/udp/9000/quic");
         let candidate_ips = vec!["10.0.0.1".parse().unwrap()];
 
-        // Trust below swap threshold — should still be admitted
+        // Trust below readmission/admission threshold is rejected by default.
         let result = dht
             .re_evaluate_admission(candidate, &candidate_ips, &|_| 0.1)
             .await;
 
         assert!(
-            result.is_ok(),
-            "low-trust candidate should be admitted via re-evaluate"
+            result.is_err(),
+            "low-trust candidate should be rejected via re-evaluate"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_re_evaluate_updates_existing_peer_below_readmit_threshold() {
+        let mut dht = DhtCoreEngine::new(
+            PeerId::from_bytes([0u8; 32]),
+            20,
+            false,
+            DEFAULT_SWAP_THRESHOLD,
+        )
+        .unwrap();
+        dht.set_trust_quarantine_thresholds(0.20, 0.45).unwrap();
+
+        let mut id = [0u8; 32];
+        id[0] = 0x80;
+        let peer = PeerId::from_bytes(id);
+        dht.add_node_no_trust(make_node_with_addr(id, "/ip4/10.0.0.1/udp/9000/quic"))
+            .await
+            .unwrap();
+
+        let candidate = make_node_with_addr(id, "/ip4/10.0.0.2/udp/9000/quic");
+        let candidate_ips = vec!["10.0.0.2".parse().unwrap()];
+
+        let events = dht
+            .re_evaluate_admission(candidate, &candidate_ips, &|id| {
+                if *id == peer { 0.30 } else { 0.5 }
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            events.is_empty(),
+            "existing peer update should not emit a second admission event"
+        );
+        assert!(dht.has_node(&peer).await);
+        assert!(
+            dht.get_node_addresses(&peer)
+                .await
+                .contains(&"/ip4/10.0.0.2/udp/9000/quic".parse().unwrap())
         );
     }
 
@@ -4896,6 +5380,532 @@ mod tests {
         }
         // Low-trust peer should still be in the table
         assert!(dht.has_node(&low_peer).await);
+    }
+
+    /// A K-closest peer below the quarantine threshold is retained while
+    /// immediate close-group eviction is disabled.
+    #[tokio::test]
+    async fn test_close_group_peer_below_quarantine_is_not_immediately_evicted() {
+        let mut dht = DhtCoreEngine::new(
+            PeerId::from_bytes([0u8; 32]),
+            SMALL_TEST_K,
+            false,
+            DEFAULT_SWAP_THRESHOLD,
+        )
+        .unwrap();
+        dht.set_trust_quarantine_thresholds(0.20, 0.45).unwrap();
+
+        let mut peer_id_bytes = [0u8; 32];
+        peer_id_bytes[31] = 1;
+        let peer = PeerId::from_bytes(peer_id_bytes);
+
+        dht.add_node_no_trust(make_node_with_addr(
+            peer_id_bytes,
+            "/ip4/10.10.0.1/udp/9000/quic",
+        ))
+        .await
+        .unwrap();
+        assert!(dht.has_node(&peer).await);
+
+        const FAR_PEER_FIRST_BYTES: [u8; SMALL_TEST_K] = [0x10, 0x20, 0x40, 0x80];
+        for first_byte in FAR_PEER_FIRST_BYTES {
+            let mut id = [0u8; 32];
+            id[0] = first_byte;
+            dht.add_node_no_trust(make_node_with_addr(
+                id,
+                &format!("/ip4/10.{first_byte}.0.1/udp/9000/quic"),
+            ))
+            .await
+            .unwrap();
+        }
+        assert_eq!(dht.routing_table_size().await, SMALL_TEST_K + 1);
+
+        let events = dht.enforce_close_group_quarantine(&peer, 0.19).await;
+        assert!(
+            events.is_empty(),
+            "close-group peer below quarantine threshold should not be immediately evicted"
+        );
+        assert!(
+            dht.has_node(&peer).await,
+            "close-group peer should remain in RT while immediate eviction is disabled"
+        );
+        assert_eq!(dht.routing_table_size().await, SMALL_TEST_K + 1);
+        assert!(
+            dht.should_avoid_for_lookup(&peer, 0.19),
+            "retained low-trust peer should still be avoided by lookup policy"
+        );
+
+        dht.remove_node_by_id(&peer).await;
+        let below_admission = dht
+            .add_node(
+                make_node_with_addr(peer_id_bytes, "/ip4/10.10.0.1/udp/9000/quic"),
+                &|id| if *id == peer { 0.30 } else { 0.5 },
+            )
+            .await;
+        assert!(
+            below_admission.is_err(),
+            "removed peer should not readmit below 0.45"
+        );
+
+        let recovered = dht
+            .add_node(
+                make_node_with_addr(peer_id_bytes, "/ip4/10.10.0.1/udp/9000/quic"),
+                &|id| if *id == peer { 0.45 } else { 0.5 },
+            )
+            .await;
+        assert!(
+            recovered.is_ok(),
+            "removed peer should readmit once trust reaches 0.45"
+        );
+        assert!(dht.has_node(&peer).await);
+    }
+
+    /// Close-group quarantine should not shrink the routing table below K.
+    #[tokio::test]
+    async fn test_close_group_quarantine_keeps_minimum_k_peers() {
+        let mut dht = DhtCoreEngine::new(
+            PeerId::from_bytes([0u8; 32]),
+            SMALL_TEST_K,
+            false,
+            DEFAULT_SWAP_THRESHOLD,
+        )
+        .unwrap();
+        dht.set_trust_quarantine_thresholds(0.20, 0.45).unwrap();
+
+        let mut close_peer_ids = Vec::new();
+        for i in 1..=SMALL_TEST_K as u8 {
+            let mut id = [0u8; 32];
+            id[31] = i;
+            let peer_id = PeerId::from_bytes(id);
+            close_peer_ids.push(peer_id);
+            dht.add_node_no_trust(make_node_with_addr(
+                id,
+                &format!("/ip4/10.{i}.0.1/udp/9000/quic"),
+            ))
+            .await
+            .unwrap();
+        }
+
+        let low_peer = close_peer_ids[0];
+        let events = dht
+            .enforce_close_group_trust_gate(&|id| if *id == low_peer { 0.10 } else { 0.5 })
+            .await;
+
+        assert!(
+            events.is_empty(),
+            "trust quarantine should not evict when the routing table is at K"
+        );
+        assert_eq!(dht.routing_table_size().await, SMALL_TEST_K);
+        assert!(dht.has_node(&low_peer).await);
+        assert!(
+            dht.should_avoid_for_lookup(&low_peer, 0.10),
+            "retained low-trust peer should still be avoided by lookup policy"
+        );
+    }
+
+    /// Once a new routing-table peer creates surplus above K, a low-trust
+    /// close-group peer is still retained while immediate eviction is disabled.
+    #[tokio::test]
+    async fn test_new_peer_surplus_does_not_trigger_close_group_quarantine() {
+        let mut dht = DhtCoreEngine::new(
+            PeerId::from_bytes([0u8; 32]),
+            SMALL_TEST_K,
+            false,
+            DEFAULT_SWAP_THRESHOLD,
+        )
+        .unwrap();
+        dht.set_trust_quarantine_thresholds(0.20, 0.45).unwrap();
+
+        let mut close_peer_ids = Vec::new();
+        for i in 1..=SMALL_TEST_K as u8 {
+            let mut id = [0u8; 32];
+            id[31] = i;
+            let peer_id = PeerId::from_bytes(id);
+            close_peer_ids.push(peer_id);
+            dht.add_node_no_trust(make_node_with_addr(
+                id,
+                &format!("/ip4/10.{i}.0.1/udp/9000/quic"),
+            ))
+            .await
+            .unwrap();
+        }
+
+        let low_peer = close_peer_ids[0];
+        let deferred = dht
+            .enforce_close_group_trust_gate(&|id| if *id == low_peer { 0.10 } else { 0.5 })
+            .await;
+        assert!(deferred.is_empty());
+
+        let mut surplus_id = [0u8; 32];
+        surplus_id[0] = 0x80;
+        dht.add_node_no_trust(make_node_with_addr(
+            surplus_id,
+            "/ip4/10.99.0.1/udp/9000/quic",
+        ))
+        .await
+        .unwrap();
+        assert_eq!(dht.routing_table_size().await, SMALL_TEST_K + 1);
+
+        let events = dht
+            .enforce_close_group_trust_gate(&|id| if *id == low_peer { 0.10 } else { 0.5 })
+            .await;
+        assert!(
+            events.is_empty(),
+            "surplus peer should not trigger close-group quarantine while immediate eviction is disabled"
+        );
+        assert_eq!(dht.routing_table_size().await, SMALL_TEST_K + 1);
+        assert!(dht.has_node(&low_peer).await);
+    }
+
+    #[test]
+    fn test_core_quarantine_readmit_threshold_must_be_reachable_by_decay() {
+        let mut dht = DhtCoreEngine::new_for_tests(PeerId::from_bytes([0u8; 32])).unwrap();
+        assert!(dht.set_trust_quarantine_thresholds(0.20, 0.49).is_ok());
+        assert!(dht.set_trust_quarantine_thresholds(0.20, 0.50).is_err());
+    }
+
+    #[test]
+    fn test_quarantined_peer_marker_cap_keeps_readmit_gap_markers() {
+        let mut dht = DhtCoreEngine::new_for_tests(PeerId::from_bytes([0u8; 32])).unwrap();
+        dht.set_trust_quarantine_thresholds(
+            TEST_QUARANTINE_THRESHOLD,
+            TEST_QUARANTINE_READMIT_THRESHOLD,
+        )
+        .unwrap();
+        let oldest_peer = peer_id_from_index(0);
+        let low_trust_overflow_peer = peer_id_from_index(MAX_QUARANTINED_PEERS);
+        let recovered_peer = oldest_peer;
+        let retained_overflow_peer = peer_id_from_index(MAX_QUARANTINED_PEERS + 1);
+
+        for index in 0..MAX_QUARANTINED_PEERS {
+            dht.remember_quarantined_peer(peer_id_from_index(index), &|_| {
+                TEST_QUARANTINE_MARKER_REQUIRED_SCORE
+            });
+        }
+
+        assert_eq!(dht.quarantined_peers.len(), MAX_QUARANTINED_PEERS);
+        assert_eq!(dht.quarantined_peer_order.len(), MAX_QUARANTINED_PEERS);
+
+        dht.remember_quarantined_peer(low_trust_overflow_peer, &|peer_id| {
+            if *peer_id == low_trust_overflow_peer {
+                TEST_QUARANTINE_LOW_SCORE
+            } else {
+                TEST_QUARANTINE_MARKER_REQUIRED_SCORE
+            }
+        });
+
+        assert_eq!(dht.quarantined_peers.len(), MAX_QUARANTINED_PEERS);
+        assert!(
+            dht.quarantined_peers.contains(&oldest_peer),
+            "markers still in the readmit gap should not be pruned"
+        );
+        assert!(
+            !dht.quarantined_peers.contains(&low_trust_overflow_peer),
+            "a below-quarantine peer remains avoided by score and can be dropped when cap is full"
+        );
+        assert!(dht.should_avoid_for_lookup(&oldest_peer, TEST_QUARANTINE_MARKER_REQUIRED_SCORE));
+        assert!(dht.should_avoid_for_lookup(&low_trust_overflow_peer, TEST_QUARANTINE_LOW_SCORE));
+
+        dht.remember_quarantined_peer(retained_overflow_peer, &|peer_id| {
+            if *peer_id == recovered_peer {
+                TEST_QUARANTINE_READMIT_THRESHOLD
+            } else {
+                TEST_QUARANTINE_MARKER_REQUIRED_SCORE
+            }
+        });
+
+        assert_eq!(dht.quarantined_peers.len(), MAX_QUARANTINED_PEERS);
+        assert!(
+            !dht.quarantined_peers.contains(&recovered_peer),
+            "recovered marker should be pruned at capacity"
+        );
+        assert!(
+            dht.quarantined_peers.contains(&retained_overflow_peer),
+            "new marker should be retained after pruning a recovered peer"
+        );
+    }
+
+    /// New peers must meet the readmit/admission threshold even when they would
+    /// occupy a non-close routing-table slot.
+    #[tokio::test]
+    async fn test_new_non_close_admission_requires_readmit_threshold() {
+        let mut dht = DhtCoreEngine::new(
+            PeerId::from_bytes([0u8; 32]),
+            4,
+            false,
+            DEFAULT_SWAP_THRESHOLD,
+        )
+        .unwrap();
+        dht.set_trust_quarantine_thresholds(0.20, 0.45).unwrap();
+
+        for i in 1..=4u8 {
+            let mut id = [0u8; 32];
+            id[31] = i;
+            dht.add_node_no_trust(make_node_with_addr(
+                id,
+                &format!("/ip4/10.{i}.0.1/udp/9000/quic"),
+            ))
+            .await
+            .unwrap();
+        }
+
+        let mut peer_id_bytes = [0u8; 32];
+        peer_id_bytes[0] = 0x80;
+        let peer = PeerId::from_bytes(peer_id_bytes);
+
+        let rejected = dht
+            .add_node(
+                make_node_with_addr(peer_id_bytes, "/ip4/10.10.0.9/udp/9000/quic"),
+                &|id| if *id == peer { 0.10 } else { 0.5 },
+            )
+            .await;
+        assert!(
+            rejected.is_err(),
+            "peer below quarantine threshold should be rejected"
+        );
+
+        let below_new_peer_admission = dht
+            .add_node(
+                make_node_with_addr(peer_id_bytes, "/ip4/10.10.0.9/udp/9000/quic"),
+                &|id| if *id == peer { 0.30 } else { 0.5 },
+            )
+            .await;
+        assert!(
+            below_new_peer_admission.is_err(),
+            "new non-close peer should need trust >= 0.45"
+        );
+
+        let recovered = dht
+            .add_node(
+                make_node_with_addr(peer_id_bytes, "/ip4/10.10.0.9/udp/9000/quic"),
+                &|id| if *id == peer { 0.45 } else { 0.5 },
+            )
+            .await;
+        assert!(
+            recovered.is_ok(),
+            "new non-close peer should enter once trust reaches 0.45"
+        );
+        assert!(dht.has_node(&peer).await);
+    }
+
+    /// A new peer that would enter the K-closest set must meet the general
+    /// new-peer admission threshold, even if it is above the lower quarantine
+    /// threshold.
+    #[tokio::test]
+    async fn test_new_close_group_admission_requires_readmit_threshold() {
+        let mut dht = DhtCoreEngine::new_for_tests(PeerId::from_bytes([0u8; 32])).unwrap();
+        dht.set_trust_quarantine_thresholds(0.20, 0.45).unwrap();
+
+        let mut peer_id_bytes = [0u8; 32];
+        peer_id_bytes[31] = 9;
+        let peer = PeerId::from_bytes(peer_id_bytes);
+
+        let below_close_group_threshold = dht
+            .add_node(
+                make_node_with_addr(peer_id_bytes, "/ip4/10.10.0.9/udp/9000/quic"),
+                &|id| if *id == peer { 0.30 } else { 0.5 },
+            )
+            .await;
+        assert!(
+            below_close_group_threshold.is_err(),
+            "new close-group peer should need trust >= 0.45"
+        );
+
+        let recovered = dht
+            .add_node(
+                make_node_with_addr(peer_id_bytes, "/ip4/10.10.0.9/udp/9000/quic"),
+                &|id| if *id == peer { 0.45 } else { 0.5 },
+            )
+            .await;
+        assert!(
+            recovered.is_ok(),
+            "new close-group peer should enter once trust reaches 0.45"
+        );
+        assert!(dht.has_node(&peer).await);
+    }
+
+    #[tokio::test]
+    async fn test_automatic_lookup_skips_unknown_below_admission_threshold() {
+        let mut dht = DhtCoreEngine::new(
+            PeerId::from_bytes([0u8; 32]),
+            4,
+            false,
+            DEFAULT_SWAP_THRESHOLD,
+        )
+        .unwrap();
+        dht.set_trust_quarantine_thresholds(0.20, 0.45).unwrap();
+
+        let mut existing_id = [0u8; 32];
+        existing_id[0] = 0x80;
+        let existing_peer = PeerId::from_bytes(existing_id);
+        dht.add_node_no_trust(make_node_with_addr(
+            existing_id,
+            "/ip4/10.99.0.1/udp/9000/quic",
+        ))
+        .await
+        .unwrap();
+
+        let mut unknown_id = [0u8; 32];
+        unknown_id[0] = 0x81;
+        let unknown_peer = PeerId::from_bytes(unknown_id);
+
+        assert!(
+            dht.should_avoid_automatic_candidate(&unknown_peer, 0.30)
+                .await,
+            "automatic lookup should skip unknown peers below new-peer admission threshold"
+        );
+        assert!(
+            !dht.should_avoid_automatic_candidate(&existing_peer, 0.30)
+                .await,
+            "existing routing-table peers above quarantine threshold should remain usable"
+        );
+    }
+
+    /// Removing one close peer can promote a non-close peer into the close
+    /// group. Existing routing-table peers above the quarantine threshold stay
+    /// even when below the new-peer admission threshold; peers below the
+    /// quarantine threshold are also retained while immediate eviction is
+    /// disabled.
+    #[tokio::test]
+    async fn test_close_group_gate_allows_existing_promotions_above_quarantine() {
+        let mut dht = DhtCoreEngine::new(
+            PeerId::from_bytes([0u8; 32]),
+            4,
+            false,
+            DEFAULT_SWAP_THRESHOLD,
+        )
+        .unwrap();
+        dht.set_trust_quarantine_thresholds(0.20, 0.45).unwrap();
+
+        let mut close_peer_ids = Vec::new();
+        for i in 1..=4u8 {
+            let mut id = [0u8; 32];
+            id[31] = i;
+            close_peer_ids.push(PeerId::from_bytes(id));
+            dht.add_node_no_trust(make_node_with_addr(
+                id,
+                &format!("/ip4/10.{i}.0.1/udp/9000/quic"),
+            ))
+            .await
+            .unwrap();
+        }
+        let mut promoted_id = [0u8; 32];
+        promoted_id[0] = 0x80;
+        let promoted_peer = PeerId::from_bytes(promoted_id);
+        dht.add_node_no_trust(make_node_with_addr(
+            promoted_id,
+            "/ip4/10.99.0.1/udp/9000/quic",
+        ))
+        .await
+        .unwrap();
+
+        let no_events = dht
+            .enforce_close_group_trust_gate(&|id| {
+                if *id == promoted_peer { 0.30 } else { 0.5 }
+            })
+            .await;
+        assert!(
+            no_events.is_empty(),
+            "peer outside the close group should not be evicted by close-group gate"
+        );
+        assert!(dht.has_node(&promoted_peer).await);
+
+        dht.remove_node_by_id(&close_peer_ids[0]).await;
+        let events = dht
+            .enforce_close_group_trust_gate(&|id| {
+                if *id == promoted_peer || *id == close_peer_ids[1] {
+                    0.30
+                } else {
+                    0.5
+                }
+            })
+            .await;
+
+        assert!(
+            !events.iter().any(
+                |event| matches!(event, RoutingTableEvent::PeerRemoved(id) if *id == promoted_peer)
+            ),
+            "existing promoted peer above quarantine threshold should stay"
+        );
+        assert!(dht.has_node(&promoted_peer).await);
+        assert!(
+            dht.has_node(&close_peer_ids[1]).await,
+            "existing close peer above quarantine threshold should stay"
+        );
+
+        let retained_events = dht
+            .enforce_close_group_trust_gate(&|id| {
+                if *id == promoted_peer { 0.10 } else { 0.5 }
+            })
+            .await;
+        assert!(
+            retained_events.is_empty(),
+            "existing promoted peer below quarantine threshold should stay while the routing table is at K"
+        );
+        assert!(dht.has_node(&promoted_peer).await);
+
+        let mut surplus_id = [0u8; 32];
+        surplus_id[0] = 0x90;
+        dht.add_node_no_trust(make_node_with_addr(
+            surplus_id,
+            "/ip4/10.100.0.1/udp/9000/quic",
+        ))
+        .await
+        .unwrap();
+
+        let quarantine_events = dht
+            .enforce_close_group_trust_gate(&|id| {
+                if *id == promoted_peer { 0.10 } else { 0.5 }
+            })
+            .await;
+        assert!(
+            quarantine_events.is_empty(),
+            "existing promoted peer below quarantine threshold should stay even when there is surplus"
+        );
+        assert!(dht.has_node(&promoted_peer).await);
+    }
+
+    /// A non-close peer below the quarantine threshold is avoided by automatic
+    /// lookup paths but is not removed merely for being below threshold.
+    #[tokio::test]
+    async fn test_non_close_quarantined_peer_is_avoided_but_not_evicted() {
+        let mut dht = DhtCoreEngine::new(
+            PeerId::from_bytes([0u8; 32]),
+            4,
+            false,
+            DEFAULT_SWAP_THRESHOLD,
+        )
+        .unwrap();
+        dht.set_trust_quarantine_thresholds(0.20, 0.45).unwrap();
+
+        for i in 1..=4u8 {
+            let mut id = [0u8; 32];
+            id[31] = i;
+            dht.add_node_no_trust(make_node_with_addr(
+                id,
+                &format!("/ip4/10.{i}.0.1/udp/9000/quic"),
+            ))
+            .await
+            .unwrap();
+        }
+
+        let mut far_id = [0u8; 32];
+        far_id[0] = 0x80;
+        let far_peer = PeerId::from_bytes(far_id);
+        dht.add_node_no_trust(make_node_with_addr(far_id, "/ip4/10.99.0.1/udp/9000/quic"))
+            .await
+            .unwrap();
+
+        let events = dht.enforce_close_group_quarantine(&far_peer, 0.10).await;
+        assert!(
+            events.is_empty(),
+            "non-close peer should not be immediately evicted"
+        );
+        assert!(dht.has_node(&far_peer).await);
+        assert!(
+            dht.should_avoid_for_lookup(&far_peer, 0.10),
+            "automatic lookup should avoid peers below quarantine threshold"
+        );
     }
 
     // -----------------------------------------------------------------------
