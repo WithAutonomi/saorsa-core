@@ -583,7 +583,7 @@ async fn pinned_address_survives_connection_drop() {
             "ExternalAddressDiscovered event should reach the pinned external \
              addresses within the timeout. If this fails, either saorsa-transport's \
              poll_discovery_task is not firing the broadcast event, or the \
-             ExternalAddressDiscovered branch in spawn_peer_address_update_forwarder \
+             ExternalAddressDiscovered branch in spawn_address_event_forwarder \
              is not pinning the address.",
         );
 
@@ -625,7 +625,7 @@ async fn pinned_address_survives_connection_drop() {
          {observed} after every live connection has dropped, but returned {after_drop:?}.\n\
          \n\
          Either the ExternalAddressDiscovered forwarder is not pinning the \
-         address (check spawn_peer_address_update_forwarder in \
+         address (check spawn_address_event_forwarder in \
          saorsa_transport_adapter.rs), or the pinned path in \
          TransportHandle::observed_external_address() is not reading it."
     );

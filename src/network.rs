@@ -20,10 +20,8 @@ use crate::adaptive::trust::{TrustRecord, TrustSnapshot};
 use crate::adaptive::{AdaptiveDHT, AdaptiveDhtConfig, TrustEngine, TrustEvent};
 use crate::bootstrap::cache::{CachedCloseGroupPeer, CloseGroupCache};
 use crate::dht::core_engine::AddressType;
-use crate::dht_network_manager::{
-    DhtNetworkConfig, DhtNetworkEvent, DhtNetworkManager, IDENTITY_EXCHANGE_TIMEOUT,
-};
-use crate::error::{IdentityError, NetworkError, P2PError, P2pResult as Result};
+use crate::dht_network_manager::{DhtNetworkConfig, DhtNetworkEvent, DhtNetworkManager};
+use crate::error::{NetworkError, P2PError, P2pResult as Result};
 use crate::reachability::spawn_acquisition_driver;
 
 use crate::MultiAddr;
@@ -137,7 +135,8 @@ const DEFAULT_CONNECTION_TIMEOUT_SECS: u64 = 25;
 
 /// Timeout in seconds for waiting on a bootstrap peer's identity exchange.
 ///
-/// Tighter than the post-bootstrap budget (`IDENTITY_EXCHANGE_TIMEOUT`,
+/// Tighter than the post-bootstrap budget
+/// ([`crate::dht_network_manager::IDENTITY_EXCHANGE_TIMEOUT`],
 /// 5 s) on purpose: bootstrap candidates are unverified and a stuck one
 /// must not be allowed to head-of-line block convergence. 3 s covers
 /// loopback (<100 ms) and direct WAN paths (~1–2 s with one handshake
@@ -1064,7 +1063,7 @@ impl P2PNode {
     ///
     /// `timeout` bounds only the response wait inside the transport; the dial
     /// is independently bounded by `connect_peer_typed` plus
-    /// [`IDENTITY_EXCHANGE_TIMEOUT`].
+    /// [`crate::dht_network_manager::IDENTITY_EXCHANGE_TIMEOUT`].
     async fn send_request_reconnecting(
         &self,
         peer_id: &PeerId,
@@ -1303,104 +1302,6 @@ impl P2PNode {
             );
         } else {
             info!("client mode — skipping relay acquisition driver");
-        }
-
-        // Spawn background task to forward peer address updates to the DHT.
-        //
-        // Two event streams are bridged from the transport layer onto DHT
-        // routing-table mutations:
-        //
-        //  - **Relay established**: when THIS node sets up a MASQUE relay,
-        //    perform a DHT self-lookup so the transport's re-advertisement
-        //    loop can ADD_ADDRESS the new relay address to the K closest
-        //    peers — propagating it beyond peers we already happen to be
-        //    connected to.
-        //  - **Peer address update**: when a connected peer advertises a new
-        //    reachable address via ADD_ADDRESS (typically its relay), update
-        //    the DHT routing table so future lookups return that address.
-        //
-        // Both are handled in a `tokio::select!` against the receiver
-        // futures so updates propagate immediately. The previous
-        // implementation polled both queues on a 1-second interval, which
-        // opened a race window in which a freshly-established relay was
-        // invisible to outbound DHT queries until the next tick — causing
-        // the first peers to dial direct (and fail) before learning about
-        // the relay.
-        //
-        // **Slow work isolation**: the relay-propagation path runs an
-        // iterative DHT lookup (`find_closest_nodes_network`) which can
-        // take many seconds. Doing it inline in the select loop would
-        // starve the peer-address-update branch and back up the bounded
-        // forwarder mpsc into drop territory. Instead, the lookup +
-        // publish is detached into its own task per relay event, so the
-        // select loop keeps polling both branches.
-        // DHT_BRIDGE: forward peer-advertised address updates from the
-        // transport layer onto DHT routing table mutations. When a connected
-        // peer's ADD_ADDRESS notification carries a different IP than the
-        // connection's source (i.e., the peer is behind a relay or has
-        // migrated), merge the advertised address into the peer's DHT entry.
-        //
-        // This node's OWN relay state changes are NOT handled here — the
-        // relay acquisition driver (see `reachability::driver`) owns them
-        // directly, so the "relay established" branch no longer belongs to
-        // the bridge. The driver knows the full typed address set for the
-        // self-record; the bridge did not.
-        {
-            let transport = Arc::clone(&self.transport);
-            let dht = self.adaptive_dht.dht_manager().clone();
-            let shutdown = self.shutdown.clone();
-            tokio::spawn(async move {
-                loop {
-                    tokio::select! {
-                        biased;
-                        _ = shutdown.cancelled() => break,
-                        update = transport.recv_peer_address_update() => {
-                            let Some((peer_addr, advertised_addr)) = update else { break };
-                            let normalized_peer =
-                                saorsa_transport::shared::normalize_socket_addr(peer_addr);
-                            let normalized_adv =
-                                saorsa_transport::shared::normalize_socket_addr(advertised_addr);
-                            // Only update DHT when the advertised IP differs
-                            // from the peer's connection IP. Same-IP updates
-                            // are just different NATted ports (useless for
-                            // symmetric NAT); different-IP means a relay.
-                            if normalized_peer.ip() == normalized_adv.ip() {
-                                debug!(
-                                    "DHT_BRIDGE: dropping same-IP update peer={} addr={}",
-                                    normalized_peer,
-                                    normalized_adv
-                                );
-                                continue;
-                            }
-                            info!(
-                                "DHT_BRIDGE: processing relay update peer={} addr={}",
-                                normalized_peer,
-                                normalized_adv
-                            );
-                            // Look up peer ID by address (tries both IPv4 and
-                            // IPv4-mapped IPv6 forms via dual_stack_alternate).
-                            // For symmetric NAT, this may fail because the
-                            // connection's channel key uses a different NATted port.
-                            if let Some(peer_id) = transport.peer_id_for_addr(&normalized_peer).await {
-                                let multi_addr = MultiAddr::quic(normalized_adv);
-                                info!(
-                                    "Updating DHT: peer {} relay address {} (connection was {})",
-                                    peer_id, advertised_addr, peer_addr
-                                );
-                                if !dht
-                                    .touch_legacy_relay_hint_if_unsequenced(&peer_id, &multi_addr)
-                                    .await
-                                {
-                                    debug!(
-                                        "DHT_BRIDGE: ignored legacy relay hint for sequenced peer {} addr {}",
-                                        peer_id, advertised_addr
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-            });
         }
 
         self.is_started
@@ -1699,14 +1600,6 @@ impl P2PNode {
         saved_addrs: &[MultiAddr],
         stale_channels: &[String],
     ) -> Result<()> {
-        // Resolve a dial address: caller-provided > saved > DHT.
-        let (address, kind) = self
-            .resolve_dial_address(peer_id, addrs, saved_addrs)
-            .await
-            .ok_or_else(|| {
-                P2PError::Network(NetworkError::PeerNotFound(peer_id.to_hex().into()))
-            })?;
-
         // Tear down stale QUIC connections using their actual channel IDs.
         // transport.send_message only removes bookkeeping (peer_to_channel,
         // peers, active_connections) — it does NOT close the underlying QUIC
@@ -1719,31 +1612,17 @@ impl P2PNode {
             tokio::time::sleep(QUIC_TEARDOWN_GRACE).await;
         }
 
-        // Dial and wait for identity exchange.
-        let channel_id = self.transport.connect_peer_typed(&address, kind).await?;
-        let authenticated = match self
-            .transport
-            .wait_for_peer_identity(&channel_id, IDENTITY_EXCHANGE_TIMEOUT)
-            .await
-        {
-            Ok(peer) => peer,
-            Err(e) => {
-                // Close the freshly-dialed QUIC connection so it doesn't
-                // linger as a zombie until idle timeout.
-                self.transport.disconnect_channel(&channel_id).await;
-                return Err(e);
-            }
-        };
-
-        if &authenticated != peer_id {
-            self.transport.disconnect_channel(&channel_id).await;
-            return Err(P2PError::Identity(IdentityError::IdentityMismatch {
-                expected: peer_id.to_hex().into(),
-                actual: authenticated.to_hex().into(),
-            }));
+        let candidates = self
+            .resolve_dial_candidates(peer_id, addrs, saved_addrs)
+            .await;
+        if candidates.is_empty() {
+            return Err(P2PError::Network(NetworkError::PeerNotFound(
+                peer_id.to_hex().into(),
+            )));
         }
-
-        Ok(())
+        self.adaptive_dht
+            .ensure_peer_channel(peer_id, &candidates)
+            .await
     }
 
     /// Tear down stale channels, reconnect to a peer, and send a message.
@@ -1762,51 +1641,35 @@ impl P2PNode {
         self.transport.send_message(peer_id, protocol, data).await
     }
 
-    /// Resolve a dial address for `peer_id`, preferring caller-provided
+    /// Resolve typed dial candidates for `peer_id`, preferring caller-provided
     /// addresses over cached/DHT sources.
     ///
-    /// Returns the first dialable (QUIC, non-unspecified) address found,
-    /// paired with the [`AddressType`] the DHT routing table believes
-    /// for that address. Caller-provided / saved addresses that don't
-    /// appear in the routing table fall back to
+    /// Returns every dialable (QUIC, non-unspecified) address from the first
+    /// non-empty source. Caller-provided / saved addresses inherit the
+    /// [`AddressType`] from the DHT when possible and otherwise fall back to
     /// [`AddressType::Unverified`] — the same default the routing table
     /// applies to legacy peers that never asserted reachability.
-    /// Returns `None` when no dialable address is available.
-    async fn resolve_dial_address(
+    async fn resolve_dial_candidates(
         &self,
         peer_id: &PeerId,
         caller_addrs: &[MultiAddr],
         saved_addrs: &[MultiAddr],
-    ) -> Option<(MultiAddr, AddressType)> {
-        // Caller- and saved-supplied addresses skip the routing-table read.
-        // The kind is only consumed as a log tag by `connect_peer_typed`, so
-        // defaulting to Unverified — the same fallback the routing table
-        // applies to legacy peers — saves an async lookup on the hot
-        // reconnect path. Only consult the DHT when both upstream sources
-        // are exhausted.
-        if let Some(addr) = Self::first_dialable(caller_addrs) {
-            return Some((addr, AddressType::Unverified));
-        }
-        if let Some(addr) = Self::first_dialable(saved_addrs) {
-            return Some((addr, AddressType::Unverified));
-        }
-
-        self.adaptive_dht
+    ) -> Vec<(MultiAddr, AddressType)> {
+        let dht_candidates = self
+            .adaptive_dht
             .peer_addresses_for_dial_typed(peer_id)
-            .await
-            .into_iter()
-            .find(|(a, _)| {
-                a.dialable_socket_addr()
-                    .is_some_and(|sa| !sa.ip().is_unspecified())
-            })
-    }
+            .await;
+        let preferred = if !caller_addrs.is_empty() {
+            caller_addrs
+        } else if !saved_addrs.is_empty() {
+            saved_addrs
+        } else {
+            return dht_candidates;
+        };
 
-    /// Return the first dialable QUIC address from a slice, skipping
-    /// non-QUIC and unspecified (`0.0.0.0` / `::`) addresses.
-    fn first_dialable(addrs: &[MultiAddr]) -> Option<MultiAddr> {
-        addrs
+        preferred
             .iter()
-            .find(|a| {
+            .filter(|a| {
                 let dialable = a
                     .dialable_socket_addr()
                     .is_some_and(|sa| !sa.ip().is_unspecified());
@@ -1815,7 +1678,14 @@ impl P2PNode {
                 }
                 dialable
             })
-            .cloned()
+            .map(|addr| {
+                let kind = dht_candidates
+                    .iter()
+                    .find_map(|(candidate, kind)| (candidate == addr).then_some(*kind))
+                    .unwrap_or(AddressType::Unverified);
+                (addr.clone(), kind)
+            })
+            .collect()
     }
 
     /// Get or create a per-peer reconnect lock.

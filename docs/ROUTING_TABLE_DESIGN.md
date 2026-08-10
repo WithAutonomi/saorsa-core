@@ -396,10 +396,10 @@ The routing table MUST emit events on membership changes to allow consumers to r
 |---|---|
 | `PeerAdded(PeerId)` | New peer inserted into routing table |
 | `PeerRemoved(PeerId)` | Peer evicted, blocked, or departed |
-| `KClosestPeersChanged { old, new }` | Composition of the `K_BUCKET_SIZE`-closest peers to self changed |
+| `KClosestPeersChanged { old, new, added, removed }` | Composition of the `K_BUCKET_SIZE`-closest peers to self changed |
 | `BootstrapComplete { num_peers }` | Bootstrap process finished (routing table stabilized or timeout reached) |
 
-`KClosestPeersChanged` is emitted when a routing table admission attempt causes the set of `K_BUCKET_SIZE` nearest peers to self to differ from the pre-admission set. The routing table snapshots the K-closest set before each admission attempt and compares after; the event carries both the old and new sets. This fires at most once per admission attempt — the entire admission (including sub-mutations like swaps and stale evictions) is treated as one logical operation.
+`KClosestPeersChanged` is emitted when a routing table admission attempt causes the set of `K_BUCKET_SIZE` nearest peers to self to differ from the pre-admission set. The routing table snapshots the K-closest set before each admission attempt and compares after; the network event carries the old and new sets plus their precomputed `added` and `removed` differences. This fires at most once per admission attempt — the entire admission (including sub-mutations like swaps and stale evictions) is treated as one logical operation.
 
 `BootstrapComplete` is emitted once per bootstrap cycle — both at initial startup and on each auto re-bootstrap (Section 10.3). It fires when the bootstrap lookups for that cycle complete — specifically, after the self-lookup and bucket refresh operations (Section 11) have all terminated. The event carries the total number of peers in the routing table at the time of emission. Consumers (e.g., replication, application-layer services) SHOULD wait for this event before initiating operations that depend on a populated routing table.
 
