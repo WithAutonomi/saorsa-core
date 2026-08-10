@@ -50,6 +50,13 @@ An Architecture Decision Record (ADR) is a document that captures an important a
 |-----|-------|--------|---------|
 | [ADR-013](./ADR-013-no-offline-delivery-v1.md) | No Offline Message Delivery (v1) | Accepted | 1-hour TTL limit without extended offline delivery (future reconsideration) |
 
+### Reachability
+
+| ADR | Title | Status | Summary |
+|-----|-------|--------|---------|
+| [ADR-014](./ADR-014-proactive-relay-first-nat-traversal.md) | Proactive Relay-First NAT Traversal | Superseded | Initial proactive-relay design replaced by canary-gated publication |
+| [ADR-016](./ADR-016-canary-gated-proactive-relays.md) | Canary-Gated Proactive Relays | Accepted | Signed allocation receipts, isolated witnesses, stable relay lifecycle, and sequenced publication |
+
 ### Operations
 
 | ADR | Title | Status | Summary |

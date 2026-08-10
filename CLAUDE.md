@@ -181,8 +181,7 @@ cargo test --lib
 ## Licensing
 
 Dual-licensed:
-- **AGPL-3.0**: For open source use
-- **Commercial**: Contact david@saorsalabs.com
+- **MIT OR Apache-2.0**: dual-licensed, at the user's option
 
 All files must include the copyright header with dual-licensing notice.
 

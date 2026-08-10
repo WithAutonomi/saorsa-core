@@ -235,12 +235,12 @@ cargo fmt --all
 
 ## License
 
-This project is dual-licensed:
+Licensed under either of
 
-- **AGPL-3.0**: Open source license for open source projects
-- **Commercial**: Commercial license for proprietary projects
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or https://opensource.org/licenses/MIT)
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or https://www.apache.org/licenses/LICENSE-2.0)
 
-For commercial licensing, contact: david@saorsalabs.com
+at your option.
 
 ## Dependencies
 

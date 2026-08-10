@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed
+Superseded by [ADR-016](./ADR-016-canary-gated-proactive-relays.md)
 
 ## Context
 

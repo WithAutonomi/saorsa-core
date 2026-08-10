@@ -1,11 +1,10 @@
 // Copyright 2024 Saorsa Labs Limited
 //
-// This software is dual-licensed under:
-// - GNU Affero General Public License v3.0 or later (AGPL-3.0-or-later)
-// - Commercial License
-//
-// For AGPL-3.0 license, see LICENSE-AGPL-3.0
-// For commercial licensing, contact: david@saorsalabs.com
+// This software is licensed under the MIT license <LICENSE-MIT or
+// https://opensource.org/licenses/MIT> or the Apache License, Version 2.0
+// <LICENSE-APACHE or https://www.apache.org/licenses/LICENSE-2.0>, at your
+// option. This file may not be copied, modified, or distributed except
+// according to those terms.
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under these licenses is distributed on an "AS IS" BASIS,
@@ -275,6 +274,21 @@ impl AdaptiveDHT {
     ) -> Vec<(MultiAddr, AddressType)> {
         self.dht_manager
             .peer_addresses_for_dial_typed(peer_id)
+            .await
+    }
+
+    /// Ensure the shared DHT dial coordinator has an authenticated channel.
+    ///
+    /// Keeping application reconnects on the same path as iterative lookups
+    /// means both callers share address-failure suppression and never create
+    /// independent retry loops against a known-bad relay.
+    pub(crate) async fn ensure_peer_channel(
+        &self,
+        peer_id: &PeerId,
+        candidates: &[(MultiAddr, AddressType)],
+    ) -> Result<()> {
+        self.dht_manager
+            .ensure_peer_channel(peer_id, candidates)
             .await
     }
 }

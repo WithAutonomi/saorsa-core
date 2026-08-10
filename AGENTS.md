@@ -56,7 +56,7 @@ trust_engine
 - **Rust 2024 edition** with `rustfmt` (4 spaces, standard rules)
 - **Clippy config**: `.clippy.toml` allows unwrap/expect in tests
 - **Documentation**: All public items must be documented
-- **Copyright**: Include AGPL-3.0 header on all files
+- **Copyright**: Include the dual MIT/Apache-2.0 header on all files
 
 ### Architecture Patterns
 - **Async traits**: Use `#[async_trait]` for async trait methods

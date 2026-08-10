@@ -2,19 +2,14 @@
 
 // This file is part of the Saorsa P2P network.
 
-// Licensed under the AGPL-3.0 license:
-// <https://www.gnu.org/licenses/agpl-3.0.html>
-
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Affero General Public License for more details.
-
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <https://www.gnu.org/licenses/>.
+// This software is licensed under the MIT license <LICENSE-MIT or
+// https://opensource.org/licenses/MIT> or the Apache License, Version 2.0
+// <LICENSE-APACHE or https://www.apache.org/licenses/LICENSE-2.0>, at your
+// option. This file may not be copied, modified, or distributed except
+// according to those terms.
 
 // Copyright 2024 P2P Foundation
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Peer Identity
 //!
@@ -70,6 +65,24 @@ pub fn peer_id_from_public_key_bytes(bytes: &[u8]) -> Result<PeerId> {
     })?;
 
     Ok(peer_id_from_public_key(&public_key))
+}
+
+/// Create a [`PeerId`] from an authenticated ML-DSA-65 TLS SPKI.
+///
+/// `saorsa-transport` exposes the exact peer certificate identity from a
+/// completed QUIC/TLS handshake as DER-encoded SubjectPublicKeyInfo. Validate
+/// the DER shape, algorithm identifier, absent ML-DSA parameters, and
+/// byte-aligned key before deriving the overlay identity from the raw key.
+pub(crate) fn peer_id_from_public_key_spki(spki_bytes: &[u8]) -> Result<PeerId> {
+    let public_key =
+        saorsa_transport::crypto::raw_public_keys::pqc::extract_public_key_from_spki(spki_bytes)
+            .map_err(|e| {
+                P2PError::Identity(IdentityError::InvalidFormat(
+                    format!("Invalid ML-DSA SubjectPublicKeyInfo: {e}").into(),
+                ))
+            })?;
+
+    peer_id_from_public_key_bytes(public_key.as_bytes())
 }
 
 /// Public node identity information (without secret keys) - safe to clone
@@ -331,6 +344,37 @@ impl NodeIdentity {
 mod tests {
     use super::*;
 
+    fn ml_dsa_65_spki(public_key: &[u8]) -> Vec<u8> {
+        const OID: [u8; 9] = [0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x12];
+        let bit_string_len = public_key.len() + 1;
+        let algorithm_len = 2 + OID.len();
+        let algorithm_total_len = 2 + algorithm_len;
+        let bit_string_total_len = 4 + bit_string_len;
+        let outer_len = algorithm_total_len + bit_string_total_len;
+
+        let mut encoded = Vec::with_capacity(4 + outer_len);
+        encoded.extend_from_slice(&[
+            0x30,
+            0x82,
+            (outer_len >> 8) as u8,
+            outer_len as u8,
+            0x30,
+            algorithm_len as u8,
+            0x06,
+            OID.len() as u8,
+        ]);
+        encoded.extend_from_slice(&OID);
+        encoded.extend_from_slice(&[
+            0x03,
+            0x82,
+            (bit_string_len >> 8) as u8,
+            bit_string_len as u8,
+            0x00,
+        ]);
+        encoded.extend_from_slice(public_key);
+        encoded
+    }
+
     #[test]
     fn test_peer_id_generation() {
         let (public_key, _secret_key) = crate::quantum_crypto::generate_ml_dsa_keypair()
@@ -343,6 +387,37 @@ mod tests {
         // Should be deterministic
         let peer_id2 = peer_id_from_public_key(&public_key);
         assert_eq!(peer_id, peer_id2);
+    }
+
+    #[test]
+    fn transport_spki_derives_same_peer_id_as_raw_key() {
+        let (public_key, _secret_key) = crate::quantum_crypto::generate_ml_dsa_keypair()
+            .expect("ML-DSA key generation should succeed");
+        let spki = ml_dsa_65_spki(public_key.as_bytes());
+
+        let from_spki =
+            peer_id_from_public_key_spki(&spki).expect("valid ML-DSA SPKI should parse");
+
+        assert_eq!(from_spki, peer_id_from_public_key(&public_key));
+    }
+
+    #[test]
+    fn transport_spki_rejects_wrong_algorithm() {
+        let (public_key, _secret_key) = crate::quantum_crypto::generate_ml_dsa_keypair()
+            .expect("ML-DSA key generation should succeed");
+        let mut spki = ml_dsa_65_spki(public_key.as_bytes());
+        let oid_last_byte = 16;
+        spki[oid_last_byte] = 0x11;
+
+        assert!(peer_id_from_public_key_spki(&spki).is_err());
+    }
+
+    #[test]
+    fn transport_spki_rejects_raw_public_key_bytes() {
+        let (public_key, _secret_key) = crate::quantum_crypto::generate_ml_dsa_keypair()
+            .expect("ML-DSA key generation should succeed");
+
+        assert!(peer_id_from_public_key_spki(public_key.as_bytes()).is_err());
     }
 
     #[test]

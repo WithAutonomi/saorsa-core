@@ -1,11 +1,10 @@
 // Copyright 2024 Saorsa Labs Limited
 //
-// This software is dual-licensed under:
-// - GNU Affero General Public License v3.0 or later (AGPL-3.0-or-later)
-// - Commercial License
-//
-// For AGPL-3.0 license, see LICENSE-AGPL-3.0
-// For commercial licensing, contact: david@saorsalabs.com
+// This software is licensed under the MIT license <LICENSE-MIT or
+// https://opensource.org/licenses/MIT> or the Apache License, Version 2.0
+// <LICENSE-APACHE or https://www.apache.org/licenses/LICENSE-2.0>, at your
+// option. This file may not be copied, modified, or distributed except
+// according to those terms.
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under these licenses is distributed on an "AS IS" BASIS,
@@ -22,7 +21,7 @@ use crate::PeerId;
 use crate::bgp_geo_provider::BgpGeoProvider;
 use crate::dht::core_engine::AddressType;
 use crate::error::{NetworkError, P2PError, P2pResult as Result, SendFailureKind, TransportError};
-use crate::identity::node_identity::NodeIdentity;
+use crate::identity::node_identity::{NodeIdentity, peer_id_from_public_key_spki};
 use crate::network::{
     ConnectionStatus, MAX_ACTIVE_REQUESTS, MAX_REQUEST_TIMEOUT, MESSAGE_RECV_CHANNEL_CAPACITY,
     NetworkSender, P2PEvent, ParsedMessage, PeerInfo, PeerResponse, PendingRequest,
@@ -38,6 +37,7 @@ use crate::validation::{RateLimitConfig, RateLimiter};
 
 use dashmap::mapref::entry::Entry as DashEntry;
 use dashmap::{DashMap, DashSet};
+use saorsa_transport::nat_traversal_api::PreparedRelay;
 use std::collections::HashSet;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -282,18 +282,7 @@ pub struct TransportHandle {
     #[allow(dead_code)]
     geo_provider: Arc<BgpGeoProvider>,
     shutdown: CancellationToken,
-    /// Peer address updates from ADD_ADDRESS frames (relay address advertisement).
-    ///
-    /// Bounded mpsc — see
-    /// [`crate::transport::saorsa_transport_adapter::ADDRESS_EVENT_CHANNEL_CAPACITY`].
-    /// The producer (`spawn_peer_address_update_forwarder`) drops events
-    /// rather than blocking when the consumer is slow.
-    peer_address_update_rx:
-        tokio::sync::Mutex<tokio::sync::mpsc::Receiver<(SocketAddr, SocketAddr)>>,
     /// Relay established events — received when this node sets up a MASQUE relay.
-    ///
-    /// Bounded mpsc with the same drop semantics as
-    /// `peer_address_update_rx`.
     relay_established_rx: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<SocketAddr>>,
     /// Relay lost events — received when a previously-advertised MASQUE
     /// relay address is no longer reachable (tunnel died, health check
@@ -301,18 +290,12 @@ pub struct TransportHandle {
     /// to trigger an immediate DHT republish with the stale relay
     /// address removed — without this, peers keep dialing the dead
     /// relay for the full health-poll cycle (5 s) or longer.
-    ///
-    /// Bounded mpsc with the same drop semantics as
-    /// `peer_address_update_rx`.
     relay_lost_rx: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<SocketAddr>>,
     /// Direct address promotion events — received when the passive
     /// reachability classifier proves one of this node's pinned external
     /// addresses is cold-dialable. Drained by the reachability driver while
     /// holding a relay so it can republish `Relay + Direct` instead of
     /// leaving peers with the older `Relay + Unverified` self-record.
-    ///
-    /// Bounded mpsc with the same drop semantics as
-    /// `peer_address_update_rx`.
     direct_address_promoted_rx: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<SocketAddr>>,
     /// Latest direct-address promotion for observers/tests. This is
     /// separate from the driver's single-consumer mpsc receiver so callers
@@ -325,9 +308,6 @@ pub struct TransportHandle {
     /// Direct without crossing the Direct proof threshold. Drained by the
     /// reachability driver so a relay-only self-record can be corrected as
     /// soon as a non-relay fallback appears.
-    ///
-    /// Bounded mpsc with the same drop semantics as
-    /// `peer_address_update_rx`.
     self_address_updated_rx: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<SocketAddr>>,
     /// Latest self-address update for observers/tests. Separate from the
     /// driver's single-consumer mpsc receiver for the same reason as
@@ -431,6 +411,26 @@ pub struct TransportHandle {
     proof_eligible_peers: Arc<DashSet<IpAddr>>,
 }
 
+struct ActiveRequestGuard {
+    active_requests: Arc<DashMap<String, PendingRequest>>,
+    message_id: String,
+}
+
+impl ActiveRequestGuard {
+    fn new(active_requests: Arc<DashMap<String, PendingRequest>>, message_id: String) -> Self {
+        Self {
+            active_requests,
+            message_id,
+        }
+    }
+}
+
+impl Drop for ActiveRequestGuard {
+    fn drop(&mut self) {
+        self.active_requests.remove(&self.message_id);
+    }
+}
+
 // ============================================================================
 // Construction
 // ============================================================================
@@ -516,7 +516,6 @@ impl TransportHandle {
         let proof_eligible_peers: Arc<DashSet<IpAddr>> = Arc::new(DashSet::new());
 
         // Subscribe to address-related P2pEvents from the transport layer:
-        //   - PeerAddressUpdated → mpsc, drained by the DHT bridge
         //   - RelayEstablished → mpsc, drained by the DHT bridge
         //   - RelayLost → mpsc, drained by the reachability driver
         //   - DirectAddressPromoted → mpsc, drained by the reachability driver
@@ -544,15 +543,14 @@ impl TransportHandle {
             self_address_updated_tx,
             self_address_updated_watch_tx.clone(),
         );
-        let (peer_addr_update_rx, relay_established_rx, relay_lost_rx) = dual_node
-            .spawn_peer_address_update_forwarder(
-                Arc::clone(&external_addresses),
-                Arc::clone(&peer_observations),
-                Arc::clone(&proof_eligible_peers),
-                Arc::clone(&proven_externals),
-                direct_promoted_events.clone(),
-                self_address_updated_events.clone(),
-            );
+        let (relay_established_rx, relay_lost_rx) = dual_node.spawn_address_event_forwarder(
+            Arc::clone(&external_addresses),
+            Arc::clone(&peer_observations),
+            Arc::clone(&proof_eligible_peers),
+            Arc::clone(&proven_externals),
+            direct_promoted_events.clone(),
+            self_address_updated_events.clone(),
+        );
 
         dual_node.spawn_direct_reachability_classifier(
             Arc::clone(&dialed_addrs),
@@ -621,7 +619,6 @@ impl TransportHandle {
             traffic,
             geo_provider,
             shutdown,
-            peer_address_update_rx: tokio::sync::Mutex::new(peer_addr_update_rx),
             relay_established_rx: tokio::sync::Mutex::new(relay_established_rx),
             relay_lost_rx: tokio::sync::Mutex::new(relay_lost_rx),
             direct_address_promoted_rx: tokio::sync::Mutex::new(direct_address_promoted_rx),
@@ -703,12 +700,6 @@ impl TransportHandle {
             traffic: Arc::new(TrafficCounters::default()),
             geo_provider: Arc::new(BgpGeoProvider::new()),
             shutdown: CancellationToken::new(),
-            peer_address_update_rx: {
-                let (_tx, rx) = tokio::sync::mpsc::channel(
-                    crate::transport::saorsa_transport_adapter::ADDRESS_EVENT_CHANNEL_CAPACITY,
-                );
-                tokio::sync::Mutex::new(rx)
-            },
             relay_established_rx: {
                 let (_tx, rx) = tokio::sync::mpsc::channel(
                     crate::transport::saorsa_transport_adapter::ADDRESS_EVENT_CHANNEL_CAPACITY,
@@ -1020,37 +1011,12 @@ impl TransportHandle {
             .and_then(|p| p.value().iter().next().copied())
     }
 
-    /// Drain pending peer address updates from ADD_ADDRESS frames.
-    ///
-    /// Returns (peer_connection_addr, advertised_addr) pairs. The caller
-    /// should look up the peer ID and update the DHT routing table.
-    pub async fn drain_peer_address_updates(&self) -> Vec<(SocketAddr, SocketAddr)> {
-        let mut rx = self.peer_address_update_rx.lock().await;
-        let mut updates = Vec::new();
-        while let Ok(update) = rx.try_recv() {
-            updates.push(update);
-        }
-        updates
-    }
-
     /// Drain any relay established events. Returns the relay address if this
     /// node has just established a MASQUE relay.
     pub async fn drain_relay_established(&self) -> Option<SocketAddr> {
         let mut rx = self.relay_established_rx.lock().await;
         // Only care about the first one (relay is established once)
         rx.try_recv().ok()
-    }
-
-    /// Wait for the next peer-address update from an ADD_ADDRESS frame.
-    ///
-    /// Returns `(peer_connection_addr, advertised_addr)` when one arrives,
-    /// or `None` if the underlying channel has closed (transport shut down).
-    ///
-    /// Use this in a `tokio::select!` against a shutdown token to react to
-    /// address updates immediately instead of polling.
-    pub async fn recv_peer_address_update(&self) -> Option<(SocketAddr, SocketAddr)> {
-        let mut rx = self.peer_address_update_rx.lock().await;
-        rx.recv().await
     }
 
     /// Wait for the next relay-established event.
@@ -1368,12 +1334,46 @@ impl TransportHandle {
         self.connect_peer_inner(address, Some(kind)).await
     }
 
+    /// Connect to a prospective relay during third-party canary validation.
+    ///
+    /// The transport semantics remain [`AddressType::Relay`], but the
+    /// dedicated structured log kind keeps a failed pre-publication probe
+    /// distinguishable from a failed dial of an already-published relay.
+    pub(crate) async fn probe_relay_canary_authenticated(
+        &self,
+        address: &MultiAddr,
+    ) -> Result<PeerId> {
+        let socket_addr = address.dialable_socket_addr().ok_or_else(|| {
+            P2PError::Network(NetworkError::InvalidAddress(
+                format!("relay canary requires a QUIC address, got {address}").into(),
+            ))
+        })?;
+        let target = normalize_wildcard_to_loopback(socket_addr);
+        let peer_public_key_spki = self
+            .dual_node
+            .probe_fresh_authenticated(target)
+            .await
+            .map_err(|error| P2PError::connection_failed(target, error.to_string()))?;
+        peer_id_from_public_key_spki(&peer_public_key_spki)
+    }
+
     async fn connect_peer_inner(
         &self,
         address: &MultiAddr,
         kind: Option<AddressType>,
     ) -> Result<String> {
-        let kind_label = address_kind_label(kind);
+        self.connect_peer_inner_authenticated(address, kind, None)
+            .await
+            .map(|(channel_id, _)| channel_id)
+    }
+
+    async fn connect_peer_inner_authenticated(
+        &self,
+        address: &MultiAddr,
+        kind: Option<AddressType>,
+        log_kind: Option<&'static str>,
+    ) -> Result<(String, Option<Vec<u8>>)> {
+        let kind_label = log_kind.unwrap_or_else(|| address_kind_label(kind));
 
         // Require a dialable (QUIC) transport.
         let socket_addr = address.dialable_socket_addr().ok_or_else(|| {
@@ -1406,8 +1406,13 @@ impl TransportHandle {
             dial_target_normalized.ip(),
         ));
 
-        let peer_id = match self.dual_node.connect_happy_eyeballs(&addr_list).await {
-            Ok(addr) => {
+        let (peer_id, peer_public_key_spki) = match self
+            .dual_node
+            .connect_happy_eyeballs_authenticated(&addr_list)
+            .await
+        {
+            Ok(dialed_peer) => {
+                let addr = dialed_peer.remote_addr;
                 let connected_peer_id = canonical_channel_id(addr);
 
                 // Prevent self-connections by comparing against all listen
@@ -1435,7 +1440,7 @@ impl TransportHandle {
                     channel_id = %connected_peer_id,
                     "Successfully connected to channel"
                 );
-                connected_peer_id
+                (connected_peer_id, dialed_peer.peer_public_key_spki)
             }
             Err(e) => {
                 warn!(
@@ -1468,7 +1473,7 @@ impl TransportHandle {
 
         // PeerConnected is emitted later when the peer's identity is
         // authenticated via a signed message — not at transport level.
-        Ok(peer_id)
+        Ok((peer_id, peer_public_key_spki))
     }
 
     /// Check if the proactive relay session is still alive.
@@ -1476,8 +1481,8 @@ impl TransportHandle {
     /// Returns `true` if no relay was established or the relay is healthy.
     /// Returns `false` if a relay was established but the QUIC connection
     /// has closed. Used by the relayer monitor (ADR-014 item 6).
-    pub fn is_relay_healthy(&self) -> bool {
-        self.dual_node.is_relay_healthy()
+    pub async fn is_relay_healthy(&self) -> bool {
+        self.dual_node.is_relay_healthy().await
     }
 
     /// Enable or disable relay serving on this node's MASQUE relay servers.
@@ -1489,15 +1494,15 @@ impl TransportHandle {
         self.dual_node.set_relay_serving_enabled(enabled);
     }
 
-    /// Establish a proactive MASQUE relay session with the peer reachable at
-    /// `relay_addr`, returning the relay-allocated public socket address on
-    /// success.
+    /// Prepare a proactive MASQUE relay session with the peer reachable at
+    /// `relay_addr`, returning its provisional public socket address.
     ///
     /// This is the caller-driven entry point for ADR-014 relay acquisition.
-    /// It delegates through [`DualStackNetworkNode::setup_proactive_relay`]
-    /// to saorsa-transport's `NatTraversalEndpoint::setup_proactive_relay`,
-    /// which establishes the MASQUE `CONNECT-UDP` session and rebinds the
-    /// local Quinn endpoint onto the tunnel.
+    /// It delegates through [`DualStackNetworkNode::prepare_proactive_relay`]
+    /// to saorsa-transport's `NatTraversalEndpoint::prepare_proactive_relay`,
+    /// which establishes the MASQUE `CONNECT-UDP` session and a relay-backed
+    /// Quinn endpoint without advertising the address. The reachability driver
+    /// publishes or aborts the allocation after the canary verdict.
     ///
     /// Error conversion: saorsa-transport's `RelayAtCapacity` variant is
     /// mapped to [`RelaySessionEstablishError::AtCapacity`] so the acquisition
@@ -1507,7 +1512,7 @@ impl TransportHandle {
     pub async fn setup_proactive_relay_session(
         &self,
         relay_addr: SocketAddr,
-    ) -> std::result::Result<SocketAddr, RelaySessionEstablishError> {
+    ) -> std::result::Result<PreparedRelay, RelaySessionEstablishError> {
         use saorsa_transport::nat_traversal_api::NatTraversalError;
         use saorsa_transport::p2p_endpoint::EndpointError;
 
@@ -1516,12 +1521,12 @@ impl TransportHandle {
             "requesting proactive MASQUE relay session from transport layer"
         );
 
-        match self.dual_node.setup_proactive_relay(relay_addr).await {
+        match self.dual_node.prepare_proactive_relay(relay_addr).await {
             Ok(allocated) => {
                 info!(
                     relay = %relay_addr,
-                    allocated = %allocated,
-                    "proactive relay established"
+                    allocated = %allocated.public_addr(),
+                    "proactive relay prepared for canary verification"
                 );
                 Ok(allocated)
             }
@@ -1542,6 +1547,33 @@ impl TransportHandle {
                 Err(RelaySessionEstablishError::Unreachable(other.to_string()))
             }
         }
+    }
+
+    /// Commit a canary-verified proactive relay and advertise it to peers.
+    pub async fn publish_proactive_relay_session(&self, allocation: PreparedRelay) -> Result<()> {
+        let relay_public_addr = allocation.public_addr();
+        self.dual_node
+            .publish_proactive_relay(allocation)
+            .await
+            .map_err(|error| {
+                P2PError::Transport(TransportError::SetupFailed(
+                    format!("Failed to publish proactive relay {relay_public_addr}: {error}")
+                        .into(),
+                ))
+            })
+    }
+
+    /// Abort a proactive relay allocation and release its MASQUE resources.
+    pub async fn abort_proactive_relay_session(&self, allocation: PreparedRelay) -> Result<()> {
+        let relay_public_addr = allocation.public_addr();
+        self.dual_node
+            .abort_proactive_relay(allocation)
+            .await
+            .map_err(|error| {
+                P2PError::Transport(TransportError::SetupFailed(
+                    format!("Failed to abort proactive relay {relay_public_addr}: {error}").into(),
+                ))
+            })
     }
 
     /// Disconnect from a peer, closing the underlying QUIC connection only
@@ -1925,6 +1957,8 @@ impl TransportHandle {
                 expected_peer: *peer_id,
             },
         );
+        let _active_request_guard =
+            ActiveRequestGuard::new(Arc::clone(&self.active_requests), message_id.clone());
 
         let envelope = RequestResponseEnvelope {
             message_id: message_id.clone(),
@@ -1934,7 +1968,6 @@ impl TransportHandle {
         let envelope_bytes = match postcard::to_allocvec(&envelope) {
             Ok(bytes) => bytes,
             Err(e) => {
-                self.active_requests.remove(&message_id);
                 return Err(P2PError::Serialization(
                     format!("Failed to serialize request envelope: {e}").into(),
                 ));
@@ -1942,15 +1975,10 @@ impl TransportHandle {
         };
 
         let wire_protocol = format!("/rr/{}", protocol);
-        if let Err(e) = self
-            .send_message(peer_id, &wire_protocol, envelope_bytes)
-            .await
-        {
-            self.active_requests.remove(&message_id);
-            return Err(e);
-        }
+        self.send_message(peer_id, &wire_protocol, envelope_bytes)
+            .await?;
 
-        let result = match tokio::time::timeout(timeout, rx).await {
+        match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(response_bytes)) => {
                 let latency = started_at.elapsed();
                 Ok(PeerResponse {
@@ -1962,19 +1990,8 @@ impl TransportHandle {
             Ok(Err(_)) => Err(P2PError::Network(NetworkError::ConnectionClosed {
                 peer_id: peer_id.to_hex().into(),
             })),
-            Err(_) => Err(P2PError::Transport(
-                crate::error::TransportError::StreamError(
-                    format!(
-                        "Request to {} on {} timed out after {:?}",
-                        peer_id, protocol, timeout
-                    )
-                    .into(),
-                ),
-            )),
-        };
-
-        self.active_requests.remove(&message_id);
-        result
+            Err(_) => Err(P2PError::Timeout(timeout)),
+        }
     }
 
     /// Send a response to a previously received request.
@@ -2762,6 +2779,23 @@ impl TransportHandle {
                                                 .send_to_peer_optimized(&remote_address, &announce_bytes)
                                                 .await
                                             {
+                                                if e
+                                                    .downcast_ref::<saorsa_transport::p2p_endpoint::EndpointError>()
+                                                    .is_some_and(|error| matches!(
+                                                        error,
+                                                        saorsa_transport::p2p_endpoint::EndpointError::PeerNotFound(_)
+                                                    ))
+                                                {
+                                                    // A one-shot reachability probe closes as
+                                                    // soon as TLS exposes the target identity.
+                                                    // Its inbound Established event can race this
+                                                    // ordinary identity hook; by the time the send
+                                                    // runs there is intentionally no peer left.
+                                                    debug!(
+                                                        "Skipping identity announce for closed channel {channel_id_for_send}"
+                                                    );
+                                                    return;
+                                                }
                                                 // {e:#} prints the full anyhow cause chain so we
                                                 // can see the underlying reason (e.g. "peer did
                                                 // not acknowledge stream data within 1s",
@@ -2906,7 +2940,7 @@ impl RelaySessionEstablisher for TransportHandle {
     async fn establish(
         &self,
         relay_addr: SocketAddr,
-    ) -> std::result::Result<SocketAddr, RelaySessionEstablishError> {
+    ) -> std::result::Result<PreparedRelay, RelaySessionEstablishError> {
         self.setup_proactive_relay_session(relay_addr).await
     }
 }
@@ -2916,7 +2950,7 @@ impl RelaySessionEstablisher for Arc<TransportHandle> {
     async fn establish(
         &self,
         relay_addr: SocketAddr,
-    ) -> std::result::Result<SocketAddr, RelaySessionEstablishError> {
+    ) -> std::result::Result<PreparedRelay, RelaySessionEstablishError> {
         self.setup_proactive_relay_session(relay_addr).await
     }
 }
