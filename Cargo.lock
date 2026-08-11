@@ -2470,7 +2470,7 @@ dependencies = [
 
 [[package]]
 name = "saorsa-core"
-version = "0.26.4"
+version = "0.27.0-rc.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2584,8 +2584,8 @@ dependencies = [
 
 [[package]]
 name = "saorsa-transport"
-version = "0.35.2"
-source = "git+https://github.com/WithAutonomi/saorsa-transport.git?branch=fix%2Fpr136-provisional-relay#4b1ed67973763e4636694a9d9c0601ff41b9e933"
+version = "0.36.0-rc.1"
+source = "git+https://github.com/WithAutonomi/saorsa-transport?branch=rc-2026.8.2#f7bb6e9e94c264123b9a9d35855b890a8b3e4f07"
 dependencies = [
  "anyhow",
  "async-trait",
