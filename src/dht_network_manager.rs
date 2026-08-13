@@ -484,6 +484,33 @@ pub struct ResponderView {
 }
 
 impl DHTNode {
+    /// Publisher-provided Unix-nanosecond sequence from the latest
+    /// `PublishAddressSet`, when this record carries one.
+    ///
+    /// This value is derived from the publisher's wall clock. It is useful for
+    /// diagnostics but is not a trusted timestamp or proof of peer uptime.
+    #[must_use]
+    pub fn publisher_address_set_unix_ns(&self) -> Option<u64> {
+        let seq = dht_node_publish_seq(self);
+        (seq != 0).then_some(seq)
+    }
+
+    /// Address type labels parallel to [`Self::addresses_by_priority`].
+    #[must_use]
+    pub fn address_type_labels_by_priority(&self) -> Vec<&'static str> {
+        let mut typed = self.typed_addresses();
+        typed.sort_by_key(|pair| pair.1.priority());
+        typed
+            .into_iter()
+            .map(|(_, kind)| match kind {
+                AddressType::Relay => "relay",
+                AddressType::Direct => "direct",
+                AddressType::Unverified => "unverified",
+                AddressType::Lan => "lan",
+            })
+            .collect()
+    }
+
     /// Pair each address with its type tag.
     ///
     /// Local-scope IP addresses are always returned as [`AddressType::Lan`],
@@ -5812,6 +5839,15 @@ impl DhtNetworkManager {
     pub async fn is_in_routing_table(&self, peer_id: &PeerId) -> bool {
         let dht_guard = self.dht.read().await;
         dht_guard.has_node(peer_id).await
+    }
+
+    /// Return this process's local last-successful-interaction age for a peer.
+    ///
+    /// The monotonic age exists only when the peer is in this process's routing
+    /// table. It is diagnostic local knowledge, not remote-record age.
+    pub async fn peer_last_seen_elapsed(&self, peer_id: &PeerId) -> Option<Duration> {
+        let dht_guard = self.dht.read().await;
+        dht_guard.node_last_seen_elapsed(peer_id).await
     }
 
     /// Return every peer currently in the DHT routing table.

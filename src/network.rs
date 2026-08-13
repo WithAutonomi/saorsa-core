@@ -1238,6 +1238,15 @@ impl P2PNode {
         classify_peer_route_from_typed(transport_source, &typed)
     }
 
+    /// Return this process's local last-successful-DHT-interaction age for a
+    /// peer. This is a diagnostic observation, not proof of remote uptime.
+    pub async fn peer_last_seen_elapsed(&self, peer_id: &PeerId) -> Option<Duration> {
+        self.adaptive_dht
+            .dht_manager()
+            .peer_last_seen_elapsed(peer_id)
+            .await
+    }
+
     // =========================================================================
     // Request/Response API — Automatic Trust Feedback
     // =========================================================================
