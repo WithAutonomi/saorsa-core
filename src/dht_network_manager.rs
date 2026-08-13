@@ -482,19 +482,39 @@ impl DHTNode {
         (seq != 0).then_some(seq)
     }
 
-    /// Address type labels parallel to [`Self::addresses_by_priority`].
+    /// Address/type pairs sorted by address-type priority.
+    ///
+    /// The stable sort preserves publisher order within each priority tier.
     #[must_use]
-    pub fn address_type_labels_by_priority(&self) -> Vec<&'static str> {
+    pub fn typed_addresses_by_priority(&self) -> Vec<(MultiAddr, AddressType)> {
         let mut typed = self.typed_addresses();
         typed.sort_by_key(|pair| pair.1.priority());
         typed
+    }
+
+    /// Address/type-label pairs sorted by address-type priority.
+    #[must_use]
+    pub fn address_and_type_labels_by_priority(&self) -> Vec<(MultiAddr, &'static str)> {
+        self.typed_addresses_by_priority()
             .into_iter()
-            .map(|(_, kind)| match kind {
-                AddressType::Relay => "relay",
-                AddressType::Direct => "direct",
-                AddressType::Unverified => "unverified",
-                AddressType::Lan => "lan",
+            .map(|(address, kind)| {
+                let label = match kind {
+                    AddressType::Relay => "relay",
+                    AddressType::Direct => "direct",
+                    AddressType::Unverified => "unverified",
+                    AddressType::Lan => "lan",
+                };
+                (address, label)
             })
+            .collect()
+    }
+
+    /// Address type labels parallel to [`Self::addresses_by_priority`].
+    #[must_use]
+    pub fn address_type_labels_by_priority(&self) -> Vec<&'static str> {
+        self.address_and_type_labels_by_priority()
+            .into_iter()
+            .map(|(_, label)| label)
             .collect()
     }
 
@@ -535,9 +555,10 @@ impl DHTNode {
     /// dial or pass addresses to a consumer that will try them in order
     /// (e.g., `send_message`, `reconnect_and_send`).
     pub fn addresses_by_priority(&self) -> Vec<MultiAddr> {
-        let mut typed = self.typed_addresses();
-        typed.sort_by_key(|(_, ty)| ty.priority());
-        typed.into_iter().map(|(addr, _)| addr).collect()
+        self.typed_addresses_by_priority()
+            .into_iter()
+            .map(|(addr, _)| addr)
+            .collect()
     }
 
     /// Merge another `DHTNode`'s typed addresses into this one.
