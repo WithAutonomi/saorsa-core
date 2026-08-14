@@ -2463,10 +2463,13 @@ impl P2PNode {
         let now_epoch = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |duration| duration.as_secs());
-        self.routing_snapshot_floor
-            .store(restored_peers, Ordering::Relaxed);
+        // Publish the timestamp first and the count second with `Release`, so a
+        // save that sees a resolved floor cannot also see the zero timestamp it
+        // was published with and conclude the floor has already expired.
         self.routing_snapshot_floor_at
             .store(now_epoch, Ordering::Relaxed);
+        self.routing_snapshot_floor
+            .store(restored_peers, Ordering::Release);
     }
 
     /// Load the routing snapshot and turn it into dial candidates.
@@ -2660,7 +2663,7 @@ async fn save_routing_snapshot(
     floor_at: &AtomicU64,
     save_reason: &'static str,
 ) {
-    let floor_peers = floor.load(Ordering::Relaxed);
+    let floor_peers = floor.load(Ordering::Acquire);
     if floor_peers == SNAPSHOT_FLOOR_UNRESOLVED {
         debug!(
             save_reason,
