@@ -36,7 +36,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex as TokioMutex, RwLock, broadcast};
 use tokio::time::Instant;
@@ -187,6 +187,19 @@ const CLIENT_BOOTSTRAP_TARGET: usize = 6;
 /// bounded, so a restart cannot open an unbounded number of simultaneous
 /// QUIC+PQC handshakes.
 const MAX_CONCURRENT_SNAPSHOT_DIALS: usize = 16;
+
+/// How long the restored peer count holds authority over saving.
+///
+/// It exists to stop a node that is stopped mid-restore from writing the
+/// fragment it has re-dialled so far over a complete snapshot. Once the table
+/// has had this long to converge it is the node's best knowledge, and a smaller
+/// table is a smaller network rather than an unfinished restore, so the floor
+/// stops applying and the file keeps being refreshed.
+const SNAPSHOT_FLOOR_ENFORCED_FOR: Duration = Duration::from_secs(60 * 60);
+
+/// The floor has not been decided yet: bootstrap has not reached the restore
+/// step, or this is a client, which never restores and never writes one.
+const SNAPSHOT_FLOOR_UNRESOLVED: usize = usize::MAX;
 
 /// Addresses tried per snapshot peer.
 ///
@@ -853,10 +866,13 @@ pub struct P2PNode {
     /// Whether the routing snapshot has already seeded a bootstrap in this
     /// process, so a re-bootstrap does not replay it.
     routing_snapshot_restored: AtomicBool,
-    /// How many peers the routing snapshot restored at startup, or zero when
-    /// none was. A save must not write a table smaller than this. Shared with
-    /// the periodic save task.
+    /// How many peers the routing snapshot restored at startup, zero when there
+    /// was none to restore, and [`SNAPSHOT_FLOOR_UNRESOLVED`] until bootstrap
+    /// has decided. A save must not write a table smaller than this while the
+    /// floor still applies. Shared with the periodic save task.
     routing_snapshot_floor: Arc<AtomicUsize>,
+    /// When that floor was decided, in epoch seconds. Zero while unresolved.
+    routing_snapshot_floor_at: Arc<AtomicU64>,
 
     /// Periodic close-group-cache task, retained so shutdown can prevent a
     /// late periodic write from replacing the final snapshot.
@@ -981,7 +997,8 @@ impl P2PNode {
             shutdown: CancellationToken::new(),
             close_group_cache_save_shutdown: CancellationToken::new(),
             routing_snapshot_restored: AtomicBool::new(false),
-            routing_snapshot_floor: Arc::new(AtomicUsize::new(0)),
+            routing_snapshot_floor: Arc::new(AtomicUsize::new(SNAPSHOT_FLOOR_UNRESOLVED)),
+            routing_snapshot_floor_at: Arc::new(AtomicU64::new(0)),
             close_group_cache_save_handle: TokioMutex::new(None),
             adaptive_dht,
             is_bootstrapped: Arc::new(AtomicBool::new(false)),
@@ -1417,6 +1434,7 @@ impl P2PNode {
                 let k_value = self.config.dht_config.k_value;
                 let shutdown = self.close_group_cache_save_shutdown.clone();
                 let snapshot_floor = Arc::clone(&self.routing_snapshot_floor);
+                let snapshot_floor_at = Arc::clone(&self.routing_snapshot_floor_at);
                 *task = Some(tokio::spawn(periodic_close_group_cache_save(
                     dht_manager,
                     trust_engine,
@@ -1425,6 +1443,7 @@ impl P2PNode {
                     dir,
                     interval,
                     snapshot_floor,
+                    snapshot_floor_at,
                     shutdown,
                 )));
                 info!(
@@ -1488,6 +1507,7 @@ impl P2PNode {
                 now_epoch,
                 dir,
                 &self.routing_snapshot_floor,
+                &self.routing_snapshot_floor_at,
                 "shutdown",
             )
             .await;
@@ -2434,6 +2454,21 @@ impl P2PNode {
         None
     }
 
+    /// Record how many peers the restore recovered from, and when.
+    ///
+    /// Until this is called a snapshot is never written, so a node stopped
+    /// before the restore step, and a client that never restores at all, cannot
+    /// overwrite a good file with an empty or partial table.
+    fn resolve_snapshot_floor(&self, restored_peers: usize) {
+        let now_epoch = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_secs());
+        self.routing_snapshot_floor
+            .store(restored_peers, Ordering::Relaxed);
+        self.routing_snapshot_floor_at
+            .store(now_epoch, Ordering::Relaxed);
+    }
+
     /// Load the routing snapshot and turn it into dial candidates.
     ///
     /// Returns `None` when there is nothing usable — no configured directory,
@@ -2448,9 +2483,13 @@ impl P2PNode {
 
         let snapshot = match RoutingSnapshot::load_from_dir(dir).await {
             Ok(Some(snapshot)) => snapshot,
-            Ok(None) => return None,
+            Ok(None) => {
+                self.resolve_snapshot_floor(0);
+                return None;
+            }
             Err(rejection) => {
                 warn!(%rejection, "Discarding routing snapshot");
+                self.resolve_snapshot_floor(0);
                 return None;
             }
         };
@@ -2462,13 +2501,14 @@ impl P2PNode {
             Ok(peers) => peers,
             Err(rejection) => {
                 warn!(%rejection, "Discarding routing snapshot");
+                self.resolve_snapshot_floor(0);
                 return None;
             }
         };
 
-        // A later save must not write a table smaller than this one.
-        self.routing_snapshot_floor
-            .store(peers.len(), Ordering::Relaxed);
+        // A later save must not write a table smaller than this one, for as
+        // long as the floor applies.
+        self.resolve_snapshot_floor(peers.len());
 
         let sets = snapshot_dial_sets(peers, &self.peer_id, seen_addresses);
         if sets.is_empty() {
@@ -2604,20 +2644,31 @@ async fn save_close_group_cache_snapshot(
 /// Best-effort and non-fatal: the close-group cache is the established path and
 /// must not start failing because a newer, unread file could not be written.
 ///
-/// Never writes a table smaller than the one restored at startup (`floor`).
-/// Between opening and finishing its restore a node holds only what it has
-/// re-dialled so far, and one stopped in that window would otherwise replace a
-/// complete snapshot with a fragment, shrinking its own file a little further
-/// on every cycle. The rule self-heals: as ordinary discovery refills the
-/// table past the floor, saving resumes with no further state.
+/// Writes nothing until the restore step has decided what the floor is, and
+/// then nothing smaller than the table it restored while that floor still
+/// applies. Between opening and finishing its restore a node holds only what it
+/// has re-dialled so far, and one stopped in that window would otherwise
+/// replace a complete snapshot with a fragment, shrinking its own file a little
+/// further on every cycle. A client never resolves a floor and so never writes
+/// a snapshot it would not read back.
 async fn save_routing_snapshot(
     dht_manager: &DhtNetworkManager,
     peer_id: PeerId,
     now_epoch: u64,
     dir: &Path,
     floor: &AtomicUsize,
+    floor_at: &AtomicU64,
     save_reason: &'static str,
 ) {
+    let floor_peers = floor.load(Ordering::Relaxed);
+    if floor_peers == SNAPSHOT_FLOOR_UNRESOLVED {
+        debug!(
+            save_reason,
+            "Skipping routing snapshot save: the restore step has not run"
+        );
+        return;
+    }
+
     let peers: Vec<SnapshotPeer> = dht_manager
         .routing_table_peers()
         .await
@@ -2629,11 +2680,22 @@ async fn save_routing_snapshot(
         .collect();
     let peer_count = peers.len();
 
-    let floor = floor.load(Ordering::Relaxed);
-    if peer_count < floor {
+    if peer_count == 0 {
         debug!(
             save_reason,
-            peer_count, floor, "Skipping routing snapshot save: it would shrink the snapshot"
+            "Skipping routing snapshot save: the table is empty"
+        );
+        return;
+    }
+    let floor_applies = now_epoch.saturating_sub(floor_at.load(Ordering::Relaxed))
+        < SNAPSHOT_FLOOR_ENFORCED_FOR.as_secs();
+    if floor_applies && peer_count < floor_peers {
+        debug!(
+            save_reason,
+            peer_count,
+            floor_peers,
+            "Skipping routing snapshot save: it would shrink the snapshot while the table is \
+             still restoring"
         );
         return;
     }
@@ -2654,6 +2716,7 @@ async fn periodic_close_group_cache_save(
     dir: PathBuf,
     interval: Duration,
     snapshot_floor: Arc<AtomicUsize>,
+    snapshot_floor_at: Arc<AtomicU64>,
     shutdown: CancellationToken,
 ) {
     let start = tokio::time::Instant::now() + interval;
@@ -2684,6 +2747,7 @@ async fn periodic_close_group_cache_save(
                     now_epoch,
                     &dir,
                     &snapshot_floor,
+                    &snapshot_floor_at,
                     "periodic",
                 ).await;
             }
