@@ -19,6 +19,7 @@ use crate::PeerId;
 use crate::adaptive::trust::{TrustRecord, TrustSnapshot};
 use crate::adaptive::{AdaptiveDHT, AdaptiveDhtConfig, TrustEngine, TrustEvent};
 use crate::bootstrap::cache::{CachedCloseGroupPeer, CloseGroupCache};
+use crate::bootstrap::{RoutingSnapshot, SnapshotPeer, network_fingerprint};
 use crate::dht::core_engine::AddressType;
 use crate::dht_network_manager::{DhtNetworkConfig, DhtNetworkEvent, DhtNetworkManager};
 use crate::error::{NetworkError, P2PError, P2pResult as Result};
@@ -178,6 +179,23 @@ const MAX_CONCURRENT_BOOTSTRAP_DIALS: usize = 4;
 /// dial every candidate so their routing table converges fully.
 const CLIENT_BOOTSTRAP_TARGET: usize = 6;
 
+/// Maximum routing-snapshot peers dialled concurrently.
+///
+/// Higher than [`MAX_CONCURRENT_BOOTSTRAP_DIALS`] because this set is an order
+/// of magnitude larger — a full table rather than a handful of seeds — and the
+/// whole value of restoring it is that the table is usable in seconds. Still
+/// bounded, so a restart cannot open an unbounded number of simultaneous
+/// QUIC+PQC handshakes.
+const MAX_CONCURRENT_SNAPSHOT_DIALS: usize = 16;
+
+/// Wall-clock budget for the routing-snapshot dial phase.
+///
+/// Startup must not be held hostage to a snapshot full of departed peers. When
+/// the budget expires the remaining candidates are abandoned and the table
+/// refills through ordinary discovery, which is exactly the behaviour of a node
+/// that had no snapshot at all.
+const SNAPSHOT_RESTORE_BUDGET: Duration = Duration::from_secs(20);
+
 /// Serde helper — returns `true`.
 const fn default_true() -> bool {
     true
@@ -291,6 +309,31 @@ pub struct NodeConfig {
     /// check. Default: one hour.
     #[serde(default = "default_close_group_cache_max_age")]
     pub close_group_cache_max_age: Option<Duration>,
+
+    /// Whether a validated routing snapshot seeds startup dials.
+    ///
+    /// **Defaults to `true`.** This is the behaviour that repairs a restarted
+    /// node's routing table in seconds rather than over the roughly daily
+    /// bucket-refresh cycle, and it is the point of persisting one at all.
+    ///
+    /// Set to `false` as an operational kill switch. That restores the previous
+    /// behaviour exactly — the close-group cache still seeds the neighbourhood,
+    /// and the snapshot is still written, so switching back needs no rebuild and
+    /// loses no data.
+    ///
+    /// **Consumer prerequisite.** A restored table is materially more complete,
+    /// and a consumer that decides record retention from routing state may treat
+    /// a table which has grown from 19 to 20 apparently-closer peers as licence
+    /// to delete a record with no holder confirmation. Any consumer must have
+    /// removed that path before adopting a version of this crate carrying
+    /// restoration. See the routing-snapshot module docs.
+    #[serde(default = "default_routing_snapshot_restore")]
+    pub routing_snapshot_restore: bool,
+}
+
+/// Routing-snapshot restoration is on by default; see the field docs.
+const fn default_routing_snapshot_restore() -> bool {
+    true
 }
 
 fn default_close_group_cache_max_age() -> Option<Duration> {
@@ -428,6 +471,7 @@ pub struct NodeConfigBuilder {
     /// Outer `None` means the builder setter was not called; inner `None`
     /// explicitly disables age enforcement.
     close_group_cache_max_age: Option<Option<Duration>>,
+    routing_snapshot_restore: Option<bool>,
 }
 
 impl Default for NodeConfigBuilder {
@@ -447,6 +491,7 @@ impl Default for NodeConfigBuilder {
             adaptive_dht_config: None,
             close_group_cache_dir: None,
             close_group_cache_max_age: None,
+            routing_snapshot_restore: None,
         }
     }
 }
@@ -575,6 +620,16 @@ impl NodeConfigBuilder {
         self
     }
 
+    /// Set whether a validated routing snapshot seeds startup dials.
+    ///
+    /// Defaults to `false`. Read the field documentation on
+    /// [`NodeConfig::routing_snapshot_restore`]. Defaults to `true`; setting
+    /// `false` is the kill switch that restores the previous startup behaviour.
+    pub fn routing_snapshot_restore(mut self, enabled: bool) -> Self {
+        self.routing_snapshot_restore = Some(enabled);
+        self
+    }
+
     /// Build the [`NodeConfig`].
     ///
     /// # Errors
@@ -605,6 +660,9 @@ impl NodeConfigBuilder {
             close_group_cache_max_age: self
                 .close_group_cache_max_age
                 .unwrap_or_else(default_close_group_cache_max_age),
+            routing_snapshot_restore: self
+                .routing_snapshot_restore
+                .unwrap_or_else(default_routing_snapshot_restore),
         })
     }
 }
@@ -628,6 +686,7 @@ impl Default for NodeConfig {
             adaptive_dht_config: AdaptiveDhtConfig::default(),
             close_group_cache_dir: None,
             close_group_cache_max_age: default_close_group_cache_max_age(),
+            routing_snapshot_restore: default_routing_snapshot_restore(),
         }
     }
 }
@@ -1382,11 +1441,13 @@ impl P2PNode {
                 let peer_id = self.peer_id;
                 let k_value = self.config.dht_config.k_value;
                 let shutdown = self.close_group_cache_save_shutdown.clone();
+                let fingerprint = network_fingerprint(&self.config.bootstrap_peers);
                 *task = Some(tokio::spawn(periodic_close_group_cache_save(
                     dht_manager,
                     trust_engine,
                     peer_id,
                     k_value,
+                    fingerprint,
                     dir,
                     interval,
                     shutdown,
@@ -2073,7 +2134,15 @@ impl P2PNode {
             }
         }
 
-        if serial_addr_sets.is_empty() && parallel_addr_sets.is_empty() {
+        // Priority 2: the routing snapshot, if one validated. Addresses already
+        // queued as close-group or configured candidates are skipped so a peer
+        // is never dialled twice.
+        let snapshot_addr_sets = self.routing_snapshot_dial_sets(&mut seen_addresses).await;
+
+        if serial_addr_sets.is_empty()
+            && parallel_addr_sets.is_empty()
+            && snapshot_addr_sets.is_none()
+        {
             info!("No bootstrap peers configured");
             return Ok(());
         }
@@ -2136,11 +2205,70 @@ impl P2PNode {
             // before we proceed to the DHT discovery phase below.
         }
 
+        // Phase C: the routing snapshot.
+        //
+        // The close group reconnects a neighbourhood; this rebuilds the rest of
+        // the table, which is what a node consults to decide whether anyone is
+        // closer to a given key than it is. Dialled concurrently and last: it is
+        // the widest set and the least urgent, and giving the close group and
+        // the configured peers the first attempts keeps cold-start latency for
+        // an unrestored node exactly as it was.
+        //
+        // Every peer here is dialled and identity-verified through the same path
+        // as any other candidate. Nothing from the file enters the routing table
+        // on the file's authority alone.
+        let mut snapshot_dial_candidates = 0usize;
+        let mut snapshot_dial_successes = 0usize;
+        if let Some(snapshot_sets) = snapshot_addr_sets {
+            snapshot_dial_candidates = snapshot_sets.len();
+            let deadline = tokio::time::Instant::now() + SNAPSHOT_RESTORE_BUDGET;
+            let mut snapshot_stream = futures::stream::iter(snapshot_sets.into_iter().map(
+                |(expected_peer_id, addrs)| async move {
+                    self.dial_bootstrap_addr_set(
+                        &addrs,
+                        identity_timeout,
+                        "routing_snapshot",
+                        Some(expected_peer_id),
+                    )
+                    .await
+                },
+            ))
+            .buffer_unordered(MAX_CONCURRENT_SNAPSHOT_DIALS);
+
+            loop {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    debug!(
+                        snapshot_dial_successes,
+                        snapshot_dial_candidates,
+                        "Routing snapshot restore hit its time budget; the rest is left to \
+                         ordinary discovery"
+                    );
+                    break;
+                }
+                match tokio::time::timeout(remaining, snapshot_stream.next()).await {
+                    Ok(Some(Some(peer_id))) => {
+                        snapshot_dial_successes += 1;
+                        successful_connections += 1;
+                        connected_peer_ids.push(peer_id);
+                    }
+                    Ok(Some(None)) => {}
+                    Ok(None) => break,
+                    Err(_) => {
+                        debug!("Routing snapshot restore timed out awaiting a dial");
+                        break;
+                    }
+                }
+            }
+        }
+
         info!(
             cache_dial_candidates,
             cache_dial_successes,
             configured_dial_candidates,
             configured_dial_successes,
+            snapshot_dial_candidates,
+            snapshot_dial_successes,
             outbound_bootstrap_successes = successful_connections,
             outbound_reachable = successful_connections > 0,
             "Bootstrap reachability summary"
@@ -2302,6 +2430,102 @@ impl P2PNode {
         None
     }
 
+    /// Load, validate and prepare the routing snapshot's dial candidates.
+    ///
+    /// Returns `None` when there is nothing usable — no configured directory, no
+    /// file, a rejected file, or restoration switched off. Every one of those is
+    /// logged with its reason: a node that quietly cold-starts on every restart
+    /// is indistinguishable from one that never had a snapshot, and that is
+    /// exactly the failure an operator needs to be able to see.
+    ///
+    /// Addresses already queued by an earlier priority are removed here, and
+    /// `seen_addresses` is extended, so no peer is dialled twice.
+    async fn routing_snapshot_dial_sets(
+        &self,
+        seen_addresses: &mut std::collections::HashSet<std::net::SocketAddr>,
+    ) -> Option<Vec<(PeerId, Vec<MultiAddr>)>> {
+        let dir = self.config.close_group_cache_dir.as_ref()?;
+
+        let snapshot = match RoutingSnapshot::load_from_dir(dir).await {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) => {
+                debug!("No routing snapshot on disk; starting from configured peers");
+                return None;
+            }
+            Err(rejection) => {
+                warn!(%rejection, "Discarding routing snapshot");
+                return None;
+            }
+        };
+
+        let now_epoch = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_secs());
+        let peers = match snapshot.validate(
+            &self.peer_id,
+            &network_fingerprint(&self.config.bootstrap_peers),
+            now_epoch,
+            self.config.close_group_cache_max_age,
+        ) {
+            Ok(peers) => peers,
+            Err(rejection) => {
+                warn!(
+                    %rejection,
+                    snapshot_peers = snapshot.peer_count(),
+                    "Discarding routing snapshot"
+                );
+                return None;
+            }
+        };
+
+        if !self.config.routing_snapshot_restore {
+            info!(
+                snapshot_peers = peers.len(),
+                "Routing snapshot is valid but restoration is switched off; \
+                 the routing table will refill at the ordinary refresh cadence"
+            );
+            return None;
+        }
+
+        let mut sets: Vec<(PeerId, Vec<MultiAddr>)> = Vec::new();
+        for peer in peers {
+            if peer.peer_id == self.peer_id {
+                continue;
+            }
+            let new_addresses: Vec<MultiAddr> = peer
+                .addresses
+                .iter()
+                .filter(|addr| {
+                    addr.dialable_socket_addr()
+                        .is_some_and(|socket| !seen_addresses.contains(&socket))
+                })
+                .cloned()
+                .collect();
+            if new_addresses.is_empty() {
+                continue;
+            }
+            for addr in &new_addresses {
+                if let Some(socket) = addr.socket_addr() {
+                    seen_addresses.insert(socket);
+                }
+            }
+            sets.push((peer.peer_id, new_addresses));
+        }
+
+        if sets.is_empty() {
+            debug!("Routing snapshot added no candidates beyond those already queued");
+            return None;
+        }
+
+        info!(
+            snapshot_peers = peers.len(),
+            new_candidates = sets.len(),
+            age_secs = now_epoch.saturating_sub(snapshot.payload.saved_at_epoch_secs),
+            "Restoring routing table from snapshot"
+        );
+        Some(sets)
+    }
+
     /// Persist the current close group peers and their trust scores to disk.
     async fn save_close_group_cache(
         &self,
@@ -2313,6 +2537,7 @@ impl P2PNode {
             self.adaptive_dht.trust_engine(),
             self.peer_id,
             self.config.dht_config.k_value,
+            &network_fingerprint(&self.config.bootstrap_peers),
             dir,
             save_reason,
         )
@@ -2331,6 +2556,7 @@ async fn save_close_group_cache_snapshot(
     trust_engine: &TrustEngine,
     peer_id: PeerId,
     k_value: usize,
+    network_fingerprint: &str,
     dir: &Path,
     save_reason: &'static str,
 ) -> anyhow::Result<()> {
@@ -2373,7 +2599,69 @@ async fn save_close_group_cache_snapshot(
         peer_count,
         dir.display()
     );
+
+    // Write the whole routing table alongside the close group. The close group
+    // is what reconnects a neighbourhood; only the full table can reconstruct
+    // the knowledge a node uses to decide whether anyone is closer to a given
+    // key than it is. Written unconditionally, including when restoration is
+    // switched off, so the kill switch never costs the next start its snapshot.
+    //
+    // A failure to write the snapshot must not fail the close-group save that
+    // already succeeded, so it is logged and swallowed.
+    save_routing_snapshot(
+        dht_manager,
+        peer_id,
+        network_fingerprint,
+        now_epoch,
+        dir,
+        save_reason,
+    )
+    .await;
+
     Ok(())
+}
+
+/// Persist the whole routing table as a [`RoutingSnapshot`].
+///
+/// Best-effort and non-fatal: the close-group cache is the established path and
+/// must not start failing because a newer, unread file could not be written.
+async fn save_routing_snapshot(
+    dht_manager: &DhtNetworkManager,
+    peer_id: PeerId,
+    network_fingerprint: &str,
+    now_epoch: u64,
+    dir: &Path,
+    save_reason: &'static str,
+) {
+    let peers: Vec<SnapshotPeer> = dht_manager
+        .routing_table_peers()
+        .await
+        .into_iter()
+        .map(|node| SnapshotPeer {
+            peer_id: node.peer_id,
+            addresses: node.addresses,
+        })
+        .collect();
+    let peer_count = peers.len();
+
+    let snapshot =
+        match RoutingSnapshot::new(peer_id, network_fingerprint.to_string(), now_epoch, peers) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                warn!(save_reason, %error, "Failed to build routing snapshot");
+                return;
+            }
+        };
+
+    match snapshot.save_to_dir(dir).await {
+        Ok(()) => info!(
+            save_reason,
+            peer_count,
+            "Saved routing snapshot ({peer_count} peers) to {}",
+            dir.display()
+        ),
+        Err(error) => warn!(save_reason, %error, "Failed to save routing snapshot"),
+    }
 }
 
 /// Periodically persist the close group until cancelled.
@@ -2382,6 +2670,7 @@ async fn periodic_close_group_cache_save(
     trust_engine: Arc<TrustEngine>,
     peer_id: PeerId,
     k_value: usize,
+    network_fingerprint: String,
     dir: PathBuf,
     interval: Duration,
     shutdown: CancellationToken,
@@ -2400,6 +2689,7 @@ async fn periodic_close_group_cache_save(
                     &trust_engine,
                     peer_id,
                     k_value,
+                    &network_fingerprint,
                     &dir,
                     "periodic",
                 ).await {
@@ -2490,6 +2780,7 @@ mod tests {
             adaptive_dht_config: AdaptiveDhtConfig::default(),
             close_group_cache_dir: None,
             close_group_cache_max_age: default_close_group_cache_max_age(),
+            routing_snapshot_restore: default_routing_snapshot_restore(),
         }
     }
 
