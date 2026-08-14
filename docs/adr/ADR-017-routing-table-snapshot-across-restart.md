@@ -35,7 +35,7 @@ Persist the whole capped routing table to its own snapshot file, and restore it 
 6. **Restored peers do not seed DHT discovery.** A dialled, identity-verified peer is already admitted to the routing table by the connection path. Adding the restored set to the discovery seed list would issue a serial `FIND_NODE` per peer to rediscover the table just restored, and then serially dial everything those queries returned, so the phase's own bound would be defeated by the phase after it.
 7. **Bounded cost, then today's behaviour.** Restoration dials at bounded concurrency (16, against 4 for bootstrap dials, because the set is an order of magnitude larger). A 20-second budget stops *new* peers being dialled; dials already in flight are allowed to finish, because cancelling a handshake mid-flight leaves the far side holding a half-open connection. The phase's bound is therefore the budget plus the last peer's attempts, which is why a snapshot peer is tried at no more than two addresses. Whatever is not restored refills through ordinary discovery, which is exactly the behaviour of a node that had no snapshot.
 8. **Once per process, and not for clients.** A re-bootstrap does not replay the snapshot, since the table it would restore is the one the node already has. `NodeMode::Client` skips restoration entirely and keeps its existing six-peer startup bound: a client does not serve the DHT, so it never asks the question this repairs.
-9. **Written only from a table that finished restoring.** The periodic and shutdown saves write the snapshot; the post-bootstrap save does not. A save is skipped entirely until the bootstrap phase that restores the previous snapshot has run, and if that restore recovered less than half of what it tried — a node that could not reach the network, rather than a table worth keeping — the older, fuller file is left in place. Without this, a node stopped or restarted inside the restore window would shrink its own snapshot a little further every time.
+9. **A save never shrinks the snapshot.** The periodic and shutdown saves write the file; the post-bootstrap save does not. A save is skipped while the live table holds fewer peers than the snapshot restored at startup, because a node between opening and finishing its restore holds only what it has re-dialled so far, and one stopped in that window would otherwise replace a complete snapshot with a fragment and shrink its own file a little further on every cycle. The rule needs no other state and self-heals: once ordinary discovery refills the table past that floor, saving resumes.
 
 ## Alternatives considered
 
@@ -59,7 +59,7 @@ Persist the whole capped routing table to its own snapshot file, and restore it 
 
 - A new on-disk artifact to version and keep compatible.
 - Startup dials a larger candidate set. New peers stop being dialled at the 20-second budget, but attempts already in flight still run, so the phase can exceed the budget by one peer's two address attempts.
-- A snapshot full of departed peers spends that budget and yields little, though never more than it.
+- A snapshot full of departed peers spends that budget and yields little. No new peer is dialled after it, though attempts already in flight still finish.
 - Every periodic and shutdown close-group save now writes a second small file before returning.
 
 ### Neutral
@@ -72,5 +72,5 @@ Persist the whole capped routing table to its own snapshot file, and restore it 
 
 - Unit tests in `src/bootstrap/routing_snapshot.rs` for the file contract: disk round trip, missing file treated as absence, truncated file reported, oversized file refused without being read, peer cap re-applied on load, foreign owner refused, unknown schema version refused, and staleness bounded on both sides of now.
 - Unit tests in `src/network.rs` for the restore path's candidate selection: self excluded, addresses already queued by an earlier bootstrap priority not redialled, undialable addresses dropped, repeated peers deduplicated, the per-peer dial list bounded, and a full table producing one candidate per peer.
-- Not covered by tests in this PR: the dial phase itself against a live transport, including budget expiry, client-mode exclusion, and the readiness rule that decides whether a table may be persisted. Those need a multi-node harness.
+- Not covered by tests in this PR: the dial phase itself against a live transport, including budget expiry, client-mode exclusion, and the no-shrink rule on saves. Those need a multi-node harness.
 - **No testnet or production measurement of this change exists.** The over-claim it targets is measured in production; the fix is evidenced by simulation and unit tests only. A dev testnet run is the next step, and nothing here claims fleet readiness.

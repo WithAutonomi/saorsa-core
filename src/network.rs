@@ -36,7 +36,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex as TokioMutex, RwLock, broadcast};
 use tokio::time::Instant;
@@ -853,9 +853,10 @@ pub struct P2PNode {
     /// Whether the routing snapshot has already seeded a bootstrap in this
     /// process, so a re-bootstrap does not replay it.
     routing_snapshot_restored: AtomicBool,
-    /// Whether the routing table is finished restoring and may therefore be
-    /// persisted. Shared with the periodic save task.
-    routing_table_ready: Arc<AtomicBool>,
+    /// How many peers the routing snapshot restored at startup, or zero when
+    /// none was. A save must not write a table smaller than this. Shared with
+    /// the periodic save task.
+    routing_snapshot_floor: Arc<AtomicUsize>,
 
     /// Periodic close-group-cache task, retained so shutdown can prevent a
     /// late periodic write from replacing the final snapshot.
@@ -980,7 +981,7 @@ impl P2PNode {
             shutdown: CancellationToken::new(),
             close_group_cache_save_shutdown: CancellationToken::new(),
             routing_snapshot_restored: AtomicBool::new(false),
-            routing_table_ready: Arc::new(AtomicBool::new(false)),
+            routing_snapshot_floor: Arc::new(AtomicUsize::new(0)),
             close_group_cache_save_handle: TokioMutex::new(None),
             adaptive_dht,
             is_bootstrapped: Arc::new(AtomicBool::new(false)),
@@ -1415,7 +1416,7 @@ impl P2PNode {
                 let peer_id = self.peer_id;
                 let k_value = self.config.dht_config.k_value;
                 let shutdown = self.close_group_cache_save_shutdown.clone();
-                let table_ready = Arc::clone(&self.routing_table_ready);
+                let snapshot_floor = Arc::clone(&self.routing_snapshot_floor);
                 *task = Some(tokio::spawn(periodic_close_group_cache_save(
                     dht_manager,
                     trust_engine,
@@ -1423,7 +1424,7 @@ impl P2PNode {
                     k_value,
                     dir,
                     interval,
-                    table_ready,
+                    snapshot_floor,
                     shutdown,
                 )));
                 info!(
@@ -1486,7 +1487,7 @@ impl P2PNode {
                 self.peer_id,
                 now_epoch,
                 dir,
-                &self.routing_table_ready,
+                &self.routing_snapshot_floor,
                 "shutdown",
             )
             .await;
@@ -2265,16 +2266,6 @@ impl P2PNode {
             }
         }
 
-        // The table may now be persisted — unless the restore recovered less
-        // than half of what it tried, which is a node that could not reach the
-        // network rather than a table worth writing over the snapshot it came
-        // from. Keeping the older, fuller file is strictly better for the next
-        // start, and discovery will refill this one either way.
-        let restore_recovered_enough = snapshot_dial_candidates == 0
-            || snapshot_dial_successes * 2 >= snapshot_dial_candidates;
-        self.routing_table_ready
-            .store(restore_recovered_enough, Ordering::Relaxed);
-
         info!(
             cache_dial_candidates,
             cache_dial_successes,
@@ -2475,6 +2466,10 @@ impl P2PNode {
             }
         };
 
+        // A later save must not write a table smaller than this one.
+        self.routing_snapshot_floor
+            .store(peers.len(), Ordering::Relaxed);
+
         let sets = snapshot_dial_sets(peers, &self.peer_id, seen_addresses);
         if sets.is_empty() {
             return None;
@@ -2609,27 +2604,20 @@ async fn save_close_group_cache_snapshot(
 /// Best-effort and non-fatal: the close-group cache is the established path and
 /// must not start failing because a newer, unread file could not be written.
 ///
-/// Skipped until `table_ready` is set, which happens when the bootstrap phase
-/// that restores the previous snapshot has finished. Writing before that
-/// replaces a complete snapshot with whatever has been re-dialled so far, and
-/// a node stopped or restarted inside that window would shrink its own table a
-/// little further every time.
+/// Never writes a table smaller than the one restored at startup (`floor`).
+/// Between opening and finishing its restore a node holds only what it has
+/// re-dialled so far, and one stopped in that window would otherwise replace a
+/// complete snapshot with a fragment, shrinking its own file a little further
+/// on every cycle. The rule self-heals: as ordinary discovery refills the
+/// table past the floor, saving resumes with no further state.
 async fn save_routing_snapshot(
     dht_manager: &DhtNetworkManager,
     peer_id: PeerId,
     now_epoch: u64,
     dir: &Path,
-    table_ready: &AtomicBool,
+    floor: &AtomicUsize,
     save_reason: &'static str,
 ) {
-    if !table_ready.load(Ordering::Relaxed) {
-        debug!(
-            save_reason,
-            "Skipping routing snapshot save: the table has not finished restoring"
-        );
-        return;
-    }
-
     let peers: Vec<SnapshotPeer> = dht_manager
         .routing_table_peers()
         .await
@@ -2640,6 +2628,15 @@ async fn save_routing_snapshot(
         })
         .collect();
     let peer_count = peers.len();
+
+    let floor = floor.load(Ordering::Relaxed);
+    if peer_count < floor {
+        debug!(
+            save_reason,
+            peer_count, floor, "Skipping routing snapshot save: it would shrink the snapshot"
+        );
+        return;
+    }
 
     let snapshot = RoutingSnapshot::new(peer_id, now_epoch, peers);
     match snapshot.save_to_dir(dir).await {
@@ -2656,7 +2653,7 @@ async fn periodic_close_group_cache_save(
     k_value: usize,
     dir: PathBuf,
     interval: Duration,
-    table_ready: Arc<AtomicBool>,
+    snapshot_floor: Arc<AtomicUsize>,
     shutdown: CancellationToken,
 ) {
     let start = tokio::time::Instant::now() + interval;
@@ -2686,7 +2683,7 @@ async fn periodic_close_group_cache_save(
                     peer_id,
                     now_epoch,
                     &dir,
-                    &table_ready,
+                    &snapshot_floor,
                     "periodic",
                 ).await;
             }
