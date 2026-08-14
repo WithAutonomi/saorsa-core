@@ -216,11 +216,19 @@ impl RoutingSnapshot {
     pub async fn load_from_dir(dir: &Path) -> Result<Option<Self>, SnapshotRejection> {
         let path = dir.join(ROUTING_SNAPSHOT_FILENAME);
 
-        let metadata = match tokio::fs::metadata(&path).await {
-            Ok(metadata) => metadata,
+        // Open once and check the handle, not the path: checking the path and
+        // then reading it again is two different files if anything replaces it
+        // in between. The read is separately capped, so the size check cannot
+        // be sidestepped by a file that grows after it is opened.
+        let file = match tokio::fs::File::open(&path).await {
+            Ok(file) => file,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(SnapshotRejection::Unreadable(e.to_string())),
         };
+        let metadata = file
+            .metadata()
+            .await
+            .map_err(|e| SnapshotRejection::Unreadable(e.to_string()))?;
         if !metadata.is_file() {
             return Err(SnapshotRejection::Unreadable("not a regular file".into()));
         }
@@ -231,9 +239,16 @@ impl RoutingSnapshot {
             )));
         }
 
-        let bytes = tokio::fs::read(&path)
+        let mut bytes = Vec::new();
+        let mut bounded = tokio::io::AsyncReadExt::take(file, MAX_SNAPSHOT_BYTES + 1);
+        tokio::io::AsyncReadExt::read_to_end(&mut bounded, &mut bytes)
             .await
             .map_err(|e| SnapshotRejection::Unreadable(e.to_string()))?;
+        if bytes.len() as u64 > MAX_SNAPSHOT_BYTES {
+            return Err(SnapshotRejection::Unreadable(format!(
+                "exceeds the {MAX_SNAPSHOT_BYTES} byte limit while reading"
+            )));
+        }
         let mut snapshot: Self = serde_json::from_slice(&bytes)
             .map_err(|e| SnapshotRejection::Unreadable(e.to_string()))?;
 
