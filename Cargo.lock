@@ -2480,6 +2480,7 @@ dependencies = [
  "dirs 6.0.0",
  "futures",
  "hex",
+ "libc",
  "lru",
  "once_cell",
  "parking_lot",

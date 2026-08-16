@@ -207,8 +207,9 @@ impl RoutingSnapshot {
     /// Read the snapshot from `{dir}/routing_snapshot.json`.
     ///
     /// Returns `Ok(None)` when there is no snapshot. A file that exists but is
-    /// oversized, not a regular file, or unparseable is reported rather than
-    /// treated as absence, because the two need different operator responses.
+    /// oversized, not a regular file, a symlink, or unparseable is reported
+    /// rather than treated as absence, because the two need different operator
+    /// responses.
     ///
     /// # Errors
     ///
@@ -220,7 +221,7 @@ impl RoutingSnapshot {
         // then reading it again is two different files if anything replaces it
         // in between. The read is separately capped, so the size check cannot
         // be sidestepped by a file that grows after it is opened.
-        let file = match tokio::fs::File::open(&path).await {
+        let file = match open_snapshot_file(&path).await {
             Ok(file) => file,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(SnapshotRejection::Unreadable(e.to_string())),
@@ -260,6 +261,37 @@ impl RoutingSnapshot {
         }
         Ok(Some(snapshot))
     }
+}
+
+/// Open the snapshot for reading without following a symlink and without
+/// blocking on a special file.
+///
+/// A plain `open` of a FIFO placed at this fixed path blocks until a writer
+/// appears, which would stall bootstrap before the regular-file check on the
+/// handle could reject it. `O_NONBLOCK` makes that open return immediately and
+/// is inert for regular files, and `O_NOFOLLOW` refuses a symlink outright:
+/// this node only ever writes a regular file here, by rename.
+#[cfg(unix)]
+async fn open_snapshot_file(path: &Path) -> std::io::Result<tokio::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let path = path.to_path_buf();
+    let file = tokio::task::spawn_blocking(move || {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+            .open(path)
+    })
+    .await
+    .map_err(|e| std::io::Error::other(format!("snapshot open task panicked: {e}")))??;
+    Ok(tokio::fs::File::from_std(file))
+}
+
+/// Non-Unix fallback: a plain open, with the non-regular-file rejection still
+/// enforced on the opened handle by the caller.
+#[cfg(not(unix))]
+async fn open_snapshot_file(path: &Path) -> std::io::Result<tokio::fs::File> {
+    tokio::fs::File::open(path).await
 }
 
 #[cfg(test)]
@@ -355,6 +387,48 @@ mod tests {
             .unwrap()
             .expect("snapshot present");
         assert_eq!(loaded.peers.len(), MAX_SNAPSHOT_PEERS);
+    }
+
+    /// Regression test: a plain blocking open of a FIFO at the snapshot path
+    /// hangs until a writer appears, so bootstrap never reached the
+    /// regular-file rejection.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_fifo_at_the_snapshot_path_is_refused_without_blocking() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(ROUTING_SNAPSHOT_FILENAME);
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            RoutingSnapshot::load_from_dir(dir.path()),
+        )
+        .await
+        .expect("loading must not block on a FIFO");
+        assert!(matches!(result, Err(SnapshotRejection::Unreadable(_))));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_symlink_at_the_snapshot_path_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = PeerId::random();
+        let target = dir.path().join("elsewhere.json");
+        std::fs::write(
+            &target,
+            serde_json::to_vec(&snapshot(owner, 1_000, 4)).unwrap(),
+        )
+        .unwrap();
+        let path = dir.path().join(ROUTING_SNAPSHOT_FILENAME);
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+
+        assert!(matches!(
+            RoutingSnapshot::load_from_dir(dir.path()).await,
+            Err(SnapshotRejection::Unreadable(_))
+        ));
     }
 
     #[test]
