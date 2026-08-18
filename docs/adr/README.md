@@ -43,6 +43,7 @@ An Architecture Decision Record (ADR) is a document that captures an important a
 | [ADR-007](./ADR-007-adaptive-networking.md) | Adaptive Networking with ML | Accepted | Machine learning for dynamic routing optimization |
 | [ADR-008](./ADR-008-bootstrap-delegation.md) | Bootstrap Peer Discovery Scope | Superseded | Historical peer discovery design replaced by configured peers plus DHT discovery |
 | [ADR-016](./ADR-016-close-group-cache-validity.md) | Age-Bounded, Periodically Refreshed Close-Group Cache | Proposed | Bound persisted close-group age and refresh it safely during normal running |
+| [ADR-017](./ADR-017-routing-table-snapshot-across-restart.md) | Persist the Whole Routing Table Across a Restart | Proposed | Restore every bucket as dial candidates so a restarted node stops claiming most of the keyspace |
 
 ### Messaging
 
