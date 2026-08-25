@@ -35,7 +35,7 @@ const DEFAULT_SWAP_THRESHOLD: f64 = 0.35;
 /// lookup/dial paths.
 const DEFAULT_QUARANTINE_THRESHOLD: f64 = 0.20;
 
-/// Default trust score a new or quarantined peer must have for admission.
+/// Default trust score an explicitly quarantined peer must regain for readmission.
 const DEFAULT_QUARANTINE_READMIT_THRESHOLD: f64 = 0.45;
 
 /// Maximum weight multiplier per single consumer-reported event.
@@ -54,8 +54,9 @@ pub struct AdaptiveDhtConfig {
     /// Trust score below which automatic lookup/dial paths avoid a peer.
     /// Default: 0.20
     pub quarantine_threshold: f64,
-    /// Trust score required before a new peer can enter the routing table, and
-    /// before a quarantined peer can re-enter.
+    /// Trust score required before an explicitly quarantined peer can re-enter
+    /// the routing table. New peers that were never quarantined are admitted at
+    /// or above `quarantine_threshold`.
     /// Default: 0.45
     pub quarantine_readmit_threshold: f64,
 }
@@ -76,8 +77,8 @@ impl AdaptiveDhtConfig {
     /// Returns `Err` if a threshold is outside its safe range or is NaN.
     /// Values >= 0.5 (neutral trust) would make all unknown peers immediately
     /// swap/quarantine eligible since they start at neutral (0.5). The
-    /// new-peer admission/readmit threshold must also stay below neutral
-    /// because recovery happens by decay toward neutral, not by active probing.
+    /// quarantine readmit threshold must also stay below neutral because
+    /// recovery happens by decay toward neutral, not by active probing.
     /// When swap enforcement is enabled, the swap threshold must remain above
     /// the quarantine threshold so quarantine is strictly more severe.
     pub fn validate(&self) -> crate::error::P2pResult<()> {

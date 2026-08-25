@@ -45,19 +45,20 @@ Defined in `src/adaptive/dht.rs:33-40` (mirrored as documentation constants in `
 |-----------|---------|---------|
 | `swap_threshold` | **0.35** | Peer becomes *eligible for lazy swap-out* — replaced only when a better routing-table candidate arrives. Never causes eviction on its own. |
 | `quarantine_threshold` | **0.20** | *Automatic avoidance*: lookup/dial machinery stops selecting the peer. The peer is not removed and explicit sends still work. |
-| `quarantine_readmit_threshold` | **0.45** | *Admission gate*: a peer **unknown to the routing table** (brand new, or previously quarantined and forgotten) must score at or above this to be admitted/readmitted. |
+| `quarantine_readmit_threshold` | **0.45** | *Readmission hysteresis*: only a peer carrying an explicit quarantine marker must recover to this score before readmission. |
 
 **Validation** (`AdaptiveDhtConfig::validate`, `src/adaptive/dht.rs:84-138`): all three must be finite and in `[0.0, 0.5)`; when quarantine is active, `quarantine_readmit_threshold >= quarantine_threshold`; when swap and quarantine are both non-zero, `swap_threshold > quarantine_threshold` (swap is a milder condition than avoidance, quarantine is strictly more severe). The quarantine pair is re-checked at the engine boundary in `set_trust_quarantine_thresholds`; `swap_threshold` is validated only by `AdaptiveDhtConfig::validate`. Values at or above neutral `0.5` are rejected because decay approaches neutral asymptotically: negatively observed peers would remain swap/quarantine-eligible indefinitely, while readmission from below at a neutral cutoff would be unreachable in finite time. Invalid config fails node construction (`AdaptiveDHT::new` returns `Err`).
 
 **Disabling**: `quarantine_threshold == 0.0` disables quarantine enforcement (`quarantine_enabled()`, `src/dht/core_engine.rs:1640-1642`). `NodeConfigBuilder::trust_enforcement(false)` (`src/network.rs:518-530`) zeroes all three thresholds — scores are still tracked, but nothing is enforced.
 
-### 3. Only unknown admissions are gated; existing peers in [0.20, 0.45) are preserved
+### 3. New peers use quarantine; explicit readmissions use hysteresis
 
-`check_new_peer_admission` (`src/dht/core_engine.rs:1644-1670`) is called **only when the peer is not already in the routing table** (`add_node`, `src/dht/core_engine.rs:2443-2446`; `re_evaluate_admission`, `src/dht/core_engine.rs:3069-3072`). Non-finite trust scores are rejected defensively. Consequences:
+`check_new_peer_admission` (`src/dht/core_engine.rs:1644-1673`) is called **only when the peer is not already in the routing table** (`add_node`, `src/dht/core_engine.rs:2443-2446`; `re_evaluate_admission`, `src/dht/core_engine.rs:3069-3072`). Non-finite trust scores are rejected defensively. Consequences:
 
 - An existing routing-table peer whose score sits in `[0.20, 0.45)` **stays in the table** and may move into the close group (close-group membership is pure XOR distance over table contents). It remains eligible for lazy swap-out below 0.35 and is skipped by automatic selection below 0.20 — but it is never ejected merely for the band it occupies.
-- Admission at or above 0.45 clears any quarantine marker (`forget_quarantined_peer`, `src/dht/core_engine.rs:1668`) — this is the readmission point.
-- `should_avoid_automatic_candidate` (`src/dht/core_engine.rs:1779-1795`) encodes the asymmetry directly: a peer scoring in `[quarantine, readmit)` is avoided as an automatic candidate *only if it is not already in the routing table*.
+- An unmarked peer is admitted and remains eligible for automatic lookup at or above 0.20. A transient failure cannot turn its absence from one observer's routing table into an implicit quarantine.
+- A marked peer remains blocked below 0.45. Admission at or above 0.45 clears its quarantine marker (`forget_quarantined_peer`) — this is the explicit readmission point.
+- `should_avoid_automatic_candidate` applies the same score/marker policy as `should_avoid_for_lookup`; routing-table absence by itself no longer raises the applicable threshold.
 
 ### 4. Stale-revalidation concurrency invariant
 
@@ -65,7 +66,7 @@ Stale-peer revalidation (evict-then-readmit under contention) must not let the n
 
 ### 5. Automatic filtering everywhere; explicit sends and wire format untouched
 
-Two engine predicates drive all filtering: `should_avoid_for_lookup` (`src/dht/core_engine.rs:1765-1775` — non-finite, below 0.20, or marked quarantined and below 0.45) and `should_avoid_automatic_candidate` (adds the unknown-peer readmit gate). They are applied on every **automatic** path in `src/dht_network_manager.rs`:
+Two engine predicates drive all filtering: `should_avoid_for_lookup` (`src/dht/core_engine.rs:1768-1778` — non-finite, below 0.20, or marked quarantined and below 0.45) and `should_avoid_automatic_candidate`, which deliberately applies the same policy to newly discovered candidates. They are applied on every **automatic** path in `src/dht_network_manager.rs`:
 
 1. Local lookup results / FIND_NODE response serving — `find_closest_nodes_local` (`:2579-2606`)
 2. Iterative lookup local seeding — `find_closest_nodes_network` (`:2740`)
@@ -148,13 +149,13 @@ The division of labour: **layers that can judge, report; layers that can't, stay
 ### Neutral
 
 - The immediate-eviction machinery (gate function, trust-gate enforcement, marker insertion) ships dark: wired, tested, and preserved, but returning no events until `close_group_immediate_eviction_enabled()` flips. Re-enabling it is a one-line change plus recalibration review — a likely follow-up ADR/amendment once scoring is deemed stable.
-- With eviction dark, quarantine *markers* have no production writer; the active enforcement today is score-based avoidance (0.20), the unknown-admission gate (0.45), and lazy swap (0.35).
+- With eviction dark, quarantine *markers* have no production writer; the active enforcement today is score-based avoidance/admission (0.20) and lazy swap (0.35). The 0.45 hysteresis becomes active when explicit quarantine eviction is enabled.
 - Trust scores keep being computed identically in observe-only mode, so enabling enforcement later needs no re-learning period.
 
 ## Compatibility and Breaking Changes
 
 - **API (breaking)**: `AdaptiveDhtConfig` gains `quarantine_threshold` and `quarantine_readmit_threshold` (with `#[serde(default)]`, so serialized configs deserialize fine); struct-literal construction without `..Default::default()` breaks. `DhtNetworkConfig` gains the same fields.
-- **Behavioural (breaking)**: quarantine defaults ON. New routing-table peers must meet 0.45 when enforcement is enabled; peers below 0.20 stop appearing in lookup results and automatic maintenance. `send_request` no longer auto-penalizes failures — consumers relying on that must add explicit `report_trust_event` calls.
+- **Behavioural (breaking)**: quarantine defaults ON. Unmarked routing-table peers must meet 0.20; explicitly quarantined peers must recover to 0.45. Peers below 0.20 stop appearing in lookup results and automatic maintenance. `send_request` no longer auto-penalizes failures — consumers relying on that must add explicit `report_trust_event` calls.
 - **Wire (non-breaking)**: no message format changes; `DHTNode` reliability keeps its legacy value.
 
 ## Operational Implications

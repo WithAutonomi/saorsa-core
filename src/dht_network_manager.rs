@@ -3725,7 +3725,6 @@ impl DhtNetworkManager {
         let trust_score = self.peer_trust_score(peer_id);
         let dht = self.dht.read().await;
         dht.should_avoid_automatic_candidate(peer_id, trust_score)
-            .await
     }
 
     /// Ensure an identity-authenticated channel to `peer_id` exists,

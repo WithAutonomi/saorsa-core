@@ -1608,8 +1608,9 @@ impl DhtCoreEngine {
     /// A `quarantine_threshold` of `0.0` disables quarantine enforcement.
     /// Otherwise, peers below that score are avoided for automatic lookups.
     /// Quarantined peers can only re-enter through normal admission after
-    /// their decayed trust reaches `quarantine_readmit_threshold`; new peers
-    /// must also meet that threshold before entering the routing table.
+    /// their decayed trust reaches `quarantine_readmit_threshold`. Peers that
+    /// were never explicitly quarantined need only remain at or above
+    /// `quarantine_threshold`.
     pub(crate) fn set_trust_quarantine_thresholds(
         &mut self,
         quarantine_threshold: f64,
@@ -1651,21 +1652,24 @@ impl DhtCoreEngine {
                 peer_id.to_hex()
             ));
         }
-        if trust_score < self.quarantine_readmit_threshold {
-            if self.quarantined_peers.contains(peer_id) {
+        if self.quarantined_peers.contains(peer_id) {
+            if trust_score < self.quarantine_readmit_threshold {
                 return Err(anyhow!(
                     "peer {} quarantined until trust >= {:.3} (current {trust_score:.3})",
                     peer_id.to_hex(),
                     self.quarantine_readmit_threshold
                 ));
             }
+            self.forget_quarantined_peer(peer_id);
+            return Ok(());
+        }
+        if trust_score < self.quarantine_threshold {
             return Err(anyhow!(
-                "peer {} below new-peer admission threshold ({trust_score:.3} < {:.3})",
+                "peer {} below quarantine threshold for new-peer admission ({trust_score:.3} < {:.3})",
                 peer_id.to_hex(),
-                self.quarantine_readmit_threshold
+                self.quarantine_threshold
             ));
         }
-        self.forget_quarantined_peer(peer_id);
         Ok(())
     }
 
@@ -1774,24 +1778,17 @@ impl DhtCoreEngine {
                 && trust_score < self.quarantine_readmit_threshold)
     }
 
-    /// Return whether automatic lookup/dial paths should avoid this peer when
-    /// it might become a new routing-table admission.
-    pub(crate) async fn should_avoid_automatic_candidate(
+    /// Return whether automatic lookup/dial paths should avoid this peer.
+    ///
+    /// Unknown peers are judged against the quarantine threshold. The higher
+    /// readmission threshold applies only when an explicit quarantine marker
+    /// records that this observer previously evicted the peer.
+    pub(crate) fn should_avoid_automatic_candidate(
         &self,
         peer_id: &PeerId,
         trust_score: f64,
     ) -> bool {
-        if self.should_avoid_for_lookup(peer_id, trust_score) {
-            return true;
-        }
-        if !self.quarantine_enabled() || trust_score >= self.quarantine_readmit_threshold {
-            return false;
-        }
-        self.routing_table
-            .read()
-            .await
-            .find_node_by_id(peer_id)
-            .is_none()
+        self.should_avoid_for_lookup(peer_id, trust_score)
     }
 
     /// Evict a quarantined peer if it currently occupies the K-closest set and
@@ -5436,26 +5433,15 @@ mod tests {
         );
 
         dht.remove_node_by_id(&peer).await;
-        let below_admission = dht
+        let readmitted = dht
             .add_node(
                 make_node_with_addr(peer_id_bytes, "/ip4/10.10.0.1/udp/9000/quic"),
                 &|id| if *id == peer { 0.30 } else { 0.5 },
             )
             .await;
         assert!(
-            below_admission.is_err(),
-            "removed peer should not readmit below 0.45"
-        );
-
-        let recovered = dht
-            .add_node(
-                make_node_with_addr(peer_id_bytes, "/ip4/10.10.0.1/udp/9000/quic"),
-                &|id| if *id == peer { 0.45 } else { 0.5 },
-            )
-            .await;
-        assert!(
-            recovered.is_ok(),
-            "removed peer should readmit once trust reaches 0.45"
+            readmitted.is_ok(),
+            "a manually removed peer without a quarantine marker should be admitted above 0.20"
         );
         assert!(dht.has_node(&peer).await);
     }
@@ -5625,10 +5611,10 @@ mod tests {
         );
     }
 
-    /// New peers must meet the readmit/admission threshold even when they would
-    /// occupy a non-close routing-table slot.
+    /// New non-close peers that were never quarantined use the lower quarantine
+    /// threshold for admission.
     #[tokio::test]
-    async fn test_new_non_close_admission_requires_readmit_threshold() {
+    async fn test_new_non_close_admission_uses_quarantine_threshold() {
         let mut dht = DhtCoreEngine::new(
             PeerId::from_bytes([0u8; 32]),
             4,
@@ -5664,35 +5650,23 @@ mod tests {
             "peer below quarantine threshold should be rejected"
         );
 
-        let below_new_peer_admission = dht
+        let admitted = dht
             .add_node(
                 make_node_with_addr(peer_id_bytes, "/ip4/10.10.0.9/udp/9000/quic"),
                 &|id| if *id == peer { 0.30 } else { 0.5 },
             )
             .await;
         assert!(
-            below_new_peer_admission.is_err(),
-            "new non-close peer should need trust >= 0.45"
-        );
-
-        let recovered = dht
-            .add_node(
-                make_node_with_addr(peer_id_bytes, "/ip4/10.10.0.9/udp/9000/quic"),
-                &|id| if *id == peer { 0.45 } else { 0.5 },
-            )
-            .await;
-        assert!(
-            recovered.is_ok(),
-            "new non-close peer should enter once trust reaches 0.45"
+            admitted.is_ok(),
+            "new non-close peer above 0.20 should be admitted without a quarantine marker"
         );
         assert!(dht.has_node(&peer).await);
     }
 
-    /// A new peer that would enter the K-closest set must meet the general
-    /// new-peer admission threshold, even if it is above the lower quarantine
-    /// threshold.
+    /// New close-group peers that were never quarantined also use the lower
+    /// quarantine threshold for admission.
     #[tokio::test]
-    async fn test_new_close_group_admission_requires_readmit_threshold() {
+    async fn test_new_close_group_admission_uses_quarantine_threshold() {
         let mut dht = DhtCoreEngine::new_for_tests(PeerId::from_bytes([0u8; 32])).unwrap();
         dht.set_trust_quarantine_thresholds(0.20, 0.45).unwrap();
 
@@ -5700,32 +5674,32 @@ mod tests {
         peer_id_bytes[31] = 9;
         let peer = PeerId::from_bytes(peer_id_bytes);
 
-        let below_close_group_threshold = dht
+        let below_quarantine = dht
+            .add_node(
+                make_node_with_addr(peer_id_bytes, "/ip4/10.10.0.9/udp/9000/quic"),
+                &|id| if *id == peer { 0.10 } else { 0.5 },
+            )
+            .await;
+        assert!(
+            below_quarantine.is_err(),
+            "new close-group peer below 0.20 should be rejected"
+        );
+
+        let admitted = dht
             .add_node(
                 make_node_with_addr(peer_id_bytes, "/ip4/10.10.0.9/udp/9000/quic"),
                 &|id| if *id == peer { 0.30 } else { 0.5 },
             )
             .await;
         assert!(
-            below_close_group_threshold.is_err(),
-            "new close-group peer should need trust >= 0.45"
-        );
-
-        let recovered = dht
-            .add_node(
-                make_node_with_addr(peer_id_bytes, "/ip4/10.10.0.9/udp/9000/quic"),
-                &|id| if *id == peer { 0.45 } else { 0.5 },
-            )
-            .await;
-        assert!(
-            recovered.is_ok(),
-            "new close-group peer should enter once trust reaches 0.45"
+            admitted.is_ok(),
+            "new close-group peer above 0.20 should be admitted without a quarantine marker"
         );
         assert!(dht.has_node(&peer).await);
     }
 
     #[tokio::test]
-    async fn test_automatic_lookup_skips_unknown_below_admission_threshold() {
+    async fn test_automatic_lookup_uses_quarantine_marker_for_readmit_hysteresis() {
         let mut dht = DhtCoreEngine::new(
             PeerId::from_bytes([0u8; 32]),
             4,
@@ -5750,20 +5724,63 @@ mod tests {
         let unknown_peer = PeerId::from_bytes(unknown_id);
 
         assert!(
-            dht.should_avoid_automatic_candidate(&unknown_peer, 0.30)
-                .await,
-            "automatic lookup should skip unknown peers below new-peer admission threshold"
+            !dht.should_avoid_automatic_candidate(&unknown_peer, 0.30),
+            "automatic lookup should allow an unknown peer above the quarantine threshold"
         );
         assert!(
-            !dht.should_avoid_automatic_candidate(&existing_peer, 0.30)
-                .await,
+            dht.should_avoid_automatic_candidate(&unknown_peer, 0.10),
+            "automatic lookup should skip an unknown peer below the quarantine threshold"
+        );
+        assert!(
+            !dht.should_avoid_automatic_candidate(&existing_peer, 0.30),
             "existing routing-table peers above quarantine threshold should remain usable"
         );
+
+        dht.remember_quarantined_peer(unknown_peer, &|_| 0.30);
+        assert!(
+            dht.should_avoid_automatic_candidate(&unknown_peer, 0.30),
+            "an explicitly quarantined peer should remain avoided below the readmit threshold"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_explicitly_quarantined_peer_requires_readmit_threshold() {
+        let mut dht = DhtCoreEngine::new_for_tests(PeerId::from_bytes([0u8; 32])).unwrap();
+        dht.set_trust_quarantine_thresholds(0.20, 0.45).unwrap();
+
+        let mut peer_id_bytes = [0u8; 32];
+        peer_id_bytes[31] = 9;
+        let peer = PeerId::from_bytes(peer_id_bytes);
+        dht.remember_quarantined_peer(peer, &|_| 0.30);
+
+        let rejected = dht
+            .add_node(
+                make_node_with_addr(peer_id_bytes, "/ip4/10.10.0.9/udp/9000/quic"),
+                &|id| if *id == peer { 0.30 } else { 0.5 },
+            )
+            .await;
+        assert!(
+            rejected.is_err(),
+            "explicitly quarantined peer should remain blocked below 0.45"
+        );
+
+        let readmitted = dht
+            .add_node(
+                make_node_with_addr(peer_id_bytes, "/ip4/10.10.0.9/udp/9000/quic"),
+                &|id| if *id == peer { 0.45 } else { 0.5 },
+            )
+            .await;
+        assert!(
+            readmitted.is_ok(),
+            "explicitly quarantined peer should re-enter at 0.45"
+        );
+        assert!(dht.has_node(&peer).await);
+        assert!(!dht.quarantined_peers.contains(&peer));
     }
 
     /// Removing one close peer can promote a non-close peer into the close
     /// group. Existing routing-table peers above the quarantine threshold stay
-    /// even when below the new-peer admission threshold; peers below the
+    /// even when below the explicit readmission threshold; peers below the
     /// quarantine threshold are also retained while immediate eviction is
     /// disabled.
     #[tokio::test]

@@ -88,7 +88,8 @@ Trust affects routing-table membership in two stages:
 |-----------------|-------------------|---------------|
 | Lazy swap eligibility | < 0.35 | `swap_threshold` |
 | Close-group quarantine / lookup avoidance | < 0.20 | `quarantine_threshold` |
-| New peer admission / quarantine readmission | >= 0.45 | `quarantine_readmit_threshold` |
+| New peer admission | >= 0.20 | `quarantine_threshold` |
+| Explicit quarantine readmission | >= 0.45 | `quarantine_readmit_threshold` |
 | Staleness | Configurable | `stale_timeout` |
 
 Peers outside the K-closest set are not globally evicted solely for low trust.
@@ -97,8 +98,9 @@ lookup paths below the quarantine threshold, and can be lazily replaced when
 better candidates need the slot.
 Peers already in the routing table at or above the quarantine threshold but
 below the readmission threshold may remain in the table, including after moving
-into the K-closest set. New routing-table admissions and quarantined
-readmissions require the readmission threshold.
+into the K-closest set. New routing-table admissions require the quarantine
+threshold; only peers carrying an explicit quarantine marker require the higher
+readmission threshold.
 
 ### Quarantine Reasons
 
