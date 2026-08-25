@@ -313,9 +313,9 @@ impl AdaptiveDHT {
     /// Start the DHT manager.
     ///
     /// Trust scores are computed live — no background tasks needed.
-    /// Low-trust peers are swapped out when better candidates arrive. Immediate
-    /// close-group eviction is temporarily disabled until trust scoring is
-    /// stable.
+    /// Low-trust peers are swapped out when better candidates arrive. Close-
+    /// group peers below the quarantine threshold are immediately evicted when
+    /// the routing table has capacity above K.
     pub async fn start(&self) -> Result<()> {
         Arc::clone(&self.dht_manager).start().await
     }

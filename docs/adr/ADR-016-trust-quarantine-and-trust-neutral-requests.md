@@ -80,13 +80,13 @@ Two engine predicates drive all filtering: `should_avoid_for_lookup` (`src/dht/c
 
 **Wire format is unchanged**: trust is never serialized into DHT lookup results — `lookup_results_from_routing_nodes` keeps the legacy `DHTNode` reliability wire value stable (`src/dht_network_manager.rs:2620-2623`, asserted by test at `:6011`). Older nodes interoperate without change.
 
-### 6. Immediate close-group trust eviction: implemented but disabled
+### 6. Immediate close-group trust eviction
 
-Immediate eviction of below-0.20 close-group peers is **currently switched off** while trust scoring stabilizes: `close_group_immediate_eviction_enabled()` is hard-wired to `false` (`src/dht/core_engine.rs:216-218`). `enforce_close_group_trust_gate` (`src/dht/core_engine.rs:1866-1924`) is still wired through `DhtNetworkManager::enforce_trust_quarantine` and `broadcast_routing_events_with_quarantine`, but returns no events; `enforce_close_group_quarantine` is retained under `#[cfg(test)]`. The gated-off bodies preserve the safety property for re-enablement: eviction only proceeds `while routing.node_count() > k_value`, so the routing table **never shrinks below K** for trust reasons. Until the gate flips, lazy swap-out (0.35) is the sole replacement mechanism for low-trust peers, and peers below 0.20 remain in the table but are avoided by the automatic paths above.
+Immediate eviction of below-0.20 close-group peers is enabled. `enforce_close_group_trust_gate` is wired through `DhtNetworkManager::enforce_trust_quarantine` and `broadcast_routing_events_with_quarantine`; it records an explicit quarantine marker before removing a peer. Eviction only proceeds `while routing.node_count() > k_value`, so the routing table **never shrinks below K** for trust reasons. When no surplus exists, the peer remains in the table but is avoided by automatic paths until a later enforcement pass can replace it safely.
 
 ### 7. Bounded quarantine markers
 
-Quarantine markers (`quarantined_peers: HashSet<PeerId>` plus FIFO `quarantined_peer_order`) are bounded at `MAX_QUARANTINED_PEERS = 8192` (`src/dht/core_engine.rs:229`). The key insight making the bound safe (`quarantine_marker_required_for_score`, `src/dht/core_engine.rs:1690-1696`): **a marker is only semantically required while a peer's score is in `[quarantine_threshold, readmit_threshold)`** — below 0.20 the score itself keeps the peer avoided; at/above 0.45 the peer is readmittable and the marker is cleared. When the set is full, `prune_redundant_quarantined_peers` drops (oldest-first) any marker whose current score no longer requires one; if the set is still full, the new marker is simply not inserted — the score-based avoidance clause covers the peer regardless. Note: with immediate eviction disabled (§6), no production path currently inserts markers; the machinery is preserved intact for re-enablement.
+Quarantine markers (`quarantined_peers: HashSet<PeerId>` plus FIFO `quarantined_peer_order`) are bounded at `MAX_QUARANTINED_PEERS = 8192` (`src/dht/core_engine.rs:229`). The key insight making the bound safe (`quarantine_marker_required_for_score`, `src/dht/core_engine.rs:1690-1696`): **a marker is only semantically required while a peer's score is in `[quarantine_threshold, readmit_threshold)`** — below 0.20 the score itself keeps the peer avoided; at/above 0.45 the peer is readmittable and the marker is cleared. When the set is full, `prune_redundant_quarantined_peers` drops (oldest-first) any marker whose current score no longer requires one; if the set is still full, the new marker is simply not inserted — the score-based avoidance clause covers the peer regardless.
 
 ### 8. Decay and recovery via rediscovery
 
@@ -118,7 +118,7 @@ The division of labour: **layers that can judge, report; layers that can't, stay
 ## Invariants
 
 1. **Threshold ordering**: when quarantine is active, `0 < quarantine_threshold <= quarantine_readmit_threshold < 0.5`; when swap and quarantine are both active, `quarantine_threshold < swap_threshold < 0.5`. Defaults: `0.20 < 0.35` and `0.20 <= 0.45`.
-2. **K-sized routing table**: trust enforcement never shrinks the routing table below K (eviction, even when re-enabled, only runs while `node_count > K`).
+2. **K-sized routing table**: trust enforcement never shrinks the routing table below K; eviction only runs while `node_count > K`.
 3. **Known-peer preservation**: a peer already in the routing table is never subjected to the new-peer admission gate — including during stale-revalidation races (§4).
 4. **No transport block**: quarantine affects only routing-table membership and automatic selection; explicit sends always go through.
 5. **Wire stability**: trust state never leaks into serialized DHT messages; filtering is strictly local policy.
@@ -141,16 +141,14 @@ The division of labour: **layers that can judge, report; layers that can't, stay
 
 ### Negative
 
-- **Slower reaction to genuinely malicious close-group peers**: with immediate eviction disabled, a below-0.20 peer stays in the close group until lazy swap-out replaces it; it is avoided by automatic paths but still occupies a slot.
+- **Close-group churn risk**: transiently driving an honest peer below 0.20 can immediately evict it when surplus capacity exists and hold it out until its score recovers to 0.45.
 - **Applications now own attribution**: any consumer that relied on `send_request`'s automatic penalties gets no trust signal for its request failures unless it explicitly reports a justified outcome. Silent trust erosion of misbehaving peers via generic requests no longer happens.
 - **Recovery latency is fixed by decay**: a wrongly-penalized peer needs up to ~46 h (worst case) to become admissible again; there is no active-probe fast path.
 - **More configuration surface**: three interdependent thresholds with ordering rules; invalid combinations fail node construction (loudly, by design).
 
 ### Neutral
 
-- The immediate-eviction machinery (gate function, trust-gate enforcement, marker insertion) ships dark: wired, tested, and preserved, but returning no events until `close_group_immediate_eviction_enabled()` flips. Re-enabling it is a one-line change plus recalibration review — a likely follow-up ADR/amendment once scoring is deemed stable.
-- With eviction dark, quarantine *markers* have no production writer; the active enforcement today is score-based avoidance/admission (0.20) and lazy swap (0.35). The 0.45 hysteresis becomes active when explicit quarantine eviction is enabled.
-- Trust scores keep being computed identically in observe-only mode, so enabling enforcement later needs no re-learning period.
+- Trust scores keep being computed identically in observe-only mode, so disabling and later re-enabling enforcement needs no re-learning period.
 
 ## Compatibility and Breaking Changes
 
@@ -161,7 +159,7 @@ The division of labour: **layers that can judge, report; layers that can't, stay
 ## Operational Implications
 
 - **Defaults are live on upgrade** — no config change needed to get the policy; use `trust_enforcement(false)` to opt out.
-- Watch trust-score distribution after deployment: since scores are stabilizing, thresholds (especially 0.45 admission on small networks, where rejecting a scarce peer costs more) may need tuning before immediate eviction is re-enabled.
+- Watch trust-score distribution and close-group churn after deployment, especially on small networks where rejecting a scarce peer costs more.
 - Reason strings (`dht_dial_failed`, `dht_request_failed`, `dht_identity_exchange_failed`, `application_failure`, …) are logged with score deltas — use them to audit which layer is driving a peer's score.
 - Downstream consumers should classify data-availability outcomes and report only justified `ApplicationSuccess`/`ApplicationFailure` events; generic request transport itself contributes no trust signal.
 - Small/bootstrap networks: bootstrap peers themselves are trust-filtered — a bootstrap peer driven below 0.20 will be skipped, so keep multiple bootstrap endpoints configured.
@@ -172,7 +170,7 @@ The division of labour: **layers that can judge, report; layers that can't, stay
 
 **Hard transport-level block of quarantined peers.** Refuse all sends to below-threshold peers. Rejected: explicit sends are how applications retry, probe, and recover — blocking them turns a local routing preference into a network partition, breaks consumer semantics, and prevents the very interactions whose successes a consumer could report to rehabilitate a peer.
 
-**Keep immediate close-group eviction active.** Evict on the spot when a K-closest peer drops below 0.20. Rejected *for now*: trust scoring is not yet stable enough; transient noise could eject honest close-group peers and churn the close group. The machinery is retained behind `close_group_immediate_eviction_enabled()` and its K-preservation guard, to be re-enabled once scoring stabilizes.
+**Keep immediate close-group eviction disabled.** Rely only on score-based avoidance and lazy swap-out. Rejected after testnet calibration: it leaves a below-0.20 peer occupying a close-group slot despite surplus capacity and leaves the 0.45 readmission hysteresis without a production marker writer. The K-preservation guard limits immediate eviction to routing tables with surplus above K.
 
 **Keep generic automatic request penalties (status quo ante).** Let `send_request` keep reporting `ConnectionFailed`/`ConnectionTimeout`. Rejected: the generic layer cannot distinguish remote misbehaviour from congestion, application delay, or local overload, and it double-counts failures that application-aware layers already report with justified weights.
 

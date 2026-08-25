@@ -640,9 +640,8 @@ pub struct DhtNetworkConfig {
     /// routing table when a better candidate is available.
     /// Default: [`AdaptiveDhtConfig::default`].
     pub swap_threshold: f64,
-    /// Trust score below which automatic lookup/dial paths avoid a peer.
-    /// Immediate close-group eviction is temporarily disabled until trust
-    /// scoring is stable.
+    /// Trust score below which automatic lookup/dial paths avoid a peer and
+    /// close-group peers are evicted when the routing table has surplus above K.
     /// Default: [`AdaptiveDhtConfig::default`].
     pub quarantine_threshold: f64,
     /// Trust score required before a new peer can enter the routing table,
