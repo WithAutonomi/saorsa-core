@@ -58,7 +58,7 @@ pub mod identity;
 // ---------------------------------------------------------------------------
 
 // Networking
-pub use address::{MultiAddr, WebTransportAddr, WebTransportCertificateHash, WebTransportHost};
+pub use address::{MultiAddr, WebRtcCertificateHash, WebRtcDirectAddr};
 pub use network::{NodeConfig, NodeMode, P2PEvent, P2PNode};
 
 // DHT types — peer discovery, routing, and network events

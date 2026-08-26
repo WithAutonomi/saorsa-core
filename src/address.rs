@@ -21,8 +21,8 @@
 //! ```text
 //! /ip4/<ipv4>/udp/<port>/quic[/p2p/<peer-id>]
 //! /ip6/<ipv6>/udp/<port>/quic[/p2p/<peer-id>]
-//! /ip4/<ipv4>/udp/<port>/quic-v1/webtransport/certhash/<multihash>/p2p/<peer-id>
-//! /dns/<hostname>/udp/<port>/quic-v1/webtransport/certhash/<multihash>/p2p/<peer-id>
+//! /ip4/<ipv4>/udp/<port>/webrtc-direct/certhash/<multihash>/p2p/<peer-id>
+//! /ip6/<ipv6>/udp/<port>/webrtc-direct/certhash/<multihash>/p2p/<peer-id>
 //! /ip4/<ipv4>/tcp/<port>[/p2p/<peer-id>]
 //! /ip6/<ipv6>/tcp/<port>[/p2p/<peer-id>]
 //! /ip4/<ipv4>/udp/<port>[/p2p/<peer-id>]
@@ -39,9 +39,7 @@ use std::str::FromStr;
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 
-pub use saorsa_transport::transport::{
-    TransportAddr, WebTransportAddr, WebTransportCertificateHash, WebTransportHost,
-};
+pub use saorsa_transport::transport::{TransportAddr, WebRtcCertificateHash, WebRtcDirectAddr};
 
 use crate::identity::peer_id::PeerId;
 
@@ -114,10 +112,10 @@ impl MultiAddr {
         Self::new(TransportAddr::Tcp(addr))
     }
 
-    /// Create a browser-compatible WebTransport multiaddress.
+    /// Create a browser-compatible WebRTC Direct multiaddress.
     #[must_use]
-    pub fn webtransport(addr: WebTransportAddr) -> Self {
-        Self::new(TransportAddr::WebTransport(addr))
+    pub fn webrtc_direct(addr: WebRtcDirectAddr) -> Self {
+        Self::new(TransportAddr::WebRtcDirect(addr))
     }
 
     /// Builder: attach a [`PeerId`] to this address.
@@ -161,19 +159,19 @@ impl MultiAddr {
         self.peer_id.as_ref()
     }
 
-    /// Return the WebTransport endpoint components when this address uses WebTransport.
+    /// Return the WebRTC Direct endpoint when this address uses WebRTC Direct.
     #[must_use]
-    pub fn webtransport_addr(&self) -> Option<&WebTransportAddr> {
+    pub fn webrtc_direct_addr(&self) -> Option<&WebRtcDirectAddr> {
         match &self.transport {
-            TransportAddr::WebTransport(address) => Some(address),
+            TransportAddr::WebRtcDirect(address) => Some(address),
             _ => None,
         }
     }
 
-    /// Whether this address describes a browser-compatible WebTransport endpoint.
+    /// Whether this address describes a browser-compatible WebRTC Direct endpoint.
     #[must_use]
-    pub fn is_webtransport(&self) -> bool {
-        self.webtransport_addr().is_some()
+    pub fn is_webrtc_direct(&self) -> bool {
+        self.webrtc_direct_addr().is_some()
     }
 
     /// `true` when this address uses the QUIC transport — the only transport
@@ -203,7 +201,7 @@ impl MultiAddr {
     #[must_use]
     pub fn socket_addr(&self) -> Option<SocketAddr> {
         match &self.transport {
-            TransportAddr::WebTransport(address) => address.socket_addr(),
+            TransportAddr::WebRtcDirect(address) => Some(address.socket_addr()),
             _ => self.transport.as_socket_addr(),
         }
     }
@@ -218,7 +216,7 @@ impl MultiAddr {
     #[must_use]
     pub fn port(&self) -> Option<u16> {
         match &self.transport {
-            TransportAddr::WebTransport(address) => Some(address.port()),
+            TransportAddr::WebRtcDirect(address) => Some(address.port()),
             _ => self.socket_addr().map(|a| a.port()),
         }
     }
@@ -418,43 +416,37 @@ mod tests {
     }
 
     #[test]
-    fn test_multiaddr_webtransport_roundtrip_with_peer_id() {
+    fn test_multiaddr_webrtc_direct_roundtrip_with_peer_id() {
         let peer_id = PeerId::from_bytes([0x55; 32]);
-        let current = WebTransportCertificateHash::new([0x11; 32]);
-        let next = WebTransportCertificateHash::new([0x22; 32]);
-        let endpoint = WebTransportAddr::new(
-            WebTransportHost::Dns("node.example".to_string()),
-            443,
-            vec![current, next],
-        )
-        .unwrap();
-        let address = MultiAddr::webtransport(endpoint).with_peer_id(peer_id);
+        let certificate_hash = WebRtcCertificateHash::new([0x11; 32]);
+        let endpoint =
+            WebRtcDirectAddr::new("203.0.113.7:443".parse().unwrap(), certificate_hash).unwrap();
+        let address = MultiAddr::webrtc_direct(endpoint).with_peer_id(peer_id);
 
         let encoded = address.to_string();
-        assert_eq!(encoded.matches("/certhash/").count(), 2);
+        assert_eq!(encoded.matches("/certhash/").count(), 1);
         assert!(encoded.ends_with(&format!("/p2p/{}", peer_id.to_hex())));
         let parsed = encoded.parse::<MultiAddr>().unwrap();
         assert_eq!(parsed, address);
         assert_eq!(parsed.peer_id(), Some(&peer_id));
-        assert!(parsed.is_webtransport());
+        assert!(parsed.is_webrtc_direct());
         assert!(!parsed.is_quic());
         assert_eq!(parsed.port(), Some(443));
         assert_eq!(
-            parsed.webtransport_addr().unwrap().certificate_hashes(),
-            &[current, next]
+            parsed.webrtc_direct_addr().unwrap().certificate_hash(),
+            certificate_hash
         );
     }
 
     #[test]
-    fn test_webtransport_multiaddr_postcard_roundtrip() {
+    fn test_webrtc_direct_multiaddr_postcard_roundtrip() {
         let peer_id = PeerId::from_bytes([0x66; 32]);
-        let endpoint = WebTransportAddr::new(
-            WebTransportHost::Ip4(Ipv4Addr::LOCALHOST),
-            443,
-            vec![WebTransportCertificateHash::new([0x33; 32])],
+        let endpoint = WebRtcDirectAddr::new(
+            "127.0.0.1:443".parse().unwrap(),
+            WebRtcCertificateHash::new([0x33; 32]),
         )
         .unwrap();
-        let address = MultiAddr::webtransport(endpoint).with_peer_id(peer_id);
+        let address = MultiAddr::webrtc_direct(endpoint).with_peer_id(peer_id);
 
         let bytes = postcard::to_stdvec(&address).unwrap();
         let decoded: MultiAddr = postcard::from_bytes(&bytes).unwrap();
