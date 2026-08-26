@@ -68,7 +68,7 @@ once_cell = "1.21"
 dashmap = "6"
 
 # Networking
-# Cross-repository WebTransport address worktree. The version remains explicit
+# Cross-repository WebRTC Direct address worktree. The version remains explicit
 # so the path can be replaced by the published crate without changing the API contract.
 saorsa-transport = { version = "0.35.3", path = "../saorsa-transport-web-support" }
 
