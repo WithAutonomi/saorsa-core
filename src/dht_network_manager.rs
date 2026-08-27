@@ -831,6 +831,21 @@ pub struct DhtNetworkManager {
     lookup_failures: Arc<LookupFailureCoordinator>,
 }
 
+/// Result of walking a peer's bounded dial plan.
+///
+/// Keeping [`Self::NoAttempt`] separate from [`Self::AttemptedAndFailed`]
+/// prevents callers from treating failure-cache suppression as a fresh
+/// transport failure.
+#[derive(Debug, PartialEq, Eq)]
+enum DialAddressesOutcome {
+    /// A transport dial succeeded and produced this channel ID.
+    Connected(String),
+    /// No transport dial was made (for example, every candidate was cached).
+    NoAttempt,
+    /// At least one transport dial was made and every such dial failed.
+    AttemptedAndFailed,
+}
+
 /// Outcome of a shared dial+identity-exchange attempt, broadcast to
 /// every task that joined the in-flight dial via
 /// [`DhtNetworkManager::ensure_peer_channel`].
@@ -845,7 +860,8 @@ enum PendingDialOutcome {
     /// QUIC handshake completed and identity exchange authenticated
     /// the remote as the expected peer.
     Connected,
-    /// Every candidate address failed to dial.
+    /// No candidate address produced a channel. The owner records a trust
+    /// failure only when at least one transport dial was actually attempted.
     DialFailed { candidates_count: usize },
     /// The dial succeeded but identity exchange failed or timed out —
     /// the owning task has already torn down the transport channel.
@@ -868,7 +884,7 @@ impl PendingDialOutcome {
             Self::DialFailed { candidates_count } => {
                 Err(P2PError::Network(NetworkError::PeerNotFound(
                     format!(
-                        "failed to dial {} at any of {} candidate address(es)",
+                        "could not establish a channel to {} using {} candidate address(es)",
                         peer_hex, candidates_count
                     )
                     .into(),
@@ -3494,8 +3510,8 @@ impl DhtNetworkManager {
     }
 
     /// Try dialing the bounded per-family plan chosen by
-    /// [`Self::select_dial_candidates`]. Returns the transport channel ID on
-    /// the first success, `None` if every attempted dial failed.
+    /// [`Self::select_dial_candidates`]. Distinguishes a failed transport dial
+    /// from a plan where every candidate was skipped without an attempt.
     ///
     /// The caller hands in typed pairs from a `DHTNode` (via
     /// [`DHTNode::typed_addresses`]) or a candidate list returned by
@@ -3505,11 +3521,11 @@ impl DhtNetworkManager {
     ///
     /// Addresses that failed a dial within the last
     /// [`DIAL_FAILURE_CACHE_TTL`] are **not re-dialed**, but they still
-    /// consume one of the plan slots — a fully cached plan therefore
-    /// returns `None` without trying anything further down the priority
-    /// list. This stops a peer that republishes the same broken Direct /
-    /// Unverified / Lan set on every DHT query from causing a dial retry
-    /// every time we encounter them.
+    /// consume one of the plan slots — a fully cached plan therefore returns
+    /// [`DialAddressesOutcome::NoAttempt`] without trying anything further
+    /// down the priority list. This stops a peer that republishes the same
+    /// broken Direct / Unverified / Lan set on every DHT query from causing a
+    /// dial retry every time we encounter them.
     ///
     /// Bails out early when the peer is already connected — the caller
     /// would otherwise be paying N redundant `is_peer_connected` reads
@@ -3518,13 +3534,13 @@ impl DhtNetworkManager {
         &self,
         peer_id: &PeerId,
         typed_addresses: &[(MultiAddr, AddressType)],
-    ) -> Option<String> {
+    ) -> DialAddressesOutcome {
         if self.transport.is_peer_connected(peer_id).await {
             trace!(
                 "dial_addresses: peer {} already connected, skipping dial",
                 peer_id.to_hex()
             );
-            return None;
+            return DialAddressesOutcome::NoAttempt;
         }
         let plan = self.contextual_dial_plan(typed_addresses).await;
         if plan.is_empty() {
@@ -3532,12 +3548,11 @@ impl DhtNetworkManager {
                 "dial_addresses: no dialable addresses for {}",
                 peer_id.to_hex()
             );
-            return None;
+            return DialAddressesOutcome::NoAttempt;
         }
         let mut attempted = 0usize;
         let mut skipped_cached = 0usize;
         for (addr, ty) in &plan {
-            attempted += 1;
             let Some(socket_addr) = addr.dialable_socket_addr() else {
                 continue;
             };
@@ -3554,15 +3569,24 @@ impl DhtNetworkManager {
                 );
                 continue;
             }
+            attempted += 1;
             match self.dial_candidate(peer_id, addr, *ty).await {
                 Some(channel_id) => {
                     self.dial_failure_cache.clear(&socket_addr);
-                    return Some(channel_id);
+                    return DialAddressesOutcome::Connected(channel_id);
                 }
                 None => {
                     self.dial_failure_cache.record_failure(socket_addr, *ty);
                 }
             }
+        }
+        if attempted == 0 {
+            debug!(
+                "dial_addresses: no address dial attempted for {} ({} skipped from failure cache)",
+                peer_id.to_hex(),
+                skipped_cached
+            );
+            return DialAddressesOutcome::NoAttempt;
         }
         debug!(
             "dial_addresses: all {} attempted address(es) failed for {} ({} skipped from failure cache)",
@@ -3570,7 +3594,7 @@ impl DhtNetworkManager {
             peer_id.to_hex(),
             skipped_cached
         );
-        None
+        DialAddressesOutcome::AttemptedAndFailed
     }
 
     /// Return true when a FIND_NODE candidate has no useful dial attempt left
@@ -3893,22 +3917,36 @@ impl DhtNetworkManager {
             candidates.len()
         );
 
-        let Some(channel_id) = self.dial_addresses(peer_id, candidates).await else {
-            warn!(
-                "[STEP 1b] {} -> {}: dial failed for all {} candidate address(es)",
-                local_hex,
-                peer_hex,
-                candidates.len()
-            );
-            self.record_peer_failure_weighted(
-                peer_id,
-                TRUST_REASON_DHT_DIAL_FAILED,
-                DHT_DIAL_FAILURE_TRUST_WEIGHT,
-            )
-            .await;
-            return PendingDialOutcome::DialFailed {
-                candidates_count: candidates.len(),
-            };
+        let channel_id = match self.dial_addresses(peer_id, candidates).await {
+            DialAddressesOutcome::Connected(channel_id) => channel_id,
+            DialAddressesOutcome::NoAttempt => {
+                debug!(
+                    "[STEP 1b] {} -> {}: no dial attempted for {} candidate address(es)",
+                    local_hex,
+                    peer_hex,
+                    candidates.len()
+                );
+                return PendingDialOutcome::DialFailed {
+                    candidates_count: candidates.len(),
+                };
+            }
+            DialAddressesOutcome::AttemptedAndFailed => {
+                warn!(
+                    "[STEP 1b] {} -> {}: dial failed for all {} candidate address(es)",
+                    local_hex,
+                    peer_hex,
+                    candidates.len()
+                );
+                self.record_peer_failure_weighted(
+                    peer_id,
+                    TRUST_REASON_DHT_DIAL_FAILED,
+                    DHT_DIAL_FAILURE_TRUST_WEIGHT,
+                )
+                .await;
+                return PendingDialOutcome::DialFailed {
+                    candidates_count: candidates.len(),
+                };
+            }
         };
 
         let identity_timeout = self.config.request_timeout.min(IDENTITY_EXCHANGE_TIMEOUT);
@@ -6243,6 +6281,63 @@ mod tests {
             score < threshold,
             "four weighted dial failures over six hours should avoid peer: score={score}, threshold={threshold}"
         );
+    }
+
+    #[tokio::test]
+    async fn cached_dial_skips_do_not_reduce_peer_trust() {
+        let identity =
+            Arc::new(crate::identity::node_identity::NodeIdentity::from_seed(&[91u8; 32]).unwrap());
+        let transport = Arc::new(
+            crate::transport_handle::TransportHandle::new(
+                crate::transport_handle::TransportConfig {
+                    listen_addrs: vec![MultiAddr::quic(SocketAddr::from(([127, 0, 0, 1], 0)))],
+                    connection_timeout: Duration::from_millis(100),
+                    max_connections: 16,
+                    event_channel_capacity: 16,
+                    max_message_size: None,
+                    node_identity: identity,
+                    user_agent: "cached-dial-regression".to_string(),
+                    allow_loopback: true,
+                    enable_relay_service: false,
+                    advertise_external_addresses: false,
+                },
+            )
+            .await
+            .unwrap(),
+        );
+        let trust_engine = Arc::new(TrustEngine::new());
+        let mut config = DhtNetworkConfig::default();
+        config.peer_id = transport.peer_id();
+        config.node_config.allow_loopback = true;
+        let manager = DhtNetworkManager::new(
+            Arc::clone(&transport),
+            Some(Arc::clone(&trust_engine)),
+            config,
+        )
+        .await
+        .unwrap();
+
+        let peer = pid(43);
+        let address = MultiAddr::quic("203.0.113.7:49001".parse().unwrap());
+        let socket_addr = address.dialable_socket_addr().unwrap();
+        let candidates = vec![(address, AddressType::Direct)];
+        manager
+            .dial_failure_cache
+            .record_failure(socket_addr, AddressType::Direct);
+
+        assert_eq!(
+            manager.dial_addresses(&peer, &candidates).await,
+            DialAddressesOutcome::NoAttempt
+        );
+        for _ in 0..4 {
+            let outcome = manager
+                .run_owned_dial(&peer, &candidates, "local", "remote")
+                .await;
+            assert!(matches!(outcome, PendingDialOutcome::DialFailed { .. }));
+        }
+        assert_eq!(trust_engine.score(&peer), DEFAULT_NEUTRAL_TRUST);
+
+        transport.stop().await.unwrap();
     }
 
     fn bucket_refresh_candidate(index: usize, refresh_debt_secs: u64) -> BucketRefreshCandidate {
