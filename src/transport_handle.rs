@@ -1764,6 +1764,41 @@ impl TransportHandle {
             .map(|(channel_id, _)| channel_id)
     }
 
+    async fn connect_peer_with_transport_identity(
+        &self,
+        address: &MultiAddr,
+        expected_daemon: PeerId,
+    ) -> Result<String> {
+        let (channel_id, peer_public_key_spki) = self
+            .connect_peer_inner_authenticated(address, None, Some("multiplex_upgrade"))
+            .await?;
+        let actual_daemon = match peer_public_key_spki {
+            Some(spki) => match peer_id_from_public_key_spki(&spki) {
+                Ok(peer_id) => peer_id,
+                Err(error) => {
+                    self.disconnect_channel_own(&channel_id).await;
+                    return Err(error);
+                }
+            },
+            None => {
+                self.disconnect_channel_own(&channel_id).await;
+                return Err(P2PError::Network(NetworkError::ProtocolError(
+                    "shared endpoint did not expose an authenticated transport identity".into(),
+                )));
+            }
+        };
+        if actual_daemon != expected_daemon {
+            self.disconnect_channel_own(&channel_id).await;
+            return Err(P2PError::Network(NetworkError::ProtocolError(
+                format!(
+                    "shared endpoint identity mismatch: expected {expected_daemon}, got {actual_daemon}"
+                )
+                .into(),
+            )));
+        }
+        Ok(channel_id)
+    }
+
     async fn connect_peer_inner_authenticated(
         &self,
         address: &MultiAddr,
@@ -2106,7 +2141,10 @@ impl TransportHandle {
             {
                 let mut upgraded = false;
                 for address in &capability.addresses {
-                    let Ok(channel_id) = shared_backend.connect_peer(address).await else {
+                    let Ok(channel_id) = shared_backend
+                        .connect_peer_with_transport_identity(address, capability.daemon_peer_id)
+                        .await
+                    else {
                         continue;
                     };
                     if shared_backend
@@ -4191,6 +4229,43 @@ mod multiplexed_transport_tests {
         for handle in [&a1, &a2, &b1, &b2] {
             handle.stop().await.expect("stop legacy endpoint");
         }
+        root_a.stop().await.expect("stop root a");
+        root_b.stop().await.expect("stop root b");
+    }
+
+    #[tokio::test]
+    async fn shared_upgrade_rejects_wrong_daemon_transport_identity() {
+        let daemon_a = Arc::new(NodeIdentity::generate().expect("daemon a"));
+        let daemon_b = Arc::new(NodeIdentity::generate().expect("daemon b"));
+        let root_a = TransportHandle::new_multiplexed(config(daemon_a))
+            .await
+            .expect("root a");
+        let root_b = TransportHandle::new_multiplexed(config(Arc::clone(&daemon_b)))
+            .await
+            .expect("root b");
+        root_a
+            .start_network_listeners()
+            .await
+            .expect("start root a");
+        root_b
+            .start_network_listeners()
+            .await
+            .expect("start root b");
+        let root_b_addr = root_b
+            .listen_addrs()
+            .await
+            .into_iter()
+            .find(|address| address.socket_addr().is_some_and(|socket| socket.is_ipv4()))
+            .expect("root b IPv4 address");
+        let wrong_daemon = PeerId::from_bytes([0xA5; 32]);
+
+        let error = root_a
+            .connect_peer_with_transport_identity(&root_b_addr, wrong_daemon)
+            .await
+            .expect_err("mismatched daemon identity must fail closed");
+        assert!(error.to_string().contains("identity mismatch"));
+        assert_eq!(root_a.active_channels().await.len(), 0);
+
         root_a.stop().await.expect("stop root a");
         root_b.stop().await.expect("stop root b");
     }
