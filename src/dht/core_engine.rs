@@ -104,7 +104,7 @@ fn xor_distance_bytes(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
 /// Maximum addresses stored per node to prevent memory exhaustion.
 /// This cap is the last-line guard; in normal operation the per-IP-family
 /// cap ([`NodeInfo::enforce_per_ip_family_cap`]) holds each external peer
-/// to at most 2 IP addresses per family. Non-IP transports (Bluetooth,
+/// to at most 3 IP addresses per family. Non-IP transports (Bluetooth,
 /// LoRa) are outside the per-family cap and rely on this bound.
 const MAX_ADDRESSES_PER_NODE: usize = 8;
 
@@ -388,7 +388,6 @@ impl NodeInfo {
     /// same-family tier (Direct) — they add no useful WAN dial option once
     /// the stronger one is known. A dual-stack peer may therefore hold
     /// up to 6 IP addresses (3 per family).
-    ///
     /// Non-IP transport addresses (Bluetooth, LoRa) are left alone — they
     /// have no IP family and are governed only by [`MAX_ADDRESSES_PER_NODE`].
     ///
@@ -1655,6 +1654,11 @@ impl DhtCoreEngine {
     ) -> Result<Vec<(NodeInfo, u64)>> {
         let routing = self.routing_table.read().await;
         Ok(routing.find_closest_nodes_with_publish_seq(key, count))
+    }
+
+    /// Latest authoritative address-set sequence known for `node_id`.
+    pub async fn publish_seq_for_node(&self, node_id: &PeerId) -> u64 {
+        self.routing_table.read().await.publish_seq_for(node_id)
     }
 
     /// Find nodes closest to a key, including self as a candidate.
@@ -4907,6 +4911,17 @@ mod tests {
         assert!(AddressType::Relay.priority() < AddressType::Direct.priority());
         assert!(AddressType::Direct.priority() < AddressType::Unverified.priority());
         assert!(AddressType::Unverified.priority() < AddressType::Lan.priority());
+    }
+
+    #[test]
+    fn legacy_address_type_postcard_discriminants_remain_unchanged() {
+        assert_eq!(postcard::to_stdvec(&AddressType::Relay).unwrap(), vec![0]);
+        assert_eq!(postcard::to_stdvec(&AddressType::Direct).unwrap(), vec![1]);
+        assert_eq!(
+            postcard::to_stdvec(&AddressType::Unverified).unwrap(),
+            vec![2]
+        );
+        assert_eq!(postcard::to_stdvec(&AddressType::Lan).unwrap(), vec![3]);
     }
 
     #[test]

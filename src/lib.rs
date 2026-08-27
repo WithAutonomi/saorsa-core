@@ -48,6 +48,7 @@ pub(crate) mod reachability;
 pub(crate) mod security;
 pub(crate) mod self_address;
 pub(crate) mod transport;
+pub(crate) mod transport_address;
 pub(crate) mod transport_handle;
 pub(crate) mod validation;
 
@@ -70,6 +71,7 @@ pub use saorsa_dht_lookup::{
     LookupPeerState, LookupProgress, LookupQuery, LookupQueryOutcome, LookupRunError,
     LookupTermination, run_iterative_lookup, xor_distance,
 };
+pub use transport_address::{KnownReachability, KnownTransport, TransportAddressRecord};
 
 // Close-group cache
 pub use bootstrap::{CachedCloseGroupPeer, CloseGroupCache};
