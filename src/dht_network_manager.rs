@@ -3771,7 +3771,7 @@ impl DhtNetworkManager {
         let identity_timeout = self.config.request_timeout.min(IDENTITY_EXCHANGE_TIMEOUT);
         match self
             .transport
-            .wait_for_peer_identity(&channel_id, identity_timeout)
+            .wait_for_specific_peer_identity(&channel_id, *peer_id, identity_timeout)
             .await
         {
             Ok(authenticated) if &authenticated == peer_id => {

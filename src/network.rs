@@ -23,7 +23,7 @@ use crate::bootstrap::routing_snapshot::{RoutingSnapshot, SnapshotPeer};
 use crate::dht::core_engine::AddressType;
 use crate::dht_network_manager::{DhtNetworkConfig, DhtNetworkEvent, DhtNetworkManager};
 use crate::error::{NetworkError, P2PError, P2pResult as Result};
-use crate::reachability::spawn_acquisition_driver;
+use crate::reachability::{spawn_acquisition_driver, spawn_shared_identity_publisher};
 
 use crate::MultiAddr;
 use crate::identity::node_identity::{NodeIdentity, peer_id_from_public_key};
@@ -74,6 +74,37 @@ pub(crate) struct WireMessage {
     #[serde(default)]
     pub(crate) signature: Vec<u8>,
 }
+
+/// Versioned wire envelope used when several logical node identities share
+/// one physical transport connection.
+///
+/// This is deliberately a separate format, prefixed by
+/// [`MULTIPLEXED_WIRE_MAGIC`], instead of appending a field to
+/// [`WireMessage`]. Postcard structs are positional, so changing the legacy
+/// struct would make compatibility dependent on decoder implementation
+/// details. The explicit prefix makes negotiation failures deterministic.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct MultiplexedWireMessage {
+    /// Protocol/topic identifier.
+    pub(crate) protocol: String,
+    /// Raw payload bytes.
+    pub(crate) data: Vec<u8>,
+    /// Authenticated logical sender.
+    pub(crate) from: PeerId,
+    /// Logical identity hosted by the receiving daemon.
+    pub(crate) to: PeerId,
+    /// Unix timestamp in seconds.
+    pub(crate) timestamp: u64,
+    /// Sender's user-agent string.
+    pub(crate) user_agent: String,
+    /// Sender's ML-DSA-65 public key.
+    pub(crate) public_key: Vec<u8>,
+    /// ML-DSA-65 signature covering sender and destination.
+    pub(crate) signature: Vec<u8>,
+}
+
+/// Unambiguous prefix for [`MultiplexedWireMessage`].
+pub(crate) const MULTIPLEXED_WIRE_MAGIC: &[u8; 4] = b"SMX2";
 
 /// Operating mode of a P2P node.
 ///
@@ -834,6 +865,51 @@ pub(crate) struct PendingRequest {
 /// Only applied when stale channels were actually disconnected.
 const QUIC_TEARDOWN_GRACE: Duration = Duration::from_millis(100);
 
+/// One physical transport endpoint shared by several logical [`P2PNode`]
+/// identities.
+///
+/// Create this once per daemon, then construct each logical node with
+/// [`P2PNode::new_with_shared_transport`]. The daemon must call
+/// [`SharedTransport::shutdown`] after all logical nodes have stopped.
+pub struct SharedTransport {
+    transport: Arc<crate::transport_handle::TransportHandle>,
+    daemon_peer_id: PeerId,
+}
+
+impl SharedTransport {
+    /// Bind a multiplexing-capable physical endpoint.
+    pub async fn new(config: &NodeConfig, daemon_identity: Arc<NodeIdentity>) -> Result<Self> {
+        let daemon_peer_id = *daemon_identity.peer_id();
+        let transport_config = crate::transport_handle::TransportConfig::from_node_config(
+            config,
+            crate::DEFAULT_EVENT_CHANNEL_CAPACITY,
+            daemon_identity,
+        );
+        let transport = Arc::new(
+            crate::transport_handle::TransportHandle::new_multiplexed(transport_config).await?,
+        );
+        Ok(Self {
+            transport,
+            daemon_peer_id,
+        })
+    }
+
+    /// Peer ID used by the physical QUIC/TLS endpoint.
+    pub fn daemon_peer_id(&self) -> PeerId {
+        self.daemon_peer_id
+    }
+
+    /// Number of physical transport channels currently open.
+    pub async fn physical_connection_count(&self) -> usize {
+        self.transport.active_channels().await.len()
+    }
+
+    /// Stop the physical listeners and all shared connections.
+    pub async fn shutdown(&self) -> Result<()> {
+        self.transport.stop().await
+    }
+}
+
 /// Main P2P network node that manages connections, routing, and communication
 ///
 /// This struct represents a complete P2P network participant that can:
@@ -952,17 +1028,7 @@ impl P2PNode {
             None => Arc::new(NodeIdentity::generate()?),
         };
 
-        // Derive the canonical peer ID from the cryptographic identity.
-        let peer_id = *node_identity.peer_id();
-
-        // Validate parameter safety constraints (Section 4 points 1-13).
-        // Reject invalid config early, before any resources are allocated.
-        config.dht_config.validate()?;
-        if let Some(ref diversity) = config.diversity_config {
-            diversity
-                .validate()
-                .map_err(|e| P2PError::Validation(format!("IP diversity config: {e}").into()))?;
-        }
+        Self::validate_config(&config)?;
 
         // Build transport handle with all transport-level concerns
         let transport_config = crate::transport_handle::TransportConfig::from_node_config(
@@ -972,6 +1038,36 @@ impl P2PNode {
         );
         let transport =
             Arc::new(crate::transport_handle::TransportHandle::new(transport_config).await?);
+
+        Self::new_with_transport(config, node_identity, transport).await
+    }
+
+    /// Create a logical node identity on an existing physical transport.
+    pub async fn new_with_shared_transport(
+        config: NodeConfig,
+        shared_transport: &SharedTransport,
+    ) -> Result<Self> {
+        let node_identity = match config.node_identity.clone() {
+            Some(identity) => identity,
+            None => Arc::new(NodeIdentity::generate()?),
+        };
+        Self::validate_config(&config)?;
+        let transport = Arc::new(shared_transport.transport.logical_handle(
+            Arc::clone(&node_identity),
+            config.user_agent(),
+            crate::DEFAULT_EVENT_CHANNEL_CAPACITY,
+        )?);
+        Self::new_with_transport(config, node_identity, transport).await
+    }
+
+    async fn new_with_transport(
+        config: NodeConfig,
+        node_identity: Arc<NodeIdentity>,
+        transport: Arc<crate::transport_handle::TransportHandle>,
+    ) -> Result<Self> {
+        // Configuration is validated before the transport or logical identity
+        // registration is allocated by both public constructors.
+        let peer_id = *node_identity.peer_id();
 
         // Initialize AdaptiveDHT — creates the trust engine and DHT manager
         let dht_manager_config = DhtNetworkConfig {
@@ -1015,6 +1111,16 @@ impl P2PNode {
         Ok(node)
     }
 
+    fn validate_config(config: &NodeConfig) -> Result<()> {
+        config.dht_config.validate()?;
+        if let Some(ref diversity) = config.diversity_config {
+            diversity
+                .validate()
+                .map_err(|e| P2PError::Validation(format!("IP diversity config: {e}").into()))?;
+        }
+        Ok(())
+    }
+
     /// Get the peer ID of this node.
     pub fn peer_id(&self) -> &PeerId {
         &self.peer_id
@@ -1023,6 +1129,30 @@ impl P2PNode {
     /// Get the transport handle for sharing with other components.
     pub fn transport(&self) -> &Arc<crate::transport_handle::TransportHandle> {
         &self.transport
+    }
+
+    /// Stable physical connection key currently carrying traffic for a
+    /// logical peer, if connected.
+    ///
+    /// Multi-identity daemons use this to group maintenance and replication
+    /// work by remote machine instead of independently scheduling identical
+    /// work for every remote logical identity.
+    pub async fn physical_connection_key(&self, peer: &PeerId) -> Option<String> {
+        let mut channels = self.transport.channels_for_peer(peer).await;
+        channels.sort_unstable();
+        channels.into_iter().next()
+    }
+
+    /// Authenticated logical identities observed on the same physical
+    /// connection as `peer`.
+    pub async fn physical_peer_group(&self, peer: &PeerId) -> Vec<PeerId> {
+        let Some(channel) = self.physical_connection_key(peer).await else {
+            return Vec::new();
+        };
+        let mut peers = self.transport.peers_on_channel(&channel).await;
+        peers.sort_unstable();
+        peers.dedup();
+        peers
     }
 
     /// The relay-allocated public address, if this node acquired a MASQUE relay.
@@ -1408,7 +1538,7 @@ impl P2PNode {
         // state machine (see `reachability::driver` for the full flow).
         // Clients (`NodeMode::Client`) do not run the driver at all: they
         // are outbound-only and do not need to be reachable.
-        if self.config.mode != NodeMode::Client {
+        if self.config.mode != NodeMode::Client && self.transport.runs_reachability_driver() {
             spawn_acquisition_driver(
                 self.adaptive_dht.dht_manager().clone(),
                 Arc::clone(&self.transport),
@@ -1416,8 +1546,17 @@ impl P2PNode {
                 Arc::clone(&self.relay_address),
                 self.shutdown.clone(),
             );
-        } else {
+        } else if self.config.mode == NodeMode::Client {
             info!("client mode — skipping relay acquisition driver");
+        } else {
+            info!(
+                "shared transport follower — publishing daemon reachability without another relay controller"
+            );
+            spawn_shared_identity_publisher(
+                self.adaptive_dht.dht_manager().clone(),
+                Arc::clone(&self.transport),
+                self.shutdown.clone(),
+            );
         }
 
         if let Some(dir) = self.config.close_group_cache_dir.clone() {
@@ -1631,6 +1770,19 @@ impl P2PNode {
     ) -> Result<PeerId> {
         self.transport
             .wait_for_peer_identity(channel_id, timeout)
+            .await
+    }
+
+    /// Wait for a specific logical identity to authenticate on a shared
+    /// physical channel.
+    pub async fn wait_for_specific_peer_identity(
+        &self,
+        channel_id: &str,
+        expected_peer: PeerId,
+        timeout: Duration,
+    ) -> Result<PeerId> {
+        self.transport
+            .wait_for_specific_peer_identity(channel_id, expected_peer, timeout)
             .await
     }
 
@@ -1893,6 +2045,9 @@ pub(crate) struct ParsedMessage {
     pub(crate) event: P2PEvent,
     /// If the message was signed and verified, the authenticated app-level [`PeerId`].
     pub(crate) authenticated_node_id: Option<PeerId>,
+    /// Logical local identity selected by the multiplexed envelope.
+    /// Legacy envelopes do not carry a destination.
+    pub(crate) destination: Option<PeerId>,
     /// The sender's user agent string from the wire message.
     pub(crate) user_agent: String,
     /// Decoded payload length (bytes). Lets the rx choke point compute wire
@@ -1910,6 +2065,10 @@ pub(crate) struct ParsedMessage {
 /// can pass it directly to `send_message()`. This eliminates a spoofing
 /// vector where a peer could claim an arbitrary identity via the payload.
 pub(crate) fn parse_protocol_message(bytes: &[u8], source: &str) -> Option<ParsedMessage> {
+    if let Some(encoded) = bytes.strip_prefix(MULTIPLEXED_WIRE_MAGIC) {
+        return parse_multiplexed_protocol_message(encoded, source);
+    }
+
     let message: WireMessage = postcard::from_bytes(bytes).ok()?;
     let transport_source = source.parse::<SocketAddr>().ok().map(MultiAddr::quic);
 
@@ -1954,6 +2113,47 @@ pub(crate) fn parse_protocol_message(bytes: &[u8], source: &str) -> Option<Parse
             data: message.data,
         },
         authenticated_node_id,
+        destination: None,
+        payload_len,
+        user_agent: message.user_agent,
+    })
+}
+
+fn parse_multiplexed_protocol_message(bytes: &[u8], source: &str) -> Option<ParsedMessage> {
+    let message: MultiplexedWireMessage = postcard::from_bytes(bytes).ok()?;
+    let transport_source = source.parse::<SocketAddr>().ok().map(MultiAddr::quic);
+
+    let authenticated_node_id = match verify_multiplexed_message_signature(&message) {
+        Ok(peer_id) => Some(peer_id),
+        Err(error) => {
+            warn!(
+                "Rejecting multiplexed message from {}: signature verification failed: {}",
+                source, error
+            );
+            return None;
+        }
+    };
+
+    debug!(
+        "Parsed multiplexed message - topic: {}, source: {:?}, destination: {}, transport: {}, payload_len: {}",
+        message.protocol,
+        authenticated_node_id,
+        message.to,
+        source,
+        message.data.len()
+    );
+
+    let payload_len = message.data.len();
+    Some(ParsedMessage {
+        event: P2PEvent::Message {
+            topic: message.protocol,
+            source: authenticated_node_id,
+            transport_source,
+            timestamp: message.timestamp,
+            data: message.data,
+        },
+        authenticated_node_id,
+        destination: Some(message.to),
         payload_len,
         user_agent: message.user_agent,
     })
@@ -1994,6 +2194,39 @@ fn verify_message_signature(message: &WireMessage) -> std::result::Result<PeerId
     let valid = crate::quantum_crypto::ml_dsa_verify(&pubkey, &signable, &sig)
         .map_err(|e| format!("verification error: {e}"))?;
 
+    if valid {
+        Ok(peer_id)
+    } else {
+        Err("signature is invalid".to_string())
+    }
+}
+
+fn verify_multiplexed_message_signature(
+    message: &MultiplexedWireMessage,
+) -> std::result::Result<PeerId, String> {
+    let pubkey = MlDsaPublicKey::from_bytes(&message.public_key)
+        .map_err(|error| format!("invalid public key: {error:?}"))?;
+    let peer_id = peer_id_from_public_key(&pubkey);
+    if message.from != peer_id {
+        return Err(format!(
+            "from field mismatch: message claims '{}' but public key derives '{}'",
+            message.from, peer_id
+        ));
+    }
+
+    let signable = postcard::to_stdvec(&(
+        &message.protocol,
+        &message.data as &[u8],
+        &message.from,
+        &message.to,
+        message.timestamp,
+        &message.user_agent,
+    ))
+    .map_err(|error| format!("failed to serialize signable bytes: {error}"))?;
+    let signature = MlDsaSignature::from_bytes(&message.signature)
+        .map_err(|error| format!("invalid signature: {error:?}"))?;
+    let valid = crate::quantum_crypto::ml_dsa_verify(&pubkey, &signable, &signature)
+        .map_err(|error| format!("verification error: {error}"))?;
     if valid {
         Ok(peer_id)
     } else {
@@ -2397,11 +2630,22 @@ impl P2PNode {
                 .connect_peer_typed(addr, AddressType::Unverified)
                 .await
             {
-                Ok(channel_id) => match self
-                    .transport
-                    .wait_for_peer_identity(&channel_id, identity_timeout)
-                    .await
-                {
+                Ok(channel_id) => match match expected_peer_id {
+                    Some(expected) => {
+                        self.transport
+                            .wait_for_specific_peer_identity(
+                                &channel_id,
+                                expected,
+                                identity_timeout,
+                            )
+                            .await
+                    }
+                    None => {
+                        self.transport
+                            .wait_for_peer_identity(&channel_id, identity_timeout)
+                            .await
+                    }
+                } {
                     Ok(real_peer_id) => {
                         if !bootstrap_peer_identity_matches(expected_peer_id, real_peer_id) {
                             warn!(
@@ -2966,6 +3210,110 @@ mod tests {
         node.stop().await?;
         assert!(!node.is_running());
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shared_transport_follower_publishes_daemon_addresses() -> Result<()> {
+        let base_config = || {
+            NodeConfig::builder()
+                .local(true)
+                .ipv6(false)
+                .port(0)
+                .build()
+                .expect("shared test config")
+        };
+
+        let remote_daemon_identity = Arc::new(NodeIdentity::generate()?);
+        let remote_transport = SharedTransport::new(&base_config(), remote_daemon_identity).await?;
+        let remote_identity = Arc::new(NodeIdentity::generate()?);
+        let mut remote_config = base_config();
+        remote_config.node_identity = Some(Arc::clone(&remote_identity));
+        let remote = P2PNode::new_with_shared_transport(remote_config, &remote_transport).await?;
+        remote.start().await?;
+        let remote_address = remote
+            .listen_addrs()
+            .await
+            .into_iter()
+            .find(|address| address.is_ipv4())
+            .expect("remote daemon should expose an IPv4 listener");
+
+        let local_daemon_identity = Arc::new(NodeIdentity::generate()?);
+        let local_transport = SharedTransport::new(&base_config(), local_daemon_identity).await?;
+        let leader_identity = Arc::new(NodeIdentity::generate()?);
+        let follower_identity = Arc::new(NodeIdentity::generate()?);
+        let leader_peer_id = *leader_identity.peer_id();
+        let follower_peer_id = *follower_identity.peer_id();
+
+        let logical_config = |identity: Arc<NodeIdentity>| {
+            let mut config = base_config();
+            config.node_identity = Some(identity);
+            config.bootstrap_peers = vec![remote_address.clone()];
+            config
+        };
+        let leader =
+            P2PNode::new_with_shared_transport(logical_config(leader_identity), &local_transport)
+                .await?;
+        let follower = P2PNode::new_with_shared_transport(
+            logical_config(Arc::clone(&follower_identity)),
+            &local_transport,
+        )
+        .await?;
+        leader.start().await?;
+        follower.start().await?;
+
+        let physical_group = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let group = remote.physical_peer_group(&leader_peer_id).await;
+                if group.contains(&leader_peer_id) && group.contains(&follower_peer_id) {
+                    return group;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("remote should group both logical IDs on one physical channel");
+        assert_eq!(physical_group.len(), 2);
+
+        let published = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let peers = remote.dht_manager().routing_table_peers().await;
+                if let Some(record) = peers
+                    .into_iter()
+                    .find(|record| record.peer_id == follower_peer_id)
+                    && record
+                        .addresses
+                        .iter()
+                        .any(|address| address.dialable_socket_addr().is_some())
+                {
+                    return record;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("follower should publish the shared daemon address set");
+
+        let local_listener_ports: HashSet<u16> = leader
+            .listen_addrs()
+            .await
+            .iter()
+            .filter_map(MultiAddr::port)
+            .collect();
+        assert!(
+            published
+                .addresses
+                .iter()
+                .filter_map(MultiAddr::port)
+                .any(|port| local_listener_ports.contains(&port)),
+            "follower DHT record must advertise its shared physical daemon listener"
+        );
+
+        follower.stop().await?;
+        leader.stop().await?;
+        local_transport.shutdown().await?;
+        remote.stop().await?;
+        remote_transport.shutdown().await?;
         Ok(())
     }
 
@@ -3752,6 +4100,82 @@ mod tests {
             signature: sig.as_bytes().to_vec(),
         };
         postcard::to_stdvec(&msg).unwrap()
+    }
+
+    fn make_multiplexed_wire_bytes(
+        identity: &NodeIdentity,
+        destination: PeerId,
+        protocol: &str,
+        data: Vec<u8>,
+        timestamp: u64,
+    ) -> Vec<u8> {
+        let from = *identity.peer_id();
+        let user_agent = "test/multiplexed";
+        let signable = postcard::to_stdvec(&(
+            protocol,
+            data.as_slice(),
+            &from,
+            &destination,
+            timestamp,
+            user_agent,
+        ))
+        .unwrap();
+        let signature = identity.sign(&signable).expect("signing should succeed");
+        let message = MultiplexedWireMessage {
+            protocol: protocol.to_string(),
+            data,
+            from,
+            to: destination,
+            timestamp,
+            user_agent: user_agent.to_string(),
+            public_key: identity.public_key().as_bytes().to_vec(),
+            signature: signature.as_bytes().to_vec(),
+        };
+        let mut bytes = MULTIPLEXED_WIRE_MAGIC.to_vec();
+        bytes.extend(postcard::to_stdvec(&message).unwrap());
+        bytes
+    }
+
+    #[test]
+    fn multiplexed_message_authenticates_sender_and_destination() {
+        let identity = NodeIdentity::generate().expect("should generate identity");
+        let destination = PeerId::from_bytes([0xD2; 32]);
+        let bytes = make_multiplexed_wire_bytes(
+            &identity,
+            destination,
+            "test/multiplexed",
+            vec![4, 5, 6],
+            current_timestamp(),
+        );
+
+        let parsed = parse_protocol_message(&bytes, "transport-daemon")
+            .expect("valid multiplexed message should parse");
+        assert_eq!(parsed.authenticated_node_id, Some(*identity.peer_id()));
+        assert_eq!(parsed.destination, Some(destination));
+    }
+
+    #[test]
+    fn multiplexed_message_rejects_destination_tampering() {
+        let identity = NodeIdentity::generate().expect("should generate identity");
+        let original_destination = PeerId::from_bytes([0xD3; 32]);
+        let bytes = make_multiplexed_wire_bytes(
+            &identity,
+            original_destination,
+            "test/multiplexed",
+            vec![7, 8, 9],
+            current_timestamp(),
+        );
+        let mut message: MultiplexedWireMessage =
+            postcard::from_bytes(&bytes[MULTIPLEXED_WIRE_MAGIC.len()..])
+                .expect("multiplexed bytes should decode");
+        message.to = PeerId::from_bytes([0xE4; 32]);
+        let mut tampered = MULTIPLEXED_WIRE_MAGIC.to_vec();
+        tampered.extend(postcard::to_stdvec(&message).expect("message should re-encode"));
+
+        assert!(
+            parse_protocol_message(&tampered, "transport-daemon").is_none(),
+            "destination is signature-covered and cannot be changed in transit"
+        );
     }
 
     #[test]

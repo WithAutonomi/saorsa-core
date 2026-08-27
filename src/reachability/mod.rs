@@ -39,4 +39,4 @@ pub(crate) mod driver;
 pub(crate) mod session;
 
 pub(crate) use acquisition::{RelaySessionEstablishError, RelaySessionEstablisher};
-pub(crate) use driver::spawn_acquisition_driver;
+pub(crate) use driver::{spawn_acquisition_driver, spawn_shared_identity_publisher};

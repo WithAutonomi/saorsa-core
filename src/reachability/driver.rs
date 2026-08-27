@@ -148,6 +148,77 @@ pub(crate) fn spawn_acquisition_driver(
     });
 }
 
+/// Publish one shared physical daemon's address set for a follower logical
+/// identity without starting another relay acquisition state machine.
+///
+/// Every hosted identity remains an independently discoverable DHT
+/// participant and therefore has to publish a self-record. Only the first
+/// logical identity controls the machine-wide relay/NAT state; followers read
+/// that physical state and publish it under their own DHT identity. A periodic
+/// refresh picks up relay acquisition/loss and address-classification changes,
+/// while DHT events promptly cover changes in the identity's own K-closest
+/// publication targets.
+pub(crate) fn spawn_shared_identity_publisher(
+    dht: Arc<DhtNetworkManager>,
+    transport: Arc<TransportHandle>,
+    shutdown: CancellationToken,
+) {
+    tokio::spawn(async move {
+        let mut events = dht.subscribe_events();
+        let mut publish_retry = tokio::time::interval(PUBLISH_RETRY_INTERVAL);
+        publish_retry.tick().await;
+
+        // Reuse the canonical typed-address publication implementation, but
+        // never run `AcquisitionDriver::run`: this identity is a publisher of
+        // shared physical state, not another owner of that state.
+        let mut publisher = AcquisitionDriver {
+            dht,
+            transport,
+            relayer_peer_id: Arc::new(RwLock::new(None)),
+            relay_address: Arc::new(RwLock::new(None)),
+            shutdown: shutdown.clone(),
+            current_backoff: BACKOFF_INITIAL,
+            last_published_typed_set: None,
+            canary_rejected_relayers: HashSet::new(),
+        };
+
+        let relay = publisher.transport.relay_external_address();
+        publisher.force_publish_typed_set(relay).await;
+
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => {
+                    debug!("shared identity address publisher: shutdown, exiting");
+                    return;
+                }
+                _ = publish_retry.tick() => {
+                    let relay = publisher.transport.relay_external_address();
+                    publisher.publish_typed_set(relay).await;
+                }
+                event = events.recv() => {
+                    match event {
+                        Ok(DhtNetworkEvent::KClosestPeersChanged { .. }) => {
+                            let relay = publisher.transport.relay_external_address();
+                            publisher.publish_typed_set(relay).await;
+                        }
+                        Ok(_) => {}
+                        Err(RecvError::Lagged(skipped)) => {
+                            publisher.last_published_typed_set = None;
+                            let relay = publisher.transport.relay_external_address();
+                            publisher.publish_typed_set(relay).await;
+                            debug!(
+                                skipped,
+                                "shared identity publisher refreshed after lagging DHT events"
+                            );
+                        }
+                        Err(RecvError::Closed) => return,
+                    }
+                }
+            }
+        }
+    });
+}
+
 /// The driver's owned state, factored out of `spawn_acquisition_driver`
 /// so the state-transition methods can share it without threading
 /// individual arguments through each step.

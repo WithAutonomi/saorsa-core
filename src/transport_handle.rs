@@ -24,9 +24,9 @@ use crate::error::{NetworkError, P2PError, P2pResult as Result, SendFailureKind,
 use crate::identity::node_identity::{NodeIdentity, peer_id_from_public_key_spki};
 use crate::network::{
     ConnectionStatus, MAX_ACTIVE_REQUESTS, MAX_REQUEST_TIMEOUT, MESSAGE_RECV_CHANNEL_CAPACITY,
-    NetworkSender, P2PEvent, ParsedMessage, PeerInfo, PeerResponse, PendingRequest,
-    RequestResponseEnvelope, WireMessage, broadcast_event, normalize_wildcard_to_loopback,
-    parse_protocol_message, register_new_channel,
+    MULTIPLEXED_WIRE_MAGIC, MultiplexedWireMessage, NetworkSender, P2PEvent, ParsedMessage,
+    PeerInfo, PeerResponse, PendingRequest, RequestResponseEnvelope, WireMessage, broadcast_event,
+    normalize_wildcard_to_loopback, parse_protocol_message, register_new_channel,
 };
 use crate::reachability::{RelaySessionEstablishError, RelaySessionEstablisher};
 use crate::transport::external_addresses::ExternalAddresses;
@@ -43,7 +43,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::{RwLock, broadcast, watch};
 use tokio::task::JoinHandle;
@@ -254,6 +254,15 @@ pub(crate) struct TrafficCounters {
     pub identity_announce_tx_count: AtomicU64,
 }
 
+/// Per-logical-identity state registered with a shared physical transport.
+#[derive(Clone)]
+struct HostedIdentity {
+    identity: Arc<NodeIdentity>,
+    user_agent: String,
+    event_tx: broadcast::Sender<P2PEvent>,
+    active_requests: Arc<DashMap<String, PendingRequest>>,
+}
+
 /// Encapsulates transport-level concerns: QUIC connections, peer registry,
 /// message I/O, and network events.
 ///
@@ -271,7 +280,7 @@ pub struct TransportHandle {
     /// as `peers`.
     active_connections: Arc<DashSet<String>>,
     event_tx: broadcast::Sender<P2PEvent>,
-    listen_addrs: RwLock<Vec<MultiAddr>>,
+    listen_addrs: Arc<RwLock<Vec<MultiAddr>>>,
     rate_limiter: Arc<RateLimiter>,
     active_requests: Arc<DashMap<String, PendingRequest>>,
     /// Cumulative wire-traffic counters (V2-623). Shared (via the enclosing
@@ -283,20 +292,20 @@ pub struct TransportHandle {
     geo_provider: Arc<BgpGeoProvider>,
     shutdown: CancellationToken,
     /// Relay established events — received when this node sets up a MASQUE relay.
-    relay_established_rx: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<SocketAddr>>,
+    relay_established_rx: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<SocketAddr>>>,
     /// Relay lost events — received when a previously-advertised MASQUE
     /// relay address is no longer reachable (tunnel died, health check
     /// failed, accept loop exited).  Drained by the reachability driver
     /// to trigger an immediate DHT republish with the stale relay
     /// address removed — without this, peers keep dialing the dead
     /// relay for the full health-poll cycle (5 s) or longer.
-    relay_lost_rx: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<SocketAddr>>,
+    relay_lost_rx: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<SocketAddr>>>,
     /// Direct address promotion events — received when the passive
     /// reachability classifier proves one of this node's pinned external
     /// addresses is cold-dialable. Drained by the reachability driver while
     /// holding a relay so it can republish `Relay + Direct` instead of
     /// leaving peers with the older `Relay + Unverified` self-record.
-    direct_address_promoted_rx: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<SocketAddr>>,
+    direct_address_promoted_rx: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<SocketAddr>>>,
     /// Latest direct-address promotion for observers/tests. This is
     /// separate from the driver's single-consumer mpsc receiver so callers
     /// can observe state changes without contending with the driver's
@@ -308,7 +317,7 @@ pub struct TransportHandle {
     /// Direct without crossing the Direct proof threshold. Drained by the
     /// reachability driver so a relay-only self-record can be corrected as
     /// soon as a non-relay fallback appears.
-    self_address_updated_rx: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<SocketAddr>>,
+    self_address_updated_rx: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<SocketAddr>>>,
     /// Latest self-address update for observers/tests. Separate from the
     /// driver's single-consumer mpsc receiver for the same reason as
     /// `direct_address_promoted_watch_rx`.
@@ -409,6 +418,33 @@ pub struct TransportHandle {
     /// background tasks, not through this field directly.
     #[allow(dead_code)]
     proof_eligible_peers: Arc<DashSet<IpAddr>>,
+    /// All logical identities served by this physical transport.
+    hosted_identities: Arc<DashMap<PeerId, HostedIdentity>>,
+    /// Whether outgoing application messages use destination-addressed
+    /// multiplexed envelopes.
+    multiplexed: bool,
+    /// Only the root handle is allowed to stop the physical endpoint.
+    manages_physical_transport: bool,
+    /// Serialises first listener startup across logical handles.
+    listener_start_lock: Arc<tokio::sync::Mutex<()>>,
+    /// True after the shared listener and receive tasks have started.
+    listeners_started: Arc<AtomicBool>,
+    /// Shared claim ensuring only one logical node drives physical NAT/relay
+    /// acquisition and consumes its single physical event streams.
+    reachability_claimed: Arc<AtomicBool>,
+    /// Whether this handle owns the physical reachability state machine.
+    runs_reachability_driver: bool,
+}
+
+impl Drop for TransportHandle {
+    fn drop(&mut self) {
+        if self.multiplexed && !self.manages_physical_transport {
+            self.hosted_identities.remove(self.node_identity.peer_id());
+            if self.runs_reachability_driver {
+                self.reachability_claimed.store(false, Ordering::Release);
+            }
+        }
+    }
 }
 
 struct ActiveRequestGuard {
@@ -442,7 +478,29 @@ impl TransportHandle {
     /// embedded in `P2PNode::new()`: dual-stack QUIC binding, rate limiter,
     /// GeoIP provider, and a background connection lifecycle monitor.
     pub async fn new(config: TransportConfig) -> Result<Self> {
+        Self::new_inner(config, false).await
+    }
+
+    /// Create the physical root of a destination-addressed shared transport.
+    pub(crate) async fn new_multiplexed(config: TransportConfig) -> Result<Self> {
+        Self::new_inner(config, true).await
+    }
+
+    async fn new_inner(config: TransportConfig, multiplexed: bool) -> Result<Self> {
         let (event_tx, _) = broadcast::channel(config.event_channel_capacity);
+        let active_requests = Arc::new(DashMap::new());
+        let hosted_identities = Arc::new(DashMap::new());
+        if !multiplexed {
+            hosted_identities.insert(
+                *config.node_identity.peer_id(),
+                HostedIdentity {
+                    identity: Arc::clone(&config.node_identity),
+                    user_agent: config.user_agent.clone(),
+                    event_tx: event_tx.clone(),
+                    active_requests: Arc::clone(&active_requests),
+                },
+            );
+        }
 
         // Initialize dual-stack saorsa-transport nodes
         // Partition listen addresses into first IPv4 and first IPv6 for
@@ -576,7 +634,6 @@ impl TransportHandle {
         let connection_monitor_handle = {
             let active_conns = Arc::clone(&active_connections);
             let peers_map = Arc::clone(&peers);
-            let event_tx_clone = event_tx.clone();
             let dual_node_clone = Arc::clone(&dual_node);
             let geo_provider_clone = Arc::clone(&geo_provider);
             let shutdown_token = shutdown.clone();
@@ -586,6 +643,7 @@ impl TransportHandle {
             let identity_clone = config.node_identity.clone();
             let user_agent_clone = config.user_agent.clone();
             let traffic_clone = Arc::clone(&traffic);
+            let hosted_identities_clone = Arc::clone(&hosted_identities);
 
             let handle = tokio::spawn(async move {
                 Self::connection_lifecycle_monitor_with_rx(
@@ -593,7 +651,6 @@ impl TransportHandle {
                     connection_event_rx,
                     active_conns,
                     peers_map,
-                    event_tx_clone,
                     geo_provider_clone,
                     shutdown_token,
                     p2c,
@@ -601,6 +658,7 @@ impl TransportHandle {
                     pua,
                     identity_clone,
                     user_agent_clone,
+                    hosted_identities_clone,
                     traffic_clone,
                 )
                 .await;
@@ -613,20 +671,22 @@ impl TransportHandle {
             peers,
             active_connections,
             event_tx,
-            listen_addrs: RwLock::new(Vec::new()),
+            listen_addrs: Arc::new(RwLock::new(Vec::new())),
             rate_limiter,
-            active_requests: Arc::new(DashMap::new()),
+            active_requests,
             traffic,
             geo_provider,
             shutdown,
-            relay_established_rx: tokio::sync::Mutex::new(relay_established_rx),
-            relay_lost_rx: tokio::sync::Mutex::new(relay_lost_rx),
-            direct_address_promoted_rx: tokio::sync::Mutex::new(direct_address_promoted_rx),
+            relay_established_rx: Arc::new(tokio::sync::Mutex::new(relay_established_rx)),
+            relay_lost_rx: Arc::new(tokio::sync::Mutex::new(relay_lost_rx)),
+            direct_address_promoted_rx: Arc::new(tokio::sync::Mutex::new(
+                direct_address_promoted_rx,
+            )),
             direct_address_promoted_watch_tx,
             direct_address_promoted_watch_rx: parking_lot::Mutex::new(
                 direct_address_promoted_watch_rx,
             ),
-            self_address_updated_rx: tokio::sync::Mutex::new(self_address_updated_rx),
+            self_address_updated_rx: Arc::new(tokio::sync::Mutex::new(self_address_updated_rx)),
             self_address_updated_watch_tx,
             self_address_updated_watch_rx: parking_lot::Mutex::new(self_address_updated_watch_rx),
             external_addresses,
@@ -644,6 +704,13 @@ impl TransportHandle {
             proven_externals,
             peer_observations,
             proof_eligible_peers,
+            hosted_identities,
+            multiplexed,
+            manages_physical_transport: true,
+            listener_start_lock: Arc::new(tokio::sync::Mutex::new(())),
+            listeners_started: Arc::new(AtomicBool::new(false)),
+            reachability_claimed: Arc::new(AtomicBool::new(!multiplexed)),
+            runs_reachability_driver: !multiplexed,
         })
     }
 
@@ -655,6 +722,17 @@ impl TransportHandle {
             ))
         })?);
         let (event_tx, _) = broadcast::channel(TEST_EVENT_CHANNEL_CAPACITY);
+        let active_requests = Arc::new(DashMap::new());
+        let hosted_identities = Arc::new(DashMap::new());
+        hosted_identities.insert(
+            *identity.peer_id(),
+            HostedIdentity {
+                identity: Arc::clone(&identity),
+                user_agent: crate::network::user_agent_for_mode(crate::network::NodeMode::Node),
+                event_tx: event_tx.clone(),
+                active_requests: Arc::clone(&active_requests),
+            },
+        );
         let dual_node = {
             let v6: Option<SocketAddr> = "[::1]:0"
                 .parse()
@@ -689,14 +767,14 @@ impl TransportHandle {
             peers: Arc::new(DashMap::new()),
             active_connections: Arc::new(DashSet::new()),
             event_tx,
-            listen_addrs: RwLock::new(Vec::new()),
+            listen_addrs: Arc::new(RwLock::new(Vec::new())),
             rate_limiter: Arc::new(RateLimiter::new(RateLimitConfig {
                 max_requests: TEST_MAX_REQUESTS,
                 burst_size: TEST_BURST_SIZE,
                 window: std::time::Duration::from_secs(TEST_RATE_LIMIT_WINDOW_SECS),
                 ..Default::default()
             })),
-            active_requests: Arc::new(DashMap::new()),
+            active_requests,
             traffic: Arc::new(TrafficCounters::default()),
             geo_provider: Arc::new(BgpGeoProvider::new()),
             shutdown: CancellationToken::new(),
@@ -704,19 +782,19 @@ impl TransportHandle {
                 let (_tx, rx) = tokio::sync::mpsc::channel(
                     crate::transport::saorsa_transport_adapter::ADDRESS_EVENT_CHANNEL_CAPACITY,
                 );
-                tokio::sync::Mutex::new(rx)
+                Arc::new(tokio::sync::Mutex::new(rx))
             },
             relay_lost_rx: {
                 let (_tx, rx) = tokio::sync::mpsc::channel(
                     crate::transport::saorsa_transport_adapter::ADDRESS_EVENT_CHANNEL_CAPACITY,
                 );
-                tokio::sync::Mutex::new(rx)
+                Arc::new(tokio::sync::Mutex::new(rx))
             },
             direct_address_promoted_rx: {
                 let (_tx, rx) = tokio::sync::mpsc::channel(
                     crate::transport::saorsa_transport_adapter::ADDRESS_EVENT_CHANNEL_CAPACITY,
                 );
-                tokio::sync::Mutex::new(rx)
+                Arc::new(tokio::sync::Mutex::new(rx))
             },
             direct_address_promoted_watch_tx,
             direct_address_promoted_watch_rx: parking_lot::Mutex::new(
@@ -726,7 +804,7 @@ impl TransportHandle {
                 let (_tx, rx) = tokio::sync::mpsc::channel(
                     crate::transport::saorsa_transport_adapter::ADDRESS_EVENT_CHANNEL_CAPACITY,
                 );
-                tokio::sync::Mutex::new(rx)
+                Arc::new(tokio::sync::Mutex::new(rx))
             },
             self_address_updated_watch_tx,
             self_address_updated_watch_rx: parking_lot::Mutex::new(self_address_updated_watch_rx),
@@ -745,6 +823,94 @@ impl TransportHandle {
             proven_externals: Arc::new(DashMap::new()),
             peer_observations: Arc::new(DashMap::new()),
             proof_eligible_peers: Arc::new(DashSet::new()),
+            hosted_identities,
+            multiplexed: false,
+            manages_physical_transport: true,
+            listener_start_lock: Arc::new(tokio::sync::Mutex::new(())),
+            listeners_started: Arc::new(AtomicBool::new(false)),
+            reachability_claimed: Arc::new(AtomicBool::new(true)),
+            runs_reachability_driver: true,
+        })
+    }
+
+    /// Register a logical node identity on a multiplexed physical transport.
+    pub(crate) fn logical_handle(
+        &self,
+        identity: Arc<NodeIdentity>,
+        user_agent: String,
+        event_channel_capacity: usize,
+    ) -> Result<Self> {
+        if !self.multiplexed {
+            return Err(P2PError::Validation(
+                "logical identities require a multiplexed transport".into(),
+            ));
+        }
+
+        let peer_id = *identity.peer_id();
+        let runs_reachability_driver = !self.reachability_claimed.swap(true, Ordering::AcqRel);
+        let (event_tx, _) = broadcast::channel(event_channel_capacity);
+        let active_requests = Arc::new(DashMap::new());
+        match self.hosted_identities.entry(peer_id) {
+            DashEntry::Occupied(_) => {
+                return Err(P2PError::Validation(
+                    format!("logical identity {peer_id} is already registered").into(),
+                ));
+            }
+            DashEntry::Vacant(entry) => {
+                entry.insert(HostedIdentity {
+                    identity: Arc::clone(&identity),
+                    user_agent: user_agent.clone(),
+                    event_tx: event_tx.clone(),
+                    active_requests: Arc::clone(&active_requests),
+                });
+            }
+        }
+
+        Ok(Self {
+            dual_node: Arc::clone(&self.dual_node),
+            peers: Arc::clone(&self.peers),
+            active_connections: Arc::clone(&self.active_connections),
+            event_tx,
+            listen_addrs: Arc::clone(&self.listen_addrs),
+            rate_limiter: Arc::clone(&self.rate_limiter),
+            active_requests,
+            traffic: Arc::clone(&self.traffic),
+            geo_provider: Arc::clone(&self.geo_provider),
+            shutdown: self.shutdown.clone(),
+            relay_established_rx: Arc::clone(&self.relay_established_rx),
+            relay_lost_rx: Arc::clone(&self.relay_lost_rx),
+            direct_address_promoted_rx: Arc::clone(&self.direct_address_promoted_rx),
+            direct_address_promoted_watch_tx: self.direct_address_promoted_watch_tx.clone(),
+            direct_address_promoted_watch_rx: parking_lot::Mutex::new(
+                self.direct_address_promoted_watch_tx.subscribe(),
+            ),
+            self_address_updated_rx: Arc::clone(&self.self_address_updated_rx),
+            self_address_updated_watch_tx: self.self_address_updated_watch_tx.clone(),
+            self_address_updated_watch_rx: parking_lot::Mutex::new(
+                self.self_address_updated_watch_tx.subscribe(),
+            ),
+            external_addresses: Arc::clone(&self.external_addresses),
+            connection_timeout: self.connection_timeout,
+            connection_monitor_handle: Arc::clone(&self.connection_monitor_handle),
+            recv_handles: Arc::clone(&self.recv_handles),
+            listener_handle: Arc::clone(&self.listener_handle),
+            node_identity: identity,
+            user_agent,
+            peer_to_channel: Arc::clone(&self.peer_to_channel),
+            channel_to_peers: Arc::clone(&self.channel_to_peers),
+            peer_user_agents: Arc::clone(&self.peer_user_agents),
+            dialed_addrs: Arc::clone(&self.dialed_addrs),
+            known_peer_ips: Arc::clone(&self.known_peer_ips),
+            proven_externals: Arc::clone(&self.proven_externals),
+            peer_observations: Arc::clone(&self.peer_observations),
+            proof_eligible_peers: Arc::clone(&self.proof_eligible_peers),
+            hosted_identities: Arc::clone(&self.hosted_identities),
+            multiplexed: true,
+            manages_physical_transport: false,
+            listener_start_lock: Arc::clone(&self.listener_start_lock),
+            listeners_started: Arc::clone(&self.listeners_started),
+            reachability_claimed: Arc::clone(&self.reachability_claimed),
+            runs_reachability_driver,
         })
     }
 }
@@ -762,6 +928,12 @@ impl TransportHandle {
     /// Get the cryptographic node identity.
     pub fn node_identity(&self) -> &Arc<NodeIdentity> {
         &self.node_identity
+    }
+
+    /// Whether this logical handle owns the shared physical reachability
+    /// state machine.
+    pub(crate) fn runs_reachability_driver(&self) -> bool {
+        self.runs_reachability_driver
     }
 
     /// Whether the named external address has been proven cold-dialable.
@@ -1148,7 +1320,7 @@ impl TransportHandle {
             &self.peer_to_channel,
             &self.channel_to_peers,
             &self.peer_user_agents,
-            &self.event_tx,
+            &self.hosted_identities,
         );
     }
 
@@ -1162,7 +1334,7 @@ impl TransportHandle {
         peer_to_channel: &DashMap<PeerId, HashSet<String>>,
         channel_to_peers: &DashMap<String, HashSet<PeerId>>,
         peer_user_agents: &DashMap<PeerId, String>,
-        event_tx: &broadcast::Sender<P2PEvent>,
+        hosted_identities: &DashMap<PeerId, HostedIdentity>,
     ) {
         let Some((_, app_peers)) = channel_to_peers.remove(channel_id) else {
             return;
@@ -1187,7 +1359,7 @@ impl TransportHandle {
             };
             if became_empty {
                 peer_user_agents.remove(app_peer);
-                let _ = event_tx.send(P2PEvent::PeerDisconnected(*app_peer));
+                Self::broadcast_to_hosted(hosted_identities, P2PEvent::PeerDisconnected(*app_peer));
             }
         }
     }
@@ -1239,7 +1411,7 @@ impl TransportHandle {
         peer_to_channel: &DashMap<PeerId, HashSet<String>>,
         channel_to_peers: &DashMap<String, HashSet<PeerId>>,
         peer_user_agents: &DashMap<PeerId, String>,
-        event_tx: &broadcast::Sender<P2PEvent>,
+        hosted_identities: &DashMap<PeerId, HostedIdentity>,
         channel_id: &str,
         remote_address: SocketAddr,
         app_id: PeerId,
@@ -1275,7 +1447,16 @@ impl TransportHandle {
         if is_new_peer {
             let peer_user_agent = peer_user_agent.to_string();
             peer_user_agents.insert(app_id, peer_user_agent.clone());
-            broadcast_event(event_tx, P2PEvent::PeerConnected(app_id, peer_user_agent));
+            Self::broadcast_to_hosted(
+                hosted_identities,
+                P2PEvent::PeerConnected(app_id, peer_user_agent),
+            );
+        }
+    }
+
+    fn broadcast_to_hosted(hosted_identities: &DashMap<PeerId, HostedIdentity>, event: P2PEvent) {
+        for hosted in hosted_identities.iter() {
+            broadcast_event(&hosted.event_tx, event.clone());
         }
     }
 }
@@ -1623,7 +1804,10 @@ impl TransportHandle {
         };
 
         self.peer_user_agents.remove(peer_id);
-        let _ = self.event_tx.send(P2PEvent::PeerDisconnected(*peer_id));
+        Self::broadcast_to_hosted(
+            &self.hosted_identities,
+            P2PEvent::PeerDisconnected(*peer_id),
+        );
 
         // Close QUIC connections for channels with no remaining peers.
         for channel_id in &orphaned_channels {
@@ -1689,7 +1873,7 @@ impl TransportHandle {
         let mut last_err = None;
         for channel_id in &channels {
             match self
-                .send_on_channel(channel_id, protocol, data.clone())
+                .send_on_channel(channel_id, Some(*peer_id), protocol, data.clone())
                 .await
             {
                 Ok(()) => return Ok(()),
@@ -1731,6 +1915,7 @@ impl TransportHandle {
     pub(crate) async fn send_on_channel(
         &self,
         channel_id: &str,
+        destination: Option<PeerId>,
         protocol: &str,
         data: Vec<u8>,
     ) -> Result<()> {
@@ -1785,7 +1970,7 @@ impl TransportHandle {
         }
 
         let raw_data_len = data.len();
-        let message_data = self.create_protocol_message(protocol, data)?;
+        let message_data = self.create_protocol_message(destination, protocol, data)?;
         debug!(
             "Sending {} bytes to channel {} on protocol {} (raw data: {} bytes)",
             message_data.len(),
@@ -1889,13 +2074,38 @@ impl TransportHandle {
         channel_id: &str,
         timeout: Duration,
     ) -> Result<PeerId> {
+        self.wait_for_peer_identity_inner(channel_id, None, timeout)
+            .await
+    }
+
+    /// Wait until a particular logical peer has authenticated on a channel.
+    pub async fn wait_for_specific_peer_identity(
+        &self,
+        channel_id: &str,
+        expected_peer: PeerId,
+        timeout: Duration,
+    ) -> Result<PeerId> {
+        self.wait_for_peer_identity_inner(channel_id, Some(expected_peer), timeout)
+            .await
+    }
+
+    async fn wait_for_peer_identity_inner(
+        &self,
+        channel_id: &str,
+        expected_peer: Option<PeerId>,
+        timeout: Duration,
+    ) -> Result<PeerId> {
         let deadline = Instant::now() + timeout;
         let poll_interval = Duration::from_millis(50);
 
         loop {
             // Check if any app-level peer has been authenticated on this channel.
             let peers = self.peers_on_channel(channel_id).await;
-            if let Some(peer_id) = peers.into_iter().next() {
+            let authenticated = match expected_peer {
+                Some(expected) => peers.into_iter().find(|peer| *peer == expected),
+                None => peers.into_iter().next(),
+            };
+            if let Some(peer_id) = authenticated {
                 return Ok(peer_id);
             }
 
@@ -2027,7 +2237,21 @@ impl TransportHandle {
     /// Create a protocol message wrapper (WireMessage serialized with postcard).
     ///
     /// Signs the message with the node's ML-DSA-65 key.
-    fn create_protocol_message(&self, protocol: &str, data: Vec<u8>) -> Result<Vec<u8>> {
+    fn create_protocol_message(
+        &self,
+        destination: Option<PeerId>,
+        protocol: &str,
+        data: Vec<u8>,
+    ) -> Result<Vec<u8>> {
+        if self.multiplexed {
+            let destination = destination.ok_or_else(|| {
+                P2PError::Network(NetworkError::ProtocolError(
+                    "multiplexed messages require a logical destination".into(),
+                ))
+            })?;
+            return self.create_multiplexed_protocol_message(destination, protocol, data);
+        }
+
         let mut message = WireMessage {
             protocol: protocol.to_string(),
             data,
@@ -2041,6 +2265,34 @@ impl TransportHandle {
         Self::sign_wire_message(&mut message, &self.node_identity)?;
 
         Self::serialize_wire_message(&message)
+    }
+
+    fn create_multiplexed_protocol_message(
+        &self,
+        destination: PeerId,
+        protocol: &str,
+        data: Vec<u8>,
+    ) -> Result<Vec<u8>> {
+        let mut message = MultiplexedWireMessage {
+            protocol: protocol.to_string(),
+            data,
+            from: *self.node_identity.peer_id(),
+            to: destination,
+            timestamp: Self::current_timestamp_secs()?,
+            user_agent: self.user_agent.clone(),
+            public_key: Vec::new(),
+            signature: Vec::new(),
+        };
+        Self::sign_multiplexed_wire_message(&mut message, &self.node_identity)?;
+        let encoded = postcard::to_stdvec(&message).map_err(|error| {
+            P2PError::Transport(crate::error::TransportError::StreamError(
+                format!("Failed to serialize multiplexed wire message: {error}").into(),
+            ))
+        })?;
+        let mut framed = Vec::with_capacity(MULTIPLEXED_WIRE_MAGIC.len() + encoded.len());
+        framed.extend_from_slice(MULTIPLEXED_WIRE_MAGIC);
+        framed.extend_from_slice(&encoded);
+        Ok(framed)
     }
 
     /// Build a signed identity announce as serialized bytes (static — no `&self`).
@@ -2097,6 +2349,33 @@ impl TransportHandle {
         Ok(())
     }
 
+    fn sign_multiplexed_wire_message(
+        message: &mut MultiplexedWireMessage,
+        identity: &NodeIdentity,
+    ) -> Result<()> {
+        let signable = postcard::to_stdvec(&(
+            &message.protocol,
+            &message.data as &[u8],
+            &message.from,
+            &message.to,
+            message.timestamp,
+            &message.user_agent,
+        ))
+        .map_err(|error| {
+            P2PError::Network(NetworkError::ProtocolError(
+                format!("Failed to serialize multiplexed signable bytes: {error}").into(),
+            ))
+        })?;
+        let signature = identity.sign(&signable).map_err(|error| {
+            P2PError::Network(NetworkError::ProtocolError(
+                format!("Failed to sign multiplexed message: {error}").into(),
+            ))
+        })?;
+        message.public_key = identity.public_key().as_bytes().to_vec();
+        message.signature = signature.as_bytes().to_vec();
+        Ok(())
+    }
+
     /// Serialize a `WireMessage` to postcard bytes.
     fn serialize_wire_message(message: &WireMessage) -> Result<Vec<u8>> {
         postcard::to_stdvec(message).map_err(|e| {
@@ -2150,13 +2429,13 @@ impl TransportHandle {
         // plus any unauthenticated channels. DashMap iteration is not a
         // consistent snapshot, but a peer added/removed mid-iteration is
         // not a correctness issue — the next publish picks it up.
-        let mut peer_channel_groups: Vec<Vec<String>> = Vec::new();
+        let mut peer_channel_groups: Vec<(Option<PeerId>, Vec<String>)> = Vec::new();
         let mut mapped_channels: HashSet<String> = HashSet::new();
         for entry in self.peer_to_channel.iter() {
             let chs: Vec<String> = entry.value().iter().cloned().collect();
             mapped_channels.extend(chs.iter().cloned());
             if !chs.is_empty() {
-                peer_channel_groups.push(chs);
+                peer_channel_groups.push((Some(*entry.key()), chs));
             }
         }
 
@@ -2166,7 +2445,7 @@ impl TransportHandle {
         // the next publish picks it up.
         for entry in self.peers.iter() {
             if !mapped_channels.contains(entry.key()) {
-                peer_channel_groups.push(vec![entry.key().clone()]);
+                peer_channel_groups.push((None, vec![entry.key().clone()]));
             }
         }
 
@@ -2175,10 +2454,13 @@ impl TransportHandle {
         } else {
             let mut send_count = 0;
             let total = peer_channel_groups.len();
-            for channels in &peer_channel_groups {
+            for (destination, channels) in &peer_channel_groups {
                 let mut sent = false;
                 for channel_id in channels {
-                    match self.send_on_channel(channel_id, topic, data.to_vec()).await {
+                    match self
+                        .send_on_channel(channel_id, *destination, topic, data.to_vec())
+                        .await
+                    {
                         Ok(()) => {
                             send_count += 1;
                             debug!("Published message via channel: {}", channel_id);
@@ -2247,6 +2529,10 @@ impl TransportHandle {
 impl TransportHandle {
     /// Start network listeners on the dual-stack transport.
     pub async fn start_network_listeners(&self) -> Result<()> {
+        let _start_guard = self.listener_start_lock.lock().await;
+        if self.listeners_started.load(Ordering::Acquire) {
+            return Ok(());
+        }
         info!("Starting dual-stack listeners (saorsa-transport)...");
         let socket_addrs = self.dual_node.local_addrs().await.map_err(|e| {
             P2PError::Transport(crate::error::TransportError::SetupFailed(
@@ -2294,6 +2580,8 @@ impl TransportHandle {
         *self.listener_handle.write().await = Some(handle);
 
         self.start_message_receiving_system().await?;
+
+        self.listeners_started.store(true, Ordering::Release);
 
         info!("Dual-stack listeners active on: {:?}", addrs);
         Ok(())
@@ -2350,14 +2638,12 @@ impl TransportHandle {
             let (shard_tx, shard_rx) = tokio::sync::mpsc::channel(per_shard_capacity);
             shard_txs.push(shard_tx);
 
-            let event_tx = self.event_tx.clone();
-            let active_requests = Arc::clone(&self.active_requests);
+            let hosted_identities = Arc::clone(&self.hosted_identities);
             let active_connections = Arc::clone(&self.active_connections);
             let peers = Arc::clone(&self.peers);
             let peer_to_channel = Arc::clone(&self.peer_to_channel);
             let channel_to_peers = Arc::clone(&self.channel_to_peers);
             let peer_user_agents = Arc::clone(&self.peer_user_agents);
-            let self_peer_id = *self.node_identity.peer_id();
             let dual_node_for_peer_reg = Arc::clone(&self.dual_node);
             let traffic = Arc::clone(&self.traffic);
 
@@ -2365,14 +2651,12 @@ impl TransportHandle {
                 Self::run_shard_consumer(
                     shard_idx,
                     shard_rx,
-                    event_tx,
-                    active_requests,
+                    hosted_identities,
                     active_connections,
                     peers,
                     peer_to_channel,
                     channel_to_peers,
                     peer_user_agents,
-                    self_peer_id,
                     dual_node_for_peer_reg,
                     traffic,
                 )
@@ -2452,14 +2736,12 @@ impl TransportHandle {
     async fn run_shard_consumer(
         shard_idx: usize,
         mut shard_rx: tokio::sync::mpsc::Receiver<(SocketAddr, Vec<u8>)>,
-        event_tx: broadcast::Sender<P2PEvent>,
-        active_requests: Arc<DashMap<String, PendingRequest>>,
+        hosted_identities: Arc<DashMap<PeerId, HostedIdentity>>,
         active_connections: Arc<DashSet<String>>,
         peers: Arc<DashMap<String, PeerInfo>>,
         peer_to_channel: Arc<DashMap<PeerId, HashSet<String>>>,
         channel_to_peers: Arc<DashMap<String, HashSet<PeerId>>>,
         peer_user_agents: Arc<DashMap<PeerId, String>>,
-        self_peer_id: PeerId,
         dual_node_for_peer_reg: Arc<DualStackNetworkNode>,
         traffic: Arc<TrafficCounters>,
     ) {
@@ -2477,6 +2759,7 @@ impl TransportHandle {
                 Some(ParsedMessage {
                     event,
                     authenticated_node_id,
+                    destination,
                     user_agent: peer_user_agent,
                     payload_len,
                 }) => {
@@ -2495,7 +2778,7 @@ impl TransportHandle {
                     // (e.g. QUIC + Bluetooth), so we add to the set — never replace.
                     // Skip our own identity to avoid self-registration via echoed messages.
                     if let Some(ref app_id) = authenticated_node_id
-                        && *app_id != self_peer_id
+                        && !hosted_identities.contains_key(app_id)
                     {
                         let already_mapped = peer_to_channel
                             .get(app_id)
@@ -2525,7 +2808,7 @@ impl TransportHandle {
                             &peer_to_channel,
                             &channel_to_peers,
                             &peer_user_agents,
-                            &event_tx,
+                            &hosted_identities,
                             &channel_id,
                             from_addr,
                             *app_id,
@@ -2554,16 +2837,35 @@ impl TransportHandle {
                         // spoofed response can't evict a legitimate pending
                         // request — the entry stays until either a matching
                         // response arrives or the caller times out.
-                        let expected_peer = match active_requests.get(&envelope.message_id) {
-                            Some(pending) => pending.expected_peer,
-                            None => {
-                                trace!(
-                                    message_id = %envelope.message_id,
-                                    "Unmatched /rr/ response (likely timed out) — suppressing"
-                                );
-                                continue;
-                            }
+                        let target_identity = match destination {
+                            Some(destination) => hosted_identities
+                                .get(&destination)
+                                .map(|entry| entry.value().clone()),
+                            None if hosted_identities.len() == 1 => hosted_identities
+                                .iter()
+                                .next()
+                                .map(|entry| entry.value().clone()),
+                            None => None,
                         };
+                        let Some(target_identity) = target_identity else {
+                            warn!(
+                                message_id = %envelope.message_id,
+                                destination = ?destination,
+                                "Response has no registered logical destination"
+                            );
+                            continue;
+                        };
+                        let expected_peer =
+                            match target_identity.active_requests.get(&envelope.message_id) {
+                                Some(pending) => pending.expected_peer,
+                                None => {
+                                    trace!(
+                                        message_id = %envelope.message_id,
+                                        "Unmatched /rr/ response (likely timed out) — suppressing"
+                                    );
+                                    continue;
+                                }
+                            };
                         // Accept response only if the authenticated app-level
                         // identity matches. Channel IDs identify connections,
                         // not peers, so they are not checked here.
@@ -2577,7 +2879,8 @@ impl TransportHandle {
                             );
                             continue;
                         }
-                        if let Some((_, pending)) = active_requests.remove(&envelope.message_id)
+                        if let Some((_, pending)) =
+                            target_identity.active_requests.remove(&envelope.message_id)
                             && pending.response_tx.send(envelope.payload).is_err()
                         {
                             warn!(
@@ -2587,7 +2890,28 @@ impl TransportHandle {
                         }
                         continue;
                     }
-                    broadcast_event(&event_tx, event);
+                    match destination {
+                        Some(destination) => {
+                            if let Some(target) = hosted_identities.get(&destination) {
+                                broadcast_event(&target.event_tx, event);
+                            } else {
+                                warn!(
+                                    destination = %destination,
+                                    "Dropping message for an identity not hosted by this daemon"
+                                );
+                            }
+                        }
+                        None if hosted_identities.len() == 1 => {
+                            if let Some(target) = hosted_identities.iter().next() {
+                                broadcast_event(&target.event_tx, event);
+                            }
+                        }
+                        None => {
+                            warn!(
+                                "Dropping legacy message because a multi-identity daemon cannot infer its logical destination"
+                            );
+                        }
+                    }
                 }
                 None => {
                     warn!(
@@ -2658,6 +2982,9 @@ fn canonical_channel_id(addr: SocketAddr) -> String {
 impl TransportHandle {
     /// Stop the transport layer: shutdown endpoints, join tasks, disconnect peers.
     pub async fn stop(&self) -> Result<()> {
+        if !self.manages_physical_transport {
+            return Ok(());
+        }
         info!("Stopping transport...");
 
         self.shutdown.cancel();
@@ -2670,6 +2997,7 @@ impl TransportHandle {
         Self::join_task_slot(&self.connection_monitor_handle, "connection monitor").await;
 
         self.disconnect_all_peers().await?;
+        self.listeners_started.store(false, Ordering::Release);
 
         info!("Transport stopped");
         Ok(())
@@ -2718,7 +3046,6 @@ impl TransportHandle {
         >,
         active_connections: Arc<DashSet<String>>,
         peers: Arc<DashMap<String, PeerInfo>>,
-        event_tx: broadcast::Sender<P2PEvent>,
         _geo_provider: Arc<BgpGeoProvider>,
         shutdown: CancellationToken,
         peer_to_channel: Arc<DashMap<PeerId, HashSet<String>>>,
@@ -2726,6 +3053,7 @@ impl TransportHandle {
         peer_user_agents: Arc<DashMap<PeerId, String>>,
         node_identity: Arc<NodeIdentity>,
         user_agent: String,
+        hosted_identities: Arc<DashMap<PeerId, HostedIdentity>>,
         traffic: Arc<TrafficCounters>,
     ) {
         info!("Connection lifecycle monitor started (pre-subscribed receiver)");
@@ -2765,21 +3093,55 @@ impl TransportHandle {
                                 // timeout doesn't block the lifecycle
                                 // monitor and back up identity announces for
                                 // every other peer that just (re)connected.
-                                match Self::create_identity_announce_bytes(&node_identity, &user_agent) {
-                                    Ok(announce_bytes) => {
-                                        let dual_node = Arc::clone(&dual_node);
-                                        let channel_id_for_send = channel_id.clone();
-                                        // V2-623: identity announce bypasses
-                                        // `send_on_channel`, so account for it
-                                        // here. Counted on successful send.
-                                        let traffic = Arc::clone(&traffic);
-                                        let announce_len = announce_bytes.len() as u64;
-                                        tokio::spawn(async move {
-                                            if let Err(e) = dual_node
-                                                .send_to_peer_optimized(&remote_address, &announce_bytes)
-                                                .await
-                                            {
-                                                if e
+                                let mut announce_messages: Vec<Vec<u8>> = hosted_identities
+                                    .iter()
+                                    .filter_map(|hosted| {
+                                        match Self::create_identity_announce_bytes(
+                                            &hosted.identity,
+                                            &hosted.user_agent,
+                                        ) {
+                                            Ok(bytes) => Some(bytes),
+                                            Err(error) => {
+                                                warn!(
+                                                    peer_id = %hosted.key(),
+                                                    "Failed to create identity announce: {error}"
+                                                );
+                                                None
+                                            }
+                                        }
+                                    })
+                                    .collect();
+                                if announce_messages.is_empty()
+                                    && let Ok(bytes) = Self::create_identity_announce_bytes(
+                                        &node_identity,
+                                        &user_agent,
+                                    )
+                                {
+                                    announce_messages.push(bytes);
+                                }
+
+                                if !announce_messages.is_empty() {
+                                    let dual_node = Arc::clone(&dual_node);
+                                    let channel_id_for_send = channel_id.clone();
+                                    // V2-623: identity announce bypasses
+                                    // `send_on_channel`, so account for it
+                                    // here. Counted on successful send.
+                                    let traffic = Arc::clone(&traffic);
+                                    let announce_len = announce_messages
+                                        .iter()
+                                        .map(|message| message.len() as u64)
+                                        .sum::<u64>();
+                                    let announce_count = announce_messages.len() as u64;
+                                    tokio::spawn(async move {
+                                        for announce_bytes in announce_messages {
+                                            let send_result = dual_node
+                                                .send_to_peer_optimized(
+                                                    &remote_address,
+                                                    &announce_bytes,
+                                                )
+                                                .await;
+                                            if let Err(error) = send_result {
+                                                if error
                                                     .downcast_ref::<saorsa_transport::p2p_endpoint::EndpointError>()
                                                     .is_some_and(|error| matches!(
                                                         error,
@@ -2794,19 +3156,22 @@ impl TransportHandle {
                                                     debug!(
                                                         "Skipping identity announce for closed channel {channel_id_for_send}"
                                                     );
-                                                    return;
+                                                    break;
                                                 }
-                                                // {e:#} prints the full anyhow cause chain so we
+                                                // {error:#} prints the full anyhow cause chain so we
                                                 // can see the underlying reason (e.g. "peer did
                                                 // not acknowledge stream data within 1s",
                                                 // "open_uni failed", "PeerNotFound").
                                                 warn!(
-                                                    "Failed to send identity announce to {channel_id_for_send}: {e:#}"
+                                                    "Failed to send identity announce to {channel_id_for_send}: {error:#}"
                                                 );
                                             } else {
                                                 traffic
                                                     .identity_announce_tx_bytes
-                                                    .fetch_add(announce_len, Ordering::Relaxed);
+                                                    .fetch_add(
+                                                        announce_bytes.len() as u64,
+                                                        Ordering::Relaxed,
+                                                    );
                                                 traffic
                                                     .identity_announce_tx_count
                                                     .fetch_add(1, Ordering::Relaxed);
@@ -2815,16 +3180,21 @@ impl TransportHandle {
                                                 // be invisible to the reconciliation line.
                                                 traffic
                                                     .wire_tx_bytes
-                                                    .fetch_add(announce_len, Ordering::Relaxed);
+                                                    .fetch_add(
+                                                        announce_bytes.len() as u64,
+                                                        Ordering::Relaxed,
+                                                    );
                                                 traffic
                                                     .wire_tx_count
                                                     .fetch_add(1, Ordering::Relaxed);
                                             }
-                                        });
-                                    }
-                                    Err(e) => {
-                                        warn!("Failed to create identity announce: {e}");
-                                    }
+                                        }
+                                        trace!(
+                                            bytes = announce_len,
+                                            count = announce_count,
+                                            "Finished hosted identity announcements"
+                                        );
+                                    });
                                 }
 
                                 // PeerConnected is emitted when the remote receives and
@@ -2844,7 +3214,7 @@ impl TransportHandle {
                                     &peer_to_channel,
                                     &channel_to_peers,
                                     &peer_user_agents,
-                                    &event_tx,
+                                    &hosted_identities,
                                 );
                             }
                             ConnectionEvent::PeerAddressUpdated { .. } => {
@@ -2991,6 +3361,17 @@ mod authenticated_peer_registration_tests {
         let channel_to_peers = DashMap::new();
         let peer_user_agents = DashMap::new();
         let (event_tx, mut event_rx) = broadcast::channel(4);
+        let hosted_identities = DashMap::new();
+        let identity = Arc::new(NodeIdentity::generate().expect("test identity"));
+        hosted_identities.insert(
+            *identity.peer_id(),
+            HostedIdentity {
+                identity,
+                user_agent: "node/test".to_string(),
+                event_tx,
+                active_requests: Arc::new(DashMap::new()),
+            },
+        );
 
         let app_id = PeerId::from_bytes([0x31; 32]);
         let remote_addr: SocketAddr = "64.227.163.41:43782".parse().expect("test addr");
@@ -3002,7 +3383,7 @@ mod authenticated_peer_registration_tests {
             &peer_to_channel,
             &channel_to_peers,
             &peer_user_agents,
-            &event_tx,
+            &hosted_identities,
             &channel_id,
             remote_addr,
             app_id,
@@ -3031,6 +3412,170 @@ mod authenticated_peer_registration_tests {
             }
             other => panic!("unexpected event: {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod multiplexed_transport_tests {
+    use super::*;
+
+    fn config(identity: Arc<NodeIdentity>) -> TransportConfig {
+        TransportConfig {
+            listen_addrs: vec![MultiAddr::quic("127.0.0.1:0".parse().expect("test addr"))],
+            connection_timeout: Duration::from_secs(5),
+            max_connections: 32,
+            event_channel_capacity: 32,
+            max_message_size: None,
+            node_identity: identity,
+            user_agent: "node/multiplex-test".to_string(),
+            allow_loopback: true,
+            enable_relay_service: false,
+            advertise_external_addresses: false,
+        }
+    }
+
+    async fn next_message(events: &mut broadcast::Receiver<P2PEvent>) -> P2PEvent {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let event = events.recv().await.expect("event channel open");
+                if matches!(event, P2PEvent::Message { .. }) {
+                    return event;
+                }
+            }
+        })
+        .await
+        .expect("message timeout")
+    }
+
+    #[tokio::test]
+    async fn logical_identities_share_one_channel_and_route_by_destination() {
+        let daemon_a = Arc::new(NodeIdentity::generate().expect("daemon a"));
+        let daemon_b = Arc::new(NodeIdentity::generate().expect("daemon b"));
+        let root_a = TransportHandle::new_multiplexed(config(daemon_a))
+            .await
+            .expect("root a");
+        let root_b = TransportHandle::new_multiplexed(config(daemon_b))
+            .await
+            .expect("root b");
+
+        let a1_id = Arc::new(NodeIdentity::generate().expect("a1"));
+        let a2_id = Arc::new(NodeIdentity::generate().expect("a2"));
+        let b1_id = Arc::new(NodeIdentity::generate().expect("b1"));
+        let b2_id = Arc::new(NodeIdentity::generate().expect("b2"));
+        let a1 = root_a
+            .logical_handle(Arc::clone(&a1_id), "node/a1".to_string(), 32)
+            .expect("a1 handle");
+        let _a2 = root_a
+            .logical_handle(a2_id, "node/a2".to_string(), 32)
+            .expect("a2 handle");
+        assert!(a1.runs_reachability_driver());
+        assert!(!_a2.runs_reachability_driver());
+        let b1 = root_b
+            .logical_handle(Arc::clone(&b1_id), "node/b1".to_string(), 32)
+            .expect("b1 handle");
+        let b2 = root_b
+            .logical_handle(Arc::clone(&b2_id), "node/b2".to_string(), 32)
+            .expect("b2 handle");
+        let mut b1_events = b1.subscribe_events();
+        let mut b2_events = b2.subscribe_events();
+
+        a1.start_network_listeners().await.expect("start a");
+        b1.start_network_listeners().await.expect("start b");
+        let b_addr = b1
+            .listen_addrs()
+            .await
+            .into_iter()
+            .find(|addr| addr.socket_addr().is_some_and(|addr| addr.is_ipv4()))
+            .expect("b IPv4 listener");
+
+        let channel = a1.connect_peer(&b_addr).await.expect("connect a to b");
+        a1.wait_for_specific_peer_identity(&channel, *b1_id.peer_id(), Duration::from_secs(5))
+            .await
+            .expect("b1 announce");
+        a1.wait_for_specific_peer_identity(&channel, *b2_id.peer_id(), Duration::from_secs(5))
+            .await
+            .expect("b2 announce");
+
+        assert_eq!(root_a.active_channels().await.len(), 1);
+        assert!(a1.is_peer_connected(b1_id.peer_id()).await);
+        assert!(a1.is_peer_connected(b2_id.peer_id()).await);
+
+        a1.send_message(b2_id.peer_id(), "destination-test", b"only-b2".to_vec())
+            .await
+            .expect("send to b2");
+        match next_message(&mut b2_events).await {
+            P2PEvent::Message {
+                topic,
+                source,
+                data,
+                ..
+            } => {
+                assert_eq!(topic, "destination-test");
+                assert_eq!(source, Some(*a1_id.peer_id()));
+                assert_eq!(data, b"only-b2");
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), next_message(&mut b1_events))
+                .await
+                .is_err(),
+            "b1 must not receive a message addressed to b2"
+        );
+
+        let request = a1.send_request(
+            b2_id.peer_id(),
+            "identity-correlation",
+            b"request-b2".to_vec(),
+            Duration::from_secs(5),
+        );
+        let respond = async {
+            let request_data = match next_message(&mut b2_events).await {
+                P2PEvent::Message {
+                    topic,
+                    source,
+                    data,
+                    ..
+                } => {
+                    assert_eq!(topic, "/rr/identity-correlation");
+                    assert_eq!(source, Some(*a1_id.peer_id()));
+                    data
+                }
+                other => panic!("unexpected event: {other:?}"),
+            };
+            let (message_id, is_response, payload) =
+                TransportHandle::parse_request_envelope(&request_data).expect("request envelope");
+            assert!(!is_response);
+            assert_eq!(payload, b"request-b2");
+
+            // A co-hosted but incorrect identity cannot consume or evict the
+            // request slot even though it shares the physical connection.
+            b1.send_response(
+                a1_id.peer_id(),
+                "identity-correlation",
+                &message_id,
+                b"spoofed-by-b1".to_vec(),
+            )
+            .await
+            .expect("send mismatched response");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            b2.send_response(
+                a1_id.peer_id(),
+                "identity-correlation",
+                &message_id,
+                b"genuine-b2".to_vec(),
+            )
+            .await
+            .expect("send genuine response");
+        };
+        let (response, ()) = tokio::join!(request, respond);
+        let response = response.expect("genuine response should complete request");
+        assert_eq!(response.peer_id, *b2_id.peer_id());
+        assert_eq!(response.data, b"genuine-b2");
+
+        root_a.stop().await.expect("stop a");
+        root_b.stop().await.expect("stop b");
     }
 }
 
