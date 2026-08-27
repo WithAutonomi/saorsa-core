@@ -24,8 +24,9 @@ use crate::error::{NetworkError, P2PError, P2pResult as Result, SendFailureKind,
 use crate::identity::node_identity::{NodeIdentity, peer_id_from_public_key_spki};
 use crate::network::{
     ConnectionStatus, MAX_ACTIVE_REQUESTS, MAX_REQUEST_TIMEOUT, MESSAGE_RECV_CHANNEL_CAPACITY,
-    MULTIPLEXED_WIRE_MAGIC, MultiplexedWireMessage, NetworkSender, P2PEvent, ParsedMessage,
-    PeerInfo, PeerResponse, PendingRequest, RequestResponseEnvelope, WireMessage, broadcast_event,
+    MULTIPLEX_CAPABILITY_MAGIC, MULTIPLEXED_WIRE_MAGIC, MultiplexCapability,
+    MultiplexedWireMessage, NetworkSender, P2PEvent, ParsedMessage, PeerInfo, PeerResponse,
+    PendingRequest, RequestResponseEnvelope, WireMessage, broadcast_event,
     normalize_wildcard_to_loopback, parse_protocol_message, register_new_channel,
 };
 use crate::reachability::{RelaySessionEstablishError, RelaySessionEstablisher};
@@ -53,6 +54,8 @@ use tracing::{debug, info, trace, warn};
 
 // Test configuration defaults (used by `new_for_tests()` which is available in all builds)
 const TEST_EVENT_CHANNEL_CAPACITY: usize = 16;
+/// Backoff after an advertised shared endpoint could not be authenticated.
+const MULTIPLEX_UPGRADE_RETRY_DELAY: Duration = Duration::from_secs(5 * 60);
 const TEST_MAX_REQUESTS: u32 = 100;
 const TEST_BURST_SIZE: u32 = 100;
 const TEST_RATE_LIMIT_WINDOW_SECS: u64 = 1;
@@ -263,6 +266,18 @@ struct HostedIdentity {
     active_requests: Arc<DashMap<String, PendingRequest>>,
 }
 
+struct LogicalTransportState {
+    event_tx: broadcast::Sender<P2PEvent>,
+    active_requests: Arc<DashMap<String, PendingRequest>>,
+}
+
+struct LegacyCompatibilityState {
+    capability: MultiplexCapability,
+    capabilities: Arc<DashMap<PeerId, MultiplexCapability>>,
+    upgrade_failures: Arc<DashMap<PeerId, Instant>>,
+    logical_connectivity: Arc<DashMap<PeerId, usize>>,
+}
+
 /// Encapsulates transport-level concerns: QUIC connections, peer registry,
 /// message I/O, and network events.
 ///
@@ -423,6 +438,18 @@ pub struct TransportHandle {
     /// Whether outgoing application messages use destination-addressed
     /// multiplexed envelopes.
     multiplexed: bool,
+    /// Destination-addressed transport used after a peer advertises support.
+    /// Present only on a per-identity legacy compatibility handle.
+    shared_backend: Option<Arc<TransportHandle>>,
+    /// Signed daemon capabilities learned from legacy identity announcements.
+    /// Shared by every logical handle on one daemon transport.
+    multiplex_capabilities: Arc<DashMap<PeerId, MultiplexCapability>>,
+    /// Last failed attempt to authenticate a peer's advertised shared endpoint.
+    multiplex_upgrade_failures: Arc<DashMap<PeerId, Instant>>,
+    /// Number of transport backends currently carrying each logical peer.
+    /// Prevents a legacy or shared path loss from emitting PeerDisconnected
+    /// while the other path is still usable.
+    logical_connectivity: Arc<DashMap<PeerId, usize>>,
     /// Only the root handle is allowed to stop the physical endpoint.
     manages_physical_transport: bool,
     /// Serialises first listener startup across logical handles.
@@ -478,17 +505,85 @@ impl TransportHandle {
     /// embedded in `P2PNode::new()`: dual-stack QUIC binding, rate limiter,
     /// GeoIP provider, and a background connection lifecycle monitor.
     pub async fn new(config: TransportConfig) -> Result<Self> {
-        Self::new_inner(config, false).await
+        Self::new_inner(config, false, None, None, None).await
     }
 
     /// Create the physical root of a destination-addressed shared transport.
     pub(crate) async fn new_multiplexed(config: TransportConfig) -> Result<Self> {
-        Self::new_inner(config, true).await
+        Self::new_inner(config, true, None, None, None).await
     }
 
-    async fn new_inner(config: TransportConfig, multiplexed: bool) -> Result<Self> {
-        let (event_tx, _) = broadcast::channel(config.event_channel_capacity);
-        let active_requests = Arc::new(DashMap::new());
+    /// Create a one-identity legacy endpoint backed by a shared multiplexed
+    /// logical handle. Both receive paths publish into the same event channel
+    /// and resolve the same request registry.
+    pub(crate) async fn new_legacy_compatible(
+        config: TransportConfig,
+        shared_backend: TransportHandle,
+        capability: MultiplexCapability,
+    ) -> Result<Self> {
+        let event_tx = shared_backend.event_tx.clone();
+        let active_requests = Arc::clone(&shared_backend.active_requests);
+        let capabilities = Arc::clone(&shared_backend.multiplex_capabilities);
+        let upgrade_failures = Arc::clone(&shared_backend.multiplex_upgrade_failures);
+        let logical_connectivity = Arc::clone(&shared_backend.logical_connectivity);
+        Self::new_inner(
+            config,
+            false,
+            Some(LogicalTransportState {
+                event_tx,
+                active_requests,
+            }),
+            Some(Arc::new(shared_backend)),
+            Some(LegacyCompatibilityState {
+                capability,
+                capabilities,
+                upgrade_failures,
+                logical_connectivity,
+            }),
+        )
+        .await
+    }
+
+    async fn new_inner(
+        config: TransportConfig,
+        multiplexed: bool,
+        logical_state: Option<LogicalTransportState>,
+        shared_backend: Option<Arc<TransportHandle>>,
+        legacy_capability: Option<LegacyCompatibilityState>,
+    ) -> Result<Self> {
+        let LogicalTransportState {
+            event_tx,
+            active_requests,
+        } = logical_state.unwrap_or_else(|| {
+            let (event_tx, _) = broadcast::channel(config.event_channel_capacity);
+            LogicalTransportState {
+                event_tx,
+                active_requests: Arc::new(DashMap::new()),
+            }
+        });
+        let (
+            legacy_capability,
+            multiplex_capabilities,
+            multiplex_upgrade_failures,
+            logical_connectivity,
+        ) = legacy_capability.map_or_else(
+            || {
+                (
+                    None,
+                    Arc::new(DashMap::new()),
+                    Arc::new(DashMap::new()),
+                    Arc::new(DashMap::new()),
+                )
+            },
+            |state| {
+                (
+                    Some(state.capability),
+                    state.capabilities,
+                    state.upgrade_failures,
+                    state.logical_connectivity,
+                )
+            },
+        );
         let hosted_identities = Arc::new(DashMap::new());
         if !multiplexed {
             hosted_identities.insert(
@@ -644,6 +739,8 @@ impl TransportHandle {
             let user_agent_clone = config.user_agent.clone();
             let traffic_clone = Arc::clone(&traffic);
             let hosted_identities_clone = Arc::clone(&hosted_identities);
+            let legacy_capability_clone = legacy_capability.clone();
+            let logical_connectivity_clone = Arc::clone(&logical_connectivity);
 
             let handle = tokio::spawn(async move {
                 Self::connection_lifecycle_monitor_with_rx(
@@ -660,6 +757,8 @@ impl TransportHandle {
                     user_agent_clone,
                     hosted_identities_clone,
                     traffic_clone,
+                    legacy_capability_clone,
+                    logical_connectivity_clone,
                 )
                 .await;
             });
@@ -706,6 +805,10 @@ impl TransportHandle {
             proof_eligible_peers,
             hosted_identities,
             multiplexed,
+            shared_backend,
+            multiplex_capabilities,
+            multiplex_upgrade_failures,
+            logical_connectivity,
             manages_physical_transport: true,
             listener_start_lock: Arc::new(tokio::sync::Mutex::new(())),
             listeners_started: Arc::new(AtomicBool::new(false)),
@@ -825,6 +928,10 @@ impl TransportHandle {
             proof_eligible_peers: Arc::new(DashSet::new()),
             hosted_identities,
             multiplexed: false,
+            shared_backend: None,
+            multiplex_capabilities: Arc::new(DashMap::new()),
+            multiplex_upgrade_failures: Arc::new(DashMap::new()),
+            logical_connectivity: Arc::new(DashMap::new()),
             manages_physical_transport: true,
             listener_start_lock: Arc::new(tokio::sync::Mutex::new(())),
             listeners_started: Arc::new(AtomicBool::new(false)),
@@ -906,6 +1013,10 @@ impl TransportHandle {
             proof_eligible_peers: Arc::clone(&self.proof_eligible_peers),
             hosted_identities: Arc::clone(&self.hosted_identities),
             multiplexed: true,
+            shared_backend: None,
+            multiplex_capabilities: Arc::clone(&self.multiplex_capabilities),
+            multiplex_upgrade_failures: Arc::clone(&self.multiplex_upgrade_failures),
+            logical_connectivity: Arc::clone(&self.logical_connectivity),
             manages_physical_transport: false,
             listener_start_lock: Arc::clone(&self.listener_start_lock),
             listeners_started: Arc::clone(&self.listeners_started),
@@ -968,6 +1079,21 @@ impl TransportHandle {
     /// Get all current listen addresses.
     pub async fn listen_addrs(&self) -> Vec<MultiAddr> {
         self.listen_addrs.read().await.clone()
+    }
+
+    /// Return the sockets allocated by the transport, even before the receive
+    /// tasks have been started. This is used to advertise the shared daemon
+    /// endpoint from per-identity compatibility listeners.
+    pub(crate) async fn bound_listen_addrs(&self) -> Result<Vec<MultiAddr>> {
+        self.dual_node
+            .local_addrs()
+            .await
+            .map(|addresses| addresses.into_iter().map(MultiAddr::quic).collect())
+            .map_err(|error| {
+                P2PError::Transport(TransportError::SetupFailed(
+                    format!("Failed to get bound listen addresses: {error}").into(),
+                ))
+            })
     }
 
     /// Returns the node's preferred external address, or `None` if no
@@ -1054,19 +1180,38 @@ impl TransportHandle {
 impl TransportHandle {
     /// Get list of authenticated app-level peer IDs.
     pub async fn connected_peers(&self) -> Vec<PeerId> {
-        self.peer_to_channel.iter().map(|e| *e.key()).collect()
+        let mut peers: HashSet<PeerId> = self.peer_to_channel.iter().map(|e| *e.key()).collect();
+        if let Some(shared_backend) = &self.shared_backend {
+            peers.extend(
+                shared_backend
+                    .peer_to_channel
+                    .iter()
+                    .map(|entry| *entry.key()),
+            );
+        }
+        peers.into_iter().collect()
     }
 
     /// Get count of authenticated app-level peers.
     pub async fn peer_count(&self) -> usize {
-        self.peer_to_channel.len()
+        self.connected_peers().await.len()
     }
 
     /// Get the user agent string for a connected peer, if known.
     pub async fn peer_user_agent(&self, peer_id: &PeerId) -> Option<String> {
-        self.peer_user_agents
-            .get(peer_id)
-            .map(|e| e.value().clone())
+        self.shared_backend
+            .as_ref()
+            .and_then(|backend| {
+                backend
+                    .peer_user_agents
+                    .get(peer_id)
+                    .map(|entry| entry.value().clone())
+            })
+            .or_else(|| {
+                self.peer_user_agents
+                    .get(peer_id)
+                    .map(|e| e.value().clone())
+            })
     }
 
     /// Get all active transport-level channel IDs (internal bookkeeping).
@@ -1083,6 +1228,15 @@ impl TransportHandle {
     /// Resolves the app-level [`PeerId`] to a channel ID via the
     /// `peer_to_channel` mapping, then looks up the channel's [`PeerInfo`].
     pub async fn peer_info(&self, peer_id: &PeerId) -> Option<PeerInfo> {
+        if let Some(shared_backend) = &self.shared_backend
+            && let Some(info) = shared_backend.peer_info_own(peer_id)
+        {
+            return Some(info);
+        }
+        self.peer_info_own(peer_id)
+    }
+
+    fn peer_info_own(&self, peer_id: &PeerId) -> Option<PeerInfo> {
         let channel = self
             .peer_to_channel
             .get(peer_id)
@@ -1136,6 +1290,15 @@ impl TransportHandle {
 
     /// Remove a channel from the tracking maps (internal only).
     pub(crate) async fn remove_channel(&self, channel_id: &str) -> bool {
+        if let Some(shared_backend) = &self.shared_backend
+            && shared_backend.active_connections.contains(channel_id)
+        {
+            return shared_backend.remove_channel_own(channel_id).await;
+        }
+        self.remove_channel_own(channel_id).await
+    }
+
+    async fn remove_channel_own(&self, channel_id: &str) -> bool {
         self.active_connections.remove(channel_id);
         self.remove_channel_mappings(channel_id).await;
         self.peers.remove(channel_id).is_some()
@@ -1147,6 +1310,16 @@ impl TransportHandle {
     /// identity exchange failed, so no [`PeerId`] is available for
     /// [`disconnect_peer`].
     pub(crate) async fn disconnect_channel(&self, channel_id: &str) {
+        if let Some(shared_backend) = &self.shared_backend
+            && shared_backend.active_connections.contains(channel_id)
+        {
+            shared_backend.disconnect_channel_own(channel_id).await;
+            return;
+        }
+        self.disconnect_channel_own(channel_id).await;
+    }
+
+    async fn disconnect_channel_own(&self, channel_id: &str) {
         match channel_id.parse::<SocketAddr>() {
             Ok(addr) => self.dual_node.disconnect_peer_by_addr(&addr).await,
             Err(e) => {
@@ -1301,12 +1474,24 @@ impl TransportHandle {
     /// Check if an authenticated peer is connected (has at least one active
     /// channel).
     pub async fn is_peer_connected(&self, peer_id: &PeerId) -> bool {
+        self.is_peer_connected_own(peer_id)
+            || self
+                .shared_backend
+                .as_ref()
+                .is_some_and(|backend| backend.is_peer_connected_own(peer_id))
+    }
+
+    fn is_peer_connected_own(&self, peer_id: &PeerId) -> bool {
         self.peer_to_channel.contains_key(peer_id)
     }
 
     /// Check if a connection to a peer is active at the transport layer (internal only).
     pub(crate) async fn is_connection_active(&self, channel_id: &str) -> bool {
         self.active_connections.contains(channel_id)
+            || self
+                .shared_backend
+                .as_ref()
+                .is_some_and(|backend| backend.active_connections.contains(channel_id))
     }
 
     /// Remove channel mappings for a disconnected channel.
@@ -1321,6 +1506,7 @@ impl TransportHandle {
             &self.channel_to_peers,
             &self.peer_user_agents,
             &self.hosted_identities,
+            &self.logical_connectivity,
         );
     }
 
@@ -1335,6 +1521,7 @@ impl TransportHandle {
         channel_to_peers: &DashMap<String, HashSet<PeerId>>,
         peer_user_agents: &DashMap<PeerId, String>,
         hosted_identities: &DashMap<PeerId, HostedIdentity>,
+        logical_connectivity: &DashMap<PeerId, usize>,
     ) {
         let Some((_, app_peers)) = channel_to_peers.remove(channel_id) else {
             return;
@@ -1359,7 +1546,23 @@ impl TransportHandle {
             };
             if became_empty {
                 peer_user_agents.remove(app_peer);
-                Self::broadcast_to_hosted(hosted_identities, P2PEvent::PeerDisconnected(*app_peer));
+                let fully_disconnected = match logical_connectivity.entry(*app_peer) {
+                    DashEntry::Occupied(mut entry) if *entry.get() > 1 => {
+                        *entry.get_mut() -= 1;
+                        false
+                    }
+                    DashEntry::Occupied(entry) => {
+                        entry.remove();
+                        true
+                    }
+                    DashEntry::Vacant(_) => true,
+                };
+                if fully_disconnected {
+                    Self::broadcast_to_hosted(
+                        hosted_identities,
+                        P2PEvent::PeerDisconnected(*app_peer),
+                    );
+                }
             }
         }
     }
@@ -1412,6 +1615,7 @@ impl TransportHandle {
         channel_to_peers: &DashMap<String, HashSet<PeerId>>,
         peer_user_agents: &DashMap<PeerId, String>,
         hosted_identities: &DashMap<PeerId, HostedIdentity>,
+        logical_connectivity: &DashMap<PeerId, usize>,
         channel_id: &str,
         remote_address: SocketAddr,
         app_id: PeerId,
@@ -1447,10 +1651,22 @@ impl TransportHandle {
         if is_new_peer {
             let peer_user_agent = peer_user_agent.to_string();
             peer_user_agents.insert(app_id, peer_user_agent.clone());
-            Self::broadcast_to_hosted(
-                hosted_identities,
-                P2PEvent::PeerConnected(app_id, peer_user_agent),
-            );
+            let first_connection = match logical_connectivity.entry(app_id) {
+                DashEntry::Occupied(mut entry) => {
+                    *entry.get_mut() += 1;
+                    false
+                }
+                DashEntry::Vacant(entry) => {
+                    entry.insert(1);
+                    true
+                }
+            };
+            if first_connection {
+                Self::broadcast_to_hosted(
+                    hosted_identities,
+                    P2PEvent::PeerConnected(app_id, peer_user_agent),
+                );
+            }
         }
     }
 
@@ -1764,6 +1980,13 @@ impl TransportHandle {
     /// peer/channel maps, and tears down the QUIC transport for any channels
     /// that become orphaned (no remaining peers).
     pub async fn disconnect_peer(&self, peer_id: &PeerId) -> Result<()> {
+        if let Some(shared_backend) = &self.shared_backend {
+            shared_backend.disconnect_peer_own(peer_id).await?;
+        }
+        self.disconnect_peer_own(peer_id).await
+    }
+
+    async fn disconnect_peer_own(&self, peer_id: &PeerId) -> Result<()> {
         info!("Disconnecting from peer: {}", peer_id);
 
         // Remove this peer from the bidirectional maps, collecting channels
@@ -1804,10 +2027,23 @@ impl TransportHandle {
         };
 
         self.peer_user_agents.remove(peer_id);
-        Self::broadcast_to_hosted(
-            &self.hosted_identities,
-            P2PEvent::PeerDisconnected(*peer_id),
-        );
+        let fully_disconnected = match self.logical_connectivity.entry(*peer_id) {
+            DashEntry::Occupied(mut entry) if *entry.get() > 1 => {
+                *entry.get_mut() -= 1;
+                false
+            }
+            DashEntry::Occupied(entry) => {
+                entry.remove();
+                true
+            }
+            DashEntry::Vacant(_) => true,
+        };
+        if fully_disconnected {
+            Self::broadcast_to_hosted(
+                &self.hosted_identities,
+                P2PEvent::PeerDisconnected(*peer_id),
+            );
+        }
 
         // Close QUIC connections for channels with no remaining peers.
         for channel_id in &orphaned_channels {
@@ -1834,7 +2070,7 @@ impl TransportHandle {
     async fn disconnect_all_peers(&self) -> Result<()> {
         let peer_ids: Vec<PeerId> = self.peer_to_channel.iter().map(|e| *e.key()).collect();
         for peer_id in &peer_ids {
-            self.disconnect_peer(peer_id).await?;
+            self.disconnect_peer_own(peer_id).await?;
         }
         Ok(())
     }
@@ -1852,6 +2088,81 @@ impl TransportHandle {
     /// active send failures are returned without trying another channel so
     /// large/partial writes are not duplicated.
     pub async fn send_message(
+        &self,
+        peer_id: &PeerId,
+        protocol: &str,
+        data: Vec<u8>,
+    ) -> Result<()> {
+        if let Some(shared_backend) = &self.shared_backend {
+            if !shared_backend.is_peer_connected_own(peer_id)
+                && self
+                    .multiplex_upgrade_failures
+                    .get(peer_id)
+                    .is_none_or(|failed| failed.value().elapsed() >= MULTIPLEX_UPGRADE_RETRY_DELAY)
+                && let Some(capability) = self
+                    .multiplex_capabilities
+                    .get(peer_id)
+                    .map(|entry| entry.value().clone())
+            {
+                let mut upgraded = false;
+                for address in &capability.addresses {
+                    let Ok(channel_id) = shared_backend.connect_peer(address).await else {
+                        continue;
+                    };
+                    if shared_backend
+                        .wait_for_specific_peer_identity(
+                            &channel_id,
+                            *peer_id,
+                            self.connection_timeout,
+                        )
+                        .await
+                        .is_ok()
+                    {
+                        info!(
+                            peer = %peer_id,
+                            daemon = %capability.daemon_peer_id,
+                            address = %address,
+                            "Upgraded peer traffic to shared daemon connection"
+                        );
+                        upgraded = true;
+                        break;
+                    }
+                    shared_backend.disconnect_channel(&channel_id).await;
+                }
+                if upgraded {
+                    self.multiplex_upgrade_failures.remove(peer_id);
+                } else {
+                    self.multiplex_upgrade_failures
+                        .insert(*peer_id, Instant::now());
+                    debug!(
+                        peer = %peer_id,
+                        retry_after_secs = MULTIPLEX_UPGRADE_RETRY_DELAY.as_secs(),
+                        "Could not authenticate advertised shared endpoint; retaining legacy path"
+                    );
+                }
+            }
+
+            if shared_backend.is_peer_connected_own(peer_id) {
+                match shared_backend
+                    .send_message_own(peer_id, protocol, data.clone())
+                    .await
+                {
+                    Ok(()) => return Ok(()),
+                    Err(error) if error.is_stale_channel_send_failure() => {
+                        debug!(
+                            peer = %peer_id,
+                            "Shared daemon channel became stale; falling back to the identity-pinned legacy path"
+                        );
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+
+        self.send_message_own(peer_id, protocol, data).await
+    }
+
+    async fn send_message_own(
         &self,
         peer_id: &PeerId,
         protocol: &str,
@@ -1913,6 +2224,30 @@ impl TransportHandle {
     /// callers (publish, keepalive, etc.) that already have a channel ID use
     /// this method directly to avoid an extra PeerId → channel lookup.
     pub(crate) async fn send_on_channel(
+        &self,
+        channel_id: &str,
+        destination: Option<PeerId>,
+        protocol: &str,
+        data: Vec<u8>,
+    ) -> Result<()> {
+        if let Some(shared_backend) = &self.shared_backend
+            && shared_backend.active_connections.contains(channel_id)
+            && destination.is_none_or(|peer_id| {
+                shared_backend
+                    .channel_to_peers
+                    .get(channel_id)
+                    .is_some_and(|peers| peers.value().contains(&peer_id))
+            })
+        {
+            return shared_backend
+                .send_on_channel_own(channel_id, destination, protocol, data)
+                .await;
+        }
+        self.send_on_channel_own(channel_id, destination, protocol, data)
+            .await
+    }
+
+    async fn send_on_channel_own(
         &self,
         channel_id: &str,
         destination: Option<PeerId>,
@@ -2026,23 +2361,40 @@ impl TransportHandle {
 
     /// Return all channel IDs for an app-level peer, if known.
     pub async fn channels_for_peer(&self, app_peer_id: &PeerId) -> Vec<String> {
-        self.peer_to_channel
-            .get(app_peer_id)
-            .map(|channels| channels.value().iter().cloned().collect())
-            .unwrap_or_default()
+        let mut channels = Vec::new();
+        if let Some(shared_backend) = &self.shared_backend
+            && let Some(shared_channels) = shared_backend.peer_to_channel.get(app_peer_id)
+        {
+            channels.extend(shared_channels.value().iter().cloned());
+        }
+        if let Some(legacy_channels) = self.peer_to_channel.get(app_peer_id) {
+            for channel in legacy_channels.value() {
+                if !channels.contains(channel) {
+                    channels.push(channel.clone());
+                }
+            }
+        }
+        channels
     }
 
     /// Get all authenticated app-level peer IDs communicating over a channel.
     pub(crate) async fn peers_on_channel(&self, channel_id: &str) -> Vec<PeerId> {
-        self.channel_to_peers
+        let mut peers: HashSet<PeerId> = self
+            .channel_to_peers
             .get(channel_id)
             .map(|set| set.value().iter().cloned().collect())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        if let Some(shared_backend) = &self.shared_backend
+            && let Some(shared_peers) = shared_backend.channel_to_peers.get(channel_id)
+        {
+            peers.extend(shared_peers.value().iter().copied());
+        }
+        peers.into_iter().collect()
     }
 
     /// Return true if `peer_id` is a known authenticated app-level peer ID.
     pub async fn is_known_app_peer_id(&self, peer_id: &PeerId) -> bool {
-        self.peer_to_channel.contains_key(peer_id)
+        self.is_peer_connected(peer_id).await
     }
 
     /// Wait for the identity exchange to complete on `channel_id` and return
@@ -2303,10 +2655,26 @@ impl TransportHandle {
     fn create_identity_announce_bytes(
         identity: &NodeIdentity,
         user_agent: &str,
+        capability: Option<&MultiplexCapability>,
     ) -> Result<Vec<u8>> {
+        let data = match capability {
+            Some(capability) => {
+                let encoded = postcard::to_stdvec(capability).map_err(|error| {
+                    P2PError::Serialization(
+                        format!("Failed to serialize multiplex capability: {error}").into(),
+                    )
+                })?;
+                let mut framed =
+                    Vec::with_capacity(MULTIPLEX_CAPABILITY_MAGIC.len() + encoded.len());
+                framed.extend_from_slice(MULTIPLEX_CAPABILITY_MAGIC);
+                framed.extend_from_slice(&encoded);
+                framed
+            }
+            None => Vec::new(),
+        };
         let mut message = WireMessage {
             protocol: IDENTITY_ANNOUNCE_PROTOCOL.to_string(),
-            data: vec![],
+            data,
             from: *identity.peer_id(),
             timestamp: Self::current_timestamp_secs()?,
             user_agent: user_agent.to_owned(),
@@ -2316,6 +2684,39 @@ impl TransportHandle {
 
         Self::sign_wire_message(&mut message, identity)?;
         Self::serialize_wire_message(&message)
+    }
+
+    fn parse_multiplex_capability(
+        data: &[u8],
+        remote_address: SocketAddr,
+    ) -> Option<MultiplexCapability> {
+        let encoded = data.strip_prefix(MULTIPLEX_CAPABILITY_MAGIC)?;
+        let mut capability: MultiplexCapability = postcard::from_bytes(encoded).ok()?;
+        capability.addresses = capability
+            .addresses
+            .into_iter()
+            .filter_map(|address| {
+                let socket = address.dialable_socket_addr()?;
+                if socket.port() == 0 {
+                    return None;
+                }
+                let advertised_ip = socket.ip();
+                let remote_ip = remote_address.ip();
+                let resolved = if advertised_ip.is_unspecified()
+                    || (advertised_ip.is_loopback() && !remote_ip.is_loopback())
+                {
+                    if advertised_ip.is_ipv4() != remote_ip.is_ipv4() {
+                        return None;
+                    }
+                    SocketAddr::new(remote_ip, socket.port())
+                } else {
+                    socket
+                };
+                Some(MultiAddr::quic(resolved))
+            })
+            .take(4)
+            .collect();
+        (!capability.addresses.is_empty()).then_some(capability)
     }
 
     /// Get the current Unix timestamp in seconds.
@@ -2529,6 +2930,13 @@ impl TransportHandle {
 impl TransportHandle {
     /// Start network listeners on the dual-stack transport.
     pub async fn start_network_listeners(&self) -> Result<()> {
+        if let Some(shared_backend) = &self.shared_backend {
+            shared_backend.start_own_network_listeners().await?;
+        }
+        self.start_own_network_listeners().await
+    }
+
+    async fn start_own_network_listeners(&self) -> Result<()> {
         let _start_guard = self.listener_start_lock.lock().await;
         if self.listeners_started.load(Ordering::Acquire) {
             return Ok(());
@@ -2646,6 +3054,8 @@ impl TransportHandle {
             let peer_user_agents = Arc::clone(&self.peer_user_agents);
             let dual_node_for_peer_reg = Arc::clone(&self.dual_node);
             let traffic = Arc::clone(&self.traffic);
+            let multiplex_capabilities = Arc::clone(&self.multiplex_capabilities);
+            let logical_connectivity = Arc::clone(&self.logical_connectivity);
 
             handles.push(tokio::spawn(async move {
                 Self::run_shard_consumer(
@@ -2659,6 +3069,8 @@ impl TransportHandle {
                     peer_user_agents,
                     dual_node_for_peer_reg,
                     traffic,
+                    multiplex_capabilities,
+                    logical_connectivity,
                 )
                 .await;
             }));
@@ -2744,6 +3156,8 @@ impl TransportHandle {
         peer_user_agents: Arc<DashMap<PeerId, String>>,
         dual_node_for_peer_reg: Arc<DualStackNetworkNode>,
         traffic: Arc<TrafficCounters>,
+        multiplex_capabilities: Arc<DashMap<PeerId, MultiplexCapability>>,
+        logical_connectivity: Arc<DashMap<PeerId, usize>>,
     ) {
         info!("Message dispatch shard {shard_idx} started");
         while let Some((from_addr, bytes)) = shard_rx.recv().await {
@@ -2763,6 +3177,20 @@ impl TransportHandle {
                     user_agent: peer_user_agent,
                     payload_len,
                 }) => {
+                    if let (Some(authenticated_node_id), P2PEvent::Message { topic, data, .. }) =
+                        (authenticated_node_id, &event)
+                        && topic == IDENTITY_ANNOUNCE_PROTOCOL
+                        && let Some(capability) = Self::parse_multiplex_capability(data, from_addr)
+                    {
+                        debug!(
+                            peer = %authenticated_node_id,
+                            daemon = %capability.daemon_peer_id,
+                            addresses = ?capability.addresses,
+                            "Learned signed shared-daemon capability"
+                        );
+                        multiplex_capabilities.insert(authenticated_node_id, capability);
+                    }
+
                     // V2-623: cumulative wire-traffic accounting (rx). Only
                     // successfully-decoded wire messages are counted. `overhead`
                     // is the signature + ML-DSA-65 public-key + framing cost.
@@ -2809,6 +3237,7 @@ impl TransportHandle {
                             &channel_to_peers,
                             &peer_user_agents,
                             &hosted_identities,
+                            &logical_connectivity,
                             &channel_id,
                             from_addr,
                             *app_id,
@@ -3055,6 +3484,8 @@ impl TransportHandle {
         user_agent: String,
         hosted_identities: Arc<DashMap<PeerId, HostedIdentity>>,
         traffic: Arc<TrafficCounters>,
+        legacy_capability: Option<MultiplexCapability>,
+        logical_connectivity: Arc<DashMap<PeerId, usize>>,
     ) {
         info!("Connection lifecycle monitor started (pre-subscribed receiver)");
 
@@ -3099,6 +3530,7 @@ impl TransportHandle {
                                         match Self::create_identity_announce_bytes(
                                             &hosted.identity,
                                             &hosted.user_agent,
+                                            legacy_capability.as_ref(),
                                         ) {
                                             Ok(bytes) => Some(bytes),
                                             Err(error) => {
@@ -3115,6 +3547,7 @@ impl TransportHandle {
                                     && let Ok(bytes) = Self::create_identity_announce_bytes(
                                         &node_identity,
                                         &user_agent,
+                                        legacy_capability.as_ref(),
                                     )
                                 {
                                     announce_messages.push(bytes);
@@ -3215,6 +3648,7 @@ impl TransportHandle {
                                     &channel_to_peers,
                                     &peer_user_agents,
                                     &hosted_identities,
+                                    &logical_connectivity,
                                 );
                             }
                             ConnectionEvent::PeerAddressUpdated { .. } => {
@@ -3360,6 +3794,7 @@ mod authenticated_peer_registration_tests {
         let peer_to_channel = DashMap::new();
         let channel_to_peers = DashMap::new();
         let peer_user_agents = DashMap::new();
+        let logical_connectivity = DashMap::new();
         let (event_tx, mut event_rx) = broadcast::channel(4);
         let hosted_identities = DashMap::new();
         let identity = Arc::new(NodeIdentity::generate().expect("test identity"));
@@ -3384,6 +3819,7 @@ mod authenticated_peer_registration_tests {
             &channel_to_peers,
             &peer_user_agents,
             &hosted_identities,
+            &logical_connectivity,
             &channel_id,
             remote_addr,
             app_id,
@@ -3446,6 +3882,23 @@ mod multiplexed_transport_tests {
         })
         .await
         .expect("message timeout")
+    }
+
+    async fn legacy_compatible_handle(
+        root: &TransportHandle,
+        identity: Arc<NodeIdentity>,
+        daemon_peer_id: PeerId,
+    ) -> TransportHandle {
+        let shared = root
+            .logical_handle(Arc::clone(&identity), "node/hybrid".to_string(), 32)
+            .expect("shared logical handle");
+        let capability = MultiplexCapability {
+            daemon_peer_id,
+            addresses: root.bound_listen_addrs().await.expect("shared addresses"),
+        };
+        TransportHandle::new_legacy_compatible(config(identity), shared, capability)
+            .await
+            .expect("legacy compatibility handle")
     }
 
     #[tokio::test]
@@ -3576,6 +4029,170 @@ mod multiplexed_transport_tests {
 
         root_a.stop().await.expect("stop a");
         root_b.stop().await.expect("stop b");
+    }
+
+    #[tokio::test]
+    async fn legacy_peer_uses_identity_pinned_compatibility_endpoint() {
+        let daemon = Arc::new(NodeIdentity::generate().expect("daemon"));
+        let root = TransportHandle::new_multiplexed(config(Arc::clone(&daemon)))
+            .await
+            .expect("shared root");
+        let logical_id = Arc::new(NodeIdentity::generate().expect("logical identity"));
+        let hybrid =
+            legacy_compatible_handle(&root, Arc::clone(&logical_id), *daemon.peer_id()).await;
+        let legacy_id = Arc::new(NodeIdentity::generate().expect("legacy identity"));
+        let legacy = TransportHandle::new(config(Arc::clone(&legacy_id)))
+            .await
+            .expect("legacy handle");
+        let mut hybrid_events = hybrid.subscribe_events();
+        let mut legacy_events = legacy.subscribe_events();
+
+        hybrid
+            .start_network_listeners()
+            .await
+            .expect("start hybrid");
+        legacy
+            .start_network_listeners()
+            .await
+            .expect("start legacy");
+        let hybrid_addr = hybrid
+            .listen_addrs()
+            .await
+            .into_iter()
+            .find(|addr| addr.socket_addr().is_some_and(|addr| addr.is_ipv4()))
+            .expect("hybrid legacy IPv4 listener");
+
+        let channel = legacy
+            .connect_peer(&hybrid_addr)
+            .await
+            .expect("legacy dial");
+        legacy
+            .wait_for_specific_peer_identity(
+                &channel,
+                *logical_id.peer_id(),
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("hybrid identity announcement");
+        legacy
+            .send_message(
+                logical_id.peer_id(),
+                "legacy-inbound",
+                b"old-to-new".to_vec(),
+            )
+            .await
+            .expect("legacy send");
+        assert!(matches!(
+            next_message(&mut hybrid_events).await,
+            P2PEvent::Message { topic, data, .. }
+                if topic == "legacy-inbound" && data == b"old-to-new"
+        ));
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !hybrid.is_peer_connected(legacy_id.peer_id()).await {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("legacy identity visible to hybrid");
+        hybrid
+            .send_message(
+                legacy_id.peer_id(),
+                "legacy-outbound",
+                b"new-to-old".to_vec(),
+            )
+            .await
+            .expect("hybrid fallback send");
+        assert!(matches!(
+            next_message(&mut legacy_events).await,
+            P2PEvent::Message { topic, data, .. }
+                if topic == "legacy-outbound" && data == b"new-to-old"
+        ));
+        assert_eq!(root.active_channels().await.len(), 0);
+
+        hybrid.stop().await.expect("stop hybrid legacy endpoint");
+        legacy.stop().await.expect("stop legacy");
+        root.stop().await.expect("stop shared root");
+    }
+
+    #[tokio::test]
+    async fn upgraded_peers_move_from_legacy_discovery_to_one_shared_connection() {
+        let daemon_a = Arc::new(NodeIdentity::generate().expect("daemon a"));
+        let daemon_b = Arc::new(NodeIdentity::generate().expect("daemon b"));
+        let root_a = TransportHandle::new_multiplexed(config(Arc::clone(&daemon_a)))
+            .await
+            .expect("root a");
+        let root_b = TransportHandle::new_multiplexed(config(Arc::clone(&daemon_b)))
+            .await
+            .expect("root b");
+        let a1_id = Arc::new(NodeIdentity::generate().expect("a1"));
+        let a2_id = Arc::new(NodeIdentity::generate().expect("a2"));
+        let b1_id = Arc::new(NodeIdentity::generate().expect("b1"));
+        let b2_id = Arc::new(NodeIdentity::generate().expect("b2"));
+        let a1 = legacy_compatible_handle(&root_a, Arc::clone(&a1_id), *daemon_a.peer_id()).await;
+        let a2 = legacy_compatible_handle(&root_a, Arc::clone(&a2_id), *daemon_a.peer_id()).await;
+        let b1 = legacy_compatible_handle(&root_b, Arc::clone(&b1_id), *daemon_b.peer_id()).await;
+        let b2 = legacy_compatible_handle(&root_b, Arc::clone(&b2_id), *daemon_b.peer_id()).await;
+        let mut b1_events = b1.subscribe_events();
+        let mut b2_events = b2.subscribe_events();
+
+        for handle in [&a1, &a2, &b1, &b2] {
+            handle
+                .start_network_listeners()
+                .await
+                .expect("start hybrid endpoint");
+        }
+        let b1_legacy_addr = b1
+            .listen_addrs()
+            .await
+            .into_iter()
+            .find(|addr| addr.socket_addr().is_some_and(|addr| addr.is_ipv4()))
+            .expect("b1 legacy address");
+        let legacy_channel = a1
+            .connect_peer(&b1_legacy_addr)
+            .await
+            .expect("initial legacy discovery dial");
+        a1.wait_for_specific_peer_identity(
+            &legacy_channel,
+            *b1_id.peer_id(),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("signed b1 capability announcement");
+
+        a1.send_message(b1_id.peer_id(), "shared-a1", b"a1-to-b1".to_vec())
+            .await
+            .expect("upgrade and send over shared endpoint");
+        assert!(matches!(
+            next_message(&mut b1_events).await,
+            P2PEvent::Message { topic, data, .. }
+                if topic == "shared-a1" && data == b"a1-to-b1"
+        ));
+        assert_eq!(root_a.active_channels().await.len(), 1);
+        assert_eq!(root_b.active_channels().await.len(), 1);
+
+        a2.send_message(b2_id.peer_id(), "shared-a2", b"a2-to-b2".to_vec())
+            .await
+            .expect("reuse shared connection for another logical pair");
+        assert!(matches!(
+            next_message(&mut b2_events).await,
+            P2PEvent::Message { topic, data, source, .. }
+                if topic == "shared-a2" && data == b"a2-to-b2" && source == Some(*a2_id.peer_id())
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), next_message(&mut b1_events))
+                .await
+                .is_err(),
+            "b1 must not receive traffic addressed to b2"
+        );
+        assert_eq!(root_a.active_channels().await.len(), 1);
+        assert_eq!(root_b.active_channels().await.len(), 1);
+
+        for handle in [&a1, &a2, &b1, &b2] {
+            handle.stop().await.expect("stop legacy endpoint");
+        }
+        root_a.stop().await.expect("stop root a");
+        root_b.stop().await.expect("stop root b");
     }
 }
 

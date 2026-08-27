@@ -106,6 +106,23 @@ pub(crate) struct MultiplexedWireMessage {
 /// Unambiguous prefix for [`MultiplexedWireMessage`].
 pub(crate) const MULTIPLEXED_WIRE_MAGIC: &[u8; 4] = b"SMX2";
 
+/// Signed capability carried inside the otherwise legacy-compatible identity
+/// announcement sent by a per-identity compatibility endpoint.
+///
+/// Older nodes already ignore the announcement payload. Upgraded nodes use it
+/// to discover the daemon endpoint and move subsequent traffic onto the
+/// destination-addressed shared connection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct MultiplexCapability {
+    /// Physical identity authenticated by the shared QUIC endpoint.
+    pub(crate) daemon_peer_id: PeerId,
+    /// Addresses of the daemon's multiplexed endpoint.
+    pub(crate) addresses: Vec<MultiAddr>,
+}
+
+/// Prefix for a [`MultiplexCapability`] embedded in identity-announcement data.
+pub(crate) const MULTIPLEX_CAPABILITY_MAGIC: &[u8; 4] = b"SMC2";
+
 /// Operating mode of a P2P node.
 ///
 /// Determines the default user agent and DHT participation behavior.
@@ -874,6 +891,7 @@ const QUIC_TEARDOWN_GRACE: Duration = Duration::from_millis(100);
 pub struct SharedTransport {
     transport: Arc<crate::transport_handle::TransportHandle>,
     daemon_peer_id: PeerId,
+    listen_addrs: Vec<MultiAddr>,
 }
 
 impl SharedTransport {
@@ -888,9 +906,11 @@ impl SharedTransport {
         let transport = Arc::new(
             crate::transport_handle::TransportHandle::new_multiplexed(transport_config).await?,
         );
+        let listen_addrs = transport.bound_listen_addrs().await?;
         Ok(Self {
             transport,
             daemon_peer_id,
+            listen_addrs,
         })
     }
 
@@ -902,6 +922,13 @@ impl SharedTransport {
     /// Number of physical transport channels currently open.
     pub async fn physical_connection_count(&self) -> usize {
         self.transport.active_channels().await.len()
+    }
+
+    fn multiplex_capability(&self) -> MultiplexCapability {
+        MultiplexCapability {
+            daemon_peer_id: self.daemon_peer_id,
+            addresses: self.listen_addrs.clone(),
+        }
     }
 
     /// Stop the physical listeners and all shared connections.
@@ -1060,6 +1087,48 @@ impl P2PNode {
         Self::new_with_transport(config, node_identity, transport).await
     }
 
+    /// Create a logical node with both the shared multiplexed endpoint and a
+    /// dedicated legacy endpoint.
+    ///
+    /// The legacy endpoint is pinned to this logical identity, so peers that
+    /// do not understand destination-addressed envelopes can communicate
+    /// without ambiguity. Its identity announcement carries a signed
+    /// capability that lets upgraded peers switch subsequent traffic to the
+    /// daemon's shared connection. Pass `0` to allocate an ephemeral legacy
+    /// port, or a unique stable port for operator-managed deployments.
+    pub async fn new_with_shared_transport_legacy_compatible(
+        mut config: NodeConfig,
+        shared_transport: &SharedTransport,
+        legacy_port: u16,
+    ) -> Result<Self> {
+        let node_identity = match config.node_identity.clone() {
+            Some(identity) => identity,
+            None => Arc::new(NodeIdentity::generate()?),
+        };
+        config.port = legacy_port;
+        Self::validate_config(&config)?;
+
+        let shared_handle = shared_transport.transport.logical_handle(
+            Arc::clone(&node_identity),
+            config.user_agent(),
+            crate::DEFAULT_EVENT_CHANNEL_CAPACITY,
+        )?;
+        let legacy_config = crate::transport_handle::TransportConfig::from_node_config(
+            &config,
+            crate::DEFAULT_EVENT_CHANNEL_CAPACITY,
+            Arc::clone(&node_identity),
+        );
+        let transport = Arc::new(
+            crate::transport_handle::TransportHandle::new_legacy_compatible(
+                legacy_config,
+                shared_handle,
+                shared_transport.multiplex_capability(),
+            )
+            .await?,
+        );
+        Self::new_with_transport(config, node_identity, transport).await
+    }
+
     async fn new_with_transport(
         config: NodeConfig,
         node_identity: Arc<NodeIdentity>,
@@ -1138,8 +1207,7 @@ impl P2PNode {
     /// work by remote machine instead of independently scheduling identical
     /// work for every remote logical identity.
     pub async fn physical_connection_key(&self, peer: &PeerId) -> Option<String> {
-        let mut channels = self.transport.channels_for_peer(peer).await;
-        channels.sort_unstable();
+        let channels = self.transport.channels_for_peer(peer).await;
         channels.into_iter().next()
     }
 
