@@ -100,14 +100,33 @@ enum ListenMode {
 
 /// Returns the default user agent string for the given mode.
 ///
-/// - `Node` → `"node/<saorsa-core-version>"`
-/// - `Client` → `"client/<saorsa-core-version>"`
+/// - `Node` → `"node/<saorsa-core-version>;addr-v2"`
+/// - `Client` → `"client/<saorsa-core-version>;addr-v2"`
 pub fn user_agent_for_mode(mode: NodeMode) -> String {
     let prefix = match mode {
         NodeMode::Node => "node",
         NodeMode::Client => "client",
     };
-    format!("{prefix}/{}", env!("CARGO_PKG_VERSION"))
+    with_address_v2_capability(format!("{prefix}/{}", env!("CARGO_PKG_VERSION")))
+}
+
+/// Signed identity-announcement capability token for the extensible address
+/// publication and lookup plane.
+pub(crate) const ADDRESS_V2_CAPABILITY: &str = "addr-v2";
+
+fn with_address_v2_capability(mut user_agent: String) -> String {
+    if !supports_address_v2(&user_agent) {
+        user_agent.push(';');
+        user_agent.push_str(ADDRESS_V2_CAPABILITY);
+    }
+    user_agent
+}
+
+pub(crate) fn supports_address_v2(user_agent: &str) -> bool {
+    user_agent
+        .split(';')
+        .skip(1)
+        .any(|capability| capability == ADDRESS_V2_CAPABILITY)
 }
 
 /// Returns `true` if the user agent identifies a full DHT participant (prefix `"node/"`).
@@ -393,9 +412,11 @@ impl NodeConfig {
     /// If a custom user agent was set, returns that. Otherwise, derives
     /// the user agent from the node's [`NodeMode`].
     pub fn user_agent(&self) -> String {
-        self.custom_user_agent
-            .clone()
-            .unwrap_or_else(|| user_agent_for_mode(self.mode))
+        with_address_v2_capability(
+            self.custom_user_agent
+                .clone()
+                .unwrap_or_else(|| user_agent_for_mode(self.mode)),
+        )
     }
 
     /// Compute the listen addresses from the configuration fields.
@@ -2813,6 +2834,23 @@ mod tests {
         assert!(bootstrap_peer_identity_matches(Some(expected), expected));
         assert!(!bootstrap_peer_identity_matches(Some(expected), other));
         assert!(bootstrap_peer_identity_matches(None, other));
+    }
+
+    #[test]
+    fn default_user_agents_advertise_address_v2() {
+        let node = user_agent_for_mode(NodeMode::Node);
+        let client = user_agent_for_mode(NodeMode::Client);
+        assert!(node.starts_with("node/"));
+        assert!(client.starts_with("client/"));
+        assert!(supports_address_v2(&node));
+        assert!(supports_address_v2(&client));
+    }
+
+    #[test]
+    fn address_v2_capability_is_an_exact_token() {
+        assert!(supports_address_v2("node/1.0;addr-v2"));
+        assert!(!supports_address_v2("node/1.0"));
+        assert!(!supports_address_v2("node/1.0;addr-v20"));
     }
 
     // Test tool handler for network tests
