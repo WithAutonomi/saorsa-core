@@ -220,10 +220,16 @@ const DEFAULT_QUARANTINE_READMIT_THRESHOLD: f64 = 0.45;
 
 /// Maximum number of evicted quarantine markers retained by the routing engine.
 ///
-/// Markers are only semantically required while a peer has recovered above the
-/// quarantine threshold but remains below the readmit threshold; below the
-/// quarantine threshold the trust score itself keeps the peer avoided.
-const MAX_QUARANTINED_PEERS: usize = 8192;
+/// A marker remains semantically required until the peer reaches the readmit
+/// threshold: dropping it while the score is still below the quarantine
+/// threshold would let time decay later bypass readmission hysteresis.
+const MAX_QUARANTINED_PEERS: usize = u16::MAX as usize;
+
+/// Maximum existing quarantine markers checked for recovery on an ordinary
+/// insertion. A bounded round-robin sweep avoids making a run of new marker
+/// insertions quadratic; an insertion at the hard cap scans the full set so it
+/// can reclaim every recovered slot before failing closed.
+const QUARANTINE_MARKER_PRUNE_BATCH_SIZE: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ClosestNodeCandidate {
@@ -1538,12 +1544,20 @@ pub struct DhtCoreEngine {
     quarantine_readmit_threshold: f64,
 
     /// Peers evicted from the close group by quarantine. Markers are bounded
-    /// to cap memory use; redundant markers are removed when direct trust-score
-    /// checks are sufficient or when the peer crosses the readmit threshold.
+    /// to cap memory use and removed once the peer crosses the readmit
+    /// threshold.
     quarantined_peers: HashSet<PeerId>,
 
-    /// FIFO order used to prune the bounded quarantine marker set.
+    /// Round-robin order used to prune the bounded quarantine marker set.
     quarantined_peer_order: VecDeque<PeerId>,
+
+    /// Whether an exact quarantine marker could not be retained at capacity.
+    ///
+    /// This is sticky because, after an ID is discarded, a later reduction in
+    /// the exact-marker count cannot prove that the discarded peer reached the
+    /// readmit threshold. While set, unmarked peers fail closed against the
+    /// readmit threshold rather than bypassing hysteresis through time decay.
+    quarantine_marker_overflowed: bool,
 
     /// Duration of no contact after which a peer is considered stale.
     /// Defaults to [`LIVE_THRESHOLD`]; overridden in tests to avoid
@@ -1594,6 +1608,7 @@ impl DhtCoreEngine {
             quarantine_readmit_threshold: DEFAULT_QUARANTINE_READMIT_THRESHOLD,
             quarantined_peers: HashSet::new(),
             quarantined_peer_order: VecDeque::new(),
+            quarantine_marker_overflowed: false,
             live_threshold: LIVE_THRESHOLD,
             shutdown: CancellationToken::new(),
         })
@@ -1648,7 +1663,8 @@ impl DhtCoreEngine {
                 peer_id.to_hex()
             ));
         }
-        if self.quarantined_peers.contains(peer_id) {
+        let has_exact_marker = self.quarantined_peers.contains(peer_id);
+        if has_exact_marker || self.quarantine_marker_overflowed {
             if trust_score < self.quarantine_readmit_threshold {
                 return Err(anyhow!(
                     "peer {} quarantined until trust >= {:.3} (current {trust_score:.3})",
@@ -1656,7 +1672,9 @@ impl DhtCoreEngine {
                     self.quarantine_readmit_threshold
                 ));
             }
-            self.forget_quarantined_peer(peer_id);
+            if has_exact_marker {
+                self.forget_quarantined_peer(peer_id);
+            }
             return Ok(());
         }
         if trust_score < self.quarantine_threshold {
@@ -1675,81 +1693,76 @@ impl DhtCoreEngine {
         peer_id: PeerId,
         trust_score: &impl Fn(&PeerId) -> f64,
     ) {
-        let quarantine_threshold = self.quarantine_threshold;
         let quarantine_readmit_threshold = self.quarantine_readmit_threshold;
-        Self::remember_quarantined_peer_with_trust(
+        let overflowed = Self::remember_quarantined_peer_with_trust(
             &mut self.quarantined_peers,
             &mut self.quarantined_peer_order,
-            quarantine_threshold,
             quarantine_readmit_threshold,
             peer_id,
             trust_score,
         );
+        self.quarantine_marker_overflowed |= overflowed;
     }
 
-    fn quarantine_marker_required_for_score(
-        score: f64,
-        quarantine_threshold: f64,
-        quarantine_readmit_threshold: f64,
-    ) -> bool {
-        score.is_finite() && score >= quarantine_threshold && score < quarantine_readmit_threshold
+    fn quarantine_marker_recovered(score: f64, quarantine_readmit_threshold: f64) -> bool {
+        score.is_finite() && score >= quarantine_readmit_threshold
     }
 
-    fn prune_redundant_quarantined_peers(
+    fn prune_recovered_quarantined_peers(
         quarantined_peers: &mut HashSet<PeerId>,
         quarantined_peer_order: &mut VecDeque<PeerId>,
-        quarantine_threshold: f64,
         quarantine_readmit_threshold: f64,
         trust_score: &impl Fn(&PeerId) -> f64,
+        scan_limit: usize,
     ) {
-        let mut retained_order = VecDeque::with_capacity(quarantined_peer_order.len());
-        while let Some(peer_id) = quarantined_peer_order.pop_front() {
+        let scan_count = quarantined_peer_order.len().min(scan_limit);
+        for _ in 0..scan_count {
+            let Some(peer_id) = quarantined_peer_order.pop_front() else {
+                break;
+            };
             if !quarantined_peers.contains(&peer_id) {
                 continue;
             }
 
             let score = trust_score(&peer_id);
-            if Self::quarantine_marker_required_for_score(
-                score,
-                quarantine_threshold,
-                quarantine_readmit_threshold,
-            ) {
-                retained_order.push_back(peer_id);
-            } else {
+            if Self::quarantine_marker_recovered(score, quarantine_readmit_threshold) {
                 quarantined_peers.remove(&peer_id);
+            } else {
+                quarantined_peer_order.push_back(peer_id);
             }
         }
-
-        *quarantined_peer_order = retained_order;
     }
 
     fn remember_quarantined_peer_with_trust(
         quarantined_peers: &mut HashSet<PeerId>,
         quarantined_peer_order: &mut VecDeque<PeerId>,
-        quarantine_threshold: f64,
         quarantine_readmit_threshold: f64,
         peer_id: PeerId,
         trust_score: &impl Fn(&PeerId) -> f64,
-    ) {
+    ) -> bool {
         if quarantined_peers.contains(&peer_id) {
-            return;
+            return false;
         }
 
+        let prune_scan_limit = if quarantined_peers.len() >= MAX_QUARANTINED_PEERS {
+            quarantined_peer_order.len()
+        } else {
+            QUARANTINE_MARKER_PRUNE_BATCH_SIZE
+        };
+        Self::prune_recovered_quarantined_peers(
+            quarantined_peers,
+            quarantined_peer_order,
+            quarantine_readmit_threshold,
+            trust_score,
+            prune_scan_limit,
+        );
         if quarantined_peers.len() >= MAX_QUARANTINED_PEERS {
-            Self::prune_redundant_quarantined_peers(
-                quarantined_peers,
-                quarantined_peer_order,
-                quarantine_threshold,
-                quarantine_readmit_threshold,
-                trust_score,
-            );
-        }
-        if quarantined_peers.len() >= MAX_QUARANTINED_PEERS {
-            return;
+            return true;
         }
 
         quarantined_peers.insert(peer_id);
         quarantined_peer_order.push_back(peer_id);
+        false
     }
 
     fn forget_quarantined_peer(&mut self, peer_id: &PeerId) {
@@ -1770,7 +1783,7 @@ impl DhtCoreEngine {
             return true;
         }
         trust_score < self.quarantine_threshold
-            || (self.quarantined_peers.contains(peer_id)
+            || ((self.quarantine_marker_overflowed || self.quarantined_peers.contains(peer_id))
                 && trust_score < self.quarantine_readmit_threshold)
     }
 
@@ -1824,10 +1837,9 @@ impl DhtCoreEngine {
 
         let quarantine_threshold = self.quarantine_threshold;
         let quarantine_readmit_threshold = self.quarantine_readmit_threshold;
-        Self::remember_quarantined_peer_with_trust(
+        let overflowed = Self::remember_quarantined_peer_with_trust(
             &mut self.quarantined_peers,
             &mut self.quarantined_peer_order,
-            quarantine_threshold,
             quarantine_readmit_threshold,
             *peer_id,
             &|id| {
@@ -1838,6 +1850,7 @@ impl DhtCoreEngine {
                 }
             },
         );
+        self.quarantine_marker_overflowed |= overflowed;
         routing.remove_node(peer_id);
 
         let k_after = routing.k_closest_ids(self.k_value);
@@ -1883,16 +1896,15 @@ impl DhtCoreEngine {
                 break;
             };
 
-            let quarantine_threshold = self.quarantine_threshold;
             let quarantine_readmit_threshold = self.quarantine_readmit_threshold;
-            Self::remember_quarantined_peer_with_trust(
+            let overflowed = Self::remember_quarantined_peer_with_trust(
                 &mut self.quarantined_peers,
                 &mut self.quarantined_peer_order,
-                quarantine_threshold,
                 quarantine_readmit_threshold,
                 peer_id,
                 trust_score,
             );
+            self.quarantine_marker_overflowed |= overflowed;
             routing.remove_node(&peer_id);
             removed.push(peer_id);
         }
@@ -3091,6 +3103,10 @@ impl std::fmt::Debug for DhtCoreEngine {
                 &self.quarantine_readmit_threshold,
             )
             .field("quarantined_peers", &self.quarantined_peers.len())
+            .field(
+                "quarantine_marker_overflowed",
+                &self.quarantine_marker_overflowed,
+            )
             .finish()
     }
 }
@@ -5549,7 +5565,37 @@ mod tests {
     }
 
     #[test]
-    fn test_quarantined_peer_marker_cap_keeps_readmit_gap_markers() {
+    fn test_new_quarantine_marker_prunes_only_recovered_markers() {
+        let mut dht = DhtCoreEngine::new_for_tests(PeerId::from_bytes([0u8; 32])).unwrap();
+        dht.set_trust_quarantine_thresholds(
+            TEST_QUARANTINE_THRESHOLD,
+            TEST_QUARANTINE_READMIT_THRESHOLD,
+        )
+        .unwrap();
+        let below_quarantine_peer = peer_id_from_index(1);
+        let recovered_peer = peer_id_from_index(2);
+        let new_peer = peer_id_from_index(3);
+
+        dht.remember_quarantined_peer(below_quarantine_peer, &|_| TEST_QUARANTINE_LOW_SCORE);
+        dht.remember_quarantined_peer(recovered_peer, &|_| TEST_QUARANTINE_LOW_SCORE);
+        dht.remember_quarantined_peer(new_peer, &|peer_id| {
+            if *peer_id == recovered_peer {
+                TEST_QUARANTINE_READMIT_THRESHOLD
+            } else {
+                TEST_QUARANTINE_LOW_SCORE
+            }
+        });
+
+        assert!(dht.quarantined_peers.contains(&below_quarantine_peer));
+        assert!(
+            !dht.quarantined_peers.contains(&recovered_peer),
+            "new marker insertion should prune peers that reached the readmit threshold"
+        );
+        assert!(dht.quarantined_peers.contains(&new_peer));
+    }
+
+    #[test]
+    fn test_quarantined_peer_marker_cap_prunes_recovered_and_fails_closed() {
         let mut dht = DhtCoreEngine::new_for_tests(PeerId::from_bytes([0u8; 32])).unwrap();
         dht.set_trust_quarantine_thresholds(
             TEST_QUARANTINE_THRESHOLD,
@@ -5561,6 +5607,7 @@ mod tests {
         let recovered_peer = oldest_peer;
         let retained_overflow_peer = peer_id_from_index(MAX_QUARANTINED_PEERS + 1);
 
+        assert_eq!(MAX_QUARANTINED_PEERS, usize::from(u16::MAX));
         for index in 0..MAX_QUARANTINED_PEERS {
             dht.remember_quarantined_peer(peer_id_from_index(index), &|_| {
                 TEST_QUARANTINE_MARKER_REQUIRED_SCORE
@@ -5585,10 +5632,34 @@ mod tests {
         );
         assert!(
             !dht.quarantined_peers.contains(&low_trust_overflow_peer),
-            "a below-quarantine peer remains avoided by score and can be dropped when cap is full"
+            "the exact-marker set should remain bounded when every retained peer still requires hysteresis"
         );
+        assert!(dht.quarantine_marker_overflowed);
         assert!(dht.should_avoid_for_lookup(&oldest_peer, TEST_QUARANTINE_MARKER_REQUIRED_SCORE));
         assert!(dht.should_avoid_for_lookup(&low_trust_overflow_peer, TEST_QUARANTINE_LOW_SCORE));
+        assert!(
+            dht.should_avoid_for_lookup(
+                &low_trust_overflow_peer,
+                TEST_QUARANTINE_MARKER_REQUIRED_SCORE
+            ),
+            "overflow must remain fail-closed after an untracked peer decays above the quarantine threshold"
+        );
+        assert!(
+            dht.check_new_peer_admission(
+                &low_trust_overflow_peer,
+                TEST_QUARANTINE_MARKER_REQUIRED_SCORE
+            )
+            .is_err(),
+            "an untracked overflow peer must not bypass the readmit threshold"
+        );
+        assert!(
+            dht.check_new_peer_admission(
+                &low_trust_overflow_peer,
+                TEST_QUARANTINE_READMIT_THRESHOLD
+            )
+            .is_ok(),
+            "fail-closed overflow should still admit peers at the readmit threshold"
+        );
 
         dht.remember_quarantined_peer(retained_overflow_peer, &|peer_id| {
             if *peer_id == recovered_peer {

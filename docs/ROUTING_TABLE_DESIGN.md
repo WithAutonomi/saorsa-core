@@ -186,7 +186,7 @@ When a candidate peer `P` with `NodeInfo` and IP address `candidate_ip` is prese
 2. **Address check**: If `P.addresses` is empty, reject.
 3. **Authentication check**: If `P` has not completed transport-level authentication, reject.
 4. **Update short-circuit**: If `P` already exists in `KBucket(BucketIndex(self, P))`, merge addresses (Section 6.3), refresh `last_seen`, move `P` to tail, and return. The peer already holds its slot — new-peer trust admission, IP diversity, and capacity checks are skipped.
-5. **New-peer trust admission check**: If `P` carries an explicit quarantine marker, reject until `TrustScore(self, P) >= QUARANTINE_READMIT_THRESHOLD`. Otherwise reject only when `TrustScore(self, P) < QUARANTINE_THRESHOLD`.
+5. **New-peer trust admission check**: If `P` carries an explicit quarantine marker, reject until `TrustScore(self, P) >= QUARANTINE_READMIT_THRESHOLD`. Otherwise reject only when `TrustScore(self, P) < QUARANTINE_THRESHOLD`, unless the bounded exact-marker set has overflowed; overflow fails closed by requiring `QUARANTINE_READMIT_THRESHOLD` for unmarked candidates too.
 6. **Loopback check**: If `candidate_ip` is loopback and loopback is disallowed, reject. If loopback is allowed, skip all IP diversity checks (step 7–9) and proceed directly to insertion/capacity handling.
 7. **Non-IP transport bypass**: If `P` has no IP-based address (e.g., Bluetooth, LoRa), skip IP diversity checks and proceed directly to insertion/capacity handling.
 8. **IP diversity enforcement** (under write lock — Invariant 10):
@@ -265,7 +265,8 @@ When any interaction records a trust failure and `TrustScore(self, P)` drops bel
 4. Do not re-admit quarantined `P` until `TrustScore(self, P) >= QUARANTINE_READMIT_THRESHOLD`.
 5. If removal would shrink `LocalRT(self)` below K peers, keep `P` in the routing table until another peer is admitted and the same eviction can happen without underfilling the table.
 6. If `P` is not in the K-closest-to-self set, it may remain in the routing table, but local lookup result selection, FIND_NODE responses, and automatic lookup/dial paths MUST avoid it while `TrustScore(self, P) < QUARANTINE_THRESHOLD`.
-7. If `P` has `QUARANTINE_THRESHOLD <= TrustScore(self, P) < QUARANTINE_READMIT_THRESHOLD`, it may remain in or enter the routing table unless it carries an explicit quarantine marker. A marked peer remains rejected until trust reaches `QUARANTINE_READMIT_THRESHOLD`.
+7. If `P` has `QUARANTINE_THRESHOLD <= TrustScore(self, P) < QUARANTINE_READMIT_THRESHOLD`, it may remain in or enter the routing table unless it carries an explicit quarantine marker or exact-marker overflow has put the engine into fail-closed mode. A marked peer remains rejected until trust reaches `QUARANTINE_READMIT_THRESHOLD`.
+8. Exact quarantine markers are capped at `u16::MAX` (65,535). New insertions prune recovered markers in bounded round-robin batches; an insertion at the cap performs a full recovery sweep. Saturation after that sweep sets a sticky fail-closed overflow marker.
 
 Quarantine is a routing-table and automatic lookup policy. It is not a blanket transport-level block for explicit user-initiated sends.
 
@@ -702,8 +703,9 @@ Each scenario should assert exact expected outcomes and state transitions.
    - Candidate with zero addresses. Rejected with error. Routing table unchanged.
 
 4. **New peer admission and quarantine readmission thresholds**:
-   - A new, unmarked peer with `TrustScore < QUARANTINE_THRESHOLD` is rejected. An unmarked peer in `[QUARANTINE_THRESHOLD, QUARANTINE_READMIT_THRESHOLD)` is admitted normally.
+   - A new, unmarked peer with `TrustScore < QUARANTINE_THRESHOLD` is rejected. Before marker overflow, an unmarked peer in `[QUARANTINE_THRESHOLD, QUARANTINE_READMIT_THRESHOLD)` is admitted normally.
    - A peer carrying an explicit quarantine marker is rejected until `TrustScore >= QUARANTINE_READMIT_THRESHOLD`.
+   - After exact-marker overflow, an unmarked peer below `QUARANTINE_READMIT_THRESHOLD` is also rejected; neutral unknown peers remain admissible.
    - Existing routing-table peers remain eligible for address/liveness updates and may later move into the K-closest set.
 
 5. **Bucket-full rejection (no stale peers)**:

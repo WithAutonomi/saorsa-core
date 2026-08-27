@@ -99,8 +99,9 @@ better candidates need the slot.
 Peers already in the routing table at or above the quarantine threshold but
 below the readmission threshold may remain in the table, including after moving
 into the K-closest set. New routing-table admissions require the quarantine
-threshold; only peers carrying an explicit quarantine marker require the higher
-readmission threshold.
+threshold. Peers carrying an explicit quarantine marker require the higher
+readmission threshold; if the bounded exact-marker set has overflowed, unmarked
+admissions also fail closed against that higher threshold.
 
 ### Quarantine Reasons
 

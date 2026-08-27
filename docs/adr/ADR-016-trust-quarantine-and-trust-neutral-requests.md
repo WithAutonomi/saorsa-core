@@ -45,7 +45,7 @@ Defined in `src/adaptive/dht.rs:33-40` (mirrored as documentation constants in `
 |-----------|---------|---------|
 | `swap_threshold` | **0.35** | Peer becomes *eligible for lazy swap-out* — replaced only when a better routing-table candidate arrives. Never causes eviction on its own. |
 | `quarantine_threshold` | **0.20** | *Automatic avoidance*: lookup/dial machinery stops selecting the peer. The peer is not removed and explicit sends still work. |
-| `quarantine_readmit_threshold` | **0.45** | *Readmission hysteresis*: only a peer carrying an explicit quarantine marker must recover to this score before readmission. |
+| `quarantine_readmit_threshold` | **0.45** | *Readmission hysteresis*: a peer carrying an explicit quarantine marker must recover to this score; unmarked peers must also do so after exact-marker overflow. |
 
 **Validation** (`AdaptiveDhtConfig::validate`, `src/adaptive/dht.rs:84-138`): all three must be finite and in `[0.0, 0.5)`; when quarantine is active, `quarantine_readmit_threshold >= quarantine_threshold`; when swap and quarantine are both non-zero, `swap_threshold > quarantine_threshold` (swap is a milder condition than avoidance, quarantine is strictly more severe). The quarantine pair is re-checked at the engine boundary in `set_trust_quarantine_thresholds`; `swap_threshold` is validated only by `AdaptiveDhtConfig::validate`. Values at or above neutral `0.5` are rejected because decay approaches neutral asymptotically: negatively observed peers would remain swap/quarantine-eligible indefinitely, while readmission from below at a neutral cutoff would be unreachable in finite time. Invalid config fails node construction (`AdaptiveDHT::new` returns `Err`).
 
@@ -56,8 +56,9 @@ Defined in `src/adaptive/dht.rs:33-40` (mirrored as documentation constants in `
 `check_new_peer_admission` (`src/dht/core_engine.rs:1644-1673`) is called **only when the peer is not already in the routing table** (`add_node`, `src/dht/core_engine.rs:2443-2446`; `re_evaluate_admission`, `src/dht/core_engine.rs:3069-3072`). Non-finite trust scores are rejected defensively. Consequences:
 
 - An existing routing-table peer whose score sits in `[0.20, 0.45)` **stays in the table** and may move into the close group (close-group membership is pure XOR distance over table contents). It remains eligible for lazy swap-out below 0.35 and is skipped by automatic selection below 0.20 — but it is never ejected merely for the band it occupies.
-- An unmarked peer is admitted and remains eligible for automatic lookup at or above 0.20. A transient failure cannot turn its absence from one observer's routing table into an implicit quarantine.
+- Before exact-marker overflow, an unmarked peer is admitted and remains eligible for automatic lookup at or above 0.20. A transient failure cannot turn its absence from one observer's routing table into an implicit quarantine.
 - A marked peer remains blocked below 0.45. Admission at or above 0.45 clears its quarantine marker (`forget_quarantined_peer`) — this is the explicit readmission point.
+- After exact-marker overflow, unmarked candidates also remain blocked below 0.45 so discarded marker history cannot become a readmission bypass.
 - `should_avoid_automatic_candidate` applies the same score/marker policy as `should_avoid_for_lookup`; routing-table absence by itself no longer raises the applicable threshold.
 
 ### 4. Stale-revalidation concurrency invariant
@@ -86,7 +87,7 @@ Immediate eviction of below-0.20 close-group peers is enabled. `enforce_close_gr
 
 ### 7. Bounded quarantine markers
 
-Quarantine markers (`quarantined_peers: HashSet<PeerId>` plus FIFO `quarantined_peer_order`) are bounded at `MAX_QUARANTINED_PEERS = 8192` (`src/dht/core_engine.rs:229`). The key insight making the bound safe (`quarantine_marker_required_for_score`, `src/dht/core_engine.rs:1690-1696`): **a marker is only semantically required while a peer's score is in `[quarantine_threshold, readmit_threshold)`** — below 0.20 the score itself keeps the peer avoided; at/above 0.45 the peer is readmittable and the marker is cleared. When the set is full, `prune_redundant_quarantined_peers` drops (oldest-first) any marker whose current score no longer requires one; if the set is still full, the new marker is simply not inserted — the score-based avoidance clause covers the peer regardless.
+Quarantine markers (`quarantined_peers: HashSet<PeerId>` plus round-robin `quarantined_peer_order`) are bounded at `MAX_QUARANTINED_PEERS = u16::MAX` (65,535). A marker remains semantically required at every score below the readmit threshold: dropping a marker while its peer is below 0.20 would let lazy time decay later carry the unmarked peer into the 0.20–0.45 admission band. Each new marker insertion checks a bounded batch of existing markers and removes peers that reached 0.45; an insertion at the hard cap scans the full set before deciding that no exact slot is available. If all 65,535 markers are still required, a sticky overflow flag makes unmarked candidates fail closed against the 0.45 readmission threshold. The flag cannot safely clear merely because exact slots later become available, because the engine can no longer identify the peer whose marker overflowed.
 
 ### 8. Decay and recovery via rediscovery
 
@@ -123,7 +124,7 @@ The division of labour: **layers that can judge, report; layers that can't, stay
 4. **No transport block**: quarantine affects only routing-table membership and automatic selection; explicit sends always go through.
 5. **Wire stability**: trust state never leaks into serialized DHT messages; filtering is strictly local policy.
 6. **Exactly-once DHT scoring**: one failed DHT request produces exactly one trust penalty (dial 2.25 *or* RPC 1.0 *or* identity-exchange 1.0 — never stacked for the same attempt).
-7. **Marker sufficiency**: quarantine markers are required only for scores in `[quarantine, readmit)`; outside that band the score alone determines behaviour, which is what makes the 8192 bound safe.
+7. **Marker sufficiency**: an exact quarantine marker remains required until its peer reaches the readmit threshold; if the 65,535-entry exact set overflows, a sticky fail-closed state applies the readmit threshold to unmarked candidates.
 8. **Penalty-only core**: saorsa-core never auto-rewards; positive signals come exclusively from consumers (capped at weight 5.0).
 9. **Trust-neutral generic transport**: `send_request`/`send_message` never report trust events; only application-aware layers do.
 
@@ -136,12 +137,13 @@ The division of labour: **layers that can judge, report; layers that can't, stay
 - **No misattributed penalties from generic transport**: honest peers are no longer punished for congestion, slow handlers, or the local node's own overload — and application penalties are no longer doubled by transport-layer penalties for the same exchange.
 - **Calibrated avoidance**: the 2.25 dial weight gives persistent unreachability a concrete, documented time-to-avoidance (four spaced failures over six hours from neutral), rather than an emergent accident of unit weights.
 - **Fully backward compatible on the wire**: mixed-version networks work; old nodes see identical messages.
-- **Bounded memory**: quarantine bookkeeping cannot grow past 8192 entries, and dropping markers under pressure degrades gracefully to score-only avoidance.
+- **Bounded memory with fail-closed overflow**: exact quarantine bookkeeping cannot grow past 65,535 entries; saturation raises the admission requirement for unmarked candidates instead of forgetting readmission history.
 - **Operators can turn it off**: `trust_enforcement(false)` gives observe-only mode (scores tracked, nothing enforced) for diagnosis or staged rollout.
 
 ### Negative
 
 - **Close-group churn risk**: transiently driving an honest peer below 0.20 can immediately evict it when surplus capacity exists and hold it out until its score recovers to 0.45.
+- **Conservative saturation mode**: after exact-marker overflow, unmarked candidates below 0.45 are treated as potentially quarantined for the rest of the engine lifetime.
 - **Applications now own attribution**: any consumer that relied on `send_request`'s automatic penalties gets no trust signal for its request failures unless it explicitly reports a justified outcome. Silent trust erosion of misbehaving peers via generic requests no longer happens.
 - **Recovery latency is fixed by decay**: a wrongly-penalized peer needs up to ~46 h (worst case) to become admissible again; there is no active-probe fast path.
 - **More configuration surface**: three interdependent thresholds with ordering rules; invalid combinations fail node construction (loudly, by design).
