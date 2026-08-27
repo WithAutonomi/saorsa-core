@@ -130,6 +130,7 @@ impl SelfAddressSet {
         typed
     }
 
+    #[cfg(test)]
     pub(crate) fn into_parallel_vecs(self) -> (Vec<MultiAddr>, Vec<AddressType>) {
         let mut addresses = Vec::with_capacity(self.len());
         let mut address_types = Vec::with_capacity(self.len());
