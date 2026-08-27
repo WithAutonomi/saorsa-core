@@ -252,9 +252,10 @@ impl AdaptiveDHT {
     ///
     /// Trust scores are updated immediately. Peers below the quarantine
     /// threshold are avoided by lookup result selection and automatic
-    /// lookup/dial paths. Immediate close-group eviction is temporarily
-    /// disabled until trust scoring is stable; low-trust peers remain eligible
-    /// for lazy swap-out when better candidates arrive.
+    /// lookup/dial paths. Close-group peers are immediately evicted when the
+    /// routing table has enough surplus to retain at least K peers; otherwise
+    /// they remain in the table but are still avoided. Low-trust peers also
+    /// remain eligible for lazy swap-out when better candidates arrive.
     pub async fn report_trust_event(&self, peer_id: &PeerId, event: TrustEvent) {
         match event {
             TrustEvent::ApplicationSuccess(weight) | TrustEvent::ApplicationFailure(weight) => {

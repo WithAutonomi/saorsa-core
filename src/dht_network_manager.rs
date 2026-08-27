@@ -644,8 +644,10 @@ pub struct DhtNetworkConfig {
     /// close-group peers are evicted when the routing table has surplus above K.
     /// Default: [`AdaptiveDhtConfig::default`].
     pub quarantine_threshold: f64,
-    /// Trust score required before a new peer can enter the routing table,
-    /// and before a quarantined peer can be admitted again.
+    /// Trust score required before an explicitly quarantined peer can re-enter
+    /// the routing table. New unmarked peers normally use
+    /// `quarantine_threshold`; after exact quarantine-marker overflow they
+    /// fail closed against this readmission threshold too.
     /// Default: [`AdaptiveDhtConfig::default`].
     pub quarantine_readmit_threshold: f64,
 }

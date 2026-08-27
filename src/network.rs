@@ -573,8 +573,10 @@ impl NodeConfigBuilder {
     /// When `true` (the default), the default adaptive DHT policy applies:
     /// peers below the swap threshold (0.35) become eligible for replacement,
     /// peers below the quarantine threshold (0.20) are avoided by automatic
-    /// lookup/dial paths, and new routing-table peers must meet the readmission
-    /// threshold (0.45).
+    /// lookup/dial paths, unmarked new routing-table peers must meet the
+    /// quarantine threshold (0.20), and explicitly quarantined peers must meet
+    /// the readmission threshold (0.45). If exact quarantine-marker storage
+    /// overflows, unmarked admissions also fail closed at 0.45.
     ///
     /// For fine-grained control over these thresholds, use
     /// [`adaptive_dht_config`](Self::adaptive_dht_config) instead.
