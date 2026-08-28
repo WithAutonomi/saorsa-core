@@ -206,7 +206,11 @@ const MAX_CONCURRENT_BUCKET_REFRESH_LOOKUPS: usize = 1;
 const BUCKET_REFRESH_SELECTION_JITTER: Duration = Duration::from_secs(60);
 
 /// Routing table size below which automatic re-bootstrap is triggered.
-const AUTO_REBOOTSTRAP_THRESHOLD: usize = 3;
+///
+/// Public so consumers reporting network health (e.g. daemon `/health`
+/// endpoints) can show the observed routing-table size against the same
+/// floor the DHT itself repairs toward.
+pub const AUTO_REBOOTSTRAP_THRESHOLD: usize = 3;
 
 /// Maximum time to wait for a background task to stop during shutdown before
 /// aborting it. Defense in depth against tasks that fail to respond to the
@@ -2156,7 +2160,13 @@ impl DhtNetworkManager {
     /// deliberately not guarded by `bucket_refresh_lookup_semaphore`: once the
     /// routing table is below the recovery threshold, bootstrap repair should
     /// not be skipped just because a best-effort bucket refresh is running.
-    async fn maybe_rebootstrap(&self) {
+    /// Trigger a re-bootstrap if the routing table has fallen below
+    /// [`AUTO_REBOOTSTRAP_THRESHOLD`] and the cooldown has elapsed.
+    ///
+    /// Runs automatically from the maintenance driver; public so consumers
+    /// (e.g. daemons with a recovery endpoint) can also request an attempt —
+    /// the threshold and cooldown checks make an extra call cheap and safe.
+    pub async fn maybe_rebootstrap(&self) {
         let rt_size = self.get_routing_table_size().await;
         if rt_size >= AUTO_REBOOTSTRAP_THRESHOLD {
             return;
@@ -2182,16 +2192,48 @@ impl DhtNetworkManager {
             AUTO_REBOOTSTRAP_THRESHOLD
         );
 
-        // Collect currently connected peers to use as bootstrap seeds.
-        let connected = self.transport.connected_peers().await;
+        // Collect currently connected peers to use as bootstrap seeds. With
+        // no connections left there is nothing to gossip from, so fall back
+        // to re-dialing the configured bootstrap peers — the same seeds
+        // initial startup uses. Without this fallback a fully isolated node
+        // could never recover at runtime (only a process restart re-dials
+        // the configured peers), while its logs claimed re-bootstrap was
+        // running.
+        let mut connected = self.transport.connected_peers().await;
         if connected.is_empty() {
-            debug!("Auto re-bootstrap: no connected peers to bootstrap from");
-            return;
+            let configured = &self.config.node_config.bootstrap_peers;
+            if configured.is_empty() {
+                debug!(
+                    "Auto re-bootstrap: no connected peers and no configured bootstrap peers to fall back to"
+                );
+                return;
+            }
+            info!(
+                "Auto re-bootstrap: no connected peers — re-dialing {} configured bootstrap peer(s)",
+                configured.len()
+            );
+            for addr in configured {
+                match self.transport.connect_peer(addr).await {
+                    Ok(_) => debug!("Auto re-bootstrap: reconnected to {addr}"),
+                    Err(e) => debug!("Auto re-bootstrap: dial of {addr} failed: {e}"),
+                }
+            }
+            connected = self.transport.connected_peers().await;
+            if connected.is_empty() {
+                warn!(
+                    "Auto re-bootstrap: all {} configured bootstrap peer(s) unreachable",
+                    configured.len()
+                );
+                return;
+            }
         }
 
         match self.bootstrap_from_peers(&connected).await {
             Ok(discovered) => {
-                info!("Auto re-bootstrap discovered {discovered} peers");
+                let rt_after = self.get_routing_table_size().await;
+                info!(
+                    "Auto re-bootstrap discovered {discovered} peers, routing table size now {rt_after}"
+                );
             }
             Err(e) => {
                 warn!("Auto re-bootstrap failed: {e}");
@@ -2310,11 +2352,36 @@ impl DhtNetworkManager {
         // demand when the client needs to reach one, which is enough for its
         // own requests — matching the rationale for skipping post-bootstrap
         // self-lookups in `P2PNode::start()`.
+        //
+        // EXCEPT when the routing table is starved: admission is
+        // connection-driven (`handle_peer_connected`), so a client below
+        // `AUTO_REBOOTSTRAP_THRESHOLD` that dials nothing can never repair
+        // its own table — `maybe_rebootstrap` would rediscover the same
+        // gossiped peers and skip them again, forever. Dial just enough of
+        // them to lift the table over the threshold. Admission runs
+        // asynchronously on the peer-connected event, so the size check may
+        // lag a dial by one iteration and over-dial slightly; that is
+        // harmless (the connections are usable) and bounded by `to_dial`.
         if matches!(self.config.node_config.mode, NodeMode::Client) {
-            debug!(
-                "DHT bootstrap: client mode — skipping {} gossiped-peer dial(s)",
-                to_dial.len()
-            );
+            if self.get_routing_table_size().await >= AUTO_REBOOTSTRAP_THRESHOLD {
+                debug!(
+                    "DHT bootstrap: client mode — skipping {} gossiped-peer dial(s)",
+                    to_dial.len()
+                );
+            } else {
+                let candidates = to_dial.len();
+                let mut dialed = 0usize;
+                for (peer_id, typed) in to_dial {
+                    if self.get_routing_table_size().await >= AUTO_REBOOTSTRAP_THRESHOLD {
+                        break;
+                    }
+                    self.dial_addresses(&peer_id, &typed).await;
+                    dialed += 1;
+                }
+                info!(
+                    "DHT bootstrap: client mode with starved routing table — dialed {dialed} of {candidates} gossiped peer(s)"
+                );
+            }
         } else {
             for (peer_id, typed) in to_dial {
                 self.dial_addresses(&peer_id, &typed).await;
