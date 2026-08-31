@@ -1507,6 +1507,27 @@ fn map_iterative_lookup_run_error(error: LookupRunError<P2PError>) -> P2PError {
     }
 }
 
+fn supplemental_reachability(native: &[(MultiAddr, AddressType)]) -> KnownReachability {
+    if native
+        .iter()
+        .any(|(_, reachability)| *reachability == AddressType::Direct)
+    {
+        KnownReachability::Direct
+    } else if native
+        .iter()
+        .any(|(_, reachability)| *reachability == AddressType::Lan)
+    {
+        KnownReachability::Lan
+    } else if native
+        .iter()
+        .any(|(_, reachability)| *reachability == AddressType::Relay)
+    {
+        KnownReachability::Relay
+    } else {
+        KnownReachability::Unverified
+    }
+}
+
 /// Best (lowest-numeric) [`AddressType::priority`] across a node's
 /// address tags. `u8::MAX` when the address list is empty.
 ///
@@ -3258,33 +3279,13 @@ impl DhtNetworkManager {
     /// queries up to `ITERATION_GRACE_TIMEOUT_SECS` to finish before giving
     /// up on them and returning whatever has arrived. Any still-pending
     /// futures are dropped (and cancelled) when the stream is returned.
-    async fn collect_iteration_results<S>(
-        mut stream: S,
-    ) -> Vec<(PeerId, Result<DhtResponseEnvelope>)>
+    async fn collect_iteration_results<S>(stream: S) -> Vec<(PeerId, Result<DhtResponseEnvelope>)>
     where
         S: futures::Stream<Item = (PeerId, Result<DhtResponseEnvelope>)> + Unpin,
     {
-        let mut results = Vec::new();
-
-        // Block for the first response — if nothing arrives the iteration
-        // has no new information to work with, so we do need to wait here.
-        let Some(first) = stream.next().await else {
-            return results;
-        };
-        results.push(first);
-
-        // Bounded drain: accept whichever stragglers finish within the
-        // grace window, then move on. `timeout` cancels the inner future
-        // on expiry, which drops the remaining query futures.
         let grace = Duration::from_secs(ITERATION_GRACE_TIMEOUT_SECS);
-        let _ = tokio::time::timeout(grace, async {
-            while let Some(next) = stream.next().await {
-                results.push(next);
-            }
-        })
-        .await;
-
-        results
+        saorsa_dht_lookup::collect_after_first_with_grace(stream, || tokio::time::sleep(grace))
+            .await
     }
 
     /// Return the K-closest candidate nodes, excluding the requester.
@@ -3344,8 +3345,10 @@ impl DhtNetworkManager {
     /// the complete V2 record to appropriate peers.
     ///
     /// Supplemental addresses never enter the legacy `DHTNode` address list.
-    /// WebRTC Direct is represented by the V2 transport identifier while its
-    /// independent reachability value starts as `Unverified`.
+    /// WebRTC Direct is represented by the V2 transport identifier and inherits
+    /// the reachability of this node's canonical QUIC address set. A node known
+    /// only through a relay therefore does not accidentally advertise its
+    /// browser UDP listener as publicly reachable.
     pub async fn set_supplemental_self_addresses(&self, addresses: Vec<MultiAddr>) {
         let mut filtered = Vec::new();
         for address in addresses {
@@ -3399,8 +3402,9 @@ impl DhtNetworkManager {
                 Err(error) => warn!(address = %address, %error, "failed to encode V2 QUIC address"),
             }
         }
+        let supplemental_reachability = supplemental_reachability(native);
         for address in self.supplemental_self_addresses.read().await.iter() {
-            match TransportAddressRecord::from_multiaddr(address, KnownReachability::Unverified) {
+            match TransportAddressRecord::from_multiaddr(address, supplemental_reachability) {
                 Ok(Some(record)) if !records.contains(&record) => records.push(record),
                 Ok(_) => {}
                 Err(error) => {
@@ -3412,11 +3416,26 @@ impl DhtNetworkManager {
         records
     }
 
-    /// Return decoded, non-QUIC V2 addresses currently known for `peer_id`.
-    /// Unknown future transports remain stored opaquely and are not returned.
-    pub async fn supplemental_addresses_for_peer(&self, peer_id: &PeerId) -> Vec<MultiAddr> {
+    /// Return decoded, non-QUIC V2 addresses and reachability currently known
+    /// for `peer_id`.
+    ///
+    /// Unknown future transports and reachability identifiers remain stored
+    /// opaquely and are not returned by this typed view.
+    pub async fn supplemental_address_records_for_peer(
+        &self,
+        peer_id: &PeerId,
+    ) -> Vec<(MultiAddr, KnownReachability)> {
         if peer_id == self.peer_id() {
-            return self.supplemental_self_addresses.read().await.clone();
+            let native = self.local_dht_node().await.typed_addresses();
+            let reachability = supplemental_reachability(&native);
+            return self
+                .supplemental_self_addresses
+                .read()
+                .await
+                .iter()
+                .cloned()
+                .map(|address| (address, reachability))
+                .collect();
         }
         let Some(set) = self
             .transport_address_sets
@@ -3434,7 +3453,25 @@ impl DhtNetworkManager {
         set.records
             .iter()
             .filter(|record| record.transport != KnownTransport::Quic.id())
-            .filter_map(|record| record.decode_known().ok().flatten())
+            .filter_map(|record| {
+                let address = record.decode_known().ok().flatten()?;
+                let reachability = KnownReachability::from_id(record.reachability)?;
+                Some((address, reachability))
+            })
+            .collect()
+    }
+
+    /// Return decoded, non-QUIC V2 addresses currently known for `peer_id`.
+    ///
+    /// This compatibility projection preserves the address-only API used by
+    /// existing native applications. New transport selectors should use
+    /// [`Self::supplemental_address_records_for_peer`] so they can enforce
+    /// reachability policy.
+    pub async fn supplemental_addresses_for_peer(&self, peer_id: &PeerId) -> Vec<MultiAddr> {
+        self.supplemental_address_records_for_peer(peer_id)
+            .await
+            .into_iter()
+            .map(|(address, _)| address)
             .collect()
     }
 
@@ -6524,6 +6561,30 @@ mod tests {
     fn is_dialable_accepts_loopback() {
         let loopback = MultiAddr::quic("127.0.0.1:9000".parse().unwrap());
         assert!(DhtNetworkManager::is_dialable(&loopback));
+    }
+
+    #[test]
+    fn supplemental_transport_inherits_strongest_native_reachability() {
+        let direct = typed_addresses(vec![(
+            "/ip4/203.0.113.9/udp/10000/quic",
+            AddressType::Direct,
+        )]);
+        let relayed = typed_addresses(vec![(
+            "/ip4/203.0.113.10/udp/10001/quic",
+            AddressType::Relay,
+        )]);
+        assert_eq!(
+            supplemental_reachability(&direct),
+            KnownReachability::Direct
+        );
+        assert_eq!(
+            supplemental_reachability(&relayed),
+            KnownReachability::Relay
+        );
+        assert_eq!(
+            supplemental_reachability(&[]),
+            KnownReachability::Unverified
+        );
     }
 
     fn dht_node(seed: u8, entries: Vec<(&str, AddressType)>) -> DHTNode {
