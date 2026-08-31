@@ -9,5 +9,9 @@ description = "Transport-independent Kademlia iterative lookup engine"
 keywords = ["p2p", "kademlia", "dht", "wasm"]
 categories = ["network-programming", "algorithms", "wasm"]
 
+[dependencies]
+futures-core = "0.3"
+futures-util = "0.3"
+
 [dev-dependencies]
 futures = "0.3"

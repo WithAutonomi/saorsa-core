@@ -23,6 +23,8 @@
 //! convergence implementation without either transport becoming a dependency
 //! of this crate.
 
+use futures_core::Stream;
+use futures_util::{StreamExt, future::Either, future::select};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
@@ -225,6 +227,37 @@ pub trait LookupQuery<N: LookupNode> {
     ) -> impl Future<Output = Result<(), Self::Error>> {
         ready(Ok(()))
     }
+}
+
+/// Collect a concurrent query batch without letting slow stragglers hold an
+/// iterative lookup round open indefinitely.
+///
+/// The first result is awaited without a grace deadline because the lookup
+/// cannot make progress until at least one query finishes. Once it arrives,
+/// `grace` is created and the remaining results are accepted only until that
+/// future completes. Dropping the supplied stream cancels any futures that are
+/// still pending.
+///
+/// Keeping the grace future runtime-agnostic lets native Tokio callers and
+/// browser WASM callers share this exact scheduling policy while supplying
+/// their platform's timer implementation.
+pub async fn collect_after_first_with_grace<S, F, G>(mut stream: S, grace: F) -> Vec<S::Item>
+where
+    S: Stream + Unpin,
+    F: FnOnce() -> G,
+    G: Future<Output = ()>,
+{
+    let mut results = Vec::new();
+    let Some(first) = stream.next().await else {
+        return results;
+    };
+    results.push(first);
+
+    let mut grace = Box::pin(grace());
+    while let Either::Left((Some(item), _)) = select(stream.next(), grace.as_mut()).await {
+        results.push(item);
+    }
+    results
 }
 
 /// Failure produced while the shared engine is driving a transport adapter.
@@ -722,7 +755,9 @@ fn encode_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::stream::FuturesUnordered;
     use std::convert::Infallible;
+    use std::pin::Pin;
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct Node(LookupKey);
@@ -975,6 +1010,29 @@ mod tests {
             lookup.peer_state(&peer(2)),
             Some(LookupPeerState::Unresponsive)
         );
+    }
+
+    #[test]
+    fn grace_collector_cancels_pending_stragglers_after_first_result() {
+        let queries: FuturesUnordered<Pin<Box<dyn Future<Output = u8>>>> = FuturesUnordered::new();
+        queries.push(Box::pin(ready(7)));
+        queries.push(Box::pin(std::future::pending()));
+
+        let results =
+            futures::executor::block_on(collect_after_first_with_grace(queries, || ready(())));
+
+        assert_eq!(results, vec![7]);
+    }
+
+    #[test]
+    fn grace_collector_keeps_completed_batch_results() {
+        let queries = futures_util::stream::iter([1_u8, 2_u8, 3_u8]);
+
+        let results = futures::executor::block_on(collect_after_first_with_grace(queries, || {
+            std::future::pending::<()>()
+        }));
+
+        assert_eq!(results, vec![1, 2, 3]);
     }
 
     #[test]
