@@ -68,9 +68,9 @@ once_cell = "1.21"
 dashmap = "6"
 
 # Networking
-# Cross-repository WebRTC Direct address worktree. The version remains explicit
-# so the path can be replaced by the published crate without changing the API contract.
-saorsa-transport = { version = "0.35.3", path = "../saorsa-transport-web-support" }
+# Cross-repository WebRTC Direct support. Pin the draft dependency so this
+# branch builds in CI until the corresponding saorsa-transport release lands.
+saorsa-transport = { version = "0.35.3", git = "https://github.com/WithAutonomi/saorsa-transport.git", rev = "c6d893bb1ce46cc7e7635b8f1dbc5e5257b67f38" }
 
 # Core-specific dependencies
 saorsa-dht-lookup = { version = "0.1.0", path = "crates/saorsa-dht-lookup" }
