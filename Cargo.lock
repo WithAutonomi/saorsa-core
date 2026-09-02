@@ -2402,7 +2402,7 @@ dependencies = [
 
 [[package]]
 name = "saorsa-core"
-version = "0.27.3-rc.1"
+version = "0.27.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2474,8 +2474,9 @@ dependencies = [
 
 [[package]]
 name = "saorsa-transport"
-version = "0.36.3-rc.1"
-source = "git+https://github.com/WithAutonomi/saorsa-transport?branch=rc-2026.9.1#e1e0ef316438187e7e40adf9956ea1a34951e1df"
+version = "0.36.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9cd4be74fa8b82e0321b338bbfbc084c66170614245660b85bb8b041ea808bc4"
 dependencies = [
  "anyhow",
  "async-trait",
