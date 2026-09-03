@@ -127,6 +127,10 @@ pub struct TransportAddressRecord {
 
 impl TransportAddressRecord {
     /// Encode a currently supported address.
+    ///
+    /// The supplied reachability applies to native QUIC. WebRTC Direct has no
+    /// relay transport today, so its reachability is always encoded as
+    /// [`KnownReachability::Unverified`].
     pub fn from_multiaddr(
         address: &MultiAddr,
         reachability: KnownReachability,
@@ -137,6 +141,10 @@ impl TransportAddressRecord {
             KnownTransport::WebRtcDirect
         } else {
             return Ok(None);
+        };
+        let reachability = match transport {
+            KnownTransport::Quic => reachability,
+            KnownTransport::WebRtcDirect => KnownReachability::Unverified,
         };
 
         Ok(Some(Self {
@@ -215,7 +223,7 @@ mod tests {
     }
 
     #[test]
-    fn webrtc_direct_record_round_trips_independently_of_reachability() {
+    fn webrtc_direct_record_is_always_unverified() {
         let peer_id = PeerId::from_bytes([0x22; 32]);
         let address = MultiAddr::webrtc_direct(
             WebRtcDirectAddr::new(
@@ -225,10 +233,9 @@ mod tests {
             .unwrap(),
         )
         .with_peer_id(peer_id);
-        let record =
-            TransportAddressRecord::from_multiaddr(&address, KnownReachability::Unverified)
-                .unwrap()
-                .unwrap();
+        let record = TransportAddressRecord::from_multiaddr(&address, KnownReachability::Direct)
+            .unwrap()
+            .unwrap();
 
         assert_eq!(record.transport, KnownTransport::WebRtcDirect.id());
         assert_eq!(record.legacy_reachability(), Some(AddressType::Unverified));
