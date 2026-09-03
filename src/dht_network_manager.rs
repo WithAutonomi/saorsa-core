@@ -1467,24 +1467,11 @@ fn map_iterative_lookup_run_error(error: LookupRunError<P2PError>) -> P2PError {
     }
 }
 
-fn supplemental_reachability(native: &[(MultiAddr, AddressType)]) -> KnownReachability {
-    if native
-        .iter()
-        .any(|(_, reachability)| *reachability == AddressType::Direct)
+fn normalize_known_webrtc_reachability(record: &mut TransportAddressRecord) {
+    if record.transport == KnownTransport::WebRtcDirect.id()
+        && KnownReachability::from_id(record.reachability).is_some()
     {
-        KnownReachability::Direct
-    } else if native
-        .iter()
-        .any(|(_, reachability)| *reachability == AddressType::Lan)
-    {
-        KnownReachability::Lan
-    } else if native
-        .iter()
-        .any(|(_, reachability)| *reachability == AddressType::Relay)
-    {
-        KnownReachability::Relay
-    } else {
-        KnownReachability::Unverified
+        record.reachability = KnownReachability::Unverified.id();
     }
 }
 
@@ -3228,10 +3215,10 @@ impl DhtNetworkManager {
     /// the complete V2 record to appropriate peers.
     ///
     /// Supplemental addresses never enter the legacy `DHTNode` address list.
-    /// WebRTC Direct is represented by the V2 transport identifier and inherits
-    /// the reachability of this node's canonical QUIC address set. A node known
-    /// only through a relay therefore does not accidentally advertise its
-    /// browser UDP listener as publicly reachable.
+    /// WebRTC Direct has no relayed address form, so supplemental WebRTC
+    /// endpoints are always published as [`KnownReachability::Unverified`].
+    /// Reachability of a native QUIC socket is deliberately not reused for a
+    /// different transport or UDP port.
     pub async fn set_supplemental_self_addresses(&self, addresses: Vec<MultiAddr>) {
         let mut filtered = Vec::new();
         for address in addresses {
@@ -3285,9 +3272,8 @@ impl DhtNetworkManager {
                 Err(error) => warn!(address = %address, %error, "failed to encode V2 QUIC address"),
             }
         }
-        let supplemental_reachability = supplemental_reachability(native);
         for address in self.supplemental_self_addresses.read().await.iter() {
-            match TransportAddressRecord::from_multiaddr(address, supplemental_reachability) {
+            match TransportAddressRecord::from_multiaddr(address, KnownReachability::Unverified) {
                 Ok(Some(record)) if !records.contains(&record) => records.push(record),
                 Ok(_) => {}
                 Err(error) => {
@@ -3303,21 +3289,20 @@ impl DhtNetworkManager {
     /// for `peer_id`.
     ///
     /// Unknown future transports and reachability identifiers remain stored
-    /// opaquely and are not returned by this typed view.
+    /// opaquely and are not returned by this typed view. Known WebRTC Direct
+    /// records are always projected as [`KnownReachability::Unverified`].
     pub async fn supplemental_address_records_for_peer(
         &self,
         peer_id: &PeerId,
     ) -> Vec<(MultiAddr, KnownReachability)> {
         if peer_id == self.peer_id() {
-            let native = self.local_dht_node().await.typed_addresses();
-            let reachability = supplemental_reachability(&native);
             return self
                 .supplemental_self_addresses
                 .read()
                 .await
                 .iter()
                 .cloned()
-                .map(|address| (address, reachability))
+                .map(|address| (address, KnownReachability::Unverified))
                 .collect();
         }
         let Some(set) = self
@@ -3338,7 +3323,11 @@ impl DhtNetworkManager {
             .filter(|record| record.transport != KnownTransport::Quic.id())
             .filter_map(|record| {
                 let address = record.decode_known().ok().flatten()?;
-                let reachability = KnownReachability::from_id(record.reachability)?;
+                let reachability = if address.is_webrtc_direct() {
+                    KnownReachability::Unverified
+                } else {
+                    KnownReachability::from_id(record.reachability)?
+                };
                 Some((address, reachability))
             })
             .collect()
@@ -3347,9 +3336,8 @@ impl DhtNetworkManager {
     /// Return decoded, non-QUIC V2 addresses currently known for `peer_id`.
     ///
     /// This compatibility projection preserves the address-only API used by
-    /// existing native applications. New transport selectors should use
-    /// [`Self::supplemental_address_records_for_peer`] so they can enforce
-    /// reachability policy.
+    /// applications whose transport has no reachability variants, including
+    /// WebRTC Direct.
     pub async fn supplemental_addresses_for_peer(&self, peer_id: &PeerId) -> Vec<MultiAddr> {
         self.supplemental_address_records_for_peer(peer_id)
             .await
@@ -3367,7 +3355,8 @@ impl DhtNetworkManager {
         let mut bounded = Vec::new();
         let mut decoded = Vec::new();
 
-        for record in records.into_iter().take(MAX_TRANSPORT_ADDRESS_RECORDS) {
+        for mut record in records.into_iter().take(MAX_TRANSPORT_ADDRESS_RECORDS) {
+            normalize_known_webrtc_reachability(&mut record);
             if !record.is_within_wire_bounds() || bounded.contains(&record) {
                 continue;
             }
@@ -3408,7 +3397,11 @@ impl DhtNetworkManager {
             {
                 if bounded[*index].legacy_reachability().is_some() {
                     bounded[*index].reachability =
-                        KnownReachability::from_legacy(*canonical_reachability).id();
+                        if bounded[*index].transport == KnownTransport::WebRtcDirect.id() {
+                            KnownReachability::Unverified.id()
+                        } else {
+                            KnownReachability::from_legacy(*canonical_reachability).id()
+                        };
                 }
             } else {
                 keep[*index] = false;
@@ -6186,26 +6179,36 @@ mod tests {
     }
 
     #[test]
-    fn supplemental_transport_inherits_strongest_native_reachability() {
-        let direct = typed_addresses(vec![(
-            "/ip4/203.0.113.9/udp/10000/quic",
-            AddressType::Direct,
-        )]);
-        let relayed = typed_addresses(vec![(
-            "/ip4/203.0.113.10/udp/10001/quic",
-            AddressType::Relay,
-        )]);
+    fn known_webrtc_reachability_is_always_unverified() {
+        let peer_id = pid(44);
+        let quic: MultiAddr = "/ip4/203.0.113.7/udp/12000/quic".parse().unwrap();
+        let webrtc = MultiAddr::webrtc_direct(
+            crate::WebRtcDirectAddr::new(
+                "203.0.113.7:42768".parse().unwrap(),
+                crate::WebRtcCertificateHash::new([0x44; 32]),
+            )
+            .unwrap(),
+        )
+        .with_peer_id(peer_id);
+        let quic_record = TransportAddressRecord::from_multiaddr(&quic, KnownReachability::Direct)
+            .unwrap()
+            .unwrap();
+        let mut webrtc_record =
+            TransportAddressRecord::from_multiaddr(&webrtc, KnownReachability::Direct)
+                .unwrap()
+                .unwrap();
+        // Model a pre-fix or malicious wire record. Ingress normalization must
+        // not let a known WebRTC endpoint claim a QUIC-style reachability tier.
+        webrtc_record.reachability = KnownReachability::Direct.id();
+        normalize_known_webrtc_reachability(&mut webrtc_record);
+
         assert_eq!(
-            supplemental_reachability(&direct),
-            KnownReachability::Direct
+            KnownReachability::from_id(quic_record.reachability),
+            Some(KnownReachability::Direct)
         );
         assert_eq!(
-            supplemental_reachability(&relayed),
-            KnownReachability::Relay
-        );
-        assert_eq!(
-            supplemental_reachability(&[]),
-            KnownReachability::Unverified
+            KnownReachability::from_id(webrtc_record.reachability),
+            Some(KnownReachability::Unverified)
         );
     }
 
