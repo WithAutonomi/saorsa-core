@@ -484,6 +484,53 @@ pub struct ResponderView {
 }
 
 impl DHTNode {
+    /// Publisher-provided Unix-nanosecond sequence from the latest
+    /// `PublishAddressSet`, when this record carries one.
+    ///
+    /// This value is derived from the publisher's wall clock. It is useful for
+    /// diagnostics but is not a trusted timestamp or proof of peer uptime.
+    #[must_use]
+    pub fn publisher_address_set_unix_ns(&self) -> Option<u64> {
+        let seq = dht_node_publish_seq(self);
+        (seq != 0).then_some(seq)
+    }
+
+    /// Address/type pairs sorted by address-type priority.
+    ///
+    /// The stable sort preserves publisher order within each priority tier.
+    #[must_use]
+    pub fn typed_addresses_by_priority(&self) -> Vec<(MultiAddr, AddressType)> {
+        let mut typed = self.typed_addresses();
+        typed.sort_by_key(|pair| pair.1.priority());
+        typed
+    }
+
+    /// Address/type-label pairs sorted by address-type priority.
+    #[must_use]
+    pub fn address_and_type_labels_by_priority(&self) -> Vec<(MultiAddr, &'static str)> {
+        self.typed_addresses_by_priority()
+            .into_iter()
+            .map(|(address, kind)| {
+                let label = match kind {
+                    AddressType::Relay => "relay",
+                    AddressType::Direct => "direct",
+                    AddressType::Unverified => "unverified",
+                    AddressType::Lan => "lan",
+                };
+                (address, label)
+            })
+            .collect()
+    }
+
+    /// Address type labels parallel to [`Self::addresses_by_priority`].
+    #[must_use]
+    pub fn address_type_labels_by_priority(&self) -> Vec<&'static str> {
+        self.address_and_type_labels_by_priority()
+            .into_iter()
+            .map(|(_, label)| label)
+            .collect()
+    }
+
     /// Pair each address with its type tag.
     ///
     /// Local-scope IP addresses are always returned as [`AddressType::Lan`],
@@ -521,9 +568,10 @@ impl DHTNode {
     /// dial or pass addresses to a consumer that will try them in order
     /// (e.g., `send_message`, `reconnect_and_send`).
     pub fn addresses_by_priority(&self) -> Vec<MultiAddr> {
-        let mut typed = self.typed_addresses();
-        typed.sort_by_key(|(_, ty)| ty.priority());
-        typed.into_iter().map(|(addr, _)| addr).collect()
+        self.typed_addresses_by_priority()
+            .into_iter()
+            .map(|(addr, _)| addr)
+            .collect()
     }
 
     /// Merge another `DHTNode`'s typed addresses into this one.
@@ -5812,6 +5860,15 @@ impl DhtNetworkManager {
     pub async fn is_in_routing_table(&self, peer_id: &PeerId) -> bool {
         let dht_guard = self.dht.read().await;
         dht_guard.has_node(peer_id).await
+    }
+
+    /// Return this process's local last-successful-interaction age for a peer.
+    ///
+    /// The monotonic age exists only when the peer is in this process's routing
+    /// table. It is diagnostic local knowledge, not remote-record age.
+    pub async fn peer_last_seen_elapsed(&self, peer_id: &PeerId) -> Option<Duration> {
+        let dht_guard = self.dht.read().await;
+        dht_guard.node_last_seen_elapsed(peer_id).await
     }
 
     /// Return every peer currently in the DHT routing table.

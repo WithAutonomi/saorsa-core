@@ -1724,6 +1724,18 @@ impl DhtCoreEngine {
             .unwrap_or_default()
     }
 
+    /// Return this process's elapsed time since its last successful DHT
+    /// interaction with `peer_id`.
+    ///
+    /// This is a local routing-table observation, not the age of a remote
+    /// record and not evidence that the remote peer has remained online.
+    pub async fn node_last_seen_elapsed(&self, peer_id: &PeerId) -> Option<Duration> {
+        let routing = self.routing_table.read().await;
+        routing
+            .find_node_by_id(peer_id)
+            .map(|node| node.last_seen.elapsed())
+    }
+
     /// Check whether a peer is present in the routing table.
     pub async fn has_node(&self, peer_id: &PeerId) -> bool {
         let routing = self.routing_table.read().await;
