@@ -3603,6 +3603,7 @@ impl DhtNetworkManager {
             .await;
 
         let dht = self.dht.read().await;
+        let previous_addresses = dht.get_node_addresses_typed(owner).await;
         let applied = dht.replace_node_addresses(owner, native.clone(), seq).await;
         if applied {
             let current = dht.get_node_addresses_typed(owner).await;
@@ -3615,6 +3616,7 @@ impl DhtNetworkManager {
                 self.dial_failure_cache.as_ref(),
                 owner,
                 true,
+                &previous_addresses,
                 &still_current,
             );
         }
