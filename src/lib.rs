@@ -47,6 +47,7 @@ pub(crate) mod reachability;
 pub(crate) mod security;
 pub(crate) mod self_address;
 pub(crate) mod transport;
+pub(crate) mod transport_address;
 pub(crate) mod transport_handle;
 pub(crate) mod validation;
 
@@ -58,12 +59,18 @@ pub mod identity;
 // ---------------------------------------------------------------------------
 
 // Networking
-pub use address::MultiAddr;
+pub use address::{MultiAddr, WebRtcCertificateHash, WebRtcDirectAddr};
 pub use network::{NodeConfig, NodeMode, P2PEvent, P2PNode};
 
 // DHT types — peer discovery, routing, and network events
 pub use dht::Key;
 pub use dht_network_manager::{DHTNode, DhtNetworkEvent, ResponderView, WitnessedCloseGroup};
+pub use saorsa_dht_lookup::{
+    CandidateInsertion, IterativeLookup, LookupConfig, LookupError, LookupKey, LookupNode,
+    LookupPeerState, LookupProgress, LookupQuery, LookupQueryOutcome, LookupRunError,
+    LookupTermination, run_iterative_lookup, xor_distance,
+};
+pub use transport_address::{KnownReachability, KnownTransport, TransportAddressRecord};
 
 // Close-group cache
 pub use bootstrap::{CachedCloseGroupPeer, CloseGroupCache};

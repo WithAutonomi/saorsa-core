@@ -25,7 +25,7 @@ use crate::{
     dht::core_engine::{AddressType, AtomicInstant, BucketRefreshCandidate, NodeInfo},
     dht::{AdmissionResult, DhtCoreEngine, DhtKey, Key, RoutingTableEvent},
     error::{DhtError, IdentityError, NetworkError},
-    network::{NodeConfig, NodeMode},
+    network::{NodeConfig, NodeMode, supports_address_v2},
     rate_limit::{Engine, SharedEngine},
     reachability::canary::{
         RELAY_CANARY_HANDLER_TIMEOUT, RELAY_CANARY_PROTOCOL, RELAY_CANARY_WIRE_TOPIC,
@@ -37,14 +37,21 @@ use crate::{
     },
     security::canonicalize_ip,
     self_address::build_self_address_set,
+    transport_address::{
+        KnownReachability, KnownTransport, MAX_TRANSPORT_ADDRESS_RECORDS, TransportAddressRecord,
+    },
 };
 use anyhow::Context as _;
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry as DashEntry;
 use futures::stream::{FuturesUnordered, StreamExt};
 use rand::Rng;
+use saorsa_dht_lookup::{
+    IterativeLookup, LookupConfig, LookupNode, LookupQuery, LookupQueryOutcome, LookupRunError,
+    LookupTermination, run_iterative_lookup,
+};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
@@ -57,10 +64,15 @@ use uuid::Uuid;
 /// Minimum concurrent operations for semaphore backpressure
 const MIN_CONCURRENT_OPERATIONS: usize = 10;
 
-/// Maximum candidate nodes queue size to prevent memory exhaustion attacks.
-/// Candidates are sorted by XOR distance to the lookup target (closest first).
-/// When at capacity, a closer newcomer evicts the farthest existing candidate.
-const MAX_CANDIDATE_NODES: usize = 200;
+/// Legacy DHT topic. Its Postcard schema must remain byte-compatible with
+/// nodes that predate extensible transport-address publication.
+const DHT_V1_TOPIC: &str = "/dht/1.0.0";
+
+/// Capability-gated DHT topic carrying the extensible address V2 operations.
+const DHT_V2_TOPIC: &str = "/dht/address/2.0.0";
+
+/// Bound opaque V2 gossip retained outside the routing table.
+const MAX_STORED_TRANSPORT_ADDRESS_SETS: usize = 4096;
 
 /// Maximum size for incoming DHT messages (64 KB) to prevent memory exhaustion DoS
 /// Messages larger than this are rejected before deserialization
@@ -456,6 +468,30 @@ pub struct DHTNode {
     pub reliability: f64,
 }
 
+/// One peer record returned by the extensible V2 address lookup plane.
+///
+/// Unlike [`DHTNode`], the records use open numeric transport and
+/// reachability identifiers. This type is sent only on [`DHT_V2_TOPIC`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransportDhtNode {
+    peer_id: PeerId,
+    records: Vec<TransportAddressRecord>,
+    publish_seq: u64,
+    reliability: f64,
+}
+
+#[derive(Debug, Clone)]
+struct StoredTransportAddressSet {
+    seq: u64,
+    records: Vec<TransportAddressRecord>,
+}
+
+impl LookupNode for DHTNode {
+    fn lookup_peer_id(&self) -> [u8; 32] {
+        *self.peer_id.as_bytes()
+    }
+}
+
 /// Witnessed close-group selection result for a target key.
 ///
 /// `initial_closest` is the client's initial pure-XOR K lookup. Each
@@ -664,6 +700,15 @@ pub enum DhtNetworkOperation {
         seq: u64,
         addresses: Vec<(crate::MultiAddr, AddressType)>,
     },
+    /// Find nodes through the extensible address plane. Sent only to peers
+    /// whose signed identity announcement advertises `addr-v2`.
+    FindNodeV2 { key: Key },
+    /// Publish the sender's complete extensible address set. This is the V2
+    /// successor to `PublishAddressSet`, not a WebRTC-only side record.
+    PublishAddressSetV2 {
+        seq: u64,
+        records: Vec<TransportAddressRecord>,
+    },
 }
 
 /// DHT network operation result
@@ -692,6 +737,11 @@ pub enum DhtNetworkResult {
     PublishAddressAck,
     /// Operation failed
     Error { operation: String, error: String },
+    /// Nodes found through the extensible address plane.
+    NodesFoundV2 {
+        key: Key,
+        nodes: Vec<TransportDhtNode>,
+    },
 }
 
 /// DHT message envelope for network transmission
@@ -819,6 +869,14 @@ pub struct DhtNetworkManager {
     /// peer failed while it was being queried, every other active lookup that
     /// is waiting on the same peer can stop spending an alpha slot on it.
     lookup_failures: Arc<LookupFailureCoordinator>,
+    /// Self-owned transport endpoints that are advertised through the DHT but
+    /// are not dialed by the native QUIC transport. Browser WebRTC Direct
+    /// listeners register their certificate-pinned multiaddresses here so the
+    /// extensible authenticated V2 address plane can propagate them.
+    supplemental_self_addresses: RwLock<Vec<MultiAddr>>,
+    /// Latest complete V2 address record for each known peer. Unknown record
+    /// identifiers remain opaque so this node can forward future transports.
+    transport_address_sets: RwLock<HashMap<PeerId, StoredTransportAddressSet>>,
 }
 
 /// Outcome of a shared dial+identity-exchange attempt, broadcast to
@@ -1431,48 +1489,29 @@ impl LookupFailureCoordinator {
     }
 }
 
-/// Per-lookup state for peers in an iterative FIND_NODE query.
-///
-/// Mirrors rust-libp2p's closest-peer iterator model: peers move from
-/// "not contacted" (absence from the map) to `Waiting`, then to a final
-/// outcome. Final states are not selected again by the same lookup, so a
-/// failed or abandoned alpha probe cannot be reintroduced by later gossip.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LookupPeerState {
-    Waiting,
-    Succeeded,
-    Failed,
-    Unresponsive,
+fn map_iterative_lookup_error(error: saorsa_dht_lookup::LookupError) -> P2PError {
+    P2PError::Dht(DhtError::RoutingError(error.to_string().into()))
 }
 
-#[derive(Debug, Default)]
-struct LookupPeerStates {
-    states: HashMap<PeerId, LookupPeerState>,
+fn map_iterative_lookup_run_error(error: LookupRunError<P2PError>) -> P2PError {
+    match error {
+        LookupRunError::Query(error) => error,
+        LookupRunError::Lookup(error) => map_iterative_lookup_error(error),
+        LookupRunError::UnexpectedResponder(peer) => P2PError::Dht(DhtError::RoutingError(
+            format!(
+                "lookup adapter returned unexpected responder {}",
+                hex::encode(peer)
+            )
+            .into(),
+        )),
+    }
 }
 
-impl LookupPeerStates {
-    fn mark_waiting(&mut self, peer_id: PeerId) {
-        self.states.insert(peer_id, LookupPeerState::Waiting);
-    }
-
-    fn mark_succeeded(&mut self, peer_id: PeerId) {
-        self.states.insert(peer_id, LookupPeerState::Succeeded);
-    }
-
-    fn mark_failed(&mut self, peer_id: PeerId) {
-        self.states.insert(peer_id, LookupPeerState::Failed);
-    }
-
-    fn mark_unresponsive(&mut self, peer_id: PeerId) {
-        self.states.insert(peer_id, LookupPeerState::Unresponsive);
-    }
-
-    fn is_contactable(&self, peer_id: &PeerId) -> bool {
-        !self.states.contains_key(peer_id)
-    }
-
-    fn state(&self, peer_id: &PeerId) -> Option<LookupPeerState> {
-        self.states.get(peer_id).copied()
+fn normalize_known_webrtc_reachability(record: &mut TransportAddressRecord) {
+    if record.transport == KnownTransport::WebRtcDirect.id()
+        && KnownReachability::from_id(record.reachability).is_some()
+    {
+        record.reachability = KnownReachability::Unverified.id();
     }
 }
 
@@ -1753,6 +1792,159 @@ fn split_witnessed_transcript_views(
     (responder_node_views, missing_responders)
 }
 
+struct NativeFindNodeQuery<'a> {
+    manager: &'a DhtNetworkManager,
+    transcript_view_count: Option<usize>,
+    transcript: FindNodeLookupTranscript,
+    subject_reports: HashMap<PeerId, SubjectReports>,
+    contacted: HashSet<PeerId>,
+}
+
+impl<'a> NativeFindNodeQuery<'a> {
+    fn new(manager: &'a DhtNetworkManager, transcript_view_count: Option<usize>) -> Self {
+        Self {
+            manager,
+            transcript_view_count,
+            transcript: FindNodeLookupTranscript::default(),
+            subject_reports: HashMap::new(),
+            contacted: HashSet::from([manager.config.peer_id]),
+        }
+    }
+}
+
+impl LookupQuery<DHTNode> for NativeFindNodeQuery<'_> {
+    type Error = P2PError;
+
+    async fn is_candidate_eligible(
+        &mut self,
+        candidate: &DHTNode,
+    ) -> std::result::Result<bool, Self::Error> {
+        Ok(!self
+            .manager
+            .lookup_candidate_dial_plan_is_exhausted(candidate)
+            .await)
+    }
+
+    async fn query_batch(
+        &mut self,
+        target: [u8; 32],
+        _count: usize,
+        iteration: usize,
+        batch: Vec<DHTNode>,
+    ) -> std::result::Result<Vec<LookupQueryOutcome<DHTNode>>, Self::Error> {
+        info!(
+            "[NETWORK] Iteration {}: querying {} nodes",
+            iteration,
+            batch.len()
+        );
+
+        self.contacted.extend(batch.iter().map(|node| node.peer_id));
+        let manager = self.manager;
+        let query_stream: FuturesUnordered<_> = batch
+            .iter()
+            .map(|node| {
+                let peer_id = node.peer_id;
+                let typed = node.typed_addresses();
+                let failure_rx = manager.lookup_failures.subscribe();
+                async move {
+                    manager
+                        .send_find_node_lookup_request(peer_id, typed, target, failure_rx)
+                        .await
+                }
+            })
+            .collect();
+
+        let results = DhtNetworkManager::collect_iteration_results(query_stream).await;
+        let mut outcomes = Vec::with_capacity(results.len());
+
+        for (peer_id, result) in results {
+            match result {
+                Ok(DhtResponseEnvelope {
+                    result: DhtNetworkResult::NodesFound { nodes, .. },
+                    transport_source,
+                    ..
+                }) => {
+                    let (candidate_nodes, responder_view) = manager
+                        .trusted_find_node_response_nodes(
+                            nodes,
+                            transport_source.as_ref(),
+                            &target,
+                            manager.k_value(),
+                            self.transcript_view_count.unwrap_or(0),
+                        )
+                        .await;
+                    if self.transcript_view_count.is_some() {
+                        self.transcript
+                            .record_responder_view(peer_id, responder_view);
+                    }
+
+                    let mut candidates = Vec::new();
+                    for node in candidate_nodes {
+                        if self.contacted.contains(&node.peer_id) {
+                            continue;
+                        }
+                        if manager.lookup_candidate_dial_plan_is_exhausted(&node).await {
+                            trace!(
+                                "[NETWORK] Skipping gossiped {} this round: all dial candidates currently in the failure cache (peer left contactable)",
+                                node.peer_id.to_hex()
+                            );
+                            continue;
+                        }
+
+                        manager.merge_trusted_gossiped_typed_addresses(&node).await;
+                        let subject_id = node.peer_id;
+                        let reports = self.subject_reports.entry(subject_id).or_default();
+                        reports.insert(peer_id, node);
+
+                        if let Some((_, winner)) = compute_winner(&subject_id, reports) {
+                            candidates.push(winner.clone());
+                        }
+                    }
+
+                    outcomes.push(LookupQueryOutcome::Succeeded {
+                        responder: *peer_id.as_bytes(),
+                        candidates,
+                    });
+                }
+                Ok(DhtResponseEnvelope {
+                    result: DhtNetworkResult::PeerRejected,
+                    ..
+                }) => {
+                    info!(
+                        "[NETWORK] Peer {} rejected us — removing from routing table",
+                        peer_id.to_hex()
+                    );
+                    let mut dht = manager.dht.write().await;
+                    let rt_events = dht.remove_node_by_id(&peer_id).await;
+                    drop(dht);
+                    manager.broadcast_routing_events(&rt_events);
+                    let _ = manager.transport.disconnect_peer(&peer_id).await;
+                    outcomes.push(LookupQueryOutcome::Failed {
+                        responder: *peer_id.as_bytes(),
+                    });
+                }
+                Ok(_) => outcomes.push(LookupQueryOutcome::Succeeded {
+                    responder: *peer_id.as_bytes(),
+                    candidates: Vec::new(),
+                }),
+                Err(error) => {
+                    trace!("[NETWORK] Query to {} failed: {}", peer_id.to_hex(), error);
+                    outcomes.push(LookupQueryOutcome::Failed {
+                        responder: *peer_id.as_bytes(),
+                    });
+                }
+            }
+        }
+
+        Ok(outcomes)
+    }
+
+    async fn candidate_evicted(&mut self, peer: [u8; 32]) -> std::result::Result<(), Self::Error> {
+        self.subject_reports.remove(&PeerId::from_bytes(peer));
+        Ok(())
+    }
+}
+
 impl DhtNetworkManager {
     fn new_from_components(
         transport: Arc<crate::transport_handle::TransportHandle>,
@@ -1820,6 +2012,8 @@ impl DhtNetworkManager {
             relay_canary_destination_ip_rate_limiter: Arc::new(Engine::new(
                 relay_canary_destination_ip_rate_limit_config(),
             )),
+            supplemental_self_addresses: RwLock::new(Vec::new()),
+            transport_address_sets: RwLock::new(HashMap::new()),
         })
     }
 
@@ -1827,6 +2021,25 @@ impl DhtNetworkManager {
     /// Get the configured Kademlia K value (bucket size / close group size).
     pub fn k_value(&self) -> usize {
         self.config.node_config.dht_config.k_value
+    }
+
+    async fn peer_supports_address_v2(&self, peer_id: &PeerId) -> bool {
+        self.transport
+            .peer_user_agent(peer_id)
+            .await
+            .is_some_and(|user_agent| supports_address_v2(&user_agent))
+    }
+
+    async fn find_node_operation_for_peer(
+        &self,
+        peer_id: &PeerId,
+        key: Key,
+    ) -> DhtNetworkOperation {
+        if self.peer_supports_address_v2(peer_id).await {
+            DhtNetworkOperation::FindNodeV2 { key }
+        } else {
+            DhtNetworkOperation::FindNode { key }
+        }
     }
 
     /// Handle a FindNode request by returning the closest nodes from the local routing table.
@@ -1857,6 +2070,50 @@ impl DhtNetworkManager {
             key: *key,
             nodes: closer_nodes,
         })
+    }
+
+    async fn handle_find_node_v2_request(
+        &self,
+        key: &Key,
+        requester: &PeerId,
+    ) -> Result<DhtNetworkResult> {
+        let candidate_nodes = self.find_closest_nodes_local(key, self.k_value()).await;
+        let closer_nodes = Self::filter_response_nodes(candidate_nodes, requester);
+        let mut nodes = Vec::with_capacity(closer_nodes.len());
+        for node in closer_nodes {
+            nodes.push(self.transport_dht_node(node).await);
+        }
+        Ok(DhtNetworkResult::NodesFoundV2 { key: *key, nodes })
+    }
+
+    async fn transport_dht_node(&self, node: DHTNode) -> TransportDhtNode {
+        let legacy_seq = dht_node_publish_seq(&node);
+        if let Some(stored) = self.transport_address_sets.read().await.get(&node.peer_id)
+            && stored.seq >= legacy_seq
+        {
+            return TransportDhtNode {
+                peer_id: node.peer_id,
+                records: stored.records.clone(),
+                publish_seq: stored.seq,
+                reliability: node.reliability,
+            };
+        }
+
+        let mut records = Vec::new();
+        for (address, reachability) in node.typed_addresses() {
+            if let Ok(Some(record)) = TransportAddressRecord::from_multiaddr(
+                &address,
+                KnownReachability::from_legacy(reachability),
+            ) {
+                records.push(record);
+            }
+        }
+        TransportDhtNode {
+            peer_id: node.peer_id,
+            records,
+            publish_seq: legacy_seq,
+            reliability: node.reliability,
+        }
     }
 
     /// Create a new DHT Network Manager using an existing transport handle.
@@ -2301,7 +2558,7 @@ impl DhtNetworkManager {
         // entirely for clients. Node-mode dials are issued serially below.
         let mut to_dial: Vec<(PeerId, Vec<(MultiAddr, AddressType)>)> = Vec::new();
         for peer_id in peers {
-            let op = DhtNetworkOperation::FindNode { key };
+            let op = self.find_node_operation_for_peer(peer_id, key).await;
             match self
                 .send_dht_request_with_response_context(peer_id, op, None)
                 .await
@@ -2805,42 +3062,25 @@ impl DhtNetworkManager {
         count: usize,
         transcript_view_count: Option<usize>,
     ) -> Result<FindNodeLookupOutcome> {
-        const MAX_ITERATIONS: usize = 20;
-        const ALPHA: usize = 3; // Parallel queries per iteration
-
         debug!(
             "[NETWORK] Finding {} closest nodes to key: {}",
             count,
             hex::encode(key)
         );
 
-        let target_key = DhtKey::from_bytes(*key);
-        let mut peer_states = LookupPeerStates::default();
-        let mut best_nodes: Vec<DHTNode> = Vec::new();
+        let mut lookup = IterativeLookup::new(*key, LookupConfig::saorsa(count))
+            .map_err(map_iterative_lookup_error)?;
 
         // Kademlia correctness: the local node must compete on distance in the
         // final K-closest result, but we must never send an RPC to ourselves.
-        // Seed best_nodes with self and mark self as "queried" so the iterative
-        // loop never tries to contact us.
-        best_nodes.push(self.local_dht_node().await);
-        self.mark_self_queried(&mut peer_states);
-
-        // Candidates sorted by XOR distance to target (closest first).
-        // Composite key (distance, peer_id) ensures uniqueness when two peers
-        // share the same distance.
-        let mut candidates: BTreeMap<(Key, PeerId), DHTNode> = BTreeMap::new();
-        // All reports collected per subject peer across the lookup,
-        // keyed by responder. `compute_winner` consults this every time
-        // a new report arrives so a quorum that emerges only after the
-        // third close-XOR responder has replied can supersede a
-        // previously-stored single-source pick.
-        let mut subject_reports: HashMap<PeerId, SubjectReports> = HashMap::new();
-        let mut transcript = FindNodeLookupTranscript::default();
+        // Register it as a known result so the shared engine orders it but
+        // never emits it through the transport query interface.
+        lookup.add_known_result(self.local_dht_node().await);
 
         // Start with local knowledge
         let initial = self.find_closest_nodes_local(key, count).await;
         for node in initial {
-            if peer_states.is_contactable(&node.peer_id) {
+            if lookup.is_contactable(node.peer_id.as_bytes()) {
                 if self.lookup_candidate_dial_plan_is_exhausted(&node).await {
                     // Cache exhaustion is a transient, address-view-local
                     // decision — not a terminal peer failure. Skip this view
@@ -2848,285 +3088,30 @@ impl DhtNetworkManager {
                     // still revive it with a usable (e.g. Direct) address.
                     continue;
                 }
-                let dist = node.peer_id.distance(&target_key);
-                candidates.entry((dist, node.peer_id)).or_insert(node);
+                let _ = lookup.add_candidate(node);
             }
         }
 
-        // Snapshot of the top-K peer IDs from the previous iteration.
-        // Stagnation = the entire top-K set is unchanged AND no unqueried
-        // candidate is closer than the current worst member of top-K.
-        let mut previous_top_k: Vec<PeerId> = Vec::new();
-
-        for iteration in 0..MAX_ITERATIONS {
-            if candidates.is_empty() {
-                debug!(
-                    "[NETWORK] No more candidates after {} iterations",
-                    iteration
-                );
-                break;
-            }
-
-            // Select up to ALPHA closest unqueried nodes to query.
-            // BTreeMap is sorted by (distance, peer_id), so first_entry()
-            // always yields the closest candidate.
-            let mut batch: Vec<DHTNode> = Vec::new();
-            while batch.len() < ALPHA {
-                let Some(entry) = candidates.first_entry() else {
-                    break;
-                };
-                let node = entry.remove();
-                if !peer_states.is_contactable(&node.peer_id) {
-                    continue;
-                }
-                if self.lookup_candidate_dial_plan_is_exhausted(&node).await {
-                    // Transient skip, not a terminal failure: keep the peer
-                    // contactable so a better address from a later responder
-                    // can re-admit it (it may have become exhausted only
-                    // because of a coarse relay-IP suppression).
-                    trace!(
-                        "[NETWORK] Skipping {} this round: all dial candidates currently in the failure cache (peer left contactable)",
-                        node.peer_id.to_hex()
-                    );
-                    continue;
-                }
-                peer_states.mark_waiting(node.peer_id);
-                batch.push(node);
-            }
-
-            if batch.is_empty() {
-                debug!(
-                    "[NETWORK] All candidates queried after {} iterations",
-                    iteration
-                );
-                break;
-            }
-
+        let mut query = NativeFindNodeQuery::new(self, transcript_view_count);
+        let termination = run_iterative_lookup(&mut lookup, &mut query)
+            .await
+            .map_err(map_iterative_lookup_run_error)?;
+        if termination == LookupTermination::Converged {
             info!(
-                "[NETWORK] Iteration {}: querying {} nodes",
-                iteration,
-                batch.len()
+                "[NETWORK] {}: Top-K converged after {} iterations",
+                self.config.peer_id.to_hex(),
+                lookup.iterations()
             );
-
-            // Query nodes in parallel.
-            //
-            // saorsa-transport connection multiplexing lets us keep a single
-            // transport socket while still querying multiple peers
-            // concurrently.
-            //
-            // We drive the α queries through `FuturesUnordered` so we can
-            // advance the lookup as soon as there's *something* to work
-            // with. Waiting for every query (`join_all`) lets a single dead
-            // peer — whose dial cascade can take 20–30s — block the whole
-            // iteration; instead, once the first response arrives, we bound
-            // the wait on the stragglers to `ITERATION_GRACE_TIMEOUT_SECS`
-            // and move on with whatever responses came in by then. Any
-            // still-pending queries are dropped (and their futures cancelled)
-            // when the stream goes out of scope.
-            let query_stream: FuturesUnordered<_> = batch
-                .iter()
-                .map(|node| {
-                    let peer_id = node.peer_id;
-                    let typed = node.typed_addresses();
-                    let lookup_key = *key;
-                    let failure_rx = self.lookup_failures.subscribe();
-                    async move {
-                        self.send_find_node_lookup_request(peer_id, typed, lookup_key, failure_rx)
-                            .await
-                    }
-                })
-                .collect();
-
-            let results = Self::collect_iteration_results(query_stream).await;
-            let responded: HashSet<PeerId> = results.iter().map(|(peer_id, _)| *peer_id).collect();
-
-            // Queries still pending after the grace window are dropped. Treat
-            // them like libp2p's `Unresponsive`: they free alpha capacity and
-            // are skipped for the rest of this lookup, preventing later gossip
-            // from reintroducing the same abandoned probe.
-            for node in &batch {
-                if !responded.contains(&node.peer_id)
-                    && peer_states.state(&node.peer_id) == Some(LookupPeerState::Waiting)
-                {
-                    peer_states.mark_unresponsive(node.peer_id);
-                }
-            }
-
-            for (peer_id, result) in results {
-                match result {
-                    Ok(DhtResponseEnvelope {
-                        result: DhtNetworkResult::NodesFound { nodes, .. },
-                        transport_source,
-                        ..
-                    }) => {
-                        peer_states.mark_succeeded(peer_id);
-                        // Add successful node to best_nodes
-                        if let Some(queried_node) = batch.iter().find(|n| n.peer_id == peer_id) {
-                            best_nodes.push(queried_node.clone());
-                        }
-
-                        let (candidate_nodes, responder_view) = self
-                            .trusted_find_node_response_nodes(
-                                nodes,
-                                transport_source.as_ref(),
-                                key,
-                                self.k_value(),
-                                transcript_view_count.unwrap_or(0),
-                            )
-                            .await;
-                        if transcript_view_count.is_some() {
-                            transcript.record_responder_view(peer_id, responder_view);
-                        }
-
-                        for node in candidate_nodes {
-                            if !peer_states.is_contactable(&node.peer_id) {
-                                continue;
-                            }
-                            if self.lookup_candidate_dial_plan_is_exhausted(&node).await {
-                                // Transient skip, not a terminal failure: a
-                                // single responder's stale/suppressed (e.g.
-                                // relay-only) view of this peer must not poison
-                                // it for the rest of the lookup. Leave it
-                                // contactable so another responder's usable
-                                // (e.g. Direct) address can still win.
-                                trace!(
-                                    "[NETWORK] Skipping gossiped {} this round: all dial candidates currently in the failure cache (peer left contactable)",
-                                    node.peer_id.to_hex()
-                                );
-                                continue;
-                            }
-                            // Ingest the responder's typed view into our
-                            // routing table (upgrade-only on existing
-                            // entries) so `Direct` and `Relay` tags
-                            // propagate beyond the publisher's K-closest
-                            // PublishAddressSet fan-out. Without this, a
-                            // peer that isn't in any open node's top-K
-                            // never learns which of its neighbours expose
-                            // a dialable Direct address and fails relay
-                            // acquisition.
-                            self.merge_trusted_gossiped_typed_addresses(&node).await;
-                            let subject_id = node.peer_id;
-                            let dist = subject_id.distance(&target_key);
-                            let cand_key = (dist, subject_id);
-
-                            // Accumulate the report, then recompute the
-                            // winner across all responders that have
-                            // reported this subject so far. The winner
-                            // may change as later responses arrive — e.g.
-                            // a quorum that only forms after the third
-                            // close-XOR responder replies supersedes the
-                            // first single-source pick.
-                            let reports = subject_reports.entry(subject_id).or_default();
-                            reports.insert(peer_id, node);
-
-                            let winner_node = match compute_winner(&subject_id, reports) {
-                                Some((_, node)) => node.clone(),
-                                None => continue,
-                            };
-
-                            // Already present at the same cand_key? Replace
-                            // in place — no capacity change.
-                            if let std::collections::btree_map::Entry::Occupied(mut e) =
-                                candidates.entry(cand_key)
-                            {
-                                e.insert(winner_node);
-                                continue;
-                            }
-
-                            if candidates.len() >= MAX_CANDIDATE_NODES {
-                                // At capacity — evict the farthest candidate if the
-                                // new one is closer, otherwise drop the new one.
-                                let farthest_key = candidates.keys().next_back().copied();
-                                match farthest_key {
-                                    Some(fk) if cand_key < fk => {
-                                        candidates.remove(&fk);
-                                        subject_reports.remove(&fk.1);
-                                    }
-                                    _ => {
-                                        trace!(
-                                            "[NETWORK] Candidate queue at capacity ({}), dropping {}",
-                                            MAX_CANDIDATE_NODES,
-                                            subject_id.to_hex()
-                                        );
-                                        continue;
-                                    }
-                                }
-                            }
-                            candidates.insert(cand_key, winner_node);
-                        }
-                    }
-                    Ok(DhtResponseEnvelope {
-                        result: DhtNetworkResult::PeerRejected,
-                        ..
-                    }) => {
-                        peer_states.mark_failed(peer_id);
-                        // Remote peer rejected us (e.g. older node with blocking) —
-                        // remove them from our routing table (no point retrying) but
-                        // do NOT penalise their trust score; the rejection is an
-                        // honest signal, not misbehaviour.
-                        info!(
-                            "[NETWORK] Peer {} rejected us — removing from routing table",
-                            peer_id.to_hex()
-                        );
-                        let mut dht = self.dht.write().await;
-                        let rt_events = dht.remove_node_by_id(&peer_id).await;
-                        drop(dht);
-                        self.broadcast_routing_events(&rt_events);
-                        let _ = self.transport.disconnect_peer(&peer_id).await;
-                    }
-                    Ok(_) => {
-                        peer_states.mark_succeeded(peer_id);
-                        // Add successful node to best_nodes
-                        if let Some(queried_node) = batch.iter().find(|n| n.peer_id == peer_id) {
-                            best_nodes.push(queried_node.clone());
-                        }
-                    }
-                    Err(e) => {
-                        peer_states.mark_failed(peer_id);
-                        trace!("[NETWORK] Query to {} failed: {}", peer_id.to_hex(), e);
-                        // Trust failure is recorded inside send_dht_request —
-                        // no additional recording needed here.
-                    }
-                }
-            }
-
-            // Sort, deduplicate, and truncate once per iteration instead of per result
-            best_nodes.sort_by(|a, b| Self::compare_node_distance(a, b, key));
-            best_nodes.dedup_by_key(|n| n.peer_id);
-            best_nodes.truncate(count);
-
-            // Stagnation: compare the entire top-K set, not just closest distance.
-            let current_top_k: Vec<PeerId> = best_nodes.iter().map(|n| n.peer_id).collect();
-            if current_top_k == previous_top_k {
-                // If we haven't filled K slots yet, any remaining candidate
-                // could improve the result — keep going.
-                if best_nodes.len() < count && !candidates.is_empty() {
-                    previous_top_k = current_top_k;
-                    continue;
-                }
-                // Top-K didn't change, but don't stop if a queued candidate is
-                // closer than the farthest member of top-K — it could still
-                // improve the result once queried.
-                let has_promising_candidate = best_nodes.last().is_some_and(|worst| {
-                    let worst_dist = worst.peer_id.distance(&target_key);
-                    candidates
-                        .keys()
-                        .next()
-                        .is_some_and(|(dist, _)| *dist < worst_dist)
-                });
-                if !has_promising_candidate {
-                    info!(
-                        "[NETWORK] {}: Top-K converged after {} iterations",
-                        self.config.peer_id.to_hex(),
-                        iteration + 1
-                    );
-                    break;
-                }
-            }
-            previous_top_k = current_top_k;
+        } else {
+            debug!(
+                "[NETWORK] Lookup stopped after {} iterations: {:?}",
+                lookup.iterations(),
+                termination
+            );
         }
 
-        best_nodes = apply_lookup_report_winners(best_nodes, &subject_reports, key, count);
+        let best_nodes =
+            apply_lookup_report_winners(lookup.results(), &query.subject_reports, key, count);
 
         info!(
             "[NETWORK] Found {} closest nodes: {:?}",
@@ -3142,7 +3127,7 @@ impl DhtNetworkManager {
 
         Ok(FindNodeLookupOutcome {
             closest_nodes: best_nodes,
-            transcript,
+            transcript: query.transcript,
         })
     }
 
@@ -3171,12 +3156,9 @@ impl DhtNetworkManager {
             // the peer-dial coordinator, so concurrent iterative lookups that
             // happen to batch the same peer join this dial rather than racing it.
             self.ensure_peer_channel(&peer_id, &typed).await?;
-            self.send_dht_request_with_response_context(
-                &peer_id,
-                DhtNetworkOperation::FindNode { key },
-                Some(&typed),
-            )
-            .await
+            let operation = self.find_node_operation_for_peer(&peer_id, key).await;
+            self.send_dht_request_with_response_context(&peer_id, operation, Some(&typed))
+                .await
         };
         tokio::pin!(request);
 
@@ -3284,33 +3266,13 @@ impl DhtNetworkManager {
     /// queries up to `ITERATION_GRACE_TIMEOUT_SECS` to finish before giving
     /// up on them and returning whatever has arrived. Any still-pending
     /// futures are dropped (and cancelled) when the stream is returned.
-    async fn collect_iteration_results<S>(
-        mut stream: S,
-    ) -> Vec<(PeerId, Result<DhtResponseEnvelope>)>
+    async fn collect_iteration_results<S>(stream: S) -> Vec<(PeerId, Result<DhtResponseEnvelope>)>
     where
         S: futures::Stream<Item = (PeerId, Result<DhtResponseEnvelope>)> + Unpin,
     {
-        let mut results = Vec::new();
-
-        // Block for the first response — if nothing arrives the iteration
-        // has no new information to work with, so we do need to wait here.
-        let Some(first) = stream.next().await else {
-            return results;
-        };
-        results.push(first);
-
-        // Bounded drain: accept whichever stragglers finish within the
-        // grace window, then move on. `timeout` cancels the inner future
-        // on expiry, which drops the remaining query futures.
         let grace = Duration::from_secs(ITERATION_GRACE_TIMEOUT_SECS);
-        let _ = tokio::time::timeout(grace, async {
-            while let Some(next) = stream.next().await {
-                results.push(next);
-            }
-        })
-        .await;
-
-        results
+        saorsa_dht_lookup::collect_after_first_with_grace(stream, || tokio::time::sleep(grace))
+            .await
     }
 
     /// Return the K-closest candidate nodes, excluding the requester.
@@ -3350,10 +3312,11 @@ impl DhtNetworkManager {
         let observed = self.transport.non_relay_external_addresses();
         let listen = self.transport.listen_addrs().await;
         let relay = self.transport.relay_external_address();
-        let (addresses, address_types) = build_self_address_set(observed, listen, relay, |sa| {
+        let typed = build_self_address_set(observed, listen, relay, |sa| {
             self.transport.is_external_proven(sa)
         })
-        .into_parallel_vecs();
+        .into_typed_vec();
+        let (addresses, address_types): (Vec<_>, Vec<_>) = typed.into_iter().unzip();
 
         DHTNode {
             peer_id: self.config.peer_id,
@@ -3364,10 +3327,302 @@ impl DhtNetworkManager {
         }
     }
 
-    /// Add the local app-level peer ID to the per-lookup state map so that
-    /// iterative lookups never send RPCs to the local node.
-    fn mark_self_queried(&self, peer_states: &mut LookupPeerStates) {
-        peer_states.mark_succeeded(self.config.peer_id);
+    /// Add self-owned, non-QUIC endpoints to this node's extensible V2 address
+    /// record and immediately republish both the compatible V1 projection and
+    /// the complete V2 record to appropriate peers.
+    ///
+    /// Supplemental addresses never enter the legacy `DHTNode` address list.
+    /// WebRTC Direct has no relayed address form, so supplemental WebRTC
+    /// endpoints are always published as [`KnownReachability::Unverified`].
+    /// Reachability of a native QUIC socket is deliberately not reused for a
+    /// different transport or UDP port.
+    pub async fn set_supplemental_self_addresses(&self, addresses: Vec<MultiAddr>) {
+        let mut filtered = Vec::new();
+        for address in addresses {
+            if !crate::dht::core_engine::is_storable_address(&address) {
+                continue;
+            }
+            if address.dialable_socket_addr().is_some() {
+                warn!(
+                    address = %address,
+                    "ignoring native-dialable supplemental self address"
+                );
+                continue;
+            }
+            if address.peer_id().is_some_and(|peer| peer != self.peer_id()) {
+                warn!(
+                    address = %address,
+                    peer = %self.peer_id().to_hex(),
+                    "ignoring supplemental self address bound to another peer"
+                );
+                continue;
+            }
+            if !filtered.contains(&address) {
+                filtered.push(address);
+            }
+        }
+        *self.supplemental_self_addresses.write().await = filtered;
+
+        let local = self.local_dht_node().await;
+        let own_key = *self.peer_id().to_bytes();
+        let peers = self
+            .find_closest_nodes_local(&own_key, self.k_value())
+            .await;
+        self.publish_address_set_to_peers(local.typed_addresses(), &peers)
+            .await;
+    }
+
+    /// Encode the complete current V2 record from the canonical QUIC
+    /// reachability set plus independently registered transports.
+    async fn complete_transport_address_records(
+        &self,
+        native: &[(MultiAddr, AddressType)],
+    ) -> Vec<TransportAddressRecord> {
+        let mut records = Vec::new();
+        for (address, reachability) in native {
+            match TransportAddressRecord::from_multiaddr(
+                address,
+                KnownReachability::from_legacy(*reachability),
+            ) {
+                Ok(Some(record)) => records.push(record),
+                Ok(None) => {}
+                Err(error) => warn!(address = %address, %error, "failed to encode V2 QUIC address"),
+            }
+        }
+        for address in self.supplemental_self_addresses.read().await.iter() {
+            match TransportAddressRecord::from_multiaddr(address, KnownReachability::Unverified) {
+                Ok(Some(record)) if !records.contains(&record) => records.push(record),
+                Ok(_) => {}
+                Err(error) => {
+                    warn!(address = %address, %error, "failed to encode supplemental V2 address")
+                }
+            }
+        }
+        records.truncate(MAX_TRANSPORT_ADDRESS_RECORDS);
+        records
+    }
+
+    /// Return decoded, non-QUIC V2 addresses and reachability currently known
+    /// for `peer_id`.
+    ///
+    /// Unknown future transports and reachability identifiers remain stored
+    /// opaquely and are not returned by this typed view. Known WebRTC Direct
+    /// records are always projected as [`KnownReachability::Unverified`].
+    pub async fn supplemental_address_records_for_peer(
+        &self,
+        peer_id: &PeerId,
+    ) -> Vec<(MultiAddr, KnownReachability)> {
+        if peer_id == self.peer_id() {
+            return self
+                .supplemental_self_addresses
+                .read()
+                .await
+                .iter()
+                .cloned()
+                .map(|address| (address, KnownReachability::Unverified))
+                .collect();
+        }
+        let Some(set) = self
+            .transport_address_sets
+            .read()
+            .await
+            .get(peer_id)
+            .cloned()
+        else {
+            return Vec::new();
+        };
+        let legacy_seq = self.dht.read().await.publish_seq_for_node(peer_id).await;
+        if set.seq < legacy_seq {
+            return Vec::new();
+        }
+        set.records
+            .iter()
+            .filter(|record| record.transport != KnownTransport::Quic.id())
+            .filter_map(|record| {
+                let address = record.decode_known().ok().flatten()?;
+                let reachability = if address.is_webrtc_direct() {
+                    KnownReachability::Unverified
+                } else {
+                    KnownReachability::from_id(record.reachability)?
+                };
+                Some((address, reachability))
+            })
+            .collect()
+    }
+
+    /// Return decoded, non-QUIC V2 addresses currently known for `peer_id`.
+    ///
+    /// This compatibility projection preserves the address-only API used by
+    /// applications whose transport has no reachability variants, including
+    /// WebRTC Direct.
+    pub async fn supplemental_addresses_for_peer(&self, peer_id: &PeerId) -> Vec<MultiAddr> {
+        self.supplemental_address_records_for_peer(peer_id)
+            .await
+            .into_iter()
+            .map(|(address, _)| address)
+            .collect()
+    }
+
+    async fn validate_transport_address_records(
+        &self,
+        owner: &PeerId,
+        records: Vec<TransportAddressRecord>,
+        transport_source: Option<&MultiAddr>,
+    ) -> (Vec<TransportAddressRecord>, Vec<(MultiAddr, AddressType)>) {
+        let mut bounded = Vec::new();
+        let mut decoded = Vec::new();
+
+        for mut record in records.into_iter().take(MAX_TRANSPORT_ADDRESS_RECORDS) {
+            normalize_known_webrtc_reachability(&mut record);
+            if !record.is_within_wire_bounds() || bounded.contains(&record) {
+                continue;
+            }
+            match record.decode_known() {
+                Ok(Some(address)) => {
+                    if address.peer_id().is_some_and(|peer| peer != owner) {
+                        continue;
+                    }
+                    if record.transport == KnownTransport::WebRtcDirect.id()
+                        && address.peer_id() != Some(owner)
+                    {
+                        continue;
+                    }
+                    let reachability = record
+                        .legacy_reachability()
+                        .unwrap_or(AddressType::Unverified);
+                    decoded.push((bounded.len(), address, reachability));
+                    bounded.push(record);
+                }
+                Ok(None) if KnownTransport::from_id(record.transport).is_none() => {
+                    bounded.push(record);
+                }
+                Ok(None) | Err(_) => {}
+            }
+        }
+
+        let candidates: Vec<(MultiAddr, AddressType)> = decoded
+            .iter()
+            .map(|(_, address, reachability)| (address.clone(), *reachability))
+            .collect();
+        let allowed = self
+            .filter_lan_addresses_for_store(candidates, transport_source)
+            .await;
+        let mut keep = vec![true; bounded.len()];
+        for (index, address, _) in &decoded {
+            if let Some((_, canonical_reachability)) =
+                allowed.iter().find(|(allowed, _)| allowed == address)
+            {
+                if bounded[*index].legacy_reachability().is_some() {
+                    bounded[*index].reachability =
+                        if bounded[*index].transport == KnownTransport::WebRtcDirect.id() {
+                            KnownReachability::Unverified.id()
+                        } else {
+                            KnownReachability::from_legacy(*canonical_reachability).id()
+                        };
+                }
+            } else {
+                keep[*index] = false;
+            }
+        }
+
+        let records: Vec<_> = bounded
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, record)| keep[index].then_some(record))
+            .collect();
+        let native = allowed
+            .into_iter()
+            .filter(|(address, _)| address.is_quic())
+            .collect();
+        (records, native)
+    }
+
+    async fn apply_transport_address_set(
+        &self,
+        owner: &PeerId,
+        seq: u64,
+        records: Vec<TransportAddressRecord>,
+        transport_source: Option<&MultiAddr>,
+    ) -> bool {
+        if seq == 0 {
+            return false;
+        }
+        let (records, native) = self
+            .validate_transport_address_records(owner, records, transport_source)
+            .await;
+
+        self.store_transport_address_set(owner, seq, records.clone(), true)
+            .await;
+
+        let dht = self.dht.read().await;
+        let previous_addresses = dht.get_node_addresses_typed(owner).await;
+        let applied = dht.replace_node_addresses(owner, native.clone(), seq).await;
+        if applied {
+            let current = dht.get_node_addresses_typed(owner).await;
+            let still_current: Vec<_> = native
+                .iter()
+                .filter(|(address, _)| current.iter().any(|(known, _)| known == address))
+                .cloned()
+                .collect();
+            clear_dial_failures_for_published(
+                self.dial_failure_cache.as_ref(),
+                owner,
+                true,
+                &previous_addresses,
+                &still_current,
+            );
+        }
+        applied
+    }
+
+    async fn store_transport_address_set(
+        &self,
+        owner: &PeerId,
+        seq: u64,
+        records: Vec<TransportAddressRecord>,
+        authoritative: bool,
+    ) -> bool {
+        let mut sets = self.transport_address_sets.write().await;
+        if sets
+            .get(owner)
+            .is_some_and(|stored| stored.seq > seq || (stored.seq == seq && !authoritative))
+        {
+            return false;
+        }
+        if !sets.contains_key(owner)
+            && sets.len() >= MAX_STORED_TRANSPORT_ADDRESS_SETS
+            && let Some(evict) = sets.keys().next().copied()
+        {
+            sets.remove(&evict);
+        }
+        sets.insert(*owner, StoredTransportAddressSet { seq, records });
+        true
+    }
+
+    async fn normalize_v2_nodes(
+        &self,
+        nodes: Vec<TransportDhtNode>,
+        transport_source: Option<&MultiAddr>,
+    ) -> Vec<DHTNode> {
+        let mut normalized = Vec::with_capacity(nodes.len());
+        for node in nodes {
+            let (records, native) = self
+                .validate_transport_address_records(&node.peer_id, node.records, transport_source)
+                .await;
+            if node.publish_seq != 0 {
+                self.store_transport_address_set(&node.peer_id, node.publish_seq, records, false)
+                    .await;
+            }
+            let (addresses, address_types): (Vec<_>, Vec<_>) = native.into_iter().unzip();
+            normalized.push(DHTNode {
+                peer_id: node.peer_id,
+                addresses,
+                address_types,
+                distance: encode_publish_seq_distance(node.publish_seq),
+                reliability: node.reliability,
+            });
+        }
+        normalized
     }
 
     /// Return the first dialable `Direct`-tagged address from a [`DHTNode`].
@@ -4054,9 +4309,10 @@ impl DhtNetworkManager {
             return Err(e);
         }
 
+        let topic = Self::topic_for_operation(&message.payload);
         let result = match self
             .transport
-            .send_message(peer_id, "/dht/1.0.0", message_data)
+            .send_message(peer_id, topic, message_data)
             .await
         {
             Ok(_) => {
@@ -4064,7 +4320,8 @@ impl DhtNetworkManager {
                 // successful send so they share the same "confirmed sent"
                 // semantics as wire_tx_*.
                 match &message.payload {
-                    DhtNetworkOperation::FindNode { .. } => {
+                    DhtNetworkOperation::FindNode { .. }
+                    | DhtNetworkOperation::FindNodeV2 { .. } => {
                         self.transport
                             .traffic
                             .find_node_tx_count
@@ -4076,7 +4333,8 @@ impl DhtNetworkManager {
                             .ping_tx_count
                             .fetch_add(1, Ordering::Relaxed);
                     }
-                    DhtNetworkOperation::PublishAddressSet { .. } => {
+                    DhtNetworkOperation::PublishAddressSet { .. }
+                    | DhtNetworkOperation::PublishAddressSetV2 { .. } => {
                         self.transport
                             .traffic
                             .publish_addr_tx_count
@@ -4473,7 +4731,10 @@ impl DhtNetworkManager {
                 // *produced* (serialised) rather than confirmed sends — the
                 // actual transmit happens later in the caller. The wire bytes
                 // are still accounted separately via wire_tx_* at send time.
-                let is_nodes_found = matches!(&result, DhtNetworkResult::NodesFound { .. });
+                let is_nodes_found = matches!(
+                    &result,
+                    DhtNetworkResult::NodesFound { .. } | DhtNetworkResult::NodesFoundV2 { .. }
+                );
                 let response = self.create_response_message(&message, result)?;
                 let response_bytes = postcard::to_stdvec(&response)
                     .map_err(|e| P2PError::Serialization(e.to_string().into()))?;
@@ -4526,6 +4787,14 @@ impl DhtNetworkManager {
             DhtNetworkOperation::FindNode { key } => {
                 debug!("Handling FIND_NODE request for key: {}", hex::encode(key));
                 self.handle_find_node_request(key, authenticated_sender)
+                    .await
+            }
+            DhtNetworkOperation::FindNodeV2 { key } => {
+                debug!(
+                    "Handling FIND_NODE_V2 request for key: {}",
+                    hex::encode(key)
+                );
+                self.handle_find_node_v2_request(key, authenticated_sender)
                     .await
             }
             DhtNetworkOperation::Ping => {
@@ -4606,6 +4875,15 @@ impl DhtNetworkManager {
                     0
                 };
                 drop(dht);
+                if applied {
+                    let mut sets = self.transport_address_sets.write().await;
+                    if sets
+                        .get(authenticated_sender)
+                        .is_some_and(|stored| stored.seq < *seq)
+                    {
+                        sets.remove(authenticated_sender);
+                    }
+                }
                 if cleared > 0 {
                     debug!(
                         peer = %authenticated_sender.to_hex(),
@@ -4614,6 +4892,22 @@ impl DhtNetworkManager {
                         "ADR-011: cleared dial-failure suppression for freshly-published addresses"
                     );
                 }
+                Ok(DhtNetworkResult::PublishAddressAck)
+            }
+            DhtNetworkOperation::PublishAddressSetV2 { seq, records } => {
+                info!(
+                    "Handling PUBLISH_ADDRESS_SET_V2 from {}: seq={} records={}",
+                    authenticated_sender,
+                    seq,
+                    records.len()
+                );
+                self.apply_transport_address_set(
+                    authenticated_sender,
+                    *seq,
+                    records.clone(),
+                    transport_source,
+                )
+                .await;
                 Ok(DhtNetworkResult::PublishAddressAck)
             }
         }
@@ -4813,6 +5107,14 @@ impl DhtNetworkManager {
             .await
     }
 
+    fn topic_for_operation(operation: &DhtNetworkOperation) -> &'static str {
+        match operation {
+            DhtNetworkOperation::FindNodeV2 { .. }
+            | DhtNetworkOperation::PublishAddressSetV2 { .. } => DHT_V2_TOPIC,
+            _ => DHT_V1_TOPIC,
+        }
+    }
+
     /// Handle DHT response message
     ///
     /// Delivers the response via oneshot channel to the waiting request coroutine.
@@ -4837,6 +5139,13 @@ impl DhtNetworkManager {
                 warn!("DHT response message {message_id} has no result field");
                 return Ok(());
             }
+        };
+        let result = match result {
+            DhtNetworkResult::NodesFoundV2 { key, nodes } => DhtNetworkResult::NodesFound {
+                key,
+                nodes: self.normalize_v2_nodes(nodes, transport_source).await,
+            },
+            result => result,
         };
 
         // Resolve sender to app-level identity. Transport IDs identify channels,
@@ -4926,6 +5235,9 @@ impl DhtNetworkManager {
         // Each variant explicitly extracts its key to avoid silent fallbacks
         let payload = match &result {
             DhtNetworkResult::NodesFound { key, .. } => DhtNetworkOperation::FindNode { key: *key },
+            DhtNetworkResult::NodesFoundV2 { key, .. } => {
+                DhtNetworkOperation::FindNodeV2 { key: *key }
+            }
             DhtNetworkResult::PongReceived { .. } => DhtNetworkOperation::Ping,
             DhtNetworkResult::JoinSuccess { .. } => DhtNetworkOperation::Join,
             DhtNetworkResult::LeaveSuccess => DhtNetworkOperation::Leave,
@@ -5263,7 +5575,7 @@ impl DhtNetworkManager {
                                         source,
                                         data.len()
                                     );
-                                    if topic == "/dht/1.0.0" {
+                                    if topic == DHT_V1_TOPIC || topic == DHT_V2_TOPIC {
                                         // DHT messages must be authenticated.
                                         let Some(source_peer) = source else {
                                             warn!("Ignoring unsigned DHT message");
@@ -5273,6 +5585,7 @@ impl DhtNetworkManager {
                                         // Process the DHT message with backpressure via semaphore
                                         let manager_clone = Arc::clone(&self_arc);
                                         let semaphore = Arc::clone(&self_arc.message_handler_semaphore);
+                                        let response_topic = topic.clone();
                                         tokio::spawn(async move {
                                             // Acquire permit for backpressure - limits concurrent handlers
                                             let _permit = match semaphore.acquire().await {
@@ -5299,7 +5612,7 @@ impl DhtNetworkManager {
                                                     // Send response back to the source peer
                                                     if let Err(e) = manager_clone
                                                         .transport
-                                                        .send_message(&source_peer, "/dht/1.0.0", response)
+                                                        .send_message(&source_peer, &response_topic, response)
                                                         .await
                                                     {
                                                         warn!(
@@ -5866,9 +6179,21 @@ impl DhtNetworkManager {
         peers: &[DHTNode],
     ) -> Vec<PeerId> {
         let seq = Self::next_publish_seq();
-        let op = DhtNetworkOperation::PublishAddressSet {
+        let legacy_addresses: Vec<_> = typed_addresses
+            .iter()
+            .filter(|(address, _)| address.is_quic())
+            .cloned()
+            .collect();
+        let legacy_op = DhtNetworkOperation::PublishAddressSet {
             seq,
-            addresses: typed_addresses.clone(),
+            addresses: legacy_addresses.clone(),
+        };
+        let records = self
+            .complete_transport_address_records(&legacy_addresses)
+            .await;
+        let v2_op = DhtNetworkOperation::PublishAddressSetV2 {
+            seq,
+            records: records.clone(),
         };
         let mut confirmed = Vec::new();
         let mut publishes = FuturesUnordered::new();
@@ -5881,12 +6206,16 @@ impl DhtNetworkManager {
             // a peer we already have in hand.
             let peer_id = peer.peer_id;
             let peer_typed = peer.typed_addresses();
-            let op = op.clone();
+            let legacy_op = legacy_op.clone();
+            let v2_op = v2_op.clone();
             publishes.push(async move {
-                (
-                    peer_id,
-                    self.send_dht_request(&peer_id, op, Some(&peer_typed)).await,
-                )
+                if let Err(error) = self.ensure_peer_channel(&peer_id, &peer_typed).await {
+                    return (peer_id, false, Err(error));
+                }
+                let uses_v2 = self.peer_supports_address_v2(&peer_id).await;
+                let op = if uses_v2 { v2_op } else { legacy_op };
+                let result = self.send_dht_request(&peer_id, op, Some(&peer_typed)).await;
+                (peer_id, uses_v2, result)
             });
         }
 
@@ -5894,13 +6223,15 @@ impl DhtNetworkManager {
         // peer while the rest of the network continues dialing the old relay.
         // Fan the full replacement out concurrently and retain the exact
         // acknowledgers so the driver can retry only missing replicas.
-        while let Some((peer_id, result)) = publishes.next().await {
+        while let Some((peer_id, uses_v2, result)) = publishes.next().await {
             match result {
                 Ok(DhtNetworkResult::PublishAddressAck) => {
                     confirmed.push(peer_id);
                     debug!(
                         peer = %peer_id.to_hex(),
-                        addrs = typed_addresses.len(),
+                        legacy_addrs = legacy_addresses.len(),
+                        v2_records = records.len(),
+                        uses_v2,
                         seq,
                         "published address set to peer",
                     );
@@ -6017,6 +6348,60 @@ impl Default for DhtNetworkConfig {
 mod tests {
     use super::*;
 
+    #[allow(dead_code)]
+    #[derive(Debug, Deserialize)]
+    enum LegacyDhtNetworkOperation {
+        FindNode {
+            key: Key,
+        },
+        Ping,
+        Join,
+        Leave,
+        PublishAddressSet {
+            seq: u64,
+            addresses: Vec<(MultiAddr, AddressType)>,
+        },
+    }
+
+    #[test]
+    fn v2_operations_are_appended_after_legacy_wire_discriminants() {
+        let key = [0x11; 32];
+        let legacy_find = postcard::to_stdvec(&DhtNetworkOperation::FindNode { key }).unwrap();
+        let legacy_publish = postcard::to_stdvec(&DhtNetworkOperation::PublishAddressSet {
+            seq: 1,
+            addresses: Vec::new(),
+        })
+        .unwrap();
+        let v2_find = postcard::to_stdvec(&DhtNetworkOperation::FindNodeV2 { key }).unwrap();
+        let v2_publish = postcard::to_stdvec(&DhtNetworkOperation::PublishAddressSetV2 {
+            seq: 1,
+            records: Vec::new(),
+        })
+        .unwrap();
+
+        assert_eq!(legacy_find[0], 0);
+        assert_eq!(legacy_publish[0], 4);
+        assert_eq!(v2_find[0], 5);
+        assert_eq!(v2_publish[0], 6);
+        assert_eq!(
+            DhtNetworkManager::topic_for_operation(&DhtNetworkOperation::FindNode { key }),
+            DHT_V1_TOPIC
+        );
+        assert_eq!(
+            DhtNetworkManager::topic_for_operation(&DhtNetworkOperation::FindNodeV2 { key }),
+            DHT_V2_TOPIC
+        );
+
+        let decoded: LegacyDhtNetworkOperation = postcard::from_bytes(&legacy_publish).unwrap();
+        match decoded {
+            LegacyDhtNetworkOperation::PublishAddressSet { seq, addresses } => {
+                assert_eq!(seq, 1);
+                assert!(addresses.is_empty());
+            }
+            other => panic!("unexpected legacy operation: {other:?}"),
+        }
+    }
+
     #[test]
     fn is_dialable_accepts_quic_with_routable_ip() {
         let quic = MultiAddr::quic("203.0.113.7:9000".parse().unwrap());
@@ -6086,47 +6471,6 @@ mod tests {
         assert_eq!(selected, expected);
     }
 
-    #[test]
-    fn lookup_peer_states_only_absent_peers_are_contactable() {
-        let mut states = LookupPeerStates::default();
-        let waiting = pid(1);
-        let succeeded = pid(2);
-        let failed = pid(3);
-        let unresponsive = pid(4);
-        let fresh = pid(5);
-
-        states.mark_waiting(waiting);
-        states.mark_succeeded(succeeded);
-        states.mark_failed(failed);
-        states.mark_unresponsive(unresponsive);
-
-        assert!(!states.is_contactable(&waiting));
-        assert!(!states.is_contactable(&succeeded));
-        assert!(!states.is_contactable(&failed));
-        assert!(!states.is_contactable(&unresponsive));
-        assert!(states.is_contactable(&fresh));
-    }
-
-    #[test]
-    fn lookup_peer_states_failure_and_unresponsive_are_final_for_lookup() {
-        let mut states = LookupPeerStates::default();
-        let failed = pid(7);
-        let unresponsive = pid(8);
-
-        states.mark_waiting(failed);
-        states.mark_failed(failed);
-        states.mark_waiting(unresponsive);
-        states.mark_unresponsive(unresponsive);
-
-        assert_eq!(states.state(&failed), Some(LookupPeerState::Failed));
-        assert_eq!(
-            states.state(&unresponsive),
-            Some(LookupPeerState::Unresponsive)
-        );
-        assert!(!states.is_contactable(&failed));
-        assert!(!states.is_contactable(&unresponsive));
-    }
-
     #[tokio::test]
     async fn lookup_failure_coordinator_broadcasts_to_all_subscribers() {
         let coordinator = LookupFailureCoordinator::new();
@@ -6188,9 +6532,18 @@ mod tests {
             dev_addr: [0xDE, 0xAD, 0xBE, 0xEF],
             freq_hz: 868_000_000,
         });
+        let webrtc = MultiAddr::webrtc_direct(
+            crate::WebRtcDirectAddr::new(
+                "203.0.113.7:42768".parse().unwrap(),
+                crate::WebRtcCertificateHash::new([0x44; 32]),
+            )
+            .unwrap(),
+        )
+        .with_peer_id(pid(44));
         assert!(!DhtNetworkManager::is_dialable(&ble));
         assert!(!DhtNetworkManager::is_dialable(&tcp));
         assert!(!DhtNetworkManager::is_dialable(&lora));
+        assert!(!DhtNetworkManager::is_dialable(&webrtc));
     }
 
     #[test]
@@ -6203,6 +6556,40 @@ mod tests {
     fn is_dialable_accepts_loopback() {
         let loopback = MultiAddr::quic("127.0.0.1:9000".parse().unwrap());
         assert!(DhtNetworkManager::is_dialable(&loopback));
+    }
+
+    #[test]
+    fn known_webrtc_reachability_is_always_unverified() {
+        let peer_id = pid(44);
+        let quic: MultiAddr = "/ip4/203.0.113.7/udp/12000/quic".parse().unwrap();
+        let webrtc = MultiAddr::webrtc_direct(
+            crate::WebRtcDirectAddr::new(
+                "203.0.113.7:42768".parse().unwrap(),
+                crate::WebRtcCertificateHash::new([0x44; 32]),
+            )
+            .unwrap(),
+        )
+        .with_peer_id(peer_id);
+        let quic_record = TransportAddressRecord::from_multiaddr(&quic, KnownReachability::Direct)
+            .unwrap()
+            .unwrap();
+        let mut webrtc_record =
+            TransportAddressRecord::from_multiaddr(&webrtc, KnownReachability::Direct)
+                .unwrap()
+                .unwrap();
+        // Model a pre-fix or malicious wire record. Ingress normalization must
+        // not let a known WebRTC endpoint claim a QUIC-style reachability tier.
+        webrtc_record.reachability = KnownReachability::Direct.id();
+        normalize_known_webrtc_reachability(&mut webrtc_record);
+
+        assert_eq!(
+            KnownReachability::from_id(quic_record.reachability),
+            Some(KnownReachability::Direct)
+        );
+        assert_eq!(
+            KnownReachability::from_id(webrtc_record.reachability),
+            Some(KnownReachability::Unverified)
+        );
     }
 
     fn dht_node(seed: u8, entries: Vec<(&str, AddressType)>) -> DHTNode {
@@ -6279,6 +6666,43 @@ mod tests {
             DhtNetworkManager::filter_lan_addresses_for_store_with_context(addrs, None, &context);
 
         assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn store_filter_keeps_public_non_quic_and_strips_private_non_quic() {
+        let context = DialAddressContext::from_parts(
+            ["198.51.100.9:9000".parse::<SocketAddr>().unwrap()],
+            Vec::<MultiAddr>::new(),
+            false,
+        );
+        let peer_id = pid(34);
+        let public = MultiAddr::webrtc_direct(
+            crate::WebRtcDirectAddr::new(
+                "203.0.113.7:42768".parse().unwrap(),
+                crate::WebRtcCertificateHash::new([0x34; 32]),
+            )
+            .unwrap(),
+        )
+        .with_peer_id(peer_id);
+        let private = MultiAddr::webrtc_direct(
+            crate::WebRtcDirectAddr::new(
+                "192.168.1.7:42768".parse().unwrap(),
+                crate::WebRtcCertificateHash::new([0x35; 32]),
+            )
+            .unwrap(),
+        )
+        .with_peer_id(peer_id);
+
+        let filtered = DhtNetworkManager::filter_lan_addresses_for_store_with_context(
+            vec![
+                (private, AddressType::Unverified),
+                (public.clone(), AddressType::Unverified),
+            ],
+            None,
+            &context,
+        );
+
+        assert_eq!(filtered, vec![(public, AddressType::Unverified)]);
     }
 
     #[test]
