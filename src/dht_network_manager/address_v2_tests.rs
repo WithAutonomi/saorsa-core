@@ -610,3 +610,35 @@ async fn v2_response_rejects_an_envelope_that_cannot_fit_even_without_nodes() {
         expected
     );
 }
+
+#[tokio::test]
+async fn supplemental_self_addresses_bind_missing_peer_ids_before_deduplication() {
+    let node = test_node().await;
+    let manager = node.dht_manager();
+    let address = MultiAddr::webrtc_direct(
+        WebRtcDirectAddr::new(
+            "203.0.113.7:42768".parse().unwrap(),
+            WebRtcCertificateHash::new([0x55; 32]),
+        )
+        .unwrap(),
+    );
+    let bound = address.clone().with_peer_id(*node.peer_id());
+    let other_peer = address.clone().with_peer_id(PeerId::from_bytes([0x22; 32]));
+    manager
+        .set_supplemental_self_addresses(vec![address, bound.clone(), other_peer])
+        .await;
+    assert_eq!(
+        manager
+            .supplemental_addresses_for_peer(node.peer_id())
+            .await,
+        vec![bound.clone()]
+    );
+    let records = manager.complete_transport_address_records(&[]).await;
+    assert_eq!(records.len(), 1);
+    let (received, _) = manager
+        .validate_transport_address_records(node.peer_id(), records, None)
+        .await
+        .unwrap();
+    assert_eq!(received.len(), 1);
+    assert_eq!(received[0].decode_known().unwrap(), Some(bound));
+}

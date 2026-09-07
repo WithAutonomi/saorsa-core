@@ -3341,6 +3341,8 @@ impl DhtNetworkManager {
     /// endpoints are always published as [`KnownReachability::Unverified`].
     /// Reachability of a native QUIC socket is deliberately not reused for a
     /// different transport or UDP port.
+    /// Addresses without a peer suffix are bound to this node's identity;
+    /// addresses explicitly bound to a different peer are discarded.
     pub async fn set_supplemental_self_addresses(&self, addresses: Vec<MultiAddr>) {
         let mut filtered = Vec::new();
         for address in addresses {
@@ -3362,6 +3364,7 @@ impl DhtNetworkManager {
                 );
                 continue;
             }
+            let address = address.with_peer_id(*self.peer_id());
             if !filtered.contains(&address) {
                 filtered.push(address);
             }
