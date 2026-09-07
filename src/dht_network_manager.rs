@@ -61,6 +61,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, trace, warn};
 use uuid::Uuid;
 
+#[cfg(test)]
+mod address_v2_tests;
+
 /// Minimum concurrent operations for semaphore backpressure
 const MIN_CONCURRENT_OPERATIONS: usize = 10;
 
@@ -5140,14 +5143,6 @@ impl DhtNetworkManager {
                 return Ok(());
             }
         };
-        let result = match result {
-            DhtNetworkResult::NodesFoundV2 { key, nodes } => DhtNetworkResult::NodesFound {
-                key,
-                nodes: self.normalize_v2_nodes(nodes, transport_source).await,
-            },
-            result => result,
-        };
-
         // Resolve sender to app-level identity. Transport IDs identify channels,
         // not peers, so unauthenticated senders are rejected outright.
         let Some(sender_app_id) = self.canonical_app_peer_id(sender).await else {
@@ -5158,12 +5153,17 @@ impl DhtNetworkManager {
             return Ok(());
         };
 
-        // Find the active operation and send response via oneshot channel
-        let Ok(mut ops) = self.active_operations.lock() else {
-            warn!("active_operations mutex poisoned");
-            return Ok(());
-        };
-        if let Some(context) = ops.get_mut(message_id) {
+        // Claim a live, correlated response before normalization can persist
+        // any address records. Release the synchronous lock before awaiting.
+        let tx = {
+            let Ok(mut ops) = self.active_operations.lock() else {
+                warn!("active_operations mutex poisoned");
+                return Ok(());
+            };
+            let Some(context) = ops.get_mut(message_id) else {
+                debug!("Ignoring unsolicited or expired DHT response: {message_id}");
+                return Ok(());
+            };
             // Authenticate solely on app-level peer ID.
             let source_authorized = context.peer_id == sender_app_id
                 || context.contacted_nodes.contains(&sender_app_id);
@@ -5184,35 +5184,40 @@ impl DhtNetworkManager {
                 return Ok(());
             }
 
-            // Take the sender out of the context (can only send once)
-            if let Some(tx) = context.response_tx.take() {
-                debug!(
-                    "[STEP 5a] {}: Delivering response for msg_id {} to waiting request",
-                    self.config.peer_id.to_hex(),
-                    message_id
-                );
-                let response = DhtResponseEnvelope {
-                    result,
-                    transport_source: transport_source.cloned(),
-                };
-                if tx.send(response).is_err() {
-                    warn!(
-                        "[STEP 5a FAILED] {}: Response channel closed for msg_id {} (receiver timed out)",
-                        self.config.peer_id.to_hex(),
-                        message_id
-                    );
-                }
-            } else {
-                debug!(
-                    "Response already delivered for message_id: {message_id}, ignoring duplicate"
-                );
+            if let DhtNetworkResult::NodesFoundV2 { key, .. } = &result
+                && !matches!(
+                    &context.operation,
+                    DhtNetworkOperation::FindNodeV2 { key: expected } if expected == key
+                )
+            {
+                warn!("Ignoring V2 response for a different operation or key: {message_id}");
+                return Ok(());
             }
-        } else {
-            warn!(
-                "[STEP 5 FAILED] {}: No active operation found for msg_id {} (may have timed out)",
-                self.config.peer_id.to_hex(),
-                message_id
-            );
+
+            let Some(tx) = context.response_tx.take() else {
+                debug!("Ignoring duplicate DHT response: {message_id}");
+                return Ok(());
+            };
+            if tx.is_closed() {
+                debug!("Ignoring DHT response for a cancelled request: {message_id}");
+                return Ok(());
+            }
+            tx
+        };
+
+        let result = match result {
+            DhtNetworkResult::NodesFoundV2 { key, nodes } => DhtNetworkResult::NodesFound {
+                key,
+                nodes: self.normalize_v2_nodes(nodes, transport_source).await,
+            },
+            result => result,
+        };
+        let response = DhtResponseEnvelope {
+            result,
+            transport_source: transport_source.cloned(),
+        };
+        if tx.send(response).is_err() {
+            debug!("DHT response receiver closed during processing: {message_id}");
         }
 
         Ok(())
