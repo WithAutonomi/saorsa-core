@@ -33,6 +33,34 @@ fn browser_address(owner: PeerId) -> MultiAddr {
     .with_peer_id(owner)
 }
 
+fn quic_record(address: &str) -> TransportAddressRecord {
+    TransportAddressRecord::from_multiaddr(&address.parse().unwrap(), KnownReachability::Direct)
+        .unwrap()
+        .unwrap()
+}
+
+async fn seed_peer(manager: &DhtNetworkManager, owner: PeerId, address: &str) {
+    manager
+        .dht
+        .write()
+        .await
+        .add_node_no_trust(NodeInfo {
+            id: owner,
+            addresses: vec![address.parse().unwrap()],
+            address_types: vec![AddressType::Direct],
+            last_seen: AtomicInstant::now(),
+        })
+        .await
+        .unwrap();
+}
+
+async fn peer_view(manager: &DhtNetworkManager, owner: PeerId) -> DHTNode {
+    manager
+        .find_closest_nodes_local(owner.as_bytes(), 1)
+        .await
+        .remove(0)
+}
+
 fn message(owner: PeerId, operation: DhtNetworkOperation) -> DhtNetworkMessage {
     DhtNetworkMessage {
         message_id: "address-v2-regression".into(),
@@ -217,4 +245,288 @@ async fn authenticated_v2_response_requires_a_live_matching_request() {
     );
     receiver.stop().await.unwrap();
     sender.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn rejected_v2_publish_preserves_both_views_and_allows_correction() {
+    let node = test_node().await;
+    let manager = node.dht_manager();
+    let owner = PeerId::from_bytes([0x22; 32]);
+    seed_peer(manager, owner, "/ip4/8.8.8.8/udp/9000/quic").await;
+    let good = quic_record("/ip4/8.8.8.8/udp/9000/quic");
+    assert!(
+        manager
+            .apply_transport_address_set(&owner, 10, vec![good.clone()], None)
+            .await
+    );
+    for invalid in [
+        quic_record("/ip4/0.0.0.0/udp/9000/quic"),
+        quic_record("/ip4/8.8.8.8/udp/0/quic"),
+        TransportAddressRecord {
+            transport: KnownTransport::Quic.id(),
+            reachability: 2,
+            address: vec![255],
+        },
+    ] {
+        assert!(
+            !manager
+                .apply_transport_address_set(&owner, 11, vec![invalid], None)
+                .await
+        );
+        let legacy = peer_view(manager, owner).await;
+        assert_eq!(dht_node_publish_seq(&legacy), 10);
+        assert_eq!(
+            manager.transport_dht_node(legacy).await.records,
+            vec![good.clone()]
+        );
+    }
+    let corrected = quic_record("/ip4/9.9.9.9/udp/9000/quic");
+    assert!(
+        manager
+            .apply_transport_address_set(&owner, 11, vec![corrected.clone()], None)
+            .await
+    );
+    for seq in [0, 10, 11] {
+        assert!(
+            !manager
+                .apply_transport_address_set(&owner, seq, vec![good.clone()], None)
+                .await
+        );
+    }
+    let legacy = peer_view(manager, owner).await;
+    assert_eq!(dht_node_publish_seq(&legacy), 11);
+    assert_eq!(
+        legacy.addresses,
+        vec![corrected.decode_known().unwrap().unwrap()]
+    );
+    assert_eq!(
+        manager.transport_dht_node(legacy).await.records,
+        vec![corrected]
+    );
+}
+
+#[tokio::test]
+async fn v2_withdrawal_clears_native_addresses_and_survives_legacy_gossip() {
+    let node = test_node().await;
+    let manager = node.dht_manager();
+    let owner = PeerId::from_bytes([0x22; 32]);
+    seed_peer(manager, owner, "/ip4/8.8.8.8/udp/9000/quic").await;
+    let browser = TransportAddressRecord::from_multiaddr(
+        &browser_address(owner),
+        KnownReachability::Unverified,
+    )
+    .unwrap()
+    .unwrap();
+    assert!(
+        manager
+            .apply_transport_address_set(
+                &owner,
+                10,
+                vec![quic_record("/ip4/8.8.8.8/udp/9000/quic"), browser.clone()],
+                None
+            )
+            .await
+    );
+    let stale = peer_view(manager, owner).await;
+    assert!(
+        manager
+            .apply_transport_address_set(&owner, 11, vec![browser.clone()], None)
+            .await
+    );
+    manager.merge_trusted_gossiped_typed_addresses(&stale).await;
+    let legacy = peer_view(manager, owner).await;
+    assert!(legacy.addresses.is_empty());
+    assert_eq!(dht_node_publish_seq(&legacy), 11);
+    assert_eq!(
+        manager.transport_dht_node(legacy).await.records,
+        vec![browser]
+    );
+
+    // Withdrawing all transports is also an authoritative complete update.
+    assert!(
+        manager
+            .apply_transport_address_set(&owner, 12, Vec::new(), None)
+            .await
+    );
+    assert!(
+        manager
+            .supplemental_addresses_for_peer(&owner)
+            .await
+            .is_empty()
+    );
+    assert!(peer_view(manager, owner).await.addresses.is_empty());
+    assert_eq!(dht_node_publish_seq(&peer_view(manager, owner).await), 12);
+}
+
+#[tokio::test]
+async fn v2_gossip_projects_withdrawals_without_refreshing_peer_liveness() {
+    let node = test_node().await;
+    let manager = node.dht_manager();
+    let owner = PeerId::from_bytes([0x22; 32]);
+    seed_peer(manager, owner, "/ip4/8.8.8.8/udp/9000/quic").await;
+    let last_seen = manager.dht.read().await.all_nodes().await[0]
+        .last_seen
+        .load();
+    let DhtNetworkResult::NodesFoundV2 { nodes, .. } = response(owner, owner, 10).result.unwrap()
+    else {
+        panic!("expected V2 response");
+    };
+    manager.normalize_v2_nodes(nodes, None).await;
+    assert!(peer_view(manager, owner).await.addresses.is_empty());
+    assert_eq!(dht_node_publish_seq(&peer_view(manager, owner).await), 10);
+    assert_eq!(
+        manager.dht.read().await.all_nodes().await[0]
+            .last_seen
+            .load(),
+        last_seen
+    );
+}
+
+#[tokio::test]
+async fn v2_filters_loopback_in_both_ip_representations_and_transports() {
+    let node = P2PNode::new(NodeConfig::builder().port(0).ipv6(false).build().unwrap())
+        .await
+        .unwrap();
+    let manager = node.dht_manager();
+    let owner = PeerId::from_bytes([0x22; 32]);
+    seed_peer(manager, owner, "/ip4/8.8.8.8/udp/9000/quic").await;
+    let lan_source = "/ip4/192.168.1.2/udp/9000/quic".parse().unwrap();
+    for (seq, socket) in [(10, "127.0.0.1:9000"), (12, "[::ffff:127.0.0.1]:9000")] {
+        assert!(
+            manager
+                .apply_transport_address_set(
+                    &owner,
+                    seq,
+                    vec![quic_record("/ip4/8.8.8.8/udp/9000/quic")],
+                    None
+                )
+                .await
+        );
+        let socket: SocketAddr = socket.parse().unwrap();
+        let addresses = [
+            MultiAddr::quic(socket),
+            MultiAddr::webrtc_direct(
+                WebRtcDirectAddr::new(socket, WebRtcCertificateHash::new([1; 32])).unwrap(),
+            )
+            .with_peer_id(owner),
+        ];
+        let records = addresses
+            .iter()
+            .map(|address| {
+                TransportAddressRecord::from_multiaddr(address, KnownReachability::Direct)
+                    .unwrap()
+                    .unwrap()
+            })
+            .collect();
+        assert!(
+            manager
+                .apply_transport_address_set(&owner, seq + 1, records, Some(&lan_source))
+                .await
+        );
+        let native = peer_view(manager, owner).await;
+        assert!(native.addresses.is_empty());
+        assert_eq!(dht_node_publish_seq(&native), seq + 1);
+        assert!(manager.transport_dht_node(native).await.records.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn concurrent_legacy_and_v2_publications_keep_the_newest_complete_set() {
+    let node = test_node().await;
+    let manager = node.dht_manager();
+    let owner = PeerId::from_bytes([0x22; 32]);
+    seed_peer(manager, owner, "/ip4/8.8.8.8/udp/9000/quic").await;
+    let quic = quic_record("/ip4/9.9.9.9/udp/9000/quic");
+    let browser = TransportAddressRecord::from_multiaddr(
+        &browser_address(owner),
+        KnownReachability::Unverified,
+    )
+    .unwrap()
+    .unwrap();
+    let legacy = message(
+        owner,
+        DhtNetworkOperation::PublishAddressSet {
+            seq: 12,
+            addresses: vec![(quic.decode_known().unwrap().unwrap(), AddressType::Direct)],
+        },
+    );
+    let (_, legacy_result) = tokio::join!(
+        manager.apply_transport_address_set(&owner, 11, vec![browser.clone()], None),
+        manager.handle_dht_request(&legacy, &owner, None),
+    );
+    legacy_result.unwrap();
+    assert_eq!(
+        manager
+            .transport_dht_node(peer_view(manager, owner).await)
+            .await
+            .records,
+        vec![quic]
+    );
+    assert!(
+        manager
+            .supplemental_addresses_for_peer(&owner)
+            .await
+            .is_empty()
+    );
+
+    let (_, legacy_result) = tokio::join!(
+        manager.apply_transport_address_set(&owner, 13, vec![browser.clone()], None),
+        manager.handle_dht_request(&legacy, &owner, None),
+    );
+    legacy_result.unwrap();
+    let native = peer_view(manager, owner).await;
+    assert!(native.addresses.is_empty());
+    assert_eq!(
+        manager.transport_dht_node(native).await.records,
+        vec![browser]
+    );
+}
+
+#[tokio::test]
+async fn v2_completes_an_identical_legacy_projection_at_the_same_sequence() {
+    let node = test_node().await;
+    let manager = node.dht_manager();
+    let owner = PeerId::from_bytes([0x22; 32]);
+    seed_peer(manager, owner, "/ip4/8.8.8.8/udp/9000/quic").await;
+    let quic = quic_record("/ip4/8.8.8.8/udp/9000/quic");
+    let legacy = message(
+        owner,
+        DhtNetworkOperation::PublishAddressSet {
+            seq: 10,
+            addresses: vec![(quic.decode_known().unwrap().unwrap(), AddressType::Direct)],
+        },
+    );
+    manager
+        .handle_dht_request(&legacy, &owner, None)
+        .await
+        .unwrap();
+    assert!(
+        !manager
+            .apply_transport_address_set(
+                &owner,
+                10,
+                vec![quic_record("/ip4/9.9.9.9/udp/9000/quic")],
+                None
+            )
+            .await
+    );
+    let browser = TransportAddressRecord::from_multiaddr(
+        &browser_address(owner),
+        KnownReachability::Unverified,
+    )
+    .unwrap()
+    .unwrap();
+    let records = vec![quic, browser];
+    assert!(
+        manager
+            .apply_transport_address_set(&owner, 10, records.clone(), None)
+            .await
+    );
+    assert_eq!(
+        manager
+            .transport_dht_node(peer_view(manager, owner).await)
+            .await
+            .records,
+        records
+    );
 }
