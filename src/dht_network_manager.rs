@@ -3382,7 +3382,7 @@ impl DhtNetworkManager {
 
     /// Encode the complete current V2 record from the canonical QUIC
     /// reachability set plus independently registered transports.
-    async fn complete_transport_address_records(
+    pub(crate) async fn complete_transport_address_records(
         &self,
         native: &[(MultiAddr, AddressType)],
     ) -> Vec<TransportAddressRecord> {
@@ -6301,19 +6301,44 @@ impl DhtNetworkManager {
         typed_addresses: Vec<(crate::MultiAddr, AddressType)>,
         peers: &[DHTNode],
     ) -> Vec<PeerId> {
-        let seq = Self::next_publish_seq();
         let legacy_addresses: Vec<_> = typed_addresses
             .iter()
             .filter(|(address, _)| address.is_quic())
             .cloned()
             .collect();
+        let records = self
+            .complete_transport_address_records(&legacy_addresses)
+            .await;
+        self.publish_address_records_to_peers(records, peers).await
+    }
+
+    /// Publish an exact complete-record snapshot. The retry driver records
+    /// acknowledgements against this same snapshot, so a concurrent change to
+    /// supplemental endpoints cannot be mistaken for an acknowledged update.
+    pub(crate) async fn publish_address_records_to_peers(
+        &self,
+        records: Vec<TransportAddressRecord>,
+        peers: &[DHTNode],
+    ) -> Vec<PeerId> {
+        let seq = Self::next_publish_seq();
+        let legacy_addresses: Vec<_> = records
+            .iter()
+            .filter_map(|record| {
+                let address = record.decode_known().ok().flatten()?;
+                address.is_quic().then(|| {
+                    (
+                        address,
+                        record
+                            .legacy_reachability()
+                            .unwrap_or(AddressType::Unverified),
+                    )
+                })
+            })
+            .collect();
         let legacy_op = DhtNetworkOperation::PublishAddressSet {
             seq,
             addresses: legacy_addresses.clone(),
         };
-        let records = self
-            .complete_transport_address_records(&legacy_addresses)
-            .await;
         let v2_op = DhtNetworkOperation::PublishAddressSetV2 {
             seq,
             records: records.clone(),
