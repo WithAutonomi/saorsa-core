@@ -756,6 +756,123 @@ pub enum ConnectionStatus {
     Failed(String),
 }
 
+/// Coarse classification of the route by which a peer's traffic reached us.
+///
+/// Derived by matching the transport source address of an incoming message
+/// against the typed dial addresses the DHT phonebook holds for that peer.
+/// See [`P2PNode::classify_peer_transport_route`].
+///
+/// This is a **provenance label** for logging and metrics. It is not an
+/// identity signal and must not be used for trust scoring or routing
+/// decisions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerRouteKind {
+    /// Traffic arrived via the peer's MASQUE relay address.
+    Relay,
+    /// Traffic arrived via the peer's direct public IP address.
+    Direct,
+    /// Traffic arrived via a LAN or other local-scope address.
+    Lan,
+    /// Traffic arrived via an address whose reachability is unverified.
+    Unverified,
+    /// The transport source is absent, non-IP, or does not match any address
+    /// the local phonebook holds for the peer.
+    Unknown,
+}
+
+impl PeerRouteKind {
+    /// Canonical lowercase label for the variant, used by the [`Display`]
+    /// implementation and suitable for log fields / metric tags.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Relay => "relay",
+            Self::Direct => "direct",
+            Self::Lan => "lan",
+            Self::Unverified => "unverified",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl std::fmt::Display for PeerRouteKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl From<AddressType> for PeerRouteKind {
+    fn from(ty: AddressType) -> Self {
+        match ty {
+            AddressType::Relay => Self::Relay,
+            AddressType::Direct => Self::Direct,
+            AddressType::Unverified => Self::Unverified,
+            AddressType::Lan => Self::Lan,
+        }
+    }
+}
+
+/// Pure classification of a transport source against a typed address slice.
+///
+/// This is the testable, I/O-free core of
+/// [`P2PNode::classify_peer_transport_route`]; it touches no node state and
+/// can be exercised without constructing a node.
+///
+/// # Classification rules
+/// - `transport_source` `None` or not an IP socket address →
+///   [`PeerRouteKind::Unknown`].
+/// - The transport source's socket address is compared by exact equality
+///   against each `(MultiAddr, AddressType)` entry's socket address
+///   ([`MultiAddr::socket_addr`]).
+/// - A single matching entry yields that entry's [`AddressType`] mapped to
+///   [`PeerRouteKind`].
+/// - Multiple matching entries that **agree** on the [`AddressType`] yield
+///   that type (deduplicated duplicates).
+/// - Multiple matching entries with **conflicting** [`AddressType`]s yield
+///   [`PeerRouteKind::Unknown`]. We deliberately do **not** use
+///   [`AddressType::priority`] to pick a winner here: that ordering governs
+///   *dial preference*, not the provenance of an already-arrived message,
+///   and silently promoting one type over another would mask a phonebook
+///   inconsistency. `Unknown` is the conservative, honest label.
+/// - No match → [`PeerRouteKind::Unknown`].
+///
+/// Address-list order is never used as a classification signal.
+#[must_use]
+pub(crate) fn classify_peer_route_from_typed(
+    transport_source: Option<&MultiAddr>,
+    typed_addrs: &[(MultiAddr, AddressType)],
+) -> PeerRouteKind {
+    let Some(src) = transport_source else {
+        return PeerRouteKind::Unknown;
+    };
+    let Some(src_sa) = src.socket_addr() else {
+        return PeerRouteKind::Unknown;
+    };
+
+    // Walk all entries; remember the first matched type and flag a conflict
+    // if a later match disagrees. We do not short-circuit on first match
+    // because duplicates with conflicting types must surface as Unknown.
+    let mut matched: Option<AddressType> = None;
+    let mut conflict = false;
+    for (addr, ty) in typed_addrs {
+        if addr.socket_addr().is_some_and(|sa| sa == src_sa) {
+            match matched {
+                None => matched = Some(*ty),
+                Some(prev) if prev == *ty => {}
+                Some(_) => {
+                    conflict = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    match (matched, conflict) {
+        (Some(ty), false) => ty.into(),
+        _ => PeerRouteKind::Unknown,
+    }
+}
+
 /// Network events that can occur in the P2P system
 ///
 /// Events are broadcast to all listeners and provide real-time
@@ -1092,6 +1209,42 @@ impl P2PNode {
     /// Get the AdaptiveDHT component for direct access
     pub fn adaptive_dht(&self) -> &AdaptiveDHT {
         &self.adaptive_dht
+    }
+
+    /// Classify the route by which a peer's traffic reached this node.
+    ///
+    /// Looks up the typed dial addresses the DHT phonebook holds for `peer_id`
+    /// and matches `transport_source` against them using the internal pure
+    /// classifier. `transport_source` must be the address observed by the
+    /// authenticated transport while delivering the message (currently a
+    /// QUIC address), not an address asserted by the remote peer. Returns
+    /// [`PeerRouteKind::Unknown`] when the source is absent, non-IP, or
+    /// matches no known address.
+    ///
+    /// This is a **provenance label** for logging and metrics — not an
+    /// identity or trust signal. It never infers a route from address-list
+    /// ordering, and a conflicting phonebook (same socket address tagged
+    /// with two different [`AddressType`]s) is reported as
+    /// [`PeerRouteKind::Unknown`] rather than silently picking a winner.
+    pub async fn classify_peer_transport_route(
+        &self,
+        peer_id: &PeerId,
+        transport_source: Option<&MultiAddr>,
+    ) -> PeerRouteKind {
+        let typed = self
+            .adaptive_dht
+            .peer_addresses_for_dial_typed(peer_id)
+            .await;
+        classify_peer_route_from_typed(transport_source, &typed)
+    }
+
+    /// Return this process's local last-successful-DHT-interaction age for a
+    /// peer. This is a diagnostic observation, not proof of remote uptime.
+    pub async fn peer_last_seen_elapsed(&self, peer_id: &PeerId) -> Option<Duration> {
+        self.adaptive_dht
+            .dht_manager()
+            .peer_last_seen_elapsed(peer_id)
+            .await
     }
 
     // =========================================================================
@@ -2843,6 +2996,158 @@ mod tests {
 
     /// Helper function to create a test tool
     // MCP removed: test tool helper deleted
+
+    // =========================================================================
+    // PeerRouteKind / route classification — pure-helper unit tests.
+    //
+    // These exercise `classify_peer_route_from_typed` directly so no live
+    // node/DHT is required. `P2PNode::classify_peer_transport_route` is a
+    // thin async wrapper over this helper plus `peer_addresses_for_dial_typed`,
+    // so the classification logic is fully covered here.
+    // =========================================================================
+
+    fn quic_addr(s: &str) -> MultiAddr {
+        MultiAddr::quic(s.parse().expect("valid socket addr"))
+    }
+
+    #[test]
+    fn test_peer_route_kind_display_labels() {
+        assert_eq!(PeerRouteKind::Relay.to_string(), "relay");
+        assert_eq!(PeerRouteKind::Direct.to_string(), "direct");
+        assert_eq!(PeerRouteKind::Lan.to_string(), "lan");
+        assert_eq!(PeerRouteKind::Unverified.to_string(), "unverified");
+        assert_eq!(PeerRouteKind::Unknown.to_string(), "unknown");
+        // as_str agrees with Display
+        assert_eq!(PeerRouteKind::Relay.as_str(), "relay");
+    }
+
+    #[test]
+    fn test_classify_none_source_is_unknown() {
+        let typed = vec![(quic_addr("203.0.113.7:9000"), AddressType::Relay)];
+        assert_eq!(
+            classify_peer_route_from_typed(None, &typed),
+            PeerRouteKind::Unknown
+        );
+    }
+
+    #[test]
+    fn test_classify_non_ip_source_is_unknown() {
+        // Bluetooth is a non-IP transport: socket_addr() returns None.
+        let ble = MultiAddr::new(crate::address::TransportAddr::Ble {
+            mac: [0x01, 0x02, 0x03, 0x04, 0x05, 0x06],
+            psm: 128,
+        });
+        let typed = vec![(quic_addr("203.0.113.7:9000"), AddressType::Relay)];
+        assert_eq!(
+            classify_peer_route_from_typed(Some(&ble), &typed),
+            PeerRouteKind::Unknown
+        );
+    }
+
+    #[test]
+    fn test_classify_each_address_type() {
+        let src = quic_addr("203.0.113.7:9000");
+        for (ty, kind) in [
+            (AddressType::Relay, PeerRouteKind::Relay),
+            (AddressType::Direct, PeerRouteKind::Direct),
+            (AddressType::Unverified, PeerRouteKind::Unverified),
+            (AddressType::Lan, PeerRouteKind::Lan),
+        ] {
+            let typed = vec![(src.clone(), ty)];
+            assert_eq!(
+                classify_peer_route_from_typed(Some(&src), &typed),
+                kind,
+                "mismatch for {ty:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_classify_no_match_is_unknown() {
+        let src = quic_addr("198.51.100.42:7000");
+        let typed = vec![
+            (quic_addr("203.0.113.7:9000"), AddressType::Relay),
+            (quic_addr("203.0.113.8:9000"), AddressType::Direct),
+        ];
+        assert_eq!(
+            classify_peer_route_from_typed(Some(&src), &typed),
+            PeerRouteKind::Unknown
+        );
+    }
+
+    #[test]
+    fn test_classify_empty_typed_is_unknown() {
+        let src = quic_addr("203.0.113.7:9000");
+        let typed: Vec<(MultiAddr, AddressType)> = vec![];
+        assert_eq!(
+            classify_peer_route_from_typed(Some(&src), &typed),
+            PeerRouteKind::Unknown
+        );
+    }
+
+    #[test]
+    fn test_classify_duplicate_agreeing_type_dedups() {
+        // Same socket address listed twice with the same type must yield that
+        // type, not Unknown — duplicates are benign.
+        let src = quic_addr("203.0.113.7:9000");
+        let typed = vec![
+            (quic_addr("203.0.113.7:9000"), AddressType::Relay),
+            (quic_addr("203.0.113.7:9000"), AddressType::Relay),
+        ];
+        assert_eq!(
+            classify_peer_route_from_typed(Some(&src), &typed),
+            PeerRouteKind::Relay
+        );
+    }
+
+    #[test]
+    fn test_classify_duplicate_conflicting_types_is_unknown() {
+        // Same socket address tagged with two different AddressTypes is a
+        // phonebook inconsistency. The classifier refuses to guess and
+        // reports Unknown — it does NOT use AddressType::priority to pick a
+        // winner, since that ordering governs dial preference, not the
+        // provenance of an arrived message.
+        let src = quic_addr("203.0.113.7:9000");
+        let typed = vec![
+            (quic_addr("203.0.113.7:9000"), AddressType::Relay),
+            (quic_addr("203.0.113.7:9000"), AddressType::Direct),
+        ];
+        assert_eq!(
+            classify_peer_route_from_typed(Some(&src), &typed),
+            PeerRouteKind::Unknown
+        );
+    }
+
+    #[test]
+    fn test_classify_matches_in_any_position() {
+        // The matching entry need not be first; order is not a signal.
+        let src = quic_addr("203.0.113.9:9000");
+        let typed = vec![
+            (quic_addr("203.0.113.7:9000"), AddressType::Relay),
+            (quic_addr("203.0.113.8:9000"), AddressType::Direct),
+            (quic_addr("203.0.113.9:9000"), AddressType::Lan),
+            (quic_addr("203.0.113.10:9000"), AddressType::Unverified),
+        ];
+        assert_eq!(
+            classify_peer_route_from_typed(Some(&src), &typed),
+            PeerRouteKind::Lan
+        );
+    }
+
+    #[test]
+    fn test_classify_tcp_source_matches_tcp_entry() {
+        // socket_addr() is shared by Quic/Tcp/Udp, so a TCP source matches a
+        // TCP phonebook entry with the same socket address.
+        let src = MultiAddr::tcp("203.0.113.7:9000".parse().unwrap());
+        let typed = vec![(
+            MultiAddr::tcp("203.0.113.7:9000".parse().unwrap()),
+            AddressType::Direct,
+        )];
+        assert_eq!(
+            classify_peer_route_from_typed(Some(&src), &typed),
+            PeerRouteKind::Direct
+        );
+    }
 
     #[tokio::test]
     async fn test_node_config_default() {
