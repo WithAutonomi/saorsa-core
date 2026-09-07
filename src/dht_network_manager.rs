@@ -4791,8 +4791,7 @@ impl DhtNetworkManager {
                     DhtNetworkResult::NodesFound { .. } | DhtNetworkResult::NodesFoundV2 { .. }
                 );
                 let response = self.create_response_message(&message, result)?;
-                let response_bytes = postcard::to_stdvec(&response)
-                    .map_err(|e| P2PError::Serialization(e.to_string().into()))?;
+                let response_bytes = Self::encode_response_message(response)?;
                 if is_nodes_found {
                     self.transport
                         .traffic
@@ -5280,6 +5279,36 @@ impl DhtNetworkManager {
         // Handle broadcast messages (for network-wide announcements)
         debug!("DHT broadcast handling not fully implemented yet");
         Ok(())
+    }
+
+    /// Encode a response within the receiver's message limit, retaining the
+    /// closest complete V2 peer records. Truncating addresses within a record
+    /// would turn a sequenced full replacement into an accidental withdrawal.
+    fn encode_response_message(mut response: DhtNetworkMessage) -> Result<Vec<u8>> {
+        fn encoded_size(value: &impl Serialize) -> Result<usize> {
+            postcard::serialize_with_flavor(value, postcard::ser_flavors::Size::default())
+                .map_err(|error| P2PError::Serialization(error.to_string().into()))
+        }
+
+        let mut size = encoded_size(&response)?;
+        if let Some(DhtNetworkResult::NodesFoundV2 { nodes, .. }) = &mut response.result {
+            while size > MAX_MESSAGE_SIZE {
+                let Some(node) = nodes.pop() else {
+                    break;
+                };
+                size = size.saturating_sub(encoded_size(&node)?);
+            }
+        }
+        // Removing nodes can also shrink the vector's length prefix; retaining
+        // its original size gives a conservative upper bound without repeatedly
+        // serializing the whole response. The envelope is included in this bound.
+        if size > MAX_MESSAGE_SIZE {
+            return Err(P2PError::Validation(
+                "DHT response exceeds the message size limit".into(),
+            ));
+        }
+        postcard::to_stdvec(&response)
+            .map_err(|error| P2PError::Serialization(error.to_string().into()))
     }
 
     /// Create response message
