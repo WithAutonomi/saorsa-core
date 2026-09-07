@@ -530,3 +530,83 @@ async fn v2_completes_an_identical_legacy_projection_at_the_same_sequence() {
         records
     );
 }
+
+#[tokio::test]
+async fn v2_lookup_bounds_the_full_envelope_and_preserves_complete_closest_records() {
+    let node = test_node().await;
+    let manager = node.dht_manager();
+    let mut expected = Vec::new();
+    for (id, ip) in [(0x22, "8.8.8.8"), (0x33, "9.9.9.9"), (0x44, "1.1.1.1")] {
+        let owner = PeerId::from_bytes([id; 32]);
+        seed_peer(manager, owner, &format!("/ip4/{ip}/udp/9000/quic")).await;
+        let mut records = vec![quic_record(&format!("/ip4/{ip}/udp/9000/quic"))];
+        records.extend((0..15).map(|i| TransportAddressRecord {
+            transport: 900 + i,
+            reachability: 901,
+            address: vec![1; 2048],
+        }));
+        let publish = message(
+            owner,
+            DhtNetworkOperation::PublishAddressSetV2 {
+                seq: 10,
+                records: records.clone(),
+            },
+        );
+        let bytes = postcard::to_stdvec(&publish).unwrap();
+        assert!(bytes.len() < MAX_MESSAGE_SIZE);
+        manager
+            .handle_dht_message(&bytes, &owner, None)
+            .await
+            .unwrap();
+        expected.push((owner, records));
+    }
+    let requester = PeerId::from_bytes([0x77; 32]);
+    // The same records fit differently when the request has a larger echoed ID.
+    for (id_len, expected_count) in [(32, 2), (10_000, 1)] {
+        let mut request = message(requester, DhtNetworkOperation::FindNodeV2 { key: [0; 32] });
+        request.message_id = "x".repeat(id_len);
+        let bytes = manager
+            .handle_dht_message(&postcard::to_stdvec(&request).unwrap(), &requester, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(bytes.len() <= MAX_MESSAGE_SIZE);
+        let response: DhtNetworkMessage = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(response.message_id, request.message_id);
+        let Some(DhtNetworkResult::NodesFoundV2 { nodes, .. }) = response.result else {
+            panic!("expected V2 lookup response");
+        };
+        assert_eq!(nodes.len(), expected_count);
+        for (actual, (owner, records)) in nodes.iter().zip(&expected) {
+            assert_eq!(actual.peer_id, *owner);
+            assert_eq!(actual.publish_seq, 10);
+            assert_eq!(actual.records, *records);
+        }
+    }
+}
+
+#[tokio::test]
+async fn v2_response_rejects_an_envelope_that_cannot_fit_even_without_nodes() {
+    let node = test_node().await;
+    let owner = PeerId::from_bytes([0x22; 32]);
+    let mut response = response(owner, owner, 10);
+    response.message_id = "x".repeat(MAX_MESSAGE_SIZE);
+    assert!(DhtNetworkManager::encode_response_message(response).is_err());
+
+    let request = message(owner, DhtNetworkOperation::FindNodeV2 { key: [0; 32] });
+    let empty = node
+        .dht_manager()
+        .create_response_message(
+            &request,
+            DhtNetworkResult::NodesFoundV2 {
+                key: [0; 32],
+                nodes: Vec::new(),
+            },
+        )
+        .unwrap();
+    let expected = postcard::to_stdvec(&empty).unwrap();
+    assert_eq!(
+        DhtNetworkManager::encode_response_message(empty).unwrap(),
+        expected
+    );
+}
