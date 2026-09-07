@@ -694,11 +694,21 @@ mod tests {
         engine1.update_node_stats(&peer, NodeStatisticsUpdate::FailedResponse);
         engine2.update_node_stats_weighted(&peer, NodeStatisticsUpdate::FailedResponse, 1.0);
 
-        let diff = (engine1.score(&peer) - engine2.score(&peer)).abs();
-        assert!(
-            diff < 1e-10,
-            "unit-weight paths should be equivalent, diff={diff}"
-        );
+        // Compare the recorded updates. score() applies wall-clock decay on
+        // each read, so scheduler delays between reads obscure equivalence.
+        let score1 = engine1
+            .peers
+            .read()
+            .get(&peer)
+            .expect("unit-weight record")
+            .score;
+        let score2 = engine2
+            .peers
+            .read()
+            .get(&peer)
+            .expect("weighted record")
+            .score;
+        assert_eq!(score1, score2, "unit-weight paths should be equivalent");
     }
 
     // =======================================================================
