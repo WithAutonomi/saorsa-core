@@ -27,11 +27,13 @@ Key design decisions are documented in [docs/adr/](docs/adr/):
 | [ADR-008](docs/adr/ADR-008-bootstrap-delegation.md) | Bootstrap Delegation | Historical bootstrap design |
 | [ADR-009](docs/adr/ADR-009-sybil-protection.md) | Sybil Protection | Multi-layered defense against identity attacks |
 | [ADR-012](docs/adr/ADR-012-identity-without-pow.md) | Identity without PoW | Pure cryptographic identity using ML-DSA |
+| [ADR-016](docs/adr/ADR-016-transport-independent-iterative-lookups.md) | Transport-independent iterative lookups | One complete Kademlia lookup engine for native QUIC and browser WebTransport |
 
 ## Features
 
 - **P2P NAT Traversal**: True peer-to-peer connectivity with automatic NAT traversal (saorsa-transport 0.21.x)
 - **DHT (Distributed Hash Table)**: Peer phonebook and routing with geographic awareness
+- **Portable DHT Lookup Engine**: A generic iterative lookup runner shared by native QUIC and WebAssembly clients
 - **QUIC Transport**: High-performance networking with saorsa-transport
 - **Post-Quantum Cryptography**: Future-ready cryptographic algorithms (ML-DSA-65, ML-KEM-768)
 - **Trust System**: Response-rate scoring with time decay and binary peer blocking
@@ -80,7 +82,8 @@ saorsa-core does **not** replicate application data. saorsa-node:
 
 1. **Network Layer**: QUIC-based P2P networking with automatic NAT traversal (saorsa-transport 0.26)
 2. **DHT**: Kademlia-based peer phonebook with geographic awareness
-3. **Trust System**: Response-rate scoring with time decay and binary peer blocking
+3. **DHT Lookup Engine**: Transport-independent XOR ordering, α-batching, peer states, candidate bounds, and convergence
+4. **Trust System**: Response-rate scoring with time decay and binary peer blocking
 
 ### Cryptographic Architecture
 

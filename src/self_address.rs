@@ -111,14 +111,6 @@ pub(crate) struct SelfAddressSet {
 }
 
 impl SelfAddressSet {
-    pub(crate) fn is_empty(&self) -> bool {
-        self.relay.is_none()
-            && self.wan_v4.is_none()
-            && self.wan_v6.is_none()
-            && self.lan_v4.is_none()
-            && self.lan_v6.is_none()
-    }
-
     pub(crate) fn into_typed_vec(self) -> Vec<(MultiAddr, AddressType)> {
         let mut typed = Vec::with_capacity(self.len());
         if let Some(relay) = self.relay {
@@ -130,6 +122,7 @@ impl SelfAddressSet {
         typed
     }
 
+    #[cfg(test)]
     pub(crate) fn into_parallel_vecs(self) -> (Vec<MultiAddr>, Vec<AddressType>) {
         let mut addresses = Vec::with_capacity(self.len());
         let mut address_types = Vec::with_capacity(self.len());

@@ -104,7 +104,7 @@ fn xor_distance_bytes(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
 /// Maximum addresses stored per node to prevent memory exhaustion.
 /// This cap is the last-line guard; in normal operation the per-IP-family
 /// cap ([`NodeInfo::enforce_per_ip_family_cap`]) holds each external peer
-/// to at most 2 IP addresses per family. Non-IP transports (Bluetooth,
+/// to at most 3 IP addresses per family. Non-IP transports (Bluetooth,
 /// LoRa) are outside the per-family cap and rely on this bound.
 const MAX_ADDRESSES_PER_NODE: usize = 8;
 
@@ -388,7 +388,6 @@ impl NodeInfo {
     /// same-family tier (Direct) — they add no useful WAN dial option once
     /// the stronger one is known. A dual-stack peer may therefore hold
     /// up to 6 IP addresses (3 per family).
-    ///
     /// Non-IP transport addresses (Bluetooth, LoRa) are left alone — they
     /// have no IP family and are governed only by [`MAX_ADDRESSES_PER_NODE`].
     ///
@@ -524,7 +523,7 @@ pub(crate) struct BucketRefreshCandidate {
 }
 
 #[derive(Debug, Clone, Copy)]
-enum AddressReplaceMode {
+pub(crate) enum AddressReplaceMode {
     /// The subject peer sent the address set over an authenticated channel.
     /// This proves liveness, so the peer and bucket recency are refreshed.
     AuthenticatedSelfPublish,
@@ -1657,6 +1656,11 @@ impl DhtCoreEngine {
         Ok(routing.find_closest_nodes_with_publish_seq(key, count))
     }
 
+    /// Latest authoritative address-set sequence known for `node_id`.
+    pub async fn publish_seq_for_node(&self, node_id: &PeerId) -> u64 {
+        self.routing_table.read().await.publish_seq_for(node_id)
+    }
+
     /// Find nodes closest to a key, including self as a candidate.
     /// Used by consumers for storage responsibility determination.
     #[allow(dead_code)]
@@ -1930,6 +1934,33 @@ impl DhtCoreEngine {
         };
         let mut routing = self.routing_table.write().await;
         routing.replace_node_addresses(node_id, filtered, seq)
+    }
+
+    /// Apply the native projection of a validated complete V2 address set.
+    /// An empty projection withdraws QUIC addresses even when other transports
+    /// remain in the full record. Legacy publication retains its empty-input
+    /// rejection semantics.
+    pub(crate) async fn replace_transport_address_projection(
+        &self,
+        node_id: &PeerId,
+        typed_addresses: Vec<(MultiAddr, AddressType)>,
+        seq: u64,
+        mode: AddressReplaceMode,
+    ) -> bool {
+        if typed_addresses.iter().any(|(address, _)| {
+            !address.is_quic()
+                || !is_storable_address(address)
+                || (!self.allow_loopback
+                    && address
+                        .ip()
+                        .is_some_and(|ip| canonicalize_ip(ip).is_loopback()))
+        }) {
+            return false;
+        }
+        self.routing_table
+            .write()
+            .await
+            .replace_node_addresses_with_mode(node_id, typed_addresses, seq, mode)
     }
 
     /// Replace a peer's advertised address list from sequence-bearing gossip
@@ -4907,6 +4938,17 @@ mod tests {
         assert!(AddressType::Relay.priority() < AddressType::Direct.priority());
         assert!(AddressType::Direct.priority() < AddressType::Unverified.priority());
         assert!(AddressType::Unverified.priority() < AddressType::Lan.priority());
+    }
+
+    #[test]
+    fn legacy_address_type_postcard_discriminants_remain_unchanged() {
+        assert_eq!(postcard::to_stdvec(&AddressType::Relay).unwrap(), vec![0]);
+        assert_eq!(postcard::to_stdvec(&AddressType::Direct).unwrap(), vec![1]);
+        assert_eq!(
+            postcard::to_stdvec(&AddressType::Unverified).unwrap(),
+            vec![2]
+        );
+        assert_eq!(postcard::to_stdvec(&AddressType::Lan).unwrap(), vec![3]);
     }
 
     #[test]
