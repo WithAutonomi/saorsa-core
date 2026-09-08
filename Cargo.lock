@@ -535,25 +535,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "790eea4361631c5e7d22598ecd5723ff611904e3344ce8720784c93e3d83d40b"
 
 [[package]]
-name = "crossbeam-deque"
-version = "0.8.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5181e0de7b61eb03a81e347d6dd8797bae9da5146707b51077e2d71a54ec0ceb"
-dependencies = [
- "crossbeam-epoch",
- "crossbeam-utils",
-]
-
-[[package]]
-name = "crossbeam-epoch"
-version = "0.9.20"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d6914041f254d6e9176c01941b21115dcfb7089e55135a35411081bd106ef3f"
-dependencies = [
- "crossbeam-utils",
-]
-
-[[package]]
 name = "crossbeam-utils"
 version = "0.8.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -715,12 +696,6 @@ name = "dunce"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
-
-[[package]]
-name = "either"
-version = "1.18.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "252afb9ae5eaa683babdc6a068b3f5726eb19e05070c731f9b2a23a7c3e8ed34"
 
 [[package]]
 name = "elliptic-curve"
@@ -2035,26 +2010,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rayon"
-version = "1.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fb39b166781f92d482534ef4b4b1b2568f42613b53e5b6c160e24cfbfa30926d"
-dependencies = [
- "either",
- "rayon-core",
-]
-
-[[package]]
-name = "rayon-core"
-version = "1.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "22e18b0f0062d30d4230b2e85ff77fdfe4326feb054b9783a3460d8435c8ab91"
-dependencies = [
- "crossbeam-deque",
- "crossbeam-utils",
-]
-
-[[package]]
 name = "rcgen"
 version = "0.14.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2376,8 +2331,7 @@ dependencies = [
 [[package]]
 name = "saorsa-pqc"
 version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a2ed2e429e5673763625ca5285bcbf15270fa16918cb5e63fc95ababacbb1a4c"
+source = "git+https://github.com/saorsa-labs/saorsa-pqc?rev=6d57e9dd73d537182fe85b0050e809a224f21154#6d57e9dd73d537182fe85b0050e809a224f21154"
 dependencies = [
  "aead",
  "aes-gcm",
@@ -2388,18 +2342,16 @@ dependencies = [
  "fips203",
  "fips204",
  "fips205",
- "futures",
+ "getrandom 0.2.17",
  "hkdf",
  "hmac",
  "hpke",
- "libc",
  "log",
  "pbkdf2",
  "postcard",
  "rand 0.8.8",
  "rand_chacha",
  "rand_core 0.6.4",
- "rayon",
  "serde",
  "serde_json",
  "sha2",
@@ -2407,7 +2359,6 @@ dependencies = [
  "subtle",
  "thiserror",
  "time",
- "tokio",
  "tracing",
  "wide",
  "zeroize",
@@ -2416,7 +2367,7 @@ dependencies = [
 [[package]]
 name = "saorsa-transport"
 version = "0.36.3"
-source = "git+https://github.com/WithAutonomi/saorsa-transport.git?rev=d2147379ae45ecccc28fb8313ec1d42efac407f6#d2147379ae45ecccc28fb8313ec1d42efac407f6"
+source = "git+https://github.com/WithAutonomi/saorsa-transport?rev=52c800ae828a47d88ad9cb553a2cd1b5d364d3eb#52c800ae828a47d88ad9cb553a2cd1b5d364d3eb"
 dependencies = [
  "anyhow",
  "async-trait",

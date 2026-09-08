@@ -6,27 +6,27 @@
 // option. This file may not be copied, modified, or distributed except
 // according to those terms.
 
-//! Integration with saorsa-transport's post-quantum cryptography
+//! Integration with saorsa-pqc's post-quantum cryptography
 //!
-//! This module provides integration with saorsa-transport's post-quantum
+//! This module provides integration with saorsa-pqc's post-quantum
 //! cryptography features, making them available to saorsa-core applications.
 
 use anyhow::Result;
 use once_cell::sync::Lazy;
 
-// Re-export key saorsa-transport PQC types from types module
+// Re-export key saorsa-pqc PQC types from types module
 // Note: saorsa-transport 0.14+ is pure PQC only (no hybrid mode)
-pub use saorsa_transport::crypto::pqc::types::{MlDsaPublicKey, MlDsaSecretKey, MlDsaSignature};
+pub use saorsa_pqc::pqc::types::{MlDsaPublicKey, MlDsaSecretKey, MlDsaSignature};
 
 // Re-export ML-DSA algorithm implementation
-pub use saorsa_transport::crypto::pqc::MlDsa65;
+pub use saorsa_pqc::pqc::MlDsa65;
 
 // Re-export PQC trait for ML-DSA operations
-pub use saorsa_transport::crypto::pqc::MlDsaOperations;
+pub use saorsa_pqc::pqc::MlDsaOperations;
 
 static ML_DSA: Lazy<MlDsa65> = Lazy::new(MlDsa65::new);
 
-/// Generate ML-DSA-65 key pair using saorsa-transport's implementation
+/// Generate ML-DSA-65 key pair using saorsa-pqc's implementation
 pub fn generate_ml_dsa_keypair() -> Result<(MlDsaPublicKey, MlDsaSecretKey)> {
     let (public_key, secret_key) = ML_DSA
         .generate_keypair()
@@ -34,14 +34,14 @@ pub fn generate_ml_dsa_keypair() -> Result<(MlDsaPublicKey, MlDsaSecretKey)> {
     Ok((public_key, secret_key))
 }
 
-/// Sign a message using ML-DSA-65 with saorsa-transport's implementation
+/// Sign a message using ML-DSA-65 with saorsa-pqc's implementation
 pub fn ml_dsa_sign(secret_key: &MlDsaSecretKey, message: &[u8]) -> Result<MlDsaSignature> {
     ML_DSA
         .sign(secret_key, message)
         .map_err(|e| anyhow::anyhow!("Failed to sign with ML-DSA: {}", e))
 }
 
-/// Verify a signature using ML-DSA-65 with saorsa-transport's implementation
+/// Verify a signature using ML-DSA-65 with saorsa-pqc's implementation
 pub fn ml_dsa_verify(
     public_key: &MlDsaPublicKey,
     message: &[u8],

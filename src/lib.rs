@@ -33,22 +33,36 @@
 #![warn(rust_2018_idioms)]
 
 // Internal modules — used by the crate but not exposed publicly.
+#[cfg(feature = "native")]
 pub(crate) mod adaptive;
 pub(crate) mod address;
+#[cfg(feature = "native")]
 pub(crate) mod bgp_geo_provider;
+#[cfg(feature = "native")]
 pub(crate) mod bootstrap;
+#[cfg(feature = "native")]
 pub(crate) mod dht;
+#[cfg(feature = "native")]
 pub(crate) mod dht_network_manager;
 pub(crate) mod error;
+#[cfg(feature = "native")]
 pub(crate) mod network;
+mod peer_record;
 pub(crate) mod quantum_crypto;
+#[cfg(feature = "native")]
 pub(crate) mod rate_limit;
+#[cfg(feature = "native")]
 pub(crate) mod reachability;
+#[cfg(feature = "native")]
 pub(crate) mod security;
+#[cfg(feature = "native")]
 pub(crate) mod self_address;
+#[cfg(feature = "native")]
 pub(crate) mod transport;
 pub(crate) mod transport_address;
+#[cfg(feature = "native")]
 pub(crate) mod transport_handle;
+#[cfg(feature = "native")]
 pub(crate) mod validation;
 
 /// User identity and privacy system (public — accessed via path by saorsa-node).
@@ -60,26 +74,37 @@ pub mod identity;
 
 // Networking
 pub use address::{MultiAddr, WebRtcCertificateHash, WebRtcDirectAddr};
+#[cfg(feature = "native")]
 pub use network::{NodeConfig, NodeMode, P2PEvent, P2PNode};
 
 // DHT types — peer discovery, routing, and network events
-pub use dht::Key;
-pub use dht_network_manager::{DHTNode, DhtNetworkEvent, ResponderView, WitnessedCloseGroup};
+/// DHT key type (256 bits).
+pub type Key = [u8; 32];
+#[cfg(feature = "native")]
+pub use dht_network_manager::DhtNetworkEvent;
+pub use peer_record::{AddressType, DHTNode, ResponderView, WitnessedCloseGroup};
 pub use saorsa_dht_lookup::{
     CandidateInsertion, IterativeLookup, LookupConfig, LookupError, LookupKey, LookupNode,
     LookupPeerState, LookupProgress, LookupQuery, LookupQueryOutcome, LookupRunError,
-    LookupTermination, run_iterative_lookup, xor_distance,
+    LookupTermination, collect_after_first_with_grace, run_iterative_lookup, xor_distance,
 };
-pub use transport_address::{KnownReachability, KnownTransport, TransportAddressRecord};
+pub use transport_address::{
+    KnownReachability, KnownTransport, MAX_TRANSPORT_ADDRESS_PAYLOAD,
+    MAX_TRANSPORT_ADDRESS_RECORDS, TransportAddressRecord,
+};
 
 // Close-group cache
+#[cfg(feature = "native")]
 pub use bootstrap::{CachedCloseGroupPeer, CloseGroupCache};
 
 // Trust & Adaptive DHT
+#[cfg(feature = "native")]
 pub use adaptive::dht::{AdaptiveDhtConfig, TrustEvent};
+#[cfg(feature = "native")]
 pub use adaptive::trust::{TrustEngine, TrustRecord};
 
 // Security
+#[cfg(feature = "native")]
 pub use security::IPDiversityConfig;
 
 // Post-quantum cryptography
@@ -94,4 +119,5 @@ pub use identity::peer_id::PeerId;
 pub(crate) use error::{P2PError, P2pResult as Result};
 
 /// Default capacity for broadcast and mpsc event channels throughout the system.
+#[cfg(feature = "native")]
 pub(crate) const DEFAULT_EVENT_CHANNEL_CAPACITY: usize = 1000;
