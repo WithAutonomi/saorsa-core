@@ -1229,7 +1229,7 @@ fn mask_ipv6(addr: Ipv6Addr, prefix_len: u8) -> Ipv6Addr {
 /// Default K parameter — number of closest nodes per bucket.
 /// Used only by test helpers; production code reads from config.
 #[cfg(test)]
-const DEFAULT_K: usize = 20;
+const DEFAULT_K: usize = crate::dht_lookup::DEFAULT_K_VALUE;
 
 // IP_EXACT_LIMIT and ip_subnet_limit are imported from crate::security
 // to keep a single source of truth for diversity constants.
