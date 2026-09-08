@@ -5,7 +5,9 @@
 //! does not know a future transport or reachability identifier can still
 //! decode, retain, and forward the record without interpreting it.
 
-use crate::{MultiAddr, dht::AddressType};
+#[cfg(any(feature = "native", test))]
+use crate::AddressType;
+use crate::MultiAddr;
 use serde::{Deserialize, Serialize};
 
 /// Maximum encoded address payload accepted from the network.
@@ -93,6 +95,7 @@ impl KnownReachability {
     }
 
     #[must_use]
+    #[cfg(any(feature = "native", test))]
     pub(crate) const fn from_legacy(value: AddressType) -> Self {
         match value {
             AddressType::Relay => Self::Relay,
@@ -103,6 +106,7 @@ impl KnownReachability {
     }
 
     #[must_use]
+    #[cfg(any(feature = "native", test))]
     pub(crate) const fn into_legacy(self) -> AddressType {
         match self {
             Self::Relay => AddressType::Relay,
@@ -170,11 +174,13 @@ impl TransportAddressRecord {
     }
 
     #[must_use]
+    #[cfg(any(feature = "native", test))]
     pub(crate) fn legacy_reachability(&self) -> Option<AddressType> {
         KnownReachability::from_id(self.reachability).map(KnownReachability::into_legacy)
     }
 
     #[must_use]
+    #[cfg(any(feature = "native", test))]
     pub(crate) fn is_within_wire_bounds(&self) -> bool {
         !self.address.is_empty() && self.address.len() <= MAX_TRANSPORT_ADDRESS_PAYLOAD
     }

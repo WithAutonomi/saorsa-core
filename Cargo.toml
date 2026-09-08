@@ -43,49 +43,53 @@ default-target = "x86_64-unknown-linux-gnu"
 members = ["crates/saorsa-dht-lookup"]
 resolver = "2"
 
+[features]
+default = ["native"]
+# Native networking and persistence; identity, addresses, crypto and lookup are portable.
+native = ["saorsa-transport/default", "dep:tokio", "dep:uuid", "dep:dirs", "dep:tempfile", "dep:tokio-util", "dep:parking_lot", "dep:dashmap", "dep:lru", "dep:async-trait", "dep:bytes"]
+
 [dependencies]
 # Core async and serialization
-tokio = { version = "1.49", features = ["full"] }
+tokio = { version = "1.49", features = ["full"] , optional = true }
 futures = "0.3"
-async-trait = "0.1"
+async-trait = { version = "0.1", optional = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 anyhow = "1.0"
 thiserror = "2.0"
 tracing = "0.1"
-uuid = { version = "1.14", features = ["v4", "serde"] }
-bytes = "1.10"
+uuid = { version = "1.14", features = ["v4", "serde"] , optional = true }
+bytes = { version = "1.10", optional = true }
 hex = "0.4"
 
 # Cryptography - Primary source of truth: saorsa-pqc
-saorsa-pqc = "0.5"
+saorsa-pqc = { version = "0.5", git = "https://github.com/saorsa-labs/saorsa-pqc", rev = "6d57e9dd73d537182fe85b0050e809a224f21154" }
 rand = "0.8"
 blake3 = "1.6"
 
 # Performance optimization
-parking_lot = "0.12"
+parking_lot = { version = "0.12", optional = true }
 once_cell = "1.21"
-dashmap = "6"
+dashmap = { version = "6", optional = true }
 
 # Networking
 # Cross-repository WebRTC Direct support. Pin the draft dependency so this
 # branch builds in CI until the corresponding saorsa-transport release lands.
-saorsa-transport = { version = "0.36.3", git = "https://github.com/WithAutonomi/saorsa-transport.git", rev = "d2147379ae45ecccc28fb8313ec1d42efac407f6" }
+saorsa-transport = { version = "0.36.3", git = "https://github.com/WithAutonomi/saorsa-transport", rev = "52c800ae828a47d88ad9cb553a2cd1b5d364d3eb", default-features = false }
 
 # Core-specific dependencies
 saorsa-dht-lookup = { version = "0.1.0", path = "crates/saorsa-dht-lookup" }
-dirs = "6.0"
+dirs = { version = "6.0", optional = true }
 postcard = { version = "1.1.3", features = ["use-std"] }
-lru = "0.16"
-tempfile = "3.17"
-tokio-util = { version = "0.7", features = ["rt"] }
+lru = { version = "0.16", optional = true }
+tempfile = { version = "3.17", optional = true }
+tokio-util = { version = "0.7", features = ["rt"] , optional = true }
 
 # Fix wyz 0.5.0 compatibility issue with tap 1.0 (CI build failure)
 wyz = "=0.5.1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-
 
 [dev-dependencies]
 tempfile = "3.17"
