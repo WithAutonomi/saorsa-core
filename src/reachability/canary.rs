@@ -876,6 +876,7 @@ mod tests {
             address_types: vec![AddressType::Direct],
             distance: None,
             reliability: 1.0,
+            address_authority: None,
         }
     }
 

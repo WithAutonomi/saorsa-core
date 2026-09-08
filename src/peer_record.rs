@@ -102,6 +102,9 @@ pub struct DHTNode {
     /// fresher address records without changing the wire shape for older nodes.
     pub distance: Option<Vec<u8>>,
     pub reliability: f64,
+    /// Locally established ownership proof; never trusted through deserialization.
+    #[serde(skip)]
+    pub address_authority: Option<crate::signed_address::AddressAuthority>,
 }
 
 impl LookupNode for DHTNode {
@@ -180,25 +183,21 @@ impl DHTNode {
         typed.into_iter().map(|(addr, _)| addr).collect()
     }
 
-    /// Merge another `DHTNode`'s typed addresses into this one.
+    /// Combine lookup views without contaminating an owner-proven replacement.
     ///
-    /// Each incoming `(addr, ty)` pair is added if the address is not
-    /// already present; if it is present, the type is upgraded when the
-    /// incoming tag has strictly higher priority (e.g. an existing
-    /// `Unverified` is promoted to `Relay` when a Relay-tagged duplicate
-    /// arrives). The final list is sorted by [`AddressType::priority`]
-    /// and capped at the incoming node's entry count plus the existing
-    /// entries — no arbitrary truncation.
-    ///
-    /// Intended for the iterative FIND_NODE path in
-    /// `DhtNetworkManager::find_closest_nodes_network`: different
-    /// responders may have different views of the same peer (one saw
-    /// only a connection-observed listen port, another received the
-    /// peer's `PublishAddressSet` with a Relay entry), and merging all
-    /// of them gives the caller the union — so `select_dial_candidates`
-    /// can pick the best tier rather than being locked into whichever
-    /// response happened to arrive first.
+    /// A newer owner-proven sequence replaces the complete view. Older records
+    /// and unsigned hints cannot change it. When both views are unsequenced,
+    /// merge their addresses and retain the strongest tag for each duplicate.
     pub fn merge_from(&mut self, other: DHTNode) {
+        // A verified replacement is a complete view, never a union with hints.
+        let current_seq = dht_node_publish_seq(self);
+        let other_seq = dht_node_publish_seq(&other);
+        if current_seq != 0 || other_seq != 0 {
+            if other_seq > current_seq {
+                *self = other;
+            }
+            return;
+        }
         // Pad own address_types to match addresses length (defensive
         // against legacy entries with trailing untagged addresses).
         while self.address_types.len() < self.addresses.len() {
@@ -259,6 +258,13 @@ pub(crate) fn encode_publish_seq_distance(seq: u64) -> Option<Vec<u8>> {
 }
 
 pub(crate) fn dht_node_publish_seq(node: &DHTNode) -> u64 {
+    node.address_authority
+        .as_ref()
+        .map_or(0, |authority| authority.sequence())
+}
+
+#[cfg(feature = "native")]
+pub(crate) fn advertised_publish_seq(node: &DHTNode) -> u64 {
     let Some(distance) = node.distance.as_deref() else {
         return 0;
     };

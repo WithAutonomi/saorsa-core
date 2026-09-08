@@ -206,6 +206,14 @@ impl MultiAddr {
         }
     }
 
+    /// Whether this address can be retained in an advertised peer record.
+    /// Rejects wildcard IPs and port zero; loopback remains valid for local devnets.
+    #[must_use]
+    pub fn is_storable(&self) -> bool {
+        self.socket_addr()
+            .is_none_or(|sa| !sa.ip().is_unspecified() && sa.port() != 0)
+    }
+
     /// Returns the IP address for IP-based transports, `None` otherwise.
     #[must_use]
     pub fn ip(&self) -> Option<IpAddr> {

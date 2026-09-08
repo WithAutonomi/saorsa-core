@@ -126,6 +126,7 @@ impl KnownReachability {
 pub struct TransportAddressRecord {
     pub transport: u16,
     pub reachability: u16,
+    #[serde(deserialize_with = "bounded_address")]
     pub address: Vec<u8>,
 }
 
@@ -184,6 +185,10 @@ impl TransportAddressRecord {
     pub(crate) fn is_within_wire_bounds(&self) -> bool {
         !self.address.is_empty() && self.address.len() <= MAX_TRANSPORT_ADDRESS_PAYLOAD
     }
+}
+
+fn bounded_address<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+    crate::signed_address::bounded_vec::<_, _, MAX_TRANSPORT_ADDRESS_PAYLOAD>(d)
 }
 
 #[cfg(test)]

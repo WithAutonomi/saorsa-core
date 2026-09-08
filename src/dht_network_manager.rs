@@ -35,7 +35,7 @@ use crate::{
     dht::core_engine::{AddressType, AtomicInstant, BucketRefreshCandidate, NodeInfo},
     dht::{AdmissionResult, DhtCoreEngine, DhtKey, Key, RoutingTableEvent},
     error::{DhtError, IdentityError, NetworkError},
-    network::{NodeConfig, NodeMode, supports_address_v2},
+    network::{NodeConfig, NodeMode, supports_address_v2, supports_signed_addresses},
     rate_limit::{Engine, SharedEngine},
     reachability::canary::{
         RELAY_CANARY_HANDLER_TIMEOUT, RELAY_CANARY_PROTOCOL, RELAY_CANARY_WIRE_TOPIC,
@@ -77,7 +77,9 @@ const MIN_CONCURRENT_OPERATIONS: usize = 10;
 /// nodes that predate extensible transport-address publication.
 const DHT_V1_TOPIC: &str = "/dht/1.0.0";
 
-/// Capability-gated DHT topic carrying the extensible address V2 operations.
+/// Capability-gated DHT topic carrying owner-signed publications.
+const DHT_SIGNED_TOPIC: &str = "/dht/address/signed/1.0.0";
+/// Capability-gated extensible unsigned address protocol.
 const DHT_V2_TOPIC: &str = "/dht/address/2.0.0";
 
 /// Bound opaque V2 gossip retained outside the routing table.
@@ -86,6 +88,10 @@ const MAX_STORED_TRANSPORT_ADDRESS_SETS: usize = 4096;
 /// Maximum size for incoming DHT messages (64 KB) to prevent memory exhaustion DoS
 /// Messages larger than this are rejected before deserialization
 const MAX_MESSAGE_SIZE: usize = 64 * 1024;
+/// Signed proofs need more space to carry a complete closest-peer response.
+// Leave room for the transport envelope within its default 1 MiB limit.
+const MAX_SIGNED_MESSAGE_SIZE: usize = 960 * 1024;
+const MAX_SIGNED_LOOKUP_NODES: usize = 256;
 
 /// Request timeout for DHT message handlers (10 seconds)
 /// Prevents long-running handlers from starving the semaphore permit pool
@@ -452,6 +458,7 @@ const IDENTITY_MISMATCH_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransportDhtNode {
     peer_id: PeerId,
+    #[serde(deserialize_with = "bounded_transport_records")]
     records: Vec<TransportAddressRecord>,
     publish_seq: u64,
     reliability: f64,
@@ -461,11 +468,34 @@ pub struct TransportDhtNode {
 struct StoredTransportAddressSet {
     seq: u64,
     records: Vec<TransportAddressRecord>,
+    proof: Option<VerifiedAddressRecord>,
+}
+
+/// Lookup entry with an optional immutable owner proof; unsigned entries are hints.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignedTransportDhtNode {
+    node: TransportDhtNode,
+    proof: Option<SignedAddressRecord>,
 }
 
 #[allow(unused_imports)]
 pub use crate::peer_record::{DHTNode, ResponderView, SerializableDHTNode, WitnessedCloseGroup};
-use crate::peer_record::{dht_node_publish_seq, encode_publish_seq_distance};
+use crate::peer_record::{
+    advertised_publish_seq, dht_node_publish_seq, encode_publish_seq_distance,
+};
+use crate::signed_address::{AddressAuthority, SignedAddressRecord, VerifiedAddressRecord};
+
+fn bounded_transport_records<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<Vec<TransportAddressRecord>, D::Error> {
+    crate::signed_address::bounded_vec::<_, _, MAX_TRANSPORT_ADDRESS_RECORDS>(d)
+}
+
+fn bounded_signed_nodes<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<Vec<SignedTransportDhtNode>, D::Error> {
+    crate::signed_address::bounded_vec::<_, _, MAX_SIGNED_LOOKUP_NODES>(d)
+}
 
 /// DHT Network Manager Configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -519,6 +549,10 @@ pub enum DhtNetworkOperation {
         seq: u64,
         records: Vec<TransportAddressRecord>,
     },
+    /// Capability-negotiated lookup carrying independently verifiable owner records.
+    FindNodeSigned { key: Key },
+    /// Original owner-signed publication, forwarded without modification.
+    PublishAddressSetSigned { record: SignedAddressRecord },
 }
 
 /// DHT network operation result
@@ -551,6 +585,12 @@ pub enum DhtNetworkResult {
     NodesFoundV2 {
         key: Key,
         nodes: Vec<TransportDhtNode>,
+    },
+    /// Signed address records with legacy hints for owners not yet upgraded.
+    NodesFoundSigned {
+        key: Key,
+        #[serde(deserialize_with = "bounded_signed_nodes")]
+        nodes: Vec<SignedTransportDhtNode>,
     },
 }
 
@@ -687,6 +727,7 @@ pub struct DhtNetworkManager {
     /// Latest complete V2 address record for each known peer. Unknown record
     /// identifiers remain opaque so this node can forward future transports.
     transport_address_sets: RwLock<HashMap<PeerId, StoredTransportAddressSet>>,
+    local_signed_addresses: RwLock<Option<VerifiedAddressRecord>>,
 }
 
 /// Outcome of a shared dial+identity-exchange attempt, broadcast to
@@ -1549,6 +1590,7 @@ impl DhtNetworkManager {
             )),
             supplemental_self_addresses: RwLock::new(Vec::new()),
             transport_address_sets: RwLock::new(HashMap::new()),
+            local_signed_addresses: RwLock::new(None),
         })
     }
 
@@ -1570,7 +1612,14 @@ impl DhtNetworkManager {
         peer_id: &PeerId,
         key: Key,
     ) -> DhtNetworkOperation {
-        if self.peer_supports_address_v2(peer_id).await {
+        if self
+            .transport
+            .peer_user_agent(peer_id)
+            .await
+            .is_some_and(|ua| supports_signed_addresses(&ua))
+        {
+            DhtNetworkOperation::FindNodeSigned { key }
+        } else if self.peer_supports_address_v2(peer_id).await {
             DhtNetworkOperation::FindNodeV2 { key }
         } else {
             DhtNetworkOperation::FindNode { key }
@@ -1784,6 +1833,11 @@ impl DhtNetworkManager {
                 tokio::select! {
                     () = shutdown.cancelled() => break,
                     _ = async {
+                        // Renew signatures and re-forward the current nonempty record
+                        // even when addresses and the routing membership are unchanged.
+                        let local = this.local_dht_node().await;
+                        let peers = this.routing_table_peers().await;
+                        this.publish_address_set_to_peers(local.typed_addresses(), &peers).await;
                         if let Err(e) = this.trigger_self_lookup().await {
                             warn!("Periodic self-lookup failed: {e}");
                         }
@@ -2511,6 +2565,8 @@ impl DhtNetworkManager {
                     addresses: node.addresses,
                     distance: encode_publish_seq_distance(publish_seq),
                     reliability: SELF_RELIABILITY_SCORE,
+                    address_authority: (publish_seq != 0)
+                        .then_some(AddressAuthority::AuthenticatedOwner(publish_seq)),
                 })
                 .collect(),
             Err(e) => {
@@ -2859,6 +2915,7 @@ impl DhtNetworkManager {
             address_types,
             distance: None,
             reliability: SELF_RELIABILITY_SCORE,
+            address_authority: None,
         }
     }
 
@@ -3109,7 +3166,7 @@ impl DhtNetworkManager {
         else {
             return false;
         };
-        self.store_transport_address_set(owner, seq, records, native, true)
+        self.store_transport_address_set(owner, seq, records, native, true, None)
             .await
     }
 
@@ -3120,6 +3177,7 @@ impl DhtNetworkManager {
         mut records: Vec<TransportAddressRecord>,
         native: Vec<(MultiAddr, AddressType)>,
         authoritative: bool,
+        proof: Option<VerifiedAddressRecord>,
     ) -> bool {
         // Lock ordering is always DHT, then V2 sets. The outer DHT write
         // guard makes native readers and other publications observe a complete
@@ -3181,43 +3239,173 @@ impl DhtNetworkManager {
         {
             sets.remove(&evict);
         }
-        sets.insert(*owner, StoredTransportAddressSet { seq, records });
+        sets.insert(
+            *owner,
+            StoredTransportAddressSet {
+                seq,
+                records,
+                proof,
+            },
+        );
         true
     }
 
+    // Legacy V2 third-party records are hints, never owner-authoritative cache writes.
     async fn normalize_v2_nodes(
         &self,
         nodes: Vec<TransportDhtNode>,
         transport_source: Option<&MultiAddr>,
     ) -> Vec<DHTNode> {
-        let mut normalized = Vec::with_capacity(nodes.len());
+        let mut normalized = Vec::new();
         for node in nodes {
-            let Some((records, native)) = self
+            if let Some((_, native)) = self
                 .validate_transport_address_records(&node.peer_id, node.records, transport_source)
                 .await
-            else {
-                continue;
-            };
-            if node.publish_seq != 0 {
-                self.store_transport_address_set(
-                    &node.peer_id,
-                    node.publish_seq,
-                    records,
-                    native.clone(),
-                    false,
-                )
-                .await;
+            {
+                let (addresses, address_types) = native.into_iter().unzip();
+                let hint = DHTNode {
+                    peer_id: node.peer_id,
+                    addresses,
+                    address_types,
+                    distance: None,
+                    reliability: node.reliability,
+                    address_authority: None,
+                };
+                normalized.push(self.protect_owner_view(hint).await);
             }
-            let (addresses, address_types): (Vec<_>, Vec<_>) = native.into_iter().unzip();
-            normalized.push(DHTNode {
-                peer_id: node.peer_id,
-                addresses,
-                address_types,
-                distance: encode_publish_seq_distance(node.publish_seq),
-                reliability: node.reliability,
-            });
         }
         normalized
+    }
+
+    async fn apply_signed_address_set(
+        &self,
+        proof: VerifiedAddressRecord,
+        transport_source: Option<&MultiAddr>,
+    ) -> bool {
+        let owner = proof.owner();
+        let Some((records, native)) = self
+            .validate_transport_address_records(&owner, proof.records().to_vec(), transport_source)
+            .await
+        else {
+            return false;
+        };
+        self.store_transport_address_set(
+            &owner,
+            proof.sequence(),
+            records,
+            native,
+            false,
+            Some(proof),
+        )
+        .await
+    }
+
+    // Return local owner-proven state instead of a third party's conflicting hint.
+    async fn protect_owner_view(&self, mut hint: DHTNode) -> DHTNode {
+        hint.distance = None;
+        hint.address_authority = None;
+        let dht = self.dht.read().await;
+        let sets = self.transport_address_sets.read().await;
+        let seq = dht.publish_seq_for_node(&hint.peer_id).await;
+        if let Some(stored) = sets.get(&hint.peer_id) {
+            if let Some(proof) = &stored.proof
+                && proof.sequence() >= seq
+                && proof.is_current(Self::address_time())
+            {
+                hint.address_authority = Some(AddressAuthority::Signed(proof.clone()));
+            }
+            if hint.address_authority.is_none() {
+                hint.address_authority =
+                    Some(AddressAuthority::AuthenticatedOwner(stored.seq.max(seq)));
+            }
+            let mut native = dht.get_node_addresses_typed(&hint.peer_id).await;
+            if native.is_empty() {
+                // A lookup can discover a signed owner before routing admission.
+                native = stored
+                    .records
+                    .iter()
+                    .filter_map(|record| {
+                        let address = record.decode_known().ok().flatten()?;
+                        address.is_quic().then(|| {
+                            (
+                                address,
+                                record
+                                    .legacy_reachability()
+                                    .unwrap_or(AddressType::Unverified),
+                            )
+                        })
+                    })
+                    .collect();
+            }
+            (hint.addresses, hint.address_types) = native.into_iter().unzip();
+        } else if seq != 0 {
+            hint.address_authority = Some(AddressAuthority::AuthenticatedOwner(seq));
+            (hint.addresses, hint.address_types) = dht
+                .get_node_addresses_typed(&hint.peer_id)
+                .await
+                .into_iter()
+                .unzip();
+        }
+        hint.distance = encode_publish_seq_distance(dht_node_publish_seq(&hint));
+        hint
+    }
+
+    fn address_time() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs())
+    }
+
+    /// Return a fresh, unchanged owner-signed record for forwarding to clients.
+    pub async fn signed_address_record_for_peer(
+        &self,
+        peer: &PeerId,
+    ) -> Option<SignedAddressRecord> {
+        if peer == self.peer_id() {
+            let local = self.local_dht_node().await;
+            let records = self
+                .complete_transport_address_records(&local.typed_addresses())
+                .await;
+            return self.local_signed_address_record(records).await;
+        }
+        let dht = self.dht.read().await;
+        let native_seq = dht.publish_seq_for_node(peer).await;
+        self.transport_address_sets
+            .read()
+            .await
+            .get(peer)
+            .and_then(|stored| stored.proof.as_ref())
+            .filter(|proof| {
+                proof.sequence() >= native_seq && proof.is_current(Self::address_time())
+            })
+            .map(|proof| proof.signed().clone())
+    }
+
+    async fn local_signed_address_record(
+        &self,
+        records: Vec<TransportAddressRecord>,
+    ) -> Option<SignedAddressRecord> {
+        if records.is_empty() {
+            return None;
+        }
+        let mut cached = self.local_signed_addresses.write().await;
+        let now = Self::address_time();
+        if let Some(proof) = cached.as_ref()
+            && proof.records() == records
+            && !proof.needs_refresh(now)
+        {
+            return Some(proof.signed().clone());
+        }
+        let sequence = Self::next_publish_seq().max(
+            cached
+                .as_ref()
+                .map_or(1, |proof| proof.sequence().saturating_add(1)),
+        );
+        let record =
+            SignedAddressRecord::sign(self.transport.node_identity(), sequence, now, records)
+                .ok()?;
+        *cached = record.verify(now).ok();
+        Some(record)
     }
 
     /// Return the first dialable `Direct`-tagged address from a [`DHTNode`].
@@ -3916,7 +4104,8 @@ impl DhtNetworkManager {
                 // semantics as wire_tx_*.
                 match &message.payload {
                     DhtNetworkOperation::FindNode { .. }
-                    | DhtNetworkOperation::FindNodeV2 { .. } => {
+                    | DhtNetworkOperation::FindNodeV2 { .. }
+                    | DhtNetworkOperation::FindNodeSigned { .. } => {
                         self.transport
                             .traffic
                             .find_node_tx_count
@@ -3929,7 +4118,8 @@ impl DhtNetworkManager {
                             .fetch_add(1, Ordering::Relaxed);
                     }
                     DhtNetworkOperation::PublishAddressSet { .. }
-                    | DhtNetworkOperation::PublishAddressSetV2 { .. } => {
+                    | DhtNetworkOperation::PublishAddressSetV2 { .. }
+                    | DhtNetworkOperation::PublishAddressSetSigned { .. } => {
                         self.transport
                             .traffic
                             .publish_addr_tx_count
@@ -4273,15 +4463,31 @@ impl DhtNetworkManager {
         sender: &PeerId,
         transport_source: Option<&MultiAddr>,
     ) -> Result<Option<Vec<u8>>> {
-        // SEC: Reject oversized messages before deserialization to prevent memory exhaustion
-        if data.len() > MAX_MESSAGE_SIZE {
+        self.handle_dht_message_on_topic(data, sender, transport_source, DHT_V1_TOPIC)
+            .await
+    }
+
+    async fn handle_dht_message_on_topic(
+        &self,
+        data: &[u8],
+        sender: &PeerId,
+        transport_source: Option<&MultiAddr>,
+        topic: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        let max_size = if topic == DHT_SIGNED_TOPIC {
+            MAX_SIGNED_MESSAGE_SIZE
+        } else {
+            MAX_MESSAGE_SIZE
+        };
+        // Reject oversized messages before deserialization.
+        if data.len() > max_size {
             warn!(
-                "Rejecting oversized DHT message from {sender}: {} bytes (max: {MAX_MESSAGE_SIZE})",
+                "Rejecting oversized DHT message from {sender}: {} bytes (max: {max_size})",
                 data.len()
             );
             return Err(P2PError::Validation(
                 format!(
-                    "Message size {} bytes exceeds maximum allowed size of {MAX_MESSAGE_SIZE} bytes",
+                    "Message size {} bytes exceeds maximum allowed size of {max_size} bytes",
                     data.len()
                 )
                 .into(),
@@ -4291,6 +4497,36 @@ impl DhtNetworkManager {
         // Deserialize message
         let message: DhtNetworkMessage = postcard::from_bytes(data)
             .map_err(|e| P2PError::Serialization(e.to_string().into()))?;
+
+        if topic == DHT_SIGNED_TOPIC
+            && !matches!(
+                (&message.message_type, &message.payload, &message.result),
+                (
+                    DhtMessageType::Request,
+                    DhtNetworkOperation::FindNodeSigned { .. }
+                        | DhtNetworkOperation::PublishAddressSetSigned { .. },
+                    None
+                ) | (
+                    DhtMessageType::Response,
+                    DhtNetworkOperation::FindNodeSigned { .. },
+                    Some(
+                        DhtNetworkResult::NodesFoundSigned { .. } | DhtNetworkResult::PeerRejected
+                    )
+                ) | (
+                    DhtMessageType::Response,
+                    DhtNetworkOperation::PublishAddressSetSigned { .. },
+                    Some(DhtNetworkResult::PeerRejected)
+                ) | (
+                    DhtMessageType::Response,
+                    DhtNetworkOperation::Ping,
+                    Some(DhtNetworkResult::PublishAddressAck)
+                )
+            )
+        {
+            return Err(P2PError::Validation(
+                "invalid message on signed address topic".into(),
+            ));
+        }
 
         debug!(
             "[STEP 3] {}: Received {:?} from {} (msg_id: {})",
@@ -4328,7 +4564,9 @@ impl DhtNetworkManager {
                 // are still accounted separately via wire_tx_* at send time.
                 let is_nodes_found = matches!(
                     &result,
-                    DhtNetworkResult::NodesFound { .. } | DhtNetworkResult::NodesFoundV2 { .. }
+                    DhtNetworkResult::NodesFound { .. }
+                        | DhtNetworkResult::NodesFoundV2 { .. }
+                        | DhtNetworkResult::NodesFoundSigned { .. }
                 );
                 let response = self.create_response_message(&message, result)?;
                 let response_bytes = Self::encode_response_message(response)?;
@@ -4382,6 +4620,37 @@ impl DhtNetworkManager {
                 debug!("Handling FIND_NODE request for key: {}", hex::encode(key));
                 self.handle_find_node_request(key, authenticated_sender)
                     .await
+            }
+            DhtNetworkOperation::FindNodeSigned { key } => {
+                let candidates = Self::filter_response_nodes(
+                    self.find_closest_nodes_local(key, self.k_value()).await,
+                    authenticated_sender,
+                );
+                let mut nodes = Vec::new();
+                for candidate in candidates {
+                    let proof = self
+                        .signed_address_record_for_peer(&candidate.peer_id)
+                        .await;
+                    let mut node = self.transport_dht_node(candidate).await;
+                    if proof.is_some() {
+                        // The immutable proof already carries the complete address set.
+                        node.records.clear();
+                    }
+                    nodes.push(SignedTransportDhtNode { node, proof });
+                }
+                Ok(DhtNetworkResult::NodesFoundSigned { key: *key, nodes })
+            }
+            DhtNetworkOperation::PublishAddressSetSigned { record } => {
+                let proof = record
+                    .verify(Self::address_time())
+                    .map_err(|e| P2PError::Validation(e.into()))?;
+                if proof.owner() != *authenticated_sender {
+                    return Err(P2PError::Validation(
+                        "publication sender is not the record owner".into(),
+                    ));
+                }
+                self.apply_signed_address_set(proof, transport_source).await;
+                Ok(DhtNetworkResult::PublishAddressAck)
             }
             DhtNetworkOperation::FindNodeV2 { key } => {
                 debug!(
@@ -4705,6 +4974,8 @@ impl DhtNetworkManager {
         match operation {
             DhtNetworkOperation::FindNodeV2 { .. }
             | DhtNetworkOperation::PublishAddressSetV2 { .. } => DHT_V2_TOPIC,
+            DhtNetworkOperation::FindNodeSigned { .. }
+            | DhtNetworkOperation::PublishAddressSetSigned { .. } => DHT_SIGNED_TOPIC,
             _ => DHT_V1_TOPIC,
         }
     }
@@ -4785,6 +5056,11 @@ impl DhtNetworkManager {
                 return Ok(());
             }
 
+            if let DhtNetworkResult::NodesFoundSigned { key, .. } = &result
+                && !matches!(&context.operation, DhtNetworkOperation::FindNodeSigned { key: expected } if expected == key)
+            {
+                return Ok(());
+            }
             let Some(tx) = context.response_tx.take() else {
                 debug!("Ignoring duplicate DHT response: {message_id}");
                 return Ok(());
@@ -4797,6 +5073,63 @@ impl DhtNetworkManager {
         };
 
         let result = match result {
+            DhtNetworkResult::NodesFoundSigned { key, nodes } => {
+                let mut normalized = Vec::new();
+                for mut entry in nodes {
+                    if let Some(record) = entry.proof {
+                        match record.verify(Self::address_time()) {
+                            Ok(proof) if proof.owner() == entry.node.peer_id => {
+                                entry.node.records = proof.records().to_vec();
+                                entry.node.publish_seq = proof.sequence();
+                                self.apply_signed_address_set(proof, transport_source).await;
+                            }
+                            _ => continue,
+                        }
+                    }
+                    normalized.extend(
+                        self.normalize_v2_nodes(vec![entry.node], transport_source)
+                            .await,
+                    );
+                }
+                DhtNetworkResult::NodesFound {
+                    key,
+                    nodes: normalized,
+                }
+            }
+            DhtNetworkResult::NodesFound { key, nodes } => {
+                let mut normalized = Vec::new();
+                for mut node in nodes {
+                    let claimed_seq = advertised_publish_seq(&node);
+                    node.address_authority = None;
+                    node.distance = None;
+                    if node.peer_id == sender_app_id && claimed_seq != 0 {
+                        let records = node
+                            .typed_addresses()
+                            .iter()
+                            .filter_map(|(address, ty)| {
+                                TransportAddressRecord::from_multiaddr(
+                                    address,
+                                    KnownReachability::from_legacy(*ty),
+                                )
+                                .ok()
+                                .flatten()
+                            })
+                            .collect();
+                        self.apply_transport_address_set(
+                            &node.peer_id,
+                            claimed_seq,
+                            records,
+                            transport_source,
+                        )
+                        .await;
+                    }
+                    normalized.push(self.protect_owner_view(node).await);
+                }
+                DhtNetworkResult::NodesFound {
+                    key,
+                    nodes: normalized,
+                }
+            }
             DhtNetworkResult::NodesFoundV2 { key, nodes } => DhtNetworkResult::NodesFound {
                 key,
                 nodes: self.normalize_v2_nodes(nodes, transport_source).await,
@@ -4830,9 +5163,28 @@ impl DhtNetworkManager {
                 .map_err(|error| P2PError::Serialization(error.to_string().into()))
         }
 
+        let max_size = if matches!(
+            response.result,
+            Some(DhtNetworkResult::NodesFoundSigned { .. })
+        ) {
+            MAX_SIGNED_MESSAGE_SIZE
+        } else {
+            MAX_MESSAGE_SIZE
+        };
+        if let Some(DhtNetworkResult::NodesFoundSigned { nodes, .. }) = &mut response.result {
+            nodes.truncate(MAX_SIGNED_LOOKUP_NODES);
+        }
         let mut size = encoded_size(&response)?;
         if let Some(DhtNetworkResult::NodesFoundV2 { nodes, .. }) = &mut response.result {
-            while size > MAX_MESSAGE_SIZE {
+            while size > max_size {
+                let Some(node) = nodes.pop() else {
+                    break;
+                };
+                size = size.saturating_sub(encoded_size(&node)?);
+            }
+        }
+        if let Some(DhtNetworkResult::NodesFoundSigned { nodes, .. }) = &mut response.result {
+            while size > max_size {
                 let Some(node) = nodes.pop() else {
                     break;
                 };
@@ -4842,7 +5194,7 @@ impl DhtNetworkManager {
         // Removing nodes can also shrink the vector's length prefix; retaining
         // its original size gives a conservative upper bound without repeatedly
         // serializing the whole response. The envelope is included in this bound.
-        if size > MAX_MESSAGE_SIZE {
+        if size > max_size {
             return Err(P2PError::Validation(
                 "DHT response exceeds the message size limit".into(),
             ));
@@ -4863,6 +5215,9 @@ impl DhtNetworkManager {
             DhtNetworkResult::NodesFound { key, .. } => DhtNetworkOperation::FindNode { key: *key },
             DhtNetworkResult::NodesFoundV2 { key, .. } => {
                 DhtNetworkOperation::FindNodeV2 { key: *key }
+            }
+            DhtNetworkResult::NodesFoundSigned { key, .. } => {
+                DhtNetworkOperation::FindNodeSigned { key: *key }
             }
             DhtNetworkResult::PongReceived { .. } => DhtNetworkOperation::Ping,
             DhtNetworkResult::JoinSuccess { .. } => DhtNetworkOperation::Join,
@@ -5201,7 +5556,7 @@ impl DhtNetworkManager {
                                         source,
                                         data.len()
                                     );
-                                    if topic == DHT_V1_TOPIC || topic == DHT_V2_TOPIC {
+                                    if topic == DHT_V1_TOPIC || topic == DHT_V2_TOPIC || topic == DHT_SIGNED_TOPIC {
                                         // DHT messages must be authenticated.
                                         let Some(source_peer) = source else {
                                             warn!("Ignoring unsigned DHT message");
@@ -5226,10 +5581,11 @@ impl DhtNetworkManager {
                                             // This ensures permits are released even if a handler gets stuck
                                             match tokio::time::timeout(
                                                 REQUEST_TIMEOUT,
-                                                manager_clone.handle_dht_message(
+                                                manager_clone.handle_dht_message_on_topic(
                                                     &data,
                                                     &source_peer,
                                                     transport_source.as_ref(),
+                                                    &response_topic,
                                                 ),
                                             )
                                             .await
@@ -5677,8 +6033,11 @@ impl DhtNetworkManager {
         node: &DHTNode,
         transport_source: Option<&MultiAddr>,
     ) {
+        let mut hint = node.clone();
+        hint.address_authority = None;
+        hint.distance = None;
         let node = self
-            .gossiped_node_with_trusted_addresses(node.clone(), transport_source)
+            .gossiped_node_with_trusted_addresses(hint, transport_source)
             .await;
         self.merge_trusted_gossiped_typed_addresses(&node).await;
     }
@@ -5701,6 +6060,16 @@ impl DhtNetworkManager {
         let typed_addresses = node.typed_addresses();
         let dht = self.dht.write().await;
         let publish_seq = dht_node_publish_seq(node);
+        if publish_seq == 0
+            && (dht.publish_seq_for_node(&node.peer_id).await != 0
+                || self
+                    .transport_address_sets
+                    .read()
+                    .await
+                    .contains_key(&node.peer_id))
+        {
+            return;
+        }
         if publish_seq != 0 {
             let mut sets = self.transport_address_sets.write().await;
             if let Some(stored) = sets.get(&node.peer_id)
@@ -5808,6 +6177,8 @@ impl DhtNetworkManager {
                     addresses: node.addresses,
                     distance: encode_publish_seq_distance(publish_seq),
                     reliability,
+                    address_authority: (publish_seq != 0)
+                        .then_some(AddressAuthority::AuthenticatedOwner(publish_seq)),
                 }
             })
             .collect()
@@ -5855,7 +6226,13 @@ impl DhtNetworkManager {
         if records.is_empty() {
             return Vec::new();
         }
-        let seq = Self::next_publish_seq();
+        let Some(signed) = self.local_signed_address_record(records.clone()).await else {
+            return Vec::new();
+        };
+        let Ok(verified) = signed.verify(Self::address_time()) else {
+            return Vec::new();
+        };
+        let seq = verified.sequence();
         let legacy_addresses: Vec<_> = records
             .iter()
             .filter_map(|record| {
@@ -5891,6 +6268,9 @@ impl DhtNetworkManager {
             let peer_typed = peer.typed_addresses();
             let legacy_op = legacy_op.clone();
             let v2_op = v2_op.clone();
+            let signed_op = DhtNetworkOperation::PublishAddressSetSigned {
+                record: signed.clone(),
+            };
             publishes.push(async move {
                 if let Err(error) = self.ensure_peer_channel(&peer_id, &peer_typed).await {
                     return (peer_id, false, Err(error));
@@ -5903,7 +6283,8 @@ impl DhtNetworkManager {
                         "no QUIC addresses to publish to a V1 peer".into(),
                     )));
                 }
-                let op = if uses_v2 { v2_op } else { legacy_op };
+                let uses_signed = self.transport.peer_user_agent(&peer_id).await.is_some_and(|ua| supports_signed_addresses(&ua));
+                let op = if uses_signed { signed_op } else if uses_v2 { v2_op } else { legacy_op };
                 let result = self.send_dht_request(&peer_id, op, Some(&peer_typed)).await;
                 (peer_id, uses_v2, result)
             });
@@ -6292,6 +6673,7 @@ mod tests {
             address_types,
             distance: None,
             reliability: 1.0,
+            address_authority: None,
         }
     }
 
@@ -6551,6 +6933,8 @@ mod tests {
             address_types: vec![ty],
             distance: encode_publish_seq_distance(publish_seq),
             reliability: 1.0,
+            address_authority: (publish_seq != 0)
+                .then_some(AddressAuthority::AuthenticatedOwner(publish_seq)),
         }
     }
 
@@ -6563,6 +6947,7 @@ mod tests {
             address_types: Vec::new(),
             distance: None,
             reliability: 1.0,
+            address_authority: None,
         }
     }
 
@@ -6976,6 +7361,7 @@ mod tests {
             address_types: vec![],
             distance: None,
             reliability: 1.0,
+            address_authority: None,
         };
         assert_eq!(best_tier_priority(&node), u8::MAX);
     }
@@ -7054,6 +7440,7 @@ mod tests {
             address_types: vec![],
             distance: None,
             reliability: 1.0,
+            address_authority: None,
         };
         assert_eq!(DhtNetworkManager::first_direct_dialable(&node), None);
     }
@@ -7186,6 +7573,7 @@ mod tests {
             address_types: vec![], // legacy wire payload
             distance: None,
             reliability: 1.0,
+            address_authority: None,
         };
         assert_eq!(DhtNetworkManager::first_direct_dialable(&node), None);
     }

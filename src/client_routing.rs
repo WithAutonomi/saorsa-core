@@ -56,12 +56,10 @@ fn report_signature(node: &DHTNode) -> Vec<(MultiAddr, u8)> {
 ///
 /// Rules (applied in order):
 ///
-///   1. **Self-report** — if the subject peer itself responded, its
-///      report is authoritative.
-///   2. **Newest publish** — any report carrying the highest non-zero
-///      `PublishAddressSet` sequence wins. That sequence originated from
-///      the subject peer's authenticated publish path and lets a newer
-///      direct-only or re-relayed record displace stale relay gossip.
+///   1. **Newest owner-proven publication** — the highest nonzero sequence
+///      established by a verified owner signature or authenticated owner
+///      connection wins. An intermediary's unsigned sequence has no authority.
+///   2. **Self-report** — among unsequenced hints, prefer the subject itself.
 ///   3. **Quorum** — among the top `QUORUM_TOP_N` closest-XOR
 ///      responders, if `QUORUM_THRESHOLD`+ agree on the address set
 ///      (same [`report_signature`]), their consensus wins. One close
@@ -79,11 +77,6 @@ pub fn compute_winner<'a>(
         return None;
     }
 
-    // Rule 1: self-report locks in.
-    if let Some(node) = reports.get(subject_id) {
-        return Some((*subject_id, node));
-    }
-
     // Sort all responders by XOR distance to subject (primary), then by
     // best-tier-priority (secondary, for stable tie-break).
     let mut by_dist: Vec<(PeerId, &DHTNode, Key, u8)> = reports
@@ -99,7 +92,7 @@ pub fn compute_winner<'a>(
         .collect();
     by_dist.sort_by(|a, b| a.2.cmp(&b.2).then(a.3.cmp(&b.3)));
 
-    // Rule 2: newest authoritative publish sequence wins. This keeps stale
+    // Rule 1: newest authoritative publish sequence wins. This keeps stale
     // third-party relay records from beating a newer direct-only or re-relayed
     // self-record during an iterative lookup.
     if let Some((rid, node, _, _)) = by_dist
@@ -113,6 +106,12 @@ pub fn compute_winner<'a>(
         })
     {
         return Some((*rid, *node));
+    }
+
+    // An authenticated self-report wins among unsequenced hints, but cannot
+    // downgrade an owner-proven sequenced publication already in this view.
+    if let Some(node) = reports.get(subject_id) {
+        return Some((*subject_id, node));
     }
 
     // Rule 3: quorum among top-N.
@@ -290,6 +289,13 @@ pub fn build_witnessed_close_group(
     }
 }
 
+/// Whether an incoming lookup view may replace an already owner-proven view.
+/// Unsigned hints cannot displace a publication or raise its accepted sequence.
+pub fn may_replace_owner_view(current: &DHTNode, incoming: &DHTNode) -> bool {
+    dht_node_publish_seq(current) == 0
+        || dht_node_publish_seq(incoming) >= dht_node_publish_seq(current)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -302,6 +308,7 @@ mod tests {
             address_types: vec![AddressType::Unverified],
             distance: None,
             reliability: 0.5,
+            address_authority: None,
         }
     }
 

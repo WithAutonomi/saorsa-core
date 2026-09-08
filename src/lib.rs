@@ -71,6 +71,9 @@ pub mod dht_lookup;
 /// Portable client routing report and witnessed-close-group policy.
 pub mod client_routing;
 
+/// Portable signed address publications and locally verified provenance.
+pub mod signed_address;
+
 /// User identity and privacy system (public — accessed via path by saorsa-node).
 pub mod identity;
 
