@@ -13,8 +13,8 @@
 //! Portable DHT peer records, address priorities, and witnessed lookup results.
 
 use crate::address::is_lan_ip;
+use crate::dht_lookup::LookupNode;
 use crate::{Key, MultiAddr, PeerId};
-use saorsa_dht_lookup::LookupNode;
 use serde::{Deserialize, Serialize};
 
 /// Address classification for priority ordering and staleness eviction.

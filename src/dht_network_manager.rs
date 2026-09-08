@@ -17,6 +17,10 @@
 
 #![allow(missing_docs)]
 
+use crate::dht_lookup::{
+    IterativeLookup, LookupConfig, LookupQuery, LookupQueryOutcome, LookupRunError,
+    LookupTermination, run_iterative_lookup,
+};
 use crate::{
     P2PError, PeerId, Result,
     adaptive::trust::DEFAULT_NEUTRAL_TRUST,
@@ -48,12 +52,6 @@ use dashmap::DashMap;
 use dashmap::mapref::entry::Entry as DashEntry;
 use futures::stream::{FuturesUnordered, StreamExt};
 use rand::Rng;
-#[cfg(test)]
-use saorsa_dht_lookup::LookupNode;
-use saorsa_dht_lookup::{
-    IterativeLookup, LookupConfig, LookupQuery, LookupQueryOutcome, LookupRunError,
-    LookupTermination, run_iterative_lookup,
-};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
@@ -1296,7 +1294,7 @@ impl LookupFailureCoordinator {
     }
 }
 
-fn map_iterative_lookup_error(error: saorsa_dht_lookup::LookupError) -> P2PError {
+fn map_iterative_lookup_error(error: crate::dht_lookup::LookupError) -> P2PError {
     P2PError::Dht(DhtError::RoutingError(error.to_string().into()))
 }
 
@@ -3078,7 +3076,7 @@ impl DhtNetworkManager {
         S: futures::Stream<Item = (PeerId, Result<DhtResponseEnvelope>)> + Unpin,
     {
         let grace = Duration::from_secs(ITERATION_GRACE_TIMEOUT_SECS);
-        saorsa_dht_lookup::collect_after_first_with_grace(stream, || tokio::time::sleep(grace))
+        crate::dht_lookup::collect_after_first_with_grace(stream, || tokio::time::sleep(grace))
             .await
     }
 

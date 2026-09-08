@@ -18,13 +18,12 @@
 //! Transport-independent Kademlia iterative lookup scheduling.
 //!
 //! [`run_iterative_lookup`] drives an [`IterativeLookup`] through a generic
-//! [`LookupQuery`] adapter. Native QUIC and browser WebTransport therefore
+//! [`LookupQuery`] adapter. Native QUIC and browser WebRTC therefore
 //! share the complete round loop, ordering, peer-state, capacity, and
 //! convergence implementation without either transport becoming a dependency
-//! of this crate.
+//! of this module.
 
-use futures_core::Stream;
-use futures_util::{StreamExt, future::Either, future::select};
+use futures::{Stream, StreamExt, future::Either, future::select};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
@@ -755,7 +754,7 @@ fn encode_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures_util::stream::FuturesUnordered;
+    use futures::stream::FuturesUnordered;
     use std::convert::Infallible;
     use std::pin::Pin;
 
@@ -1026,7 +1025,7 @@ mod tests {
 
     #[test]
     fn grace_collector_keeps_completed_batch_results() {
-        let queries = futures_util::stream::iter([1_u8, 2_u8, 3_u8]);
+        let queries = futures::stream::iter([1_u8, 2_u8, 3_u8]);
 
         let results = futures::executor::block_on(collect_after_first_with_grace(queries, || {
             std::future::pending::<()>()

@@ -65,6 +65,9 @@ pub(crate) mod transport_handle;
 #[cfg(feature = "native")]
 pub(crate) mod validation;
 
+/// Transport-independent iterative DHT lookup, shared by native and browser clients.
+pub mod dht_lookup;
+
 /// User identity and privacy system (public — accessed via path by saorsa-node).
 pub mod identity;
 
@@ -80,14 +83,14 @@ pub use network::{NodeConfig, NodeMode, P2PEvent, P2PNode};
 // DHT types — peer discovery, routing, and network events
 /// DHT key type (256 bits).
 pub type Key = [u8; 32];
-#[cfg(feature = "native")]
-pub use dht_network_manager::DhtNetworkEvent;
-pub use peer_record::{AddressType, DHTNode, ResponderView, WitnessedCloseGroup};
-pub use saorsa_dht_lookup::{
+pub use dht_lookup::{
     CandidateInsertion, IterativeLookup, LookupConfig, LookupError, LookupKey, LookupNode,
     LookupPeerState, LookupProgress, LookupQuery, LookupQueryOutcome, LookupRunError,
     LookupTermination, collect_after_first_with_grace, run_iterative_lookup, xor_distance,
 };
+#[cfg(feature = "native")]
+pub use dht_network_manager::DhtNetworkEvent;
+pub use peer_record::{AddressType, DHTNode, ResponderView, WitnessedCloseGroup};
 pub use transport_address::{
     KnownReachability, KnownTransport, MAX_TRANSPORT_ADDRESS_PAYLOAD,
     MAX_TRANSPORT_ADDRESS_RECORDS, TransportAddressRecord,

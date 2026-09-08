@@ -14,8 +14,8 @@ env:
 # - unit-tests.yml: Unit and integration tests (all platforms)
 
 jobs:
-  portable-lookup-wasm:
-    name: Portable lookup WASM
+  portable-core-wasm:
+    name: Portable core WASM
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -23,7 +23,7 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
       - name: Check transport-independent lookup engine
-        run: cargo check -p saorsa-dht-lookup --target wasm32-unknown-unknown
+        run: cargo check --lib --no-default-features --target wasm32-unknown-unknown
 
   # Build verification on all platforms
   build:

@@ -17,8 +17,10 @@ crate graph on wasm32-unknown-unknown.
 Keep native defaults and introduce an explicit `native` feature boundary.
 Identity generation/import/export/signing, addresses, peer records, witnessed
 lookup transcripts, and iterative lookup APIs remain in saorsa-core on both
-targets. The existing lookup crate remains an implementation dependency and is
-re-exported by core; browser clients no longer need to import it separately.
+targets. The lookup engine lives in the always-available `saorsa_core::dht_lookup` module,
+with its existing root re-exports retained. The separate `saorsa-dht-lookup`
+package and workspace membership are removed: the portable core now provides
+the isolation for which ADR-016 originally introduced that crate.
 Move peer-record definitions out of the native DHT manager and re-export their
 old native paths. Use saorsa-pqc keys directly, converting only at the native
 transport's keypair boundary.
