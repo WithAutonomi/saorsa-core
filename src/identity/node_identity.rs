@@ -347,6 +347,7 @@ impl NodeIdentity {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "native")]
     fn ml_dsa_65_spki(public_key: &[u8]) -> Vec<u8> {
         const OID: [u8; 9] = [0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x12];
         let bit_string_len = public_key.len() + 1;
@@ -393,6 +394,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "native")]
     fn transport_spki_derives_same_peer_id_as_raw_key() {
         let (public_key, _secret_key) = crate::quantum_crypto::generate_ml_dsa_keypair()
             .expect("ML-DSA key generation should succeed");
@@ -405,6 +407,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "native")]
     fn transport_spki_rejects_wrong_algorithm() {
         let (public_key, _secret_key) = crate::quantum_crypto::generate_ml_dsa_keypair()
             .expect("ML-DSA key generation should succeed");
@@ -416,6 +419,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "native")]
     fn transport_spki_rejects_raw_public_key_bytes() {
         let (public_key, _secret_key) = crate::quantum_crypto::generate_ml_dsa_keypair()
             .expect("ML-DSA key generation should succeed");
