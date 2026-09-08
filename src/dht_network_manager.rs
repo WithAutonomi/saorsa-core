@@ -5995,18 +5995,11 @@ impl DhtNetworkManager {
     /// Ingest a peer's typed address set from a FIND_NODE gossip response
     /// into the local routing table.
     ///
-    /// If the report carries a marker-encoded publish sequence in its existing
-    /// `distance` metadata slot, it is a propagated `PublishAddressSet` view
-    /// and the sequence guard decides whether to replace our local record
-    /// wholesale. Older sequence-bearing reports are ignored instead of being
-    /// merged, which prevents stale relay addresses from being reintroduced
-    /// after the publisher has republished a newer direct-only or re-relayed
-    /// set. Legacy reports without a sequence keep the old upgrade-only
-    /// behavior: add a new address or promote the existing entry, but never
-    /// demote a higher-priority tag already held. Peers absent from the routing
-    /// table are left alone; we don't accept *new* peer identities from
-    /// untrusted gossip, only additional information about peers we already
-    /// know.
+    /// Public callers supply discovery hints. Any wire sequence and claimed
+    /// provenance are cleared; hints can add or promote addresses only while
+    /// the peer has no owner-proven publication. Verified signed responses use
+    /// the internal replacement path and its monotonic sequence guard.
+    /// This method does not admit new peer identities to the routing table.
     ///
     /// This closes the hole where a NAT'd peer XOR-far from every open
     /// node could never land in anyone's K-closest for `PublishAddressSet`
