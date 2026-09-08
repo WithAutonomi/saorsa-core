@@ -306,11 +306,12 @@ async fn rejected_v2_publish_preserves_both_views_and_allows_correction() {
 }
 
 #[tokio::test]
-async fn v2_withdrawal_clears_native_addresses_and_survives_legacy_gossip() {
+async fn supplemental_replacements_preserve_native_addresses_and_reject_empty_sets() {
     let node = test_node().await;
     let manager = node.dht_manager();
     let owner = PeerId::from_bytes([0x22; 32]);
     seed_peer(manager, owner, "/ip4/8.8.8.8/udp/9000/quic").await;
+    let quic = quic_record("/ip4/8.8.8.8/udp/9000/quic");
     let browser = TransportAddressRecord::from_multiaddr(
         &browser_address(owner),
         KnownReachability::Unverified,
@@ -319,12 +320,7 @@ async fn v2_withdrawal_clears_native_addresses_and_survives_legacy_gossip() {
     .unwrap();
     assert!(
         manager
-            .apply_transport_address_set(
-                &owner,
-                10,
-                vec![quic_record("/ip4/8.8.8.8/udp/9000/quic"), browser.clone()],
-                None
-            )
+            .apply_transport_address_set(&owner, 10, vec![quic.clone(), browser.clone()], None)
             .await
     );
     let stale = peer_view(manager, owner).await;
@@ -334,18 +330,27 @@ async fn v2_withdrawal_clears_native_addresses_and_survives_legacy_gossip() {
             .await
     );
     manager.merge_trusted_gossiped_typed_addresses(&stale).await;
-    let legacy = peer_view(manager, owner).await;
-    assert!(legacy.addresses.is_empty());
-    assert_eq!(dht_node_publish_seq(&legacy), 11);
+    let native = peer_view(manager, owner).await;
+    assert_eq!(native.addresses, stale.addresses);
+    assert_eq!(dht_node_publish_seq(&native), 10);
     assert_eq!(
-        manager.transport_dht_node(legacy).await.records,
-        vec![browser]
+        manager.transport_dht_node(native).await.records,
+        vec![browser.clone()]
     );
-
-    // Withdrawing all transports is also an authoritative complete update.
+    assert!(
+        !manager
+            .apply_transport_address_set(&owner, u64::MAX, Vec::new(), None)
+            .await
+    );
+    assert_eq!(manager.transport_address_sets.read().await[&owner].seq, 11);
+    assert_eq!(
+        manager.supplemental_addresses_for_peer(&owner).await,
+        vec![browser_address(owner)]
+    );
+    // A real nonempty replacement still removes omitted supplemental records.
     assert!(
         manager
-            .apply_transport_address_set(&owner, 12, Vec::new(), None)
+            .apply_transport_address_set(&owner, 12, vec![quic], None)
             .await
     );
     assert!(
@@ -354,31 +359,75 @@ async fn v2_withdrawal_clears_native_addresses_and_survives_legacy_gossip() {
             .await
             .is_empty()
     );
-    assert!(peer_view(manager, owner).await.addresses.is_empty());
     assert_eq!(dht_node_publish_seq(&peer_view(manager, owner).await), 12);
 }
 
 #[tokio::test]
-async fn v2_gossip_projects_withdrawals_without_refreshing_peer_liveness() {
+async fn v2_gossip_rejects_empty_sets_and_retains_unknown_transports_without_clearing_native() {
     let node = test_node().await;
     let manager = node.dht_manager();
     let owner = PeerId::from_bytes([0x22; 32]);
+    let quic = quic_record("/ip4/8.8.8.8/udp/9000/quic");
     seed_peer(manager, owner, "/ip4/8.8.8.8/udp/9000/quic").await;
+    assert!(
+        manager
+            .apply_transport_address_set(&owner, 10, vec![quic.clone()], None)
+            .await
+    );
     let last_seen = manager.dht.read().await.all_nodes().await[0]
         .last_seen
         .load();
-    let DhtNetworkResult::NodesFoundV2 { nodes, .. } = response(owner, owner, 10).result.unwrap()
-    else {
-        panic!("expected V2 response");
+    assert!(
+        manager
+            .normalize_v2_nodes(
+                vec![TransportDhtNode {
+                    peer_id: owner,
+                    records: Vec::new(),
+                    publish_seq: u64::MAX,
+                    reliability: 1.0
+                }],
+                None
+            )
+            .await
+            .is_empty()
+    );
+    assert_eq!(manager.transport_address_sets.read().await[&owner].seq, 10);
+    let opaque = TransportAddressRecord {
+        transport: 900,
+        reachability: 901,
+        address: vec![1, 2, 3],
     };
-    manager.normalize_v2_nodes(nodes, None).await;
-    assert!(peer_view(manager, owner).await.addresses.is_empty());
-    assert_eq!(dht_node_publish_seq(&peer_view(manager, owner).await), 10);
+    manager
+        .normalize_v2_nodes(
+            vec![TransportDhtNode {
+                peer_id: owner,
+                records: vec![opaque.clone()],
+                publish_seq: 11,
+                reliability: 1.0,
+            }],
+            None,
+        )
+        .await;
+    let native = peer_view(manager, owner).await;
+    assert_eq!(
+        native.addresses,
+        vec![quic.decode_known().unwrap().unwrap()]
+    );
+    assert_eq!(dht_node_publish_seq(&native), 10);
+    assert_eq!(
+        manager.transport_dht_node(native).await.records,
+        vec![opaque]
+    );
     assert_eq!(
         manager.dht.read().await.all_nodes().await[0]
             .last_seen
             .load(),
         last_seen
+    );
+    assert!(
+        manager
+            .apply_transport_address_set(&owner, 12, vec![quic], None)
+            .await
     );
 }
 
@@ -419,14 +468,20 @@ async fn v2_filters_loopback_in_both_ip_representations_and_transports() {
             })
             .collect();
         assert!(
-            manager
+            !manager
                 .apply_transport_address_set(&owner, seq + 1, records, Some(&lan_source))
                 .await
         );
         let native = peer_view(manager, owner).await;
-        assert!(native.addresses.is_empty());
-        assert_eq!(dht_node_publish_seq(&native), seq + 1);
-        assert!(manager.transport_dht_node(native).await.records.is_empty());
+        assert_eq!(
+            native.addresses,
+            vec!["/ip4/8.8.8.8/udp/9000/quic".parse::<MultiAddr>().unwrap()]
+        );
+        assert_eq!(dht_node_publish_seq(&native), seq);
+        assert_eq!(
+            manager.transport_dht_node(native).await.records,
+            vec![quic_record("/ip4/8.8.8.8/udp/9000/quic")]
+        );
     }
 }
 
@@ -475,7 +530,11 @@ async fn concurrent_legacy_and_v2_publications_keep_the_newest_complete_set() {
     );
     legacy_result.unwrap();
     let native = peer_view(manager, owner).await;
-    assert!(native.addresses.is_empty());
+    assert_eq!(
+        native.addresses,
+        vec!["/ip4/9.9.9.9/udp/9000/quic".parse::<MultiAddr>().unwrap()]
+    );
+    assert_eq!(dht_node_publish_seq(&native), 12);
     assert_eq!(
         manager.transport_dht_node(native).await.records,
         vec![browser]
@@ -641,4 +700,40 @@ async fn supplemental_self_addresses_bind_missing_peer_ids_before_deduplication(
         .unwrap();
     assert_eq!(received.len(), 1);
     assert_eq!(received[0].decode_known().unwrap(), Some(bound));
+}
+
+#[tokio::test]
+async fn empty_publication_is_not_sent_or_acknowledged() {
+    let publisher = test_node().await;
+    let receiver = test_node().await;
+    publisher.start().await.unwrap();
+    receiver.start().await.unwrap();
+    let address = receiver
+        .listen_addrs()
+        .await
+        .into_iter()
+        .find(MultiAddr::is_ipv4)
+        .unwrap();
+    let peer = DHTNode {
+        peer_id: *receiver.peer_id(),
+        addresses: vec![address],
+        address_types: vec![AddressType::Direct],
+        distance: None,
+        reliability: 1.0,
+    };
+    let confirmed = publisher
+        .dht_manager()
+        .publish_address_records_to_peers(Vec::new(), &[peer])
+        .await;
+    assert!(confirmed.is_empty());
+    assert!(
+        receiver
+            .dht_manager()
+            .transport_address_sets
+            .read()
+            .await
+            .is_empty()
+    );
+    publisher.stop().await.unwrap();
+    receiver.stop().await.unwrap();
 }

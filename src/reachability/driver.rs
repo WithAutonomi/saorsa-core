@@ -22,9 +22,10 @@
 //!
 //! The driver runs as a single tokio task and cycles through five states:
 //!
-//! 1. **Starting**: publish a newer relay-free address set before the first
-//!    acquisition walk. This withdraws any relay allocation left in DHT
-//!    replicas by a previous process incarnation before peers can dial it.
+//! 1. **Starting**: publish a newer nonempty relay-free address set before the
+//!    first acquisition walk when replacement addresses are available. Empty
+//!    publications are skipped; replicas retain their previous addresses until
+//!    a nonempty replacement arrives.
 //! 2. **Acquiring**: call [`run_relay_acquisition`]. On success, run
 //!    third-party relay canaries before publishing. Only a canary-verified
 //!    relay is written to the full typed self-record (relay-allocated
@@ -410,7 +411,7 @@ impl AcquisitionDriver {
     ///    promote unrelated externals.
     ///
     /// Tracks the complete transport record for retries, including certificate
-    /// changes and withdrawals of supplemental browser endpoints.
+    /// changes to supplemental browser endpoints in nonempty replacement sets.
     async fn publish_typed_set(&mut self, relay: Option<SocketAddr>) {
         self.publish_typed_set_with_policy(relay, false).await;
     }
@@ -455,15 +456,9 @@ impl AcquisitionDriver {
 
         let typed = self_addresses.into_typed_vec();
         let records = self.dht.complete_transport_address_records(&typed).await;
-        if records.is_empty() && !force && self.last_published_address_set.is_none() {
+        if records.is_empty() {
             debug!("driver: publish skipped, no self addresses");
             return;
-        }
-
-        if records.is_empty() {
-            info!(
-                "driver: publishing empty authoritative address set to withdraw stale relay state"
-            );
         }
 
         let own_key = *self.dht.peer_id().to_bytes();
@@ -962,7 +957,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn publication_driver_tracks_browser_only_records_and_their_withdrawal() {
+    async fn publication_driver_skips_empty_replacements_even_when_forced() {
         let node = crate::P2PNode::new(
             crate::NodeConfig::builder()
                 .local(true)
@@ -994,20 +989,23 @@ mod tests {
         driver.publish_typed_set(None).await;
         let published = driver.last_published_address_set.as_ref().unwrap();
         assert_eq!(published.records.len(), 1);
-        assert_eq!(published.records[0].decode_known().unwrap(), Some(address));
+        assert_eq!(
+            published.records[0].decode_known().unwrap(),
+            Some(address.clone())
+        );
 
         node.dht_manager()
             .set_supplemental_self_addresses(Vec::new())
             .await;
-        driver.publish_typed_set(None).await;
-        assert!(
-            driver
-                .last_published_address_set
-                .as_ref()
-                .unwrap()
-                .records
-                .is_empty()
-        );
+        for force in [false, true] {
+            driver.publish_typed_set_with_policy(None, force).await;
+            let published = driver.last_published_address_set.as_ref().unwrap();
+            assert_eq!(published.records.len(), 1);
+            assert_eq!(
+                published.records[0].decode_known().unwrap(),
+                Some(address.clone())
+            );
+        }
     }
 
     #[test]

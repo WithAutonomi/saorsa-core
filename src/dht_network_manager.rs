@@ -32,9 +32,7 @@ use crate::{
     adaptive::trust::DEFAULT_NEUTRAL_TRUST,
     adaptive::{NodeStatisticsUpdate, TrustEngine},
     address::{MultiAddr, is_lan_ip},
-    dht::core_engine::{
-        AddressReplaceMode, AddressType, AtomicInstant, BucketRefreshCandidate, NodeInfo,
-    },
+    dht::core_engine::{AddressType, AtomicInstant, BucketRefreshCandidate, NodeInfo},
     dht::{AdmissionResult, DhtCoreEngine, DhtKey, Key, RoutingTableEvent},
     error::{DhtError, IdentityError, NetworkError},
     network::{NodeConfig, NodeMode, supports_address_v2},
@@ -3010,7 +3008,9 @@ impl DhtNetworkManager {
         records: Vec<TransportAddressRecord>,
         transport_source: Option<&MultiAddr>,
     ) -> Option<(Vec<TransportAddressRecord>, Vec<(MultiAddr, AddressType)>)> {
-        let input_was_non_empty = !records.is_empty();
+        if records.is_empty() {
+            return None;
+        }
         let mut bounded = Vec::new();
         let mut decoded = Vec::new();
 
@@ -3045,9 +3045,9 @@ impl DhtNetworkManager {
             }
         }
 
-        // Malformed input is not an intentional withdrawal. Do not advance
-        // its sequence; a corrected publication at the same sequence can land.
-        if input_was_non_empty && bounded.is_empty() {
+        // A replacement must contain at least one valid record. Do not advance
+        // its sequence when validation rejects the complete set.
+        if bounded.is_empty() {
             return None;
         }
         let candidates: Vec<(MultiAddr, AddressType)> = decoded
@@ -3086,6 +3086,9 @@ impl DhtNetworkManager {
             .enumerate()
             .filter_map(|(index, record)| keep[index].then_some(record))
             .collect();
+        if records.is_empty() {
+            return None;
+        }
         let native = allowed
             .into_iter()
             .filter(|(address, _)| address.is_quic())
@@ -3128,13 +3131,10 @@ impl DhtNetworkManager {
             return false;
         }
 
-        if dht.has_node(owner).await {
+        // Non-native records are useful to browser clients and future transports,
+        // but an empty projection is not a replacement for existing QUIC addresses.
+        if !native.is_empty() && dht.has_node(owner).await {
             let previous = dht.get_node_addresses_typed(owner).await;
-            let mode = if authoritative {
-                AddressReplaceMode::AuthenticatedSelfPublish
-            } else {
-                AddressReplaceMode::GossipedRecord
-            };
             if seq == legacy_seq {
                 // A V1 projection may arrive before the full V2 record of the
                 // same publication. Fill in the other transports only when
@@ -3144,11 +3144,16 @@ impl DhtNetworkManager {
                 {
                     return false;
                 }
-            } else if !dht
-                .replace_transport_address_projection(owner, native, seq, mode)
-                .await
-            {
-                return false;
+            } else {
+                let applied = if authoritative {
+                    dht.replace_node_addresses(owner, native, seq).await
+                } else {
+                    dht.replace_node_addresses_from_gossip(owner, native, seq)
+                        .await
+                };
+                if !applied {
+                    return false;
+                }
             }
             let current = dht.get_node_addresses_typed(owner).await;
             // Keep the same native address caps in both projections.
@@ -5702,8 +5707,8 @@ impl DhtNetworkManager {
                 && stored.seq >= publish_seq
             {
                 // A peer can enter the routing table after its V2 record was
-                // learned. Project that canonical record, including an empty
-                // QUIC withdrawal, instead of overwriting it with stale gossip.
+                // learned. Apply its native replacement using V1's guards;
+                // a supplemental-only record cannot clear existing addresses.
                 let native = stored
                     .records
                     .iter()
@@ -5719,13 +5724,8 @@ impl DhtNetworkManager {
                         })
                     })
                     .collect();
-                dht.replace_transport_address_projection(
-                    &node.peer_id,
-                    native,
-                    stored.seq,
-                    AddressReplaceMode::GossipedRecord,
-                )
-                .await;
+                dht.replace_node_addresses_from_gossip(&node.peer_id, native, stored.seq)
+                    .await;
                 return;
             }
             if dht
@@ -5844,14 +5844,17 @@ impl DhtNetworkManager {
         self.publish_address_records_to_peers(records, peers).await
     }
 
-    /// Publish an exact complete-record snapshot. The retry driver records
-    /// acknowledgements against this same snapshot, so a concurrent change to
+    /// Publish a nonempty replacement snapshot. Empty snapshots are ignored.
+    /// The retry driver records acknowledgements against this same snapshot, so a concurrent change to
     /// supplemental endpoints cannot be mistaken for an acknowledged update.
     pub(crate) async fn publish_address_records_to_peers(
         &self,
         records: Vec<TransportAddressRecord>,
         peers: &[DHTNode],
     ) -> Vec<PeerId> {
+        if records.is_empty() {
+            return Vec::new();
+        }
         let seq = Self::next_publish_seq();
         let legacy_addresses: Vec<_> = records
             .iter()
@@ -5893,15 +5896,21 @@ impl DhtNetworkManager {
                     return (peer_id, false, Err(error));
                 }
                 let uses_v2 = self.peer_supports_address_v2(&peer_id).await;
+                if !uses_v2
+                    && matches!(&legacy_op, DhtNetworkOperation::PublishAddressSet { addresses, .. } if addresses.is_empty())
+                {
+                    return (peer_id, false, Err(P2PError::Validation(
+                        "no QUIC addresses to publish to a V1 peer".into(),
+                    )));
+                }
                 let op = if uses_v2 { v2_op } else { legacy_op };
                 let result = self.send_dht_request(&peer_id, op, Some(&peer_typed)).await;
                 (peer_id, uses_v2, result)
             });
         }
 
-        // A withdrawal must not spend one full request timeout per unavailable
-        // peer while the rest of the network continues dialing the old relay.
-        // Fan the full replacement out concurrently and retain the exact
+        // Fan the replacement out concurrently so unavailable peers cannot
+        // delay publication to the rest of the network. Retain the exact
         // acknowledgers so the driver can retry only missing replicas.
         while let Some((peer_id, uses_v2, result)) = publishes.next().await {
             match result {

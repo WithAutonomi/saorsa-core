@@ -1883,33 +1883,6 @@ impl DhtCoreEngine {
         routing.replace_node_addresses(node_id, filtered, seq)
     }
 
-    /// Apply the native projection of a validated complete V2 address set.
-    /// An empty projection withdraws QUIC addresses even when other transports
-    /// remain in the full record. Legacy publication retains its empty-input
-    /// rejection semantics.
-    pub(crate) async fn replace_transport_address_projection(
-        &self,
-        node_id: &PeerId,
-        typed_addresses: Vec<(MultiAddr, AddressType)>,
-        seq: u64,
-        mode: AddressReplaceMode,
-    ) -> bool {
-        if typed_addresses.iter().any(|(address, _)| {
-            !address.is_quic()
-                || !is_storable_address(address)
-                || (!self.allow_loopback
-                    && address
-                        .ip()
-                        .is_some_and(|ip| canonicalize_ip(ip).is_loopback()))
-        }) {
-            return false;
-        }
-        self.routing_table
-            .write()
-            .await
-            .replace_node_addresses_with_mode(node_id, typed_addresses, seq, mode)
-    }
-
     /// Replace a peer's advertised address list from sequence-bearing gossip
     /// without refreshing liveness.
     ///
