@@ -6006,7 +6006,7 @@ const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 15;
 /// a second, so this leaves ample slack for legitimate stragglers while
 /// letting us abandon dial cascades that are almost certainly going to
 /// fail anyway.
-const ITERATION_GRACE_TIMEOUT_SECS: u64 = 5;
+use crate::dht_lookup::ITERATION_GRACE_TIMEOUT_SECS;
 
 /// Default maximum concurrent DHT operations
 const DEFAULT_MAX_CONCURRENT_OPS: usize = 100;

@@ -693,8 +693,8 @@ impl Default for NodeConfig {
 
 impl DHTConfig {
     /// Default K value (bucket size) for Kademlia routing.
-    pub const DEFAULT_K_VALUE: usize = 20;
-    const DEFAULT_ALPHA_VALUE: usize = 3;
+    pub const DEFAULT_K_VALUE: usize = crate::dht_lookup::DEFAULT_K_VALUE;
+    const DEFAULT_ALPHA_VALUE: usize = crate::dht_lookup::DEFAULT_ALPHA_VALUE;
     const DEFAULT_REFRESH_INTERVAL_SECS: u64 = 600;
     /// Minimum k_value — values below this produce degenerate routing behavior.
     const MIN_K_VALUE: usize = 4;
