@@ -131,10 +131,7 @@ pub use crate::peer_record::AddressType;
 /// store loopback addresses, and the per-node `allow_loopback` config lives
 /// at [`DhtCoreEngine::replace_node_addresses`].
 pub(crate) fn is_storable_address(addr: &MultiAddr) -> bool {
-    let Some(sa) = addr.socket_addr() else {
-        return true;
-    };
-    !sa.ip().is_unspecified() && sa.port() != 0
+    addr.is_storable()
 }
 
 /// Convenience alias for the internal callers that predate the method form.
