@@ -701,6 +701,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "native")]
     fn test_send_failure_reconnect_classification() {
         let stale = P2PError::Transport(TransportError::SendFailed {
             kind: SendFailureKind::StaleChannel,
