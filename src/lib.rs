@@ -68,6 +68,9 @@ pub(crate) mod validation;
 /// Transport-independent iterative DHT lookup, shared by native and browser clients.
 pub mod dht_lookup;
 
+/// Portable client routing report and witnessed-close-group policy.
+pub mod client_routing;
+
 /// User identity and privacy system (public — accessed via path by saorsa-node).
 pub mod identity;
 
