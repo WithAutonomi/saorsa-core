@@ -98,8 +98,8 @@ pub struct DHTNode {
     #[serde(default)]
     pub address_types: Vec<AddressType>,
     /// Optional per-record metadata. In current DHT responses this may carry
-    /// a marker-encoded `PublishAddressSet` sequence so newer nodes can prefer
-    /// fresher address records without changing the wire shape for older nodes.
+    /// a marker-encoded `PublishAddressSet` sequence for wire compatibility.
+    /// That value has no authority without locally established owner provenance.
     pub distance: Option<Vec<u8>>,
     pub reliability: f64,
     /// Locally established ownership proof; never trusted through deserialization.

@@ -172,6 +172,7 @@ pub fn apply_lookup_report_winners(
         let node = subject_reports
             .get(&node.peer_id)
             .and_then(|reports| compute_winner(&node.peer_id, reports))
+            .filter(|(_, winner)| may_replace_owner_view(&node, winner))
             .map(|(_, winner)| winner.clone())
             .unwrap_or(node);
 
@@ -359,5 +360,17 @@ mod tests {
             group.responder_views[0].closest[1].peer_id,
             responder.peer_id
         );
+    }
+    #[test]
+    fn final_lookup_results_cannot_downgrade_an_owner_proven_candidate() {
+        let mut current = node(1, "/ip4/9.9.9.9/udp/9000/quic");
+        current.address_authority = Some(
+            crate::signed_address::AddressAuthority::AuthenticatedOwner(10),
+        );
+        let hint = node(1, "/ip4/1.1.1.1/udp/9000/quic");
+        let reports = HashMap::from([(current.peer_id, HashMap::from([(current.peer_id, hint)]))]);
+        let result = apply_lookup_report_winners(vec![current.clone()], &reports, &[0; 32], 1);
+        assert_eq!(result[0].addresses, current.addresses);
+        assert_eq!(dht_node_publish_seq(&result[0]), 10);
     }
 }
