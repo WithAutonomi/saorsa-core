@@ -73,6 +73,7 @@ pub fn peer_id_from_public_key_bytes(bytes: &[u8]) -> Result<PeerId> {
 /// completed QUIC/TLS handshake as DER-encoded SubjectPublicKeyInfo. Validate
 /// the DER shape, algorithm identifier, absent ML-DSA parameters, and
 /// byte-aligned key before deriving the overlay identity from the raw key.
+#[cfg(feature = "native")]
 pub(crate) fn peer_id_from_public_key_spki(spki_bytes: &[u8]) -> Result<PeerId> {
     let public_key =
         saorsa_transport::crypto::raw_public_keys::pqc::extract_public_key_from_spki(spki_bytes)
@@ -249,6 +250,7 @@ impl NodeIdentity {
 
 impl NodeIdentity {
     /// Save identity to a JSON file (async)
+    #[cfg(feature = "native")]
     pub async fn save_to_file(&self, path: &std::path::Path) -> Result<()> {
         use tokio::fs;
         let data = self.export();
@@ -275,6 +277,7 @@ impl NodeIdentity {
     }
 
     /// Load identity from a JSON file (async)
+    #[cfg(feature = "native")]
     pub async fn load_from_file(path: &std::path::Path) -> Result<Self> {
         let json = tokio::fs::read_to_string(path).await.map_err(|e| {
             P2PError::Identity(crate::error::IdentityError::InvalidFormat(

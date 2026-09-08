@@ -513,6 +513,7 @@ pub enum BootstrapError {
 
 /// Geographic validation errors for connection rejection
 #[derive(Debug, Error, Clone)]
+#[cfg(feature = "native")]
 pub enum GeoRejectionError {
     #[error("Peer from blocked region: {0}")]
     BlockedRegion(String),
@@ -523,6 +524,7 @@ pub enum GeoRejectionError {
 
 /// Geographic enforcement mode
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg(feature = "native")]
 pub enum GeoEnforcementMode {
     /// Strict mode - reject connections that violate rules
     #[default]
@@ -531,6 +533,7 @@ pub enum GeoEnforcementMode {
 
 /// Configuration for geographic diversity enforcement
 #[derive(Debug, Clone)]
+#[cfg(feature = "native")]
 pub struct GeographicConfig {
     /// Maximum ratio of peers from a single region (default: 0.4 = 40%)
     pub max_single_region_ratio: f64,
@@ -540,6 +543,7 @@ pub struct GeographicConfig {
     pub enforcement_mode: GeoEnforcementMode,
 }
 
+#[cfg(feature = "native")]
 impl Default for GeographicConfig {
     fn default() -> Self {
         Self {
@@ -579,6 +583,7 @@ impl P2PError {
     }
 
     /// Whether retrying this send by reconnecting is safe.
+    #[cfg(feature = "native")]
     pub(crate) fn is_stale_channel_send_failure(&self) -> bool {
         match self {
             P2PError::Network(NetworkError::PeerNotFound(_)) => true,
@@ -630,12 +635,14 @@ impl From<std::net::AddrParseError> for P2PError {
     }
 }
 
+#[cfg(feature = "native")]
 impl From<tokio::time::error::Elapsed> for P2PError {
     fn from(_: tokio::time::error::Elapsed) -> Self {
         P2PError::Network(NetworkError::Timeout)
     }
 }
 
+#[cfg(feature = "native")]
 impl From<crate::adaptive::AdaptiveNetworkError> for P2PError {
     fn from(err: crate::adaptive::AdaptiveNetworkError) -> Self {
         use crate::adaptive::AdaptiveNetworkError;

@@ -4,7 +4,7 @@
 //! trust-weighted peer selection, and security-hardened maintenance tasks.
 
 use crate::PeerId;
-use crate::address::{MultiAddr, is_lan_ip};
+use crate::address::MultiAddr;
 use crate::security::{IP_EXACT_LIMIT, IPDiversityConfig, canonicalize_ip, ip_subnet_limit};
 use anyhow::{Result, anyhow};
 use parking_lot::Mutex as PlMutex;
@@ -108,60 +108,7 @@ fn xor_distance_bytes(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
 /// LoRa) are outside the per-family cap and rely on this bound.
 const MAX_ADDRESSES_PER_NODE: usize = 8;
 
-/// Address classification for priority ordering and staleness eviction.
-///
-/// Priority: Relay > Direct > Unverified > Lan. The `merge_typed_address`
-/// method uses this for insertion ordering and the eviction of excess
-/// `Lan` / `Unverified` entries.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum AddressType {
-    /// Address through a MASQUE relay server (always reachable)
-    Relay,
-    /// Direct public IP address verified reachable without NAT traversal
-    Direct,
-    /// Self-published observed external address whose reachability has not
-    /// been confirmed by the local classifier. Published by cold-start nodes
-    /// that have not yet accepted an unsolicited inbound handshake and have
-    /// not yet acquired a relay. Dialers try these after Relay/Direct and
-    /// before LAN-only fallback
-    /// and must accept the possibility of a timeout.
-    Unverified,
-    /// LAN or other local-scope address. This reuses the old `NATted`
-    /// variant slot for wire compatibility with older nodes.
-    #[serde(alias = "NATted")]
-    Lan,
-}
-
-impl AddressType {
-    /// Priority index for ordering addresses by type. Lower is preferred.
-    ///
-    /// Relay (0) → Direct (1) → Unverified (2) → Lan (3).
-    ///
-    /// Used by [`NodeInfo::merge_typed_address`], [`KBucket::replace_node_addresses`],
-    /// [`DHTNode::addresses_by_priority`], and [`DhtNetworkManager::dialable_addresses_typed`]
-    /// to maintain a consistent ordering invariant.
-    pub const fn priority(self) -> u8 {
-        match self {
-            Self::Relay => 0,
-            Self::Direct => 1,
-            Self::Unverified => 2,
-            Self::Lan => 3,
-        }
-    }
-
-    /// Canonicalize an advertised type against the address itself.
-    ///
-    /// A local-scope IP address is never accepted as Relay, Direct, or
-    /// Unverified, even if that is what a peer advertised. It may still be
-    /// stored as [`AddressType::Lan`] so same-LAN/same-WAN peers can use it.
-    pub(crate) fn for_advertised_address(addr: &MultiAddr, advertised: Self) -> Self {
-        if addr.ip().is_some_and(is_lan_ip) {
-            Self::Lan
-        } else {
-            advertised
-        }
-    }
-}
+pub use crate::peer_record::AddressType;
 
 /// Whether `addr` is worth storing in a peer's address record.
 ///
