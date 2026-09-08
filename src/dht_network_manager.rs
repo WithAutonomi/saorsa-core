@@ -17,12 +17,12 @@
 
 #![allow(missing_docs)]
 
+#[cfg(test)]
+use crate::client_routing::best_tier_priority;
 use crate::client_routing::{
     SubjectReports, apply_lookup_report_winners, build_witnessed_close_group, compute_winner,
     sort_dedup_witnessed_nodes,
 };
-#[cfg(test)]
-use crate::client_routing::{best_tier_priority, self_inclusive_responder_view};
 use crate::dht_lookup::{
     IterativeLookup, LookupConfig, LookupQuery, LookupQueryOutcome, LookupRunError,
     LookupTermination, run_iterative_lookup,
