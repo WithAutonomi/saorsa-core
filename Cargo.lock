@@ -2357,7 +2357,7 @@ dependencies = [
 [[package]]
 name = "saorsa-transport"
 version = "0.36.3"
-source = "git+https://github.com/WithAutonomi/saorsa-transport?rev=52c800ae828a47d88ad9cb553a2cd1b5d364d3eb#52c800ae828a47d88ad9cb553a2cd1b5d364d3eb"
+source = "git+https://github.com/WithAutonomi/saorsa-transport?rev=aff9876341e710627426977fafacccee1595a898#aff9876341e710627426977fafacccee1595a898"
 dependencies = [
  "anyhow",
  "async-trait",
