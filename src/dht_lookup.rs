@@ -29,6 +29,16 @@ use std::error::Error;
 use std::fmt;
 use std::future::{Future, ready};
 
+/// Default Kademlia bucket and lookup result count.
+pub const DEFAULT_K_VALUE: usize = 20;
+
+/// Default concurrent queries in one lookup round.
+pub const DEFAULT_ALPHA_VALUE: usize = 3;
+
+/// Additional wait for remaining queries after the first response in a round.
+/// Bounds slow dial cascades while allowing already-connected peers to reply.
+pub const ITERATION_GRACE_TIMEOUT_SECS: u64 = 5;
+
 /// Canonical 256-bit DHT key or peer identity.
 pub type LookupKey = [u8; 32];
 
@@ -57,7 +67,7 @@ impl LookupConfig {
     pub const fn saorsa(count: usize) -> Self {
         Self {
             count,
-            alpha: 3,
+            alpha: DEFAULT_ALPHA_VALUE,
             max_iterations: 20,
             max_candidates: 200,
         }
