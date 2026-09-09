@@ -1,5 +1,10 @@
-// Copyright 2026 Saorsa Labs Limited
-// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2024 Saorsa Labs Limited
+//
+// This software is licensed under the MIT license <LICENSE-MIT or
+// https://opensource.org/licenses/MIT> or the Apache License, Version 2.0
+// <LICENSE-APACHE or https://www.apache.org/licenses/LICENSE-2.0>, at your
+// option. This file may not be copied, modified, or distributed except
+// according to those terms.
 
 //! Portable owner-signed address publications. Forward the original signed
 //! record; filtering and reachability normalization belong to derived views.
@@ -19,22 +24,15 @@ use std::{fmt, marker::PhantomData, sync::Arc};
 /// Capability token for the extensible address protocol with mandatory owner proofs.
 pub const ADDRESS_V2_CAPABILITY: &str = "addr-v2";
 
-/// Maximum lifetime and permitted clock skew for a signed publication.
-pub const ADDRESS_RECORD_LIFETIME_SECS: u64 = 60 * 60;
-/// Republish unchanged records before their signatures expire.
-pub const ADDRESS_RECORD_REFRESH_SECS: u64 = ADDRESS_RECORD_LIFETIME_SECS / 2;
 /// Upper bound for one encoded signed address record.
 pub const MAX_SIGNED_ADDRESS_BYTES: usize = 40 * 1024;
-const CLOCK_SKEW_SECS: u64 = 120;
-const DOMAIN: &str = "saorsa/address-record/1";
+const DOMAIN: &str = "saorsa/address-record/2";
 
 /// Original immutable publication, including the owner's identity proof.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignedAddressRecord {
     owner: PeerId,
     sequence: u64,
-    issued_at: u64,
-    expires_at: u64,
     #[serde(deserialize_with = "records")]
     records: Vec<TransportAddressRecord>,
     #[serde(deserialize_with = "public_key")]
@@ -43,7 +41,8 @@ pub struct SignedAddressRecord {
     signature: Vec<u8>,
 }
 
-/// A publication whose owner, bounds, freshness and signature were verified.
+/// A publication whose owner, bounds and signature were verified.
+/// Publications do not expire; receivers retain the newest known sequence.
 /// It cannot be constructed by deserialization.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VerifiedAddressRecord(Arc<SignedAddressRecord>);
@@ -51,10 +50,19 @@ pub struct VerifiedAddressRecord(Arc<SignedAddressRecord>);
 /// Local-only provenance. This is deliberately absent from wire peer records.
 #[derive(Clone, Debug)]
 pub enum AddressAuthority {
-    /// Received directly on the owner's authenticated connection.
+    /// QUIC projection received directly on the owner's authenticated connection.
     AuthenticatedOwner(u64),
     /// A portable owner signature, independently checked by this process.
     Signed(VerifiedAddressRecord),
+    /// A local view combining independently versioned QUIC and V2 information.
+    /// The signature covers only `publication`, never the combined address list.
+    Combined {
+        /// Sequence of the owner-proven QUIC projection, or zero for an
+        /// unsequenced routing contact retained alongside a supplemental record.
+        quic_sequence: u64,
+        /// Latest unchanged owner-signed V2 publication.
+        publication: VerifiedAddressRecord,
+    },
 }
 
 impl AddressAuthority {
@@ -63,6 +71,53 @@ impl AddressAuthority {
         match self {
             Self::AuthenticatedOwner(seq) => *seq,
             Self::Signed(record) => record.sequence(),
+            Self::Combined {
+                quic_sequence,
+                publication,
+            } => (*quic_sequence).max(publication.sequence()),
+        }
+    }
+
+    /// Sequence of the QUIC information represented by this local view.
+    pub fn quic_sequence(&self) -> u64 {
+        match self {
+            Self::AuthenticatedOwner(seq) => *seq,
+            Self::Signed(record) => {
+                if record
+                    .records()
+                    .iter()
+                    .any(|r| r.transport == KnownTransport::Quic.id())
+                {
+                    record.sequence()
+                } else {
+                    0
+                }
+            }
+            Self::Combined { quic_sequence, .. } => *quic_sequence,
+        }
+    }
+
+    /// Original signed V2 publication, independent of newer QUIC-only updates.
+    pub fn publication(&self) -> Option<&VerifiedAddressRecord> {
+        match self {
+            Self::AuthenticatedOwner(_) => None,
+            Self::Signed(record)
+            | Self::Combined {
+                publication: record,
+                ..
+            } => Some(record),
+        }
+    }
+
+    pub(crate) fn with_publication(quic_sequence: u64, publication: VerifiedAddressRecord) -> Self {
+        let signed = Self::Signed(publication.clone());
+        if signed.quic_sequence() == quic_sequence {
+            signed
+        } else {
+            Self::Combined {
+                quic_sequence,
+                publication,
+            }
         }
     }
 }
@@ -72,21 +127,16 @@ impl SignedAddressRecord {
     pub fn sign(
         identity: &NodeIdentity,
         sequence: u64,
-        now: u64,
         records: Vec<TransportAddressRecord>,
     ) -> Result<Self, String> {
         let mut record = Self {
             owner: *identity.peer_id(),
             sequence,
-            issued_at: now,
-            expires_at: now
-                .checked_add(ADDRESS_RECORD_LIFETIME_SECS)
-                .ok_or("address record expiry overflow")?,
             records,
             public_key: identity.public_key().as_bytes().to_vec(),
             signature: Vec::new(),
         };
-        record.validate(now)?;
+        record.validate()?;
         record.signature = identity
             .sign(&record.signable_bytes()?)
             .map_err(|e| e.to_string())?
@@ -96,30 +146,16 @@ impl SignedAddressRecord {
     }
 
     fn signable_bytes(&self) -> Result<Vec<u8>, String> {
-        postcard::to_stdvec(&(
-            DOMAIN,
-            self.owner,
-            self.sequence,
-            self.issued_at,
-            self.expires_at,
-            &self.records,
-        ))
-        .map_err(|e| e.to_string())
+        postcard::to_stdvec(&(DOMAIN, self.owner, self.sequence, &self.records))
+            .map_err(|e| e.to_string())
     }
 
-    fn validate(&self, now: u64) -> Result<(), String> {
+    fn validate(&self) -> Result<(), String> {
         if self.sequence == 0
             || self.records.is_empty()
             || self.records.len() > MAX_TRANSPORT_ADDRESS_RECORDS
         {
             return Err("invalid address record sequence or cardinality".into());
-        }
-        if self.issued_at > now.saturating_add(CLOCK_SKEW_SECS)
-            || self.expires_at <= now
-            || self.expires_at <= self.issued_at
-            || self.expires_at - self.issued_at > ADDRESS_RECORD_LIFETIME_SECS
-        {
-            return Err("expired or invalid address record lifetime".into());
         }
         for record in &self.records {
             if record.address.is_empty()
@@ -144,8 +180,8 @@ impl SignedAddressRecord {
     }
 
     /// Verify the signature and public-key-derived owner before using any fields.
-    pub fn verify(&self, now: u64) -> Result<VerifiedAddressRecord, String> {
-        self.validate(now)?;
+    pub fn verify(&self) -> Result<VerifiedAddressRecord, String> {
+        self.validate()?;
         let key = MlDsaPublicKey::from_bytes(&self.public_key).map_err(|e| e.to_string())?;
         if peer_id_from_public_key(&key) != self.owner {
             return Err("address signing key does not match owner".into());
@@ -184,14 +220,6 @@ impl VerifiedAddressRecord {
     /// Original records, including unknown transport payloads.
     pub fn records(&self) -> &[TransportAddressRecord] {
         &self.0.records
-    }
-    /// Whether this record is still acceptable for forwarding.
-    pub fn is_current(&self, now: u64) -> bool {
-        self.0.validate(now).is_ok()
-    }
-    /// Whether an unchanged local publication should be renewed.
-    pub fn needs_refresh(&self, now: u64) -> bool {
-        now >= self.0.issued_at.saturating_add(ADDRESS_RECORD_REFRESH_SECS)
     }
     /// Original signed payload, never a filtered projection.
     pub fn signed(&self) -> &SignedAddressRecord {
@@ -309,7 +337,6 @@ mod tests {
         SignedAddressRecord::sign(
             identity,
             sequence,
-            1000,
             vec![TransportAddressRecord {
                 transport: 900,
                 reachability: 901,
@@ -319,13 +346,13 @@ mod tests {
         .unwrap()
     }
     #[test]
-    fn signatures_bind_owner_sequence_expiry_and_opaque_future_records() {
+    fn signatures_bind_owner_sequence_and_opaque_future_records() {
         let identity = NodeIdentity::generate().unwrap();
         let original = record(&identity, 10);
         let encoded = original.encode().unwrap();
         let verified = SignedAddressRecord::decode(&encoded)
             .unwrap()
-            .verify(1000)
+            .verify()
             .unwrap();
         assert_eq!(verified.owner(), *identity.peer_id());
         assert_eq!(verified.signed().encode().unwrap(), encoded);
@@ -337,28 +364,23 @@ mod tests {
         changed.sequence = u64::MAX;
         mutations.push(changed);
         let mut changed = original.clone();
-        changed.expires_at -= 1;
-        mutations.push(changed);
-        let mut changed = original.clone();
         changed.records[0].address[0] ^= 1;
         mutations.push(changed);
         let mut changed = original.clone();
         changed.signature[0] ^= 1;
         mutations.push(changed);
         for changed in mutations {
-            assert!(changed.verify(1000).is_err());
+            assert!(changed.verify().is_err());
         }
-        assert!(
-            original
-                .verify(1000 + ADDRESS_RECORD_LIFETIME_SECS)
-                .is_err()
-        );
-        assert!(original.verify(0).is_err());
+        // The wire publication has no clock-dependent validity fields.
+        let json = serde_json::to_value(&original).unwrap();
+        assert!(json.get("expires_at").is_none());
+        assert!(json.get("issued_at").is_none());
     }
     #[test]
     fn bounded_decode_and_nonempty_rules_apply_before_signature_verification() {
         let identity = NodeIdentity::generate().unwrap();
-        assert!(SignedAddressRecord::sign(&identity, 1, 1000, Vec::new()).is_err());
+        assert!(SignedAddressRecord::sign(&identity, 1, Vec::new()).is_err());
         let mut malformed = record(&identity, 1);
         malformed.records = vec![malformed.records[0].clone(); MAX_TRANSPORT_ADDRESS_RECORDS + 1];
         assert!(SignedAddressRecord::decode(&malformed.encode().unwrap()).is_err());
@@ -373,7 +395,7 @@ mod tests {
     #[test]
     fn deserialization_cannot_grant_authority_or_override_a_verified_view() {
         let identity = NodeIdentity::generate().unwrap();
-        let signed = record(&identity, 10).verify(1000).unwrap();
+        let signed = record(&identity, 10).verify().unwrap();
         let known = signed.peer_record(1.0);
         let bytes = postcard::to_stdvec(&known).unwrap();
         let mut hint: DHTNode = postcard::from_bytes(&bytes).unwrap();
@@ -393,6 +415,6 @@ mod tests {
             (PeerId::from_bytes([9; 32]), known.clone()),
         ]);
         let (_, winner) = crate::client_routing::compute_winner(&known.peer_id, &reports).unwrap();
-        assert_eq!(crate::peer_record::dht_node_publish_seq(winner), 10);
+        assert_eq!(crate::peer_record::dht_node_publish_seq(&winner), 10);
     }
 }
