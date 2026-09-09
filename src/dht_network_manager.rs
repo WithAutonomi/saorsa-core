@@ -80,9 +80,6 @@ const DHT_V1_TOPIC: &str = "/dht/1.0.0";
 /// Capability-gated extensible address protocol with mandatory owner signatures.
 const DHT_V2_TOPIC: &str = "/dht/address/2.0.0";
 
-/// Bound opaque V2 gossip retained outside the routing table.
-const MAX_STORED_TRANSPORT_ADDRESS_SETS: usize = 4096;
-
 /// Maximum size for incoming legacy DHT messages (64 KB) to prevent memory exhaustion DoS
 /// Messages larger than this are rejected before deserialization
 const MAX_MESSAGE_SIZE: usize = 64 * 1024;
@@ -459,13 +456,6 @@ pub struct TransportDhtNode {
     reliability: f64,
 }
 
-#[derive(Debug, Clone)]
-struct StoredTransportAddressSet {
-    seq: u64,
-    records: Vec<TransportAddressRecord>,
-    proof: Option<VerifiedAddressRecord>,
-}
-
 #[allow(unused_imports)]
 pub use crate::peer_record::{DHTNode, ResponderView, SerializableDHTNode, WitnessedCloseGroup};
 use crate::peer_record::{
@@ -693,9 +683,6 @@ pub struct DhtNetworkManager {
     /// listeners register their certificate-pinned multiaddresses here so the
     /// extensible authenticated V2 address plane can propagate them.
     supplemental_self_addresses: RwLock<Vec<MultiAddr>>,
-    /// Latest complete V2 address record for each known peer. Unknown record
-    /// identifiers remain opaque so this node can forward future transports.
-    transport_address_sets: RwLock<HashMap<PeerId, StoredTransportAddressSet>>,
     local_signed_addresses: RwLock<Option<VerifiedAddressRecord>>,
 }
 
@@ -1392,9 +1379,13 @@ impl LookupQuery<DHTNode> for NativeFindNodeQuery<'_> {
                 let typed = node.typed_addresses();
                 let failure_rx = manager.lookup_failures.subscribe();
                 async move {
-                    manager
+                    let result = manager
                         .send_find_node_lookup_request(peer_id, typed, target, failure_rx)
-                        .await
+                        .await;
+                    if result.1.is_ok() {
+                        manager.merge_trusted_gossiped_typed_addresses(node).await;
+                    }
+                    result
                 }
             })
             .collect();
@@ -1558,7 +1549,6 @@ impl DhtNetworkManager {
                 relay_canary_destination_ip_rate_limit_config(),
             )),
             supplemental_self_addresses: RwLock::new(Vec::new()),
-            transport_address_sets: RwLock::new(HashMap::new()),
             local_signed_addresses: RwLock::new(None),
         })
     }
@@ -2960,13 +2950,7 @@ impl DhtNetworkManager {
                 .collect();
         }
         let dht = self.dht.read().await;
-        let Some(set) = self
-            .transport_address_sets
-            .read()
-            .await
-            .get(peer_id)
-            .cloned()
-        else {
+        let Some(set) = dht.transport_address_set(peer_id).await else {
             return Vec::new();
         };
         let legacy_seq = dht.publish_seq_for_node(peer_id).await;
@@ -3121,19 +3105,21 @@ impl DhtNetworkManager {
         authoritative: bool,
         proof: Option<VerifiedAddressRecord>,
     ) -> bool {
-        // Lock ordering is always DHT, then V2 sets. The outer DHT write
-        // guard makes native readers and other publications observe a complete
-        // update, including the sequence and the extensible record.
+        // Serialize the native projection and full publication with routing
+        // admission/removal. Both are owned by the existing routing table.
         let dht = self.dht.write().await;
-        let mut sets = self.transport_address_sets.write().await;
+        if !dht.has_node(owner).await {
+            return false;
+        }
+        let stored = dht.transport_address_set(owner).await;
         let legacy_seq = dht.publish_seq_for_node(owner).await;
-        if seq == 0 || seq < legacy_seq || sets.get(owner).is_some_and(|stored| seq <= stored.seq) {
+        if seq == 0 || seq < legacy_seq || stored.as_ref().is_some_and(|stored| seq <= stored.seq) {
             return false;
         }
 
         // Non-native records are useful to browser clients and future transports,
         // but an empty projection is not a replacement for existing QUIC addresses.
-        if !native.is_empty() && dht.has_node(owner).await {
+        if !native.is_empty() {
             let previous = dht.get_node_addresses_typed(owner).await;
             if seq == legacy_seq {
                 // A V1 projection may arrive before the full V2 record of the
@@ -3175,21 +3161,15 @@ impl DhtNetworkManager {
                 );
             }
         }
-        if !sets.contains_key(owner)
-            && sets.len() >= MAX_STORED_TRANSPORT_ADDRESS_SETS
-            && let Some(evict) = sets.keys().next().copied()
-        {
-            sets.remove(&evict);
-        }
-        sets.insert(
-            *owner,
-            StoredTransportAddressSet {
+        dht.store_transport_address_set(
+            owner,
+            crate::dht::core_engine::TransportAddressSet {
                 seq,
                 records,
                 proof,
             },
-        );
-        true
+        )
+        .await
     }
 
     // Verify every V2 record before accepting any addresses or sequence metadata.
@@ -3214,7 +3194,7 @@ impl DhtNetworkManager {
                 continue;
             };
             let owner = proof.owner();
-            self.apply_signed_address_set(proof, transport_source, false)
+            self.apply_signed_address_set(proof.clone(), transport_source, false)
                 .await;
             let (addresses, address_types) = native.into_iter().unzip();
             normalized.push(
@@ -3224,7 +3204,7 @@ impl DhtNetworkManager {
                     address_types,
                     distance: None,
                     reliability: node.reliability,
-                    address_authority: None,
+                    address_authority: Some(AddressAuthority::Signed(proof)),
                 })
                 .await,
             );
@@ -3238,6 +3218,9 @@ impl DhtNetworkManager {
         transport_source: Option<&MultiAddr>,
         authoritative: bool,
     ) -> bool {
+        if !proof.is_current(Self::address_time()) {
+            return false;
+        }
         let owner = proof.owner();
         let Some((records, native)) = self
             .validate_transport_address_records(&owner, proof.records().to_vec(), transport_source)
@@ -3259,11 +3242,20 @@ impl DhtNetworkManager {
     // Return local owner-proven state instead of a third party's conflicting hint.
     async fn protect_owner_view(&self, mut hint: DHTNode) -> DHTNode {
         hint.distance = None;
-        hint.address_authority = None;
         let dht = self.dht.read().await;
-        let sets = self.transport_address_sets.read().await;
         let seq = dht.publish_seq_for_node(&hint.peer_id).await;
-        if let Some(stored) = sets.get(&hint.peer_id) {
+        let stored = dht.transport_address_set(&hint.peer_id).await;
+        let stored_seq = stored.as_ref().map_or(seq, |set| set.seq.max(seq));
+        // Verified discoveries remain lookup-local until normal routing admission.
+        if let Some(AddressAuthority::Signed(proof)) = &hint.address_authority
+            && proof.sequence() > stored_seq
+            && proof.is_current(Self::address_time())
+        {
+            hint.distance = encode_publish_seq_distance(proof.sequence());
+            return hint;
+        }
+        hint.address_authority = None;
+        if let Some(stored) = stored {
             if let Some(proof) = &stored.proof
                 && proof.sequence() >= seq
                 && proof.is_current(Self::address_time())
@@ -3276,7 +3268,8 @@ impl DhtNetworkManager {
             }
             let mut native = dht.get_node_addresses_typed(&hint.peer_id).await;
             if native.is_empty() {
-                // A lookup can discover a signed owner before routing admission.
+                // Supplemental-only publications preserve the existing native
+                // projection; fall back to the filtered full record if needed.
                 native = stored
                     .records
                     .iter()
@@ -3326,11 +3319,9 @@ impl DhtNetworkManager {
         }
         let dht = self.dht.read().await;
         let native_seq = dht.publish_seq_for_node(peer).await;
-        self.transport_address_sets
-            .read()
+        dht.transport_address_set(peer)
             .await
-            .get(peer)
-            .and_then(|stored| stored.proof.as_ref())
+            .and_then(|stored| stored.proof.clone())
             .filter(|proof| {
                 proof.sequence() >= native_seq && proof.is_current(Self::address_time())
             })
@@ -3540,14 +3531,17 @@ impl DhtNetworkManager {
     }
 
     /// Return true when a FIND_NODE candidate has no useful dial attempt left
-    /// right now because every address in the dial plan is cooling down in the
-    /// shared failed-address cache.
+    /// right now because it has no native QUIC dial addresses or every address
+    /// in its dial plan is cooling down in the shared failed-address cache.
     ///
     /// Already-connected peers are still queryable even if their advertised
     /// addresses are cached as failed, because the request path can reuse the
     /// open channel without dialing.
     async fn lookup_candidate_dial_plan_is_exhausted(&self, node: &DHTNode) -> bool {
         let typed = node.typed_addresses();
+        if !typed.iter().any(|(address, _)| Self::is_dialable(address)) {
+            return !self.transport.is_peer_connected(&node.peer_id).await;
+        }
         if !self
             .dial_plan_fully_failed_in_cache_for_local(&node.peer_id, &typed)
             .await
@@ -4580,6 +4574,11 @@ impl DhtNetworkManager {
                         "publication sender is not the record owner".into(),
                     ));
                 }
+                // Publications share routing admission. Do not acknowledge an
+                // unstored record: the publisher must retry after admission.
+                if !self.dht.read().await.has_node(authenticated_sender).await {
+                    return Ok(DhtNetworkResult::PeerRejected);
+                }
                 self.apply_signed_address_set(proof, transport_source, true)
                     .await;
                 Ok(DhtNetworkResult::PublishAddressAck)
@@ -4636,9 +4635,9 @@ impl DhtNetworkManager {
                     );
                 }
                 let dht = self.dht.write().await;
-                let mut sets = self.transport_address_sets.write().await;
-                if sets
-                    .get(authenticated_sender)
+                if dht
+                    .transport_address_set(authenticated_sender)
+                    .await
                     .is_some_and(|stored| stored.seq >= *seq)
                 {
                     return Ok(DhtNetworkResult::PublishAddressAck);
@@ -4676,9 +4675,6 @@ impl DhtNetworkManager {
                 } else {
                     0
                 };
-                if applied {
-                    sets.remove(authenticated_sender);
-                }
                 if cleared > 0 {
                     debug!(
                         peer = %authenticated_sender.to_hex(),
@@ -5932,52 +5928,32 @@ impl DhtNetworkManager {
     }
 
     async fn merge_trusted_gossiped_typed_addresses(&self, node: &DHTNode) {
+        if let Some(AddressAuthority::Signed(proof)) = &node.address_authority {
+            // A lookup result carries its proof through discovery. Persist it
+            // only if normal admission has since installed the routing peer.
+            self.apply_signed_address_set(proof.clone(), None, false)
+                .await;
+            return;
+        }
         let typed_addresses = node.typed_addresses();
         let dht = self.dht.write().await;
         let publish_seq = dht_node_publish_seq(node);
         if publish_seq == 0
             && (dht.publish_seq_for_node(&node.peer_id).await != 0
-                || self
-                    .transport_address_sets
-                    .read()
-                    .await
-                    .contains_key(&node.peer_id))
+                || dht.transport_address_set(&node.peer_id).await.is_some())
         {
             return;
         }
         if publish_seq != 0 {
-            let mut sets = self.transport_address_sets.write().await;
-            if let Some(stored) = sets.get(&node.peer_id)
-                && stored.seq >= publish_seq
+            if dht
+                .transport_address_set(&node.peer_id)
+                .await
+                .is_some_and(|stored| stored.seq >= publish_seq)
             {
-                // A peer can enter the routing table after its V2 record was
-                // learned. Apply its native replacement using V1's guards;
-                // a supplemental-only record cannot clear existing addresses.
-                let native = stored
-                    .records
-                    .iter()
-                    .filter_map(|record| {
-                        let address = record.decode_known().ok().flatten()?;
-                        address.is_quic().then(|| {
-                            (
-                                address,
-                                record
-                                    .legacy_reachability()
-                                    .unwrap_or(AddressType::Unverified),
-                            )
-                        })
-                    })
-                    .collect();
-                dht.replace_node_addresses_from_gossip(&node.peer_id, native, stored.seq)
-                    .await;
                 return;
             }
-            if dht
-                .replace_node_addresses_from_gossip(&node.peer_id, typed_addresses, publish_seq)
-                .await
-            {
-                sets.remove(&node.peer_id);
-            }
+            dht.replace_node_addresses_from_gossip(&node.peer_id, typed_addresses, publish_seq)
+                .await;
             return;
         }
         for (addr, ty) in typed_addresses {

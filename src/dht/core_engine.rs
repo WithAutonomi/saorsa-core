@@ -1,3 +1,11 @@
+// Copyright 2024 Saorsa Labs Limited
+//
+// This software is licensed under the MIT license <LICENSE-MIT or
+// https://opensource.org/licenses/MIT> or the Apache License, Version 2.0
+// <LICENSE-APACHE or https://www.apache.org/licenses/LICENSE-2.0>, at your
+// option. This file may not be copied, modified, or distributed except
+// according to those terms.
+
 //! DHT Core Engine with Kademlia routing
 //!
 //! Provides peer discovery and routing via a Kademlia DHT with k=8 buckets,
@@ -6,6 +14,8 @@
 use crate::PeerId;
 use crate::address::MultiAddr;
 use crate::security::{IP_EXACT_LIMIT, IPDiversityConfig, canonicalize_ip, ip_subnet_limit};
+use crate::signed_address::VerifiedAddressRecord;
+use crate::transport_address::TransportAddressRecord;
 use anyhow::{Result, anyhow};
 use parking_lot::Mutex as PlMutex;
 use serde::{Deserialize, Serialize};
@@ -815,7 +825,7 @@ impl KBucket {
         // If filtering emptied a non-empty input (publisher sent only
         // wildcards or other non-storable addresses), refuse the replace
         // entirely. The caller (KademliaRoutingTable::replace_node_addresses_with_mode)
-        // gates `last_publish_seqs` on this return value, so refusing here
+        // gates `address_publications` on this return value, so refusing here
         // preserves the peer's prior good addresses AND leaves the door
         // open for a subsequent CORRECT publish at the same sequence number
         // to land. Without this guard we would (a) wipe a working address
@@ -852,17 +862,33 @@ impl KBucket {
     }
 }
 
+/// Full transport publication retained for an admitted routing peer.
+/// The proof remains unchanged for forwarding; records are the filtered local view.
+#[derive(Debug, Clone)]
+pub(crate) struct TransportAddressSet {
+    pub(crate) seq: u64,
+    pub(crate) records: Vec<TransportAddressRecord>,
+    pub(crate) proof: Option<VerifiedAddressRecord>,
+}
+
+#[derive(Debug, Default)]
+struct AddressPublication {
+    // Sequence of the native address projection (legacy V1 compatibility).
+    seq: u64,
+    transport: Option<Arc<TransportAddressSet>>,
+}
+
 /// Kademlia routing table
 pub struct KademliaRoutingTable {
     buckets: Vec<KBucket>,
     node_id: PeerId,
-    /// Highest `PublishAddressSet` sequence number received from each peer.
+    /// Publication sequence and complete transport record for each admitted peer.
     ///
     /// Republishes with a lower-or-equal sequence than the stored value are
     /// discarded to close the "relay-lost → relay-acquired" reorder race.
     /// Stored alongside the routing table so the sequence check and the
     /// address replacement are atomic under the same write lock.
-    last_publish_seqs: HashMap<PeerId, u64>,
+    address_publications: HashMap<PeerId, AddressPublication>,
 }
 
 impl KademliaRoutingTable {
@@ -875,7 +901,7 @@ impl KademliaRoutingTable {
         Self {
             buckets,
             node_id,
-            last_publish_seqs: HashMap::new(),
+            address_publications: HashMap::new(),
         }
     }
 
@@ -890,11 +916,42 @@ impl KademliaRoutingTable {
         if let Some(bucket_index) = self.get_bucket_index(node_id) {
             self.buckets[bucket_index].remove_node(node_id);
         }
-        self.last_publish_seqs.remove(node_id);
+        self.address_publications.remove(node_id);
     }
 
     fn publish_seq_for(&self, node_id: &PeerId) -> u64 {
-        self.last_publish_seqs.get(node_id).copied().unwrap_or(0)
+        self.address_publications
+            .get(node_id)
+            .map_or(0, |stored| stored.seq)
+    }
+
+    fn transport_address_set(&self, node_id: &PeerId) -> Option<&Arc<TransportAddressSet>> {
+        self.address_publications.get(node_id)?.transport.as_ref()
+    }
+
+    fn store_transport_address_set(&mut self, node_id: &PeerId, set: TransportAddressSet) -> bool {
+        let Some(index) = self.get_bucket_index(node_id) else {
+            return false;
+        };
+        if !self.buckets[index]
+            .nodes
+            .iter()
+            .any(|node| &node.id == node_id)
+        {
+            return false;
+        }
+        let publication = self.address_publications.entry(*node_id).or_default();
+        if set.seq == 0
+            || set.seq < publication.seq
+            || publication
+                .transport
+                .as_ref()
+                .is_some_and(|old| set.seq <= old.seq)
+        {
+            return false;
+        }
+        publication.transport = Some(Arc::new(set));
+        true
     }
 
     /// Merge a legacy relay hint only while the peer has no authoritative
@@ -969,8 +1026,11 @@ impl KademliaRoutingTable {
             return false;
         }
 
-        if let Some(&stored) = self.last_publish_seqs.get(node_id)
-            && seq <= stored
+        if let Some(stored) = self.address_publications.get(node_id)
+            && seq
+                <= stored
+                    .seq
+                    .max(stored.transport.as_ref().map_or(0, |set| set.seq))
         {
             return false;
         }
@@ -987,7 +1047,13 @@ impl KademliaRoutingTable {
                 .replace_node_addresses_from_gossip(node_id, typed_addresses),
         };
         if applied {
-            self.last_publish_seqs.insert(*node_id, seq);
+            self.address_publications.insert(
+                *node_id,
+                AddressPublication {
+                    seq,
+                    transport: None,
+                },
+            );
         }
         applied
     }
@@ -1605,6 +1671,31 @@ impl DhtCoreEngine {
         self.routing_table.read().await.publish_seq_for(node_id)
     }
 
+    /// Complete publication for an admitted peer, with its original owner proof.
+    pub(crate) async fn transport_address_set(
+        &self,
+        node_id: &PeerId,
+    ) -> Option<Arc<TransportAddressSet>> {
+        self.routing_table
+            .read()
+            .await
+            .transport_address_set(node_id)
+            .cloned()
+    }
+
+    /// Retain a publication only for an existing routing peer. Removal of that
+    /// peer also removes its publication; discovery alone never admits an owner.
+    pub(crate) async fn store_transport_address_set(
+        &self,
+        node_id: &PeerId,
+        set: TransportAddressSet,
+    ) -> bool {
+        self.routing_table
+            .write()
+            .await
+            .store_transport_address_set(node_id, set)
+    }
+
     /// Find nodes closest to a key, including self as a candidate.
     /// Used by consumers for storage responsibility determination.
     #[allow(dead_code)]
@@ -1851,11 +1942,11 @@ impl DhtCoreEngine {
     ///     if stripping loopback empties a non-empty input, the **empty set
     ///     is still applied**. A publisher that legitimately drops to zero
     ///     reachable addresses must not keep stale ones alive, and
-    ///     `last_publish_seqs` advances normally.
+    ///     `address_publications` advances normally.
     ///   - *Wildcard / port-zero* ([`KBucket::replace_node_addresses_with_mode`]
     ///     via `is_storable_address`): if this empties a non-empty input the
     ///     replace is **refused** — prior good addresses are preserved and
-    ///     `last_publish_seqs` is NOT advanced, so a corrected republish at
+    ///     `address_publications` is NOT advanced, so a corrected republish at
     ///     the same `seq` can still land. Wildcard-only is treated as a
     ///     malformed publish, not an intentional "I have no addresses", so
     ///     callers and tests must not assume all filter-empty publishes
@@ -3190,7 +3281,7 @@ mod tests {
         assert!(table.replace_node_addresses(&peer, typed.clone(), 100));
 
         table.remove_node(&peer);
-        assert!(!table.last_publish_seqs.contains_key(&peer));
+        assert!(!table.address_publications.contains_key(&peer));
 
         // Re-add and verify the seq counter was cleared (lower seq now accepted).
         table

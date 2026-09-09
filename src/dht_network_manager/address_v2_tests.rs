@@ -170,6 +170,7 @@ async fn authenticated_v2_response_requires_a_live_matching_request() {
     let sender_id = *sender.peer_id();
     let identity = crate::identity::NodeIdentity::generate().unwrap();
     let owner = *identity.peer_id();
+    seed_peer(manager, owner, "/ip4/8.8.8.8/udp/9000/quic").await;
     let wire_response = response(sender_id, &identity, 10);
     assert_eq!(
         manager.canonical_app_peer_id(&sender_id).await,
@@ -256,7 +257,17 @@ async fn authenticated_v2_response_requires_a_live_matching_request() {
         .handle_dht_response(&response(sender_id, &identity, u64::MAX), &sender_id, None)
         .await
         .unwrap();
-    assert_eq!(manager.transport_address_sets.read().await[&owner].seq, 10);
+    assert_eq!(
+        manager
+            .dht
+            .read()
+            .await
+            .transport_address_set(&owner)
+            .await
+            .unwrap()
+            .seq,
+        10
+    );
     receiver.stop().await.unwrap();
     sender.stop().await.unwrap();
 }
@@ -290,7 +301,14 @@ async fn rejected_v2_publish_preserves_both_views_and_allows_correction() {
         let legacy = peer_view(manager, owner).await;
         assert_eq!(dht_node_publish_seq(&legacy), 10);
         assert_eq!(
-            manager.transport_address_sets.read().await[&owner].records,
+            manager
+                .dht
+                .read()
+                .await
+                .transport_address_set(&owner)
+                .await
+                .unwrap()
+                .records,
             vec![good.clone()]
         );
     }
@@ -314,7 +332,14 @@ async fn rejected_v2_publish_preserves_both_views_and_allows_correction() {
         vec![corrected.decode_known().unwrap().unwrap()]
     );
     assert_eq!(
-        manager.transport_address_sets.read().await[&owner].records,
+        manager
+            .dht
+            .read()
+            .await
+            .transport_address_set(&owner)
+            .await
+            .unwrap()
+            .records,
         vec![corrected]
     );
 }
@@ -348,7 +373,14 @@ async fn supplemental_replacements_preserve_native_addresses_and_reject_empty_se
     assert_eq!(native.addresses, stale.addresses);
     assert_eq!(dht_node_publish_seq(&native), 10);
     assert_eq!(
-        manager.transport_address_sets.read().await[&owner].records,
+        manager
+            .dht
+            .read()
+            .await
+            .transport_address_set(&owner)
+            .await
+            .unwrap()
+            .records,
         vec![browser.clone()]
     );
     assert!(
@@ -356,7 +388,17 @@ async fn supplemental_replacements_preserve_native_addresses_and_reject_empty_se
             .apply_transport_address_set(&owner, u64::MAX, Vec::new(), None)
             .await
     );
-    assert_eq!(manager.transport_address_sets.read().await[&owner].seq, 11);
+    assert_eq!(
+        manager
+            .dht
+            .read()
+            .await
+            .transport_address_set(&owner)
+            .await
+            .unwrap()
+            .seq,
+        11
+    );
     assert_eq!(
         manager.supplemental_addresses_for_peer(&owner).await,
         vec![browser_address(owner)]
@@ -484,7 +526,14 @@ async fn v2_filters_loopback_in_both_ip_representations_and_transports() {
         );
         assert_eq!(dht_node_publish_seq(&native), seq);
         assert_eq!(
-            manager.transport_address_sets.read().await[&owner].records,
+            manager
+                .dht
+                .read()
+                .await
+                .transport_address_set(&owner)
+                .await
+                .unwrap()
+                .records,
             vec![quic_record("/ip4/8.8.8.8/udp/9000/quic")]
         );
     }
@@ -538,7 +587,14 @@ async fn concurrent_legacy_and_v2_publications_keep_the_newest_complete_set() {
     );
     assert_eq!(dht_node_publish_seq(&native), 12);
     assert_eq!(
-        manager.transport_address_sets.read().await[&owner].records,
+        manager
+            .dht
+            .read()
+            .await
+            .transport_address_set(&owner)
+            .await
+            .unwrap()
+            .records,
         vec![browser]
     );
 }
@@ -584,7 +640,14 @@ async fn v2_completes_an_identical_legacy_projection_at_the_same_sequence() {
             .await
     );
     assert_eq!(
-        manager.transport_address_sets.read().await[&owner].records,
+        manager
+            .dht
+            .read()
+            .await
+            .transport_address_set(&owner)
+            .await
+            .unwrap()
+            .records,
         records
     );
 }
@@ -744,10 +807,12 @@ async fn empty_publication_is_not_sent_or_acknowledged() {
     assert!(
         receiver
             .dht_manager()
-            .transport_address_sets
+            .dht
             .read()
             .await
-            .is_empty()
+            .transport_address_set(publisher.peer_id())
+            .await
+            .is_none()
     );
     publisher.stop().await.unwrap();
     receiver.stop().await.unwrap();
@@ -824,11 +889,13 @@ async fn signed_gossip_survives_forwarding_and_unsigned_downgrade_attempts() {
         .await
         .unwrap();
     assert!(
-        !manager
-            .transport_address_sets
+        manager
+            .dht
             .read()
             .await
-            .contains_key(&owner)
+            .transport_address_set(&owner)
+            .await
+            .is_none()
     );
     let rx = track_request(manager, sender, operation);
     let mut wrong_key = wire.clone();
@@ -840,11 +907,13 @@ async fn signed_gossip_survives_forwarding_and_unsigned_downgrade_attempts() {
         .await
         .unwrap();
     assert!(
-        !manager
-            .transport_address_sets
+        manager
+            .dht
             .read()
             .await
-            .contains_key(&owner)
+            .transport_address_set(&owner)
+            .await
+            .is_none()
     );
     manager
         .handle_dht_response(&wire, &sender, None)
@@ -914,7 +983,17 @@ async fn signed_gossip_survives_forwarding_and_unsigned_downgrade_attempts() {
         vec![native.decode_known().unwrap().unwrap()]
     );
     assert_eq!(dht_node_publish_seq(&nodes[0]), 20);
-    assert_eq!(manager.transport_address_sets.read().await[&owner].seq, 20);
+    assert_eq!(
+        manager
+            .dht
+            .read()
+            .await
+            .transport_address_set(&owner)
+            .await
+            .unwrap()
+            .seq,
+        20
+    );
     let stale = SignedAddressRecord::sign(
         &identity,
         19,
@@ -966,7 +1045,7 @@ async fn signed_discovery_precedes_admission_and_defers_to_newer_direct_publicat
     )
     .unwrap();
     assert!(
-        manager
+        !manager
             .apply_signed_address_set(
                 signed.verify(DhtNetworkManager::address_time()).unwrap(),
                 None,
@@ -974,21 +1053,57 @@ async fn signed_discovery_precedes_admission_and_defers_to_newer_direct_publicat
             )
             .await
     );
-    let hint = DHTNode {
-        peer_id: owner,
-        addresses: vec![],
-        address_types: vec![],
-        distance: None,
-        reliability: 1.0,
-        address_authority: None,
-    };
-    let view = manager.protect_owner_view(hint.clone()).await;
+    let request = message(
+        owner,
+        DhtNetworkOperation::PublishAddressSetV2 {
+            record: signed.clone(),
+        },
+    );
+    assert!(matches!(
+        manager
+            .handle_dht_request(&request, &owner, None)
+            .await
+            .unwrap(),
+        DhtNetworkResult::PeerRejected
+    ));
+    let view = manager
+        .normalize_v2_nodes(
+            vec![TransportDhtNode {
+                record: signed.clone(),
+                reliability: 1.0,
+            }],
+            None,
+        )
+        .await
+        .remove(0);
     assert_eq!(
         view.addresses,
         vec![record.decode_known().unwrap().unwrap()]
     );
     assert_eq!(dht_node_publish_seq(&view), 20);
+    assert!(
+        manager
+            .signed_address_record_for_peer(&owner)
+            .await
+            .is_none()
+    );
+    assert!(
+        manager
+            .dht
+            .read()
+            .await
+            .transport_address_set(&owner)
+            .await
+            .is_none()
+    );
+    assert!(!manager.dht.read().await.has_node(&owner).await);
     seed_peer(manager, owner, "/ip4/8.8.8.8/udp/9000/quic").await;
+    manager.merge_trusted_gossiped_typed_addresses(&view).await;
+    assert_eq!(
+        manager.signed_address_record_for_peer(&owner).await,
+        Some(signed)
+    );
+    let hint = view;
     let direct: MultiAddr = "/ip4/1.1.1.1/udp/9000/quic".parse().unwrap();
     assert!(
         manager
@@ -1199,19 +1314,135 @@ async fn v2_publication_checks_signature_and_authenticated_owner_before_mutation
             .is_err()
     );
     assert!(
-        !manager
-            .transport_address_sets
+        manager
+            .dht
             .read()
             .await
-            .contains_key(&owner)
+            .transport_address_set(&owner)
+            .await
+            .is_none()
     );
     manager
         .handle_dht_request(&request, &owner, None)
         .await
         .unwrap();
-    assert_eq!(manager.transport_address_sets.read().await[&owner].seq, 10);
+    assert_eq!(
+        manager
+            .dht
+            .read()
+            .await
+            .transport_address_set(&owner)
+            .await
+            .unwrap()
+            .seq,
+        10
+    );
     assert_eq!(
         peer_view(manager, owner).await.addresses,
         vec!["/ip4/9.9.9.9/udp/9000/quic".parse::<MultiAddr>().unwrap()]
+    );
+}
+
+#[tokio::test]
+async fn routing_publication_forwards_signed_transports_but_native_dials_only_quic() {
+    let node = test_node().await;
+    let manager = node.dht_manager();
+    let identity = crate::identity::NodeIdentity::generate().unwrap();
+    let owner = *identity.peer_id();
+    let quic: MultiAddr = "/ip4/9.9.9.9/udp/9000/quic".parse().unwrap();
+    let browser = browser_address(owner);
+    let records = vec![
+        quic_record("/ip4/9.9.9.9/udp/9000/quic"),
+        TransportAddressRecord::from_multiaddr(&browser, KnownReachability::Unverified)
+            .unwrap()
+            .unwrap(),
+    ];
+    let signed = SignedAddressRecord::sign(
+        &identity,
+        10,
+        DhtNetworkManager::address_time(),
+        records.clone(),
+    )
+    .unwrap();
+    seed_peer(manager, owner, "/ip4/8.8.8.8/udp/9000/quic").await;
+    let publication = message(
+        owner,
+        DhtNetworkOperation::PublishAddressSetV2 {
+            record: signed.clone(),
+        },
+    );
+    manager
+        .handle_dht_request(&publication, &owner, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        manager.supplemental_addresses_for_peer(&owner).await,
+        vec![browser.clone()]
+    );
+    assert_eq!(
+        manager.peer_addresses_for_dial_typed(&owner).await,
+        vec![(quic.clone(), AddressType::Direct)]
+    );
+    let mixed = vec![
+        (browser.clone(), AddressType::Direct),
+        (quic, AddressType::Direct),
+    ];
+    let plan = manager.contextual_dial_plan(&mixed).await;
+    assert_eq!(plan.len(), 1);
+    assert!(plan[0].0.is_quic());
+    let browser_only = DHTNode {
+        peer_id: owner,
+        addresses: vec![browser.clone()],
+        address_types: vec![AddressType::Direct],
+        distance: None,
+        reliability: 1.0,
+        address_authority: None,
+    };
+    let mut query = NativeFindNodeQuery::new(manager, None);
+    assert!(!query.is_candidate_eligible(&browser_only).await.unwrap());
+    assert!(manager.transport.connect_peer(&browser).await.is_err());
+
+    // A client receives the unchanged signed QUIC + WebRTC record and can
+    // verify/decode it using the same portable types exposed on WASM.
+    let result = manager
+        .handle_find_node_v2_request(owner.as_bytes(), node.peer_id())
+        .await
+        .unwrap();
+    let encoded = postcard::to_stdvec(&result).unwrap();
+    let DhtNetworkResult::NodesFoundV2 { nodes, .. } = postcard::from_bytes(&encoded).unwrap()
+    else {
+        panic!("expected a V2 lookup response");
+    };
+    let forwarded = nodes
+        .into_iter()
+        .find(|entry| entry.record == signed)
+        .unwrap();
+    let verified = forwarded
+        .record
+        .verify(DhtNetworkManager::address_time())
+        .unwrap();
+    assert_eq!(verified.records(), records);
+    assert_eq!(verified.records()[1].decode_known().unwrap(), Some(browser));
+
+    // All address metadata follows routing membership, with no separate eviction.
+    manager.dht.write().await.remove_node_by_id(&owner).await;
+    assert!(
+        manager
+            .supplemental_addresses_for_peer(&owner)
+            .await
+            .is_empty()
+    );
+    assert!(
+        manager
+            .signed_address_record_for_peer(&owner)
+            .await
+            .is_none()
+    );
+    seed_peer(manager, owner, "/ip4/8.8.8.8/udp/9000/quic").await;
+    assert!(
+        manager
+            .signed_address_record_for_peer(&owner)
+            .await
+            .is_none()
     );
 }
