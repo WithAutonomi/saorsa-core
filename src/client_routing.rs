@@ -56,9 +56,9 @@ fn report_signature(node: &DHTNode) -> Vec<(MultiAddr, u8)> {
 ///
 /// Rules (applied in order):
 ///
-///   1. **Newest owner-proven publication** — the highest nonzero sequence
-///      established by a verified owner signature or authenticated owner
-///      connection wins. An intermediary's unsigned sequence has no authority.
+///   1. **Owner-proven information** — combine the newest QUIC projection and
+///      newest signed V2 publication. An intermediary's unsigned sequence has
+///      no authority over either view.
 ///   2. **Self-report** — among unsequenced hints, prefer the subject itself.
 ///   3. **Quorum** — among the top `QUORUM_TOP_N` closest-XOR
 ///      responders, if `QUORUM_THRESHOLD`+ agree on the address set
@@ -69,10 +69,7 @@ fn report_signature(node: &DHTNode) -> Vec<(MultiAddr, u8)> {
 ///      the one whose best tag tier is stronger breaks it.
 ///
 /// Returns `None` only when `reports` is empty.
-pub fn compute_winner<'a>(
-    subject_id: &PeerId,
-    reports: &'a SubjectReports,
-) -> Option<(PeerId, &'a DHTNode)> {
+pub fn compute_winner(subject_id: &PeerId, reports: &SubjectReports) -> Option<(PeerId, DHTNode)> {
     if reports.is_empty() {
         return None;
     }
@@ -105,13 +102,17 @@ pub fn compute_winner<'a>(
                 .then_with(|| b.3.cmp(&a.3))
         })
     {
-        return Some((*rid, *node));
+        let mut winner = (*node).clone();
+        for (_, report, _, _) in &by_dist {
+            winner.merge_from((*report).clone());
+        }
+        return Some((*rid, winner));
     }
 
     // An authenticated self-report wins among unsequenced hints, but cannot
     // downgrade an owner-proven sequenced publication already in this view.
     if let Some(node) = reports.get(subject_id) {
-        return Some((*subject_id, node));
+        return Some((*subject_id, node.clone()));
     }
 
     // Rule 3: quorum among top-N.
@@ -134,13 +135,15 @@ pub fn compute_winner<'a>(
             // All consensus reports have the same address set by
             // construction, so any pick is behaviourally equivalent;
             // choosing closest makes the result deterministic.
-            return reports.get(&winner_rid).map(|node| (winner_rid, node));
+            return reports
+                .get(&winner_rid)
+                .map(|node| (winner_rid, node.clone()));
         }
     }
 
     // Rule 4: fallback — closest-XOR (then strongest-tier) responder.
     let (rid, node, _, _) = by_dist.first()?;
-    Some((*rid, *node))
+    Some((*rid, (*node).clone()))
 }
 
 fn prefer_lookup_record(candidate: &DHTNode, existing: &DHTNode) -> bool {
@@ -168,17 +171,23 @@ pub fn apply_lookup_report_winners(
 ) -> Vec<DHTNode> {
     let mut by_peer: HashMap<PeerId, DHTNode> = HashMap::new();
 
-    for node in best_nodes {
-        let node = subject_reports
+    for mut node in best_nodes {
+        if let Some((_, winner)) = subject_reports
             .get(&node.peer_id)
             .and_then(|reports| compute_winner(&node.peer_id, reports))
-            .filter(|(_, winner)| may_replace_owner_view(&node, winner))
-            .map(|(_, winner)| winner.clone())
-            .unwrap_or(node);
+        {
+            if dht_node_publish_seq(&node) != 0 || dht_node_publish_seq(&winner) != 0 {
+                node.merge_from(winner);
+            } else {
+                node = winner;
+            }
+        }
 
         match by_peer.entry(node.peer_id) {
             std::collections::hash_map::Entry::Occupied(mut entry) => {
-                if prefer_lookup_record(&node, entry.get()) {
+                if dht_node_publish_seq(&node) != 0 || dht_node_publish_seq(entry.get()) != 0 {
+                    entry.get_mut().merge_from(node);
+                } else if prefer_lookup_record(&node, entry.get()) {
                     *entry.get_mut() = node;
                 }
             }
@@ -292,9 +301,21 @@ pub fn build_witnessed_close_group(
 
 /// Whether an incoming lookup view may replace an already owner-proven view.
 /// Unsigned hints cannot displace a publication or raise its accepted sequence.
+/// If neither view supersedes both scopes, use [`DHTNode::merge_from`] instead.
 pub fn may_replace_owner_view(current: &DHTNode, incoming: &DHTNode) -> bool {
-    dht_node_publish_seq(current) == 0
-        || dht_node_publish_seq(incoming) >= dht_node_publish_seq(current)
+    use crate::signed_address::AddressAuthority;
+    let versions = |node: &DHTNode| {
+        let authority = node.address_authority.as_ref();
+        (
+            authority.map_or(0, AddressAuthority::quic_sequence),
+            authority
+                .and_then(AddressAuthority::publication)
+                .map_or(0, |proof| proof.sequence()),
+        )
+    };
+    let (current_quic, current_v2) = versions(current);
+    let (incoming_quic, incoming_v2) = versions(incoming);
+    incoming_quic >= current_quic && incoming_v2 >= current_v2
 }
 
 #[cfg(test)]
@@ -311,6 +332,125 @@ mod tests {
             reliability: 0.5,
             address_authority: None,
         }
+    }
+
+    #[test]
+    fn portable_lookup_merges_quic_and_signed_transports_in_either_order() {
+        use crate::identity::NodeIdentity;
+        use crate::signed_address::{AddressAuthority, SignedAddressRecord};
+        use crate::{
+            KnownReachability, TransportAddressRecord, WebRtcCertificateHash, WebRtcDirectAddr,
+        };
+        let identity = NodeIdentity::generate().unwrap();
+        let owner = *identity.peer_id();
+        let signed = |sequence: u64, include_browser: bool| {
+            let mut records = vec![
+                TransportAddressRecord::from_multiaddr(
+                    &"/ip4/9.9.9.9/udp/9000/quic".parse().unwrap(),
+                    KnownReachability::Direct,
+                )
+                .unwrap()
+                .unwrap(),
+            ];
+            if include_browser {
+                let browser = MultiAddr::webrtc_direct(
+                    WebRtcDirectAddr::new(
+                        "203.0.113.7:42768".parse().unwrap(),
+                        WebRtcCertificateHash::new([sequence as u8; 32]),
+                    )
+                    .unwrap(),
+                )
+                .with_peer_id(owner);
+                records.push(
+                    TransportAddressRecord::from_multiaddr(&browser, KnownReachability::Unverified)
+                        .unwrap()
+                        .unwrap(),
+                );
+            }
+            SignedAddressRecord::sign(&identity, sequence, records)
+                .unwrap()
+                .verify()
+                .unwrap()
+        };
+        let old = signed(10, true);
+        let latest = signed(11, true);
+        let mut native = node(0, "/ip4/1.1.1.1/udp/9001/quic");
+        native.peer_id = owner;
+        native.address_authority = Some(AddressAuthority::AuthenticatedOwner(12));
+        assert!(!may_replace_owner_view(&latest.peer_record(1.0), &native));
+        assert!(!may_replace_owner_view(&native, &latest.peer_record(1.0)));
+        let expected_browser = latest
+            .peer_record(1.0)
+            .addresses
+            .into_iter()
+            .find(MultiAddr::is_webrtc_direct)
+            .unwrap();
+        let views = [
+            old.peer_record(1.0),
+            native.clone(),
+            latest.peer_record(1.0),
+        ];
+        for order in [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ] {
+            let mut merged = views[order[0]].clone();
+            merged.merge_from(views[order[1]].clone());
+            merged.merge_from(views[order[2]].clone());
+            assert_eq!(
+                merged.addresses,
+                vec![native.addresses[0].clone(), expected_browser.clone()]
+            );
+            let authority = merged.address_authority.as_ref().unwrap();
+            assert_eq!(authority.quic_sequence(), 12);
+            assert_eq!(authority.publication(), Some(&latest));
+            let decoded: DHTNode =
+                postcard::from_bytes(&postcard::to_stdvec(&merged).unwrap()).unwrap();
+            assert!(decoded.address_authority.is_none());
+        }
+        let reports = SubjectReports::from([
+            (PeerId::from_bytes([1; 32]), native.clone()),
+            (PeerId::from_bytes([2; 32]), latest.peer_record(1.0)),
+        ]);
+        let winner = compute_winner(&owner, &reports).unwrap().1;
+        assert!(winner.addresses.contains(&expected_browser));
+        assert!(winner.addresses.contains(&native.addresses[0]));
+        let result = apply_lookup_report_winners(
+            vec![native.clone()],
+            &HashMap::from([(owner, reports)]),
+            owner.as_bytes(),
+            1,
+        )
+        .remove(0);
+        assert_eq!(result.addresses, winner.addresses);
+        // A conflicting V2 proof at the same QUIC sequence cannot be attached.
+        let mut equal_conflict = native.clone();
+        equal_conflict.merge_from(signed(12, true).peer_record(1.0));
+        assert_eq!(equal_conflict.addresses, native.addresses);
+        assert!(
+            equal_conflict
+                .address_authority
+                .unwrap()
+                .publication()
+                .is_none()
+        );
+        let mut removed = winner;
+        removed.merge_from(signed(13, false).peer_record(1.0));
+        removed.merge_from(latest.peer_record(1.0));
+        assert!(removed.addresses.iter().all(MultiAddr::is_quic));
+        assert_eq!(
+            removed
+                .address_authority
+                .unwrap()
+                .publication()
+                .unwrap()
+                .sequence(),
+            13
+        );
     }
 
     #[test]
