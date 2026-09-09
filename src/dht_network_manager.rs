@@ -456,11 +456,11 @@ pub struct TransportDhtNode {
     reliability: f64,
 }
 
+#[cfg(test)]
+use crate::peer_record::dht_node_publish_seq;
 #[allow(unused_imports)]
 pub use crate::peer_record::{DHTNode, ResponderView, SerializableDHTNode, WitnessedCloseGroup};
-use crate::peer_record::{
-    advertised_publish_seq, dht_node_publish_seq, encode_publish_seq_distance,
-};
+use crate::peer_record::{advertised_publish_seq, encode_publish_seq_distance};
 use crate::signed_address::{AddressAuthority, SignedAddressRecord, VerifiedAddressRecord};
 
 fn bounded_v2_nodes<'de, D: serde::Deserializer<'de>>(
@@ -1433,7 +1433,7 @@ impl LookupQuery<DHTNode> for NativeFindNodeQuery<'_> {
                         reports.insert(peer_id, node);
 
                         if let Some((_, winner)) = compute_winner(&subject_id, reports) {
-                            candidates.push(winner.clone());
+                            candidates.push(winner);
                         }
                     }
 
@@ -2953,10 +2953,6 @@ impl DhtNetworkManager {
         let Some(set) = dht.transport_address_set(peer_id).await else {
             return Vec::new();
         };
-        let legacy_seq = dht.publish_seq_for_node(peer_id).await;
-        if set.seq < legacy_seq {
-            return Vec::new();
-        }
         set.records
             .iter()
             .filter(|record| record.transport != KnownTransport::Quic.id())
@@ -3079,6 +3075,46 @@ impl DhtNetworkManager {
         Some((records, native))
     }
 
+    // V1 owner self-reports are QUIC projections, never synthetic V2 records.
+    // Keep the same validation and dial-failure recovery as direct publications.
+    async fn apply_native_self_report(
+        &self,
+        node: &DHTNode,
+        sequence: u64,
+        transport_source: Option<&MultiAddr>,
+    ) -> Option<Vec<(MultiAddr, AddressType)>> {
+        let records = node
+            .typed_addresses()
+            .into_iter()
+            .filter(|(address, _)| address.is_quic())
+            .filter_map(|(address, ty)| {
+                TransportAddressRecord::from_multiaddr(&address, KnownReachability::from_legacy(ty))
+                    .ok()
+                    .flatten()
+            })
+            .collect();
+        let (_, native) = self
+            .validate_transport_address_records(&node.peer_id, records, transport_source)
+            .await?;
+        let dht = self.dht.write().await;
+        let previous = dht.get_node_addresses_typed(&node.peer_id).await;
+        if dht
+            .replace_node_addresses(&node.peer_id, native.clone(), sequence)
+            .await
+        {
+            let current = dht.get_node_addresses_typed(&node.peer_id).await;
+            clear_dial_failures_for_published(
+                self.dial_failure_cache.as_ref(),
+                &node.peer_id,
+                true,
+                &previous,
+                &current,
+            );
+        }
+        Some(native)
+    }
+
+    #[cfg(test)]
     async fn apply_transport_address_set(
         &self,
         owner: &PeerId,
@@ -3113,13 +3149,15 @@ impl DhtNetworkManager {
         }
         let stored = dht.transport_address_set(owner).await;
         let legacy_seq = dht.publish_seq_for_node(owner).await;
-        if seq == 0 || seq < legacy_seq || stored.as_ref().is_some_and(|stored| seq <= stored.seq) {
+        let newer_v2 = stored.as_ref().is_none_or(|stored| seq > stored.seq);
+        let newer_native = !native.is_empty() && seq > legacy_seq;
+        if seq == 0 || (!newer_v2 && !newer_native) {
             return false;
         }
 
         // Non-native records are useful to browser clients and future transports,
         // but an empty projection is not a replacement for existing QUIC addresses.
-        if !native.is_empty() {
+        if !native.is_empty() && seq >= legacy_seq {
             let previous = dht.get_node_addresses_typed(owner).await;
             if seq == legacy_seq {
                 // A V1 projection may arrive before the full V2 record of the
@@ -3161,6 +3199,9 @@ impl DhtNetworkManager {
                 );
             }
         }
+        if !newer_v2 {
+            return newer_native;
+        }
         dht.store_transport_address_set(
             owner,
             crate::dht::core_engine::TransportAddressSet {
@@ -3180,7 +3221,7 @@ impl DhtNetworkManager {
     ) -> Vec<DHTNode> {
         let mut normalized = Vec::with_capacity(nodes.len());
         for node in nodes {
-            let Ok(proof) = node.record.verify(Self::address_time()) else {
+            let Ok(proof) = node.record.verify() else {
                 continue;
             };
             let Some((_, native)) = self
@@ -3218,9 +3259,6 @@ impl DhtNetworkManager {
         transport_source: Option<&MultiAddr>,
         authoritative: bool,
     ) -> bool {
-        if !proof.is_current(Self::address_time()) {
-            return false;
-        }
         let owner = proof.owner();
         let Some((records, native)) = self
             .validate_transport_address_records(&owner, proof.records().to_vec(), transport_source)
@@ -3239,73 +3277,48 @@ impl DhtNetworkManager {
         .await
     }
 
-    // Return local owner-proven state instead of a third party's conflicting hint.
-    async fn protect_owner_view(&self, mut hint: DHTNode) -> DHTNode {
-        hint.distance = None;
+    // Use the independently versioned views admitted by the store paths above.
+    // Discoveries without routing state remain lookup-local until admission.
+    async fn protect_owner_view(&self, hint: DHTNode) -> DHTNode {
         let dht = self.dht.read().await;
-        let seq = dht.publish_seq_for_node(&hint.peer_id).await;
+        let quic_sequence = dht.publish_seq_for_node(&hint.peer_id).await;
         let stored = dht.transport_address_set(&hint.peer_id).await;
-        let stored_seq = stored.as_ref().map_or(seq, |set| set.seq.max(seq));
-        // Verified discoveries remain lookup-local until normal routing admission.
-        if let Some(AddressAuthority::Signed(proof)) = &hint.address_authority
-            && proof.sequence() > stored_seq
-            && proof.is_current(Self::address_time())
-        {
-            hint.distance = encode_publish_seq_distance(proof.sequence());
+        if quic_sequence == 0 && stored.is_none() {
             return hint;
         }
-        hint.address_authority = None;
-        if let Some(stored) = stored {
-            if let Some(proof) = &stored.proof
-                && proof.sequence() >= seq
-                && proof.is_current(Self::address_time())
-            {
-                hint.address_authority = Some(AddressAuthority::Signed(proof.clone()));
-            }
-            if hint.address_authority.is_none() {
-                hint.address_authority =
-                    Some(AddressAuthority::AuthenticatedOwner(stored.seq.max(seq)));
-            }
-            let mut native = dht.get_node_addresses_typed(&hint.peer_id).await;
-            if native.is_empty() {
-                // Supplemental-only publications preserve the existing native
-                // projection; fall back to the filtered full record if needed.
-                native = stored
-                    .records
-                    .iter()
-                    .filter_map(|record| {
-                        let address = record.decode_known().ok().flatten()?;
-                        address.is_quic().then(|| {
-                            (
-                                address,
-                                record
-                                    .legacy_reachability()
-                                    .unwrap_or(AddressType::Unverified),
-                            )
-                        })
-                    })
-                    .collect();
-            }
-            (hint.addresses, hint.address_types) = native.into_iter().unzip();
-        } else if seq != 0 {
-            hint.address_authority = Some(AddressAuthority::AuthenticatedOwner(seq));
-            (hint.addresses, hint.address_types) = dht
-                .get_node_addresses_typed(&hint.peer_id)
-                .await
-                .into_iter()
-                .unzip();
-        }
-        hint.distance = encode_publish_seq_distance(dht_node_publish_seq(&hint));
-        hint
+        let mut local = hint.clone();
+        (local.addresses, local.address_types) = dht
+            .get_node_addresses_typed(&hint.peer_id)
+            .await
+            .into_iter()
+            .unzip();
+        local.address_authority = stored
+            .as_ref()
+            .and_then(|set| set.proof.clone())
+            .map(|proof| {
+                if quic_sequence == 0 && !local.addresses.is_empty() {
+                    AddressAuthority::Combined {
+                        quic_sequence,
+                        publication: proof,
+                    }
+                } else {
+                    AddressAuthority::with_publication(quic_sequence, proof)
+                }
+            })
+            .or_else(|| {
+                (quic_sequence != 0).then_some(AddressAuthority::AuthenticatedOwner(quic_sequence))
+            });
+        local.distance = encode_publish_seq_distance(
+            local
+                .address_authority
+                .as_ref()
+                .map_or(0, AddressAuthority::sequence),
+        );
+        local
     }
 
-    fn address_time() -> u64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |elapsed| elapsed.as_secs())
-    }
-
-    /// Return a fresh, unchanged owner-signed record for forwarding to clients.
+    /// Return the newest known, unchanged owner-signed V2 record for forwarding.
+    /// A newer V1 update affects only QUIC and does not supersede this proof.
     pub async fn signed_address_record_for_peer(
         &self,
         peer: &PeerId,
@@ -3318,13 +3331,9 @@ impl DhtNetworkManager {
             return self.local_signed_address_record(records).await;
         }
         let dht = self.dht.read().await;
-        let native_seq = dht.publish_seq_for_node(peer).await;
         dht.transport_address_set(peer)
             .await
             .and_then(|stored| stored.proof.clone())
-            .filter(|proof| {
-                proof.sequence() >= native_seq && proof.is_current(Self::address_time())
-            })
             .map(|proof| proof.signed().clone())
     }
 
@@ -3336,10 +3345,8 @@ impl DhtNetworkManager {
             return None;
         }
         let mut cached = self.local_signed_addresses.write().await;
-        let now = Self::address_time();
         if let Some(proof) = cached.as_ref()
             && proof.records() == records
-            && !proof.needs_refresh(now)
         {
             return Some(proof.signed().clone());
         }
@@ -3349,9 +3356,8 @@ impl DhtNetworkManager {
                 .map_or(1, |proof| proof.sequence().saturating_add(1)),
         );
         let record =
-            SignedAddressRecord::sign(self.transport.node_identity(), sequence, now, records)
-                .ok()?;
-        *cached = record.verify(now).ok();
+            SignedAddressRecord::sign(self.transport.node_identity(), sequence, records).ok()?;
+        *cached = record.verify().ok();
         Some(record)
     }
 
@@ -4567,7 +4573,7 @@ impl DhtNetworkManager {
             }
             DhtNetworkOperation::PublishAddressSetV2 { record } => {
                 let proof = record
-                    .verify(Self::address_time())
+                    .verify()
                     .map_err(|e| P2PError::Validation(e.into()))?;
                 if proof.owner() != *authenticated_sender {
                     return Err(P2PError::Validation(
@@ -4635,13 +4641,6 @@ impl DhtNetworkManager {
                     );
                 }
                 let dht = self.dht.write().await;
-                if dht
-                    .transport_address_set(authenticated_sender)
-                    .await
-                    .is_some_and(|stored| stored.seq >= *seq)
-                {
-                    return Ok(DhtNetworkResult::PublishAddressAck);
-                }
                 let previous_addresses = dht.get_node_addresses_typed(authenticated_sender).await;
                 let applied = dht
                     .replace_node_addresses(authenticated_sender, filtered_addresses.clone(), *seq)
@@ -4995,25 +4994,17 @@ impl DhtNetworkManager {
                     node.address_authority = None;
                     node.distance = None;
                     if node.peer_id == sender_app_id && claimed_seq != 0 {
-                        let records = node
-                            .typed_addresses()
-                            .iter()
-                            .filter_map(|(address, ty)| {
-                                TransportAddressRecord::from_multiaddr(
-                                    address,
-                                    KnownReachability::from_legacy(*ty),
-                                )
-                                .ok()
-                                .flatten()
-                            })
-                            .collect();
-                        self.apply_transport_address_set(
-                            &node.peer_id,
-                            claimed_seq,
-                            records,
-                            transport_source,
-                        )
-                        .await;
+                        if let Some(typed) = self
+                            .apply_native_self_report(&node, claimed_seq, transport_source)
+                            .await
+                        {
+                            (node.addresses, node.address_types) = typed.into_iter().unzip();
+                            node.address_authority =
+                                Some(AddressAuthority::AuthenticatedOwner(claimed_seq));
+                        } else {
+                            node.addresses.clear();
+                            node.address_types.clear();
+                        }
                     }
                     normalized.push(self.protect_owner_view(node).await);
                 }
@@ -5928,16 +5919,30 @@ impl DhtNetworkManager {
     }
 
     async fn merge_trusted_gossiped_typed_addresses(&self, node: &DHTNode) {
-        if let Some(AddressAuthority::Signed(proof)) = &node.address_authority {
+        if let Some(proof) = node
+            .address_authority
+            .as_ref()
+            .and_then(AddressAuthority::publication)
+        {
             // A lookup result carries its proof through discovery. Persist it
             // only if normal admission has since installed the routing peer.
             self.apply_signed_address_set(proof.clone(), None, false)
                 .await;
-            return;
+            if matches!(&node.address_authority, Some(AddressAuthority::Signed(_))) {
+                // The signed store path owns validation of its native projection.
+                return;
+            }
         }
-        let typed_addresses = node.typed_addresses();
+        let typed_addresses = node
+            .typed_addresses()
+            .into_iter()
+            .filter(|(address, _)| address.is_quic())
+            .collect();
         let dht = self.dht.write().await;
-        let publish_seq = dht_node_publish_seq(node);
+        let publish_seq = node
+            .address_authority
+            .as_ref()
+            .map_or(0, AddressAuthority::quic_sequence);
         if publish_seq == 0
             && (dht.publish_seq_for_node(&node.peer_id).await != 0
                 || dht.transport_address_set(&node.peer_id).await.is_some())
@@ -5945,13 +5950,6 @@ impl DhtNetworkManager {
             return;
         }
         if publish_seq != 0 {
-            if dht
-                .transport_address_set(&node.peer_id)
-                .await
-                .is_some_and(|stored| stored.seq >= publish_seq)
-            {
-                return;
-            }
             dht.replace_node_addresses_from_gossip(&node.peer_id, typed_addresses, publish_seq)
                 .await;
             return;
@@ -6040,16 +6038,15 @@ impl DhtNetworkManager {
         &self.config.peer_id
     }
 
-    /// Publish this node's complete typed address set to a list of peers.
+    /// Publish this node's QUIC addresses and registered supplemental endpoints.
     ///
-    /// Used by the relay-acquisition driver: on initial acquisition, on
-    /// relay-lost (before rebinding), and on successful rebind. The sender
-    /// is authoritative — the receiver replaces any prior record wholesale,
-    /// which is how stale relay addresses get dropped when a session closes.
+    /// `typed_addresses` supplies the native QUIC projection. Other transports
+    /// come from [`Self::set_supplemental_self_addresses`]. V2 peers receive the
+    /// combined signed record; V1 peers receive only its QUIC projection.
     ///
-    /// `seq` is a non-zero per-call Unix-nanosecond timestamp from
-    /// [`Self::next_publish_seq`], guaranteeing monotonicity across sends
-    /// from the same node.
+    /// Used by periodic self-lookup and supplemental endpoint registration.
+    /// Changed snapshots receive a new monotonic sequence; unchanged snapshots
+    /// reuse their signed publication. Empty snapshots are not published.
     pub async fn publish_address_set_to_peers(
         &self,
         typed_addresses: Vec<(crate::MultiAddr, AddressType)>,
@@ -6080,7 +6077,7 @@ impl DhtNetworkManager {
         let Some(signed) = self.local_signed_address_record(records.clone()).await else {
             return Vec::new();
         };
-        let Ok(verified) = signed.verify(Self::address_time()) else {
+        let Ok(verified) = signed.verify() else {
             return Vec::new();
         };
         let seq = verified.sequence();
@@ -6291,7 +6288,6 @@ mod tests {
         let record = SignedAddressRecord::sign(
             &identity,
             1,
-            DhtNetworkManager::address_time(),
             vec![TransportAddressRecord {
                 transport: 900,
                 reachability: 901,

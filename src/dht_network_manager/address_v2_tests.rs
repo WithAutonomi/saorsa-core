@@ -93,13 +93,7 @@ fn response(
     response.result = Some(DhtNetworkResult::NodesFoundV2 {
         key: [0; 32],
         nodes: vec![TransportDhtNode {
-            record: SignedAddressRecord::sign(
-                identity,
-                seq,
-                DhtNetworkManager::address_time(),
-                records,
-            )
-            .unwrap(),
+            record: SignedAddressRecord::sign(identity, seq, records).unwrap(),
             reliability: 1.0,
         }],
     });
@@ -456,16 +450,11 @@ async fn v2_lookup_omits_peers_without_current_owner_proofs() {
     let proof = SignedAddressRecord::sign(
         &identity,
         10,
-        DhtNetworkManager::address_time(),
         vec![quic_record("/ip4/8.8.8.8/udp/9000/quic")],
     )
     .unwrap();
     manager
-        .apply_signed_address_set(
-            proof.verify(DhtNetworkManager::address_time()).unwrap(),
-            None,
-            false,
-        )
+        .apply_signed_address_set(proof.verify().unwrap(), None, false)
         .await;
     let DhtNetworkResult::NodesFoundV2 { nodes, .. } = manager
         .handle_find_node_v2_request(&[0; 32], &requester)
@@ -568,11 +557,9 @@ async fn concurrent_legacy_and_v2_publications_keep_the_newest_complete_set() {
         peer_view(manager, owner).await.addresses,
         vec![quic.decode_known().unwrap().unwrap()]
     );
-    assert!(
-        manager
-            .supplemental_addresses_for_peer(&owner)
-            .await
-            .is_empty()
+    assert_eq!(
+        manager.supplemental_addresses_for_peer(&owner).await,
+        vec![browser_address(owner)]
     );
 
     let (_, legacy_result) = tokio::join!(
@@ -668,9 +655,7 @@ async fn v2_lookup_bounds_the_full_envelope_and_preserves_complete_closest_recor
             reachability: 901,
             address: vec![1; 2048],
         }));
-        let record =
-            SignedAddressRecord::sign(&identity, 10, DhtNetworkManager::address_time(), records)
-                .unwrap();
+        let record = SignedAddressRecord::sign(&identity, 10, records).unwrap();
         let publish = message(
             owner,
             DhtNetworkOperation::PublishAddressSetV2 {
@@ -855,13 +840,9 @@ async fn signed_gossip_survives_forwarding_and_unsigned_downgrade_attempts() {
         reachability: 901,
         address: vec![1, 2, 3],
     };
-    let proof = SignedAddressRecord::sign(
-        &identity,
-        20,
-        DhtNetworkManager::address_time(),
-        vec![native.clone(), browser.clone(), opaque],
-    )
-    .unwrap();
+    let proof =
+        SignedAddressRecord::sign(&identity, 20, vec![native.clone(), browser.clone(), opaque])
+            .unwrap();
     let last_seen = manager
         .dht
         .read()
@@ -997,33 +978,18 @@ async fn signed_gossip_survives_forwarding_and_unsigned_downgrade_attempts() {
     let stale = SignedAddressRecord::sign(
         &identity,
         19,
-        DhtNetworkManager::address_time(),
         vec![quic_record("/ip4/1.1.1.1/udp/9000/quic")],
     )
     .unwrap();
     assert!(
         !manager
-            .apply_signed_address_set(
-                stale.verify(DhtNetworkManager::address_time()).unwrap(),
-                None,
-                false
-            )
+            .apply_signed_address_set(stale.verify().unwrap(), None, false)
             .await
     );
-    let corrected = SignedAddressRecord::sign(
-        &identity,
-        21,
-        DhtNetworkManager::address_time(),
-        vec![native],
-    )
-    .unwrap();
+    let corrected = SignedAddressRecord::sign(&identity, 21, vec![native]).unwrap();
     assert!(
         manager
-            .apply_signed_address_set(
-                corrected.verify(DhtNetworkManager::address_time()).unwrap(),
-                None,
-                false
-            )
+            .apply_signed_address_set(corrected.verify().unwrap(), None, false)
             .await
     );
     receiver.stop().await.unwrap();
@@ -1037,20 +1003,10 @@ async fn signed_discovery_precedes_admission_and_defers_to_newer_direct_publicat
     let identity = crate::identity::NodeIdentity::generate().unwrap();
     let owner = *identity.peer_id();
     let record = quic_record("/ip4/9.9.9.9/udp/9000/quic");
-    let signed = SignedAddressRecord::sign(
-        &identity,
-        20,
-        DhtNetworkManager::address_time(),
-        vec![record.clone()],
-    )
-    .unwrap();
+    let signed = SignedAddressRecord::sign(&identity, 20, vec![record.clone()]).unwrap();
     assert!(
         !manager
-            .apply_signed_address_set(
-                signed.verify(DhtNetworkManager::address_time()).unwrap(),
-                None,
-                false
-            )
+            .apply_signed_address_set(signed.verify().unwrap(), None, false)
             .await
     );
     let request = message(
@@ -1117,14 +1073,17 @@ async fn signed_discovery_precedes_admission_and_defers_to_newer_direct_publicat
         manager
             .signed_address_record_for_peer(&owner)
             .await
-            .is_none()
+            .is_some()
     );
     let view = manager.protect_owner_view(hint).await;
     assert_eq!(view.addresses, vec![direct]);
     assert_eq!(dht_node_publish_seq(&view), 21);
     assert!(matches!(
         view.address_authority,
-        Some(AddressAuthority::AuthenticatedOwner(21))
+        Some(AddressAuthority::Combined {
+            quic_sequence: 21,
+            ..
+        })
     ));
 }
 
@@ -1136,7 +1095,6 @@ async fn signed_envelope_keeps_full_close_group_and_enforces_topic_and_collectio
     let proof = SignedAddressRecord::sign(
         &identity,
         1,
-        DhtNetworkManager::address_time(),
         vec![quic_record("/ip4/9.9.9.9/udp/9000/quic")],
     )
     .unwrap();
@@ -1195,7 +1153,7 @@ async fn signed_envelope_keeps_full_close_group_and_enforces_topic_and_collectio
 }
 
 #[tokio::test]
-async fn unchanged_local_proofs_are_reused_and_renewed_before_expiry() {
+async fn unchanged_local_proofs_are_reused_until_addresses_change() {
     let node = test_node().await;
     let manager = node.dht_manager();
     let records = vec![quic_record("/ip4/9.9.9.9/udp/9000/quic")];
@@ -1210,19 +1168,19 @@ async fn unchanged_local_proofs_are_reused_and_renewed_before_expiry() {
             .unwrap(),
         first
     );
-    let now = DhtNetworkManager::address_time();
-    let old = SignedAddressRecord::sign(
-        manager.transport.node_identity(),
-        1,
-        now - crate::signed_address::ADDRESS_RECORD_REFRESH_SECS,
-        records.clone(),
-    )
-    .unwrap();
-    *manager.local_signed_addresses.write().await = Some(old.verify(now).unwrap());
-    let renewed = manager.local_signed_address_record(records).await.unwrap();
-    let verified = renewed.verify(now).unwrap();
-    assert!(verified.sequence() > 1);
-    assert!(!verified.needs_refresh(now));
+    let old =
+        SignedAddressRecord::sign(manager.transport.node_identity(), 1, records.clone()).unwrap();
+    *manager.local_signed_addresses.write().await = Some(old.verify().unwrap());
+    assert_eq!(
+        manager.local_signed_address_record(records).await.unwrap(),
+        old
+    );
+    let changed = manager
+        .local_signed_address_record(vec![quic_record("/ip4/1.1.1.1/udp/9001/quic")])
+        .await
+        .unwrap();
+    assert!(changed.verify().unwrap().sequence() > 1);
+    assert_ne!(changed, old);
     assert!(
         manager
             .local_signed_address_record(Vec::new())
@@ -1283,7 +1241,6 @@ async fn v2_publication_checks_signature_and_authenticated_owner_before_mutation
     let proof = SignedAddressRecord::sign(
         &identity,
         10,
-        DhtNetworkManager::address_time(),
         vec![quic_record("/ip4/9.9.9.9/udp/9000/quic")],
     )
     .unwrap();
@@ -1357,13 +1314,7 @@ async fn routing_publication_forwards_signed_transports_but_native_dials_only_qu
             .unwrap()
             .unwrap(),
     ];
-    let signed = SignedAddressRecord::sign(
-        &identity,
-        10,
-        DhtNetworkManager::address_time(),
-        records.clone(),
-    )
-    .unwrap();
+    let signed = SignedAddressRecord::sign(&identity, 10, records.clone()).unwrap();
     seed_peer(manager, owner, "/ip4/8.8.8.8/udp/9000/quic").await;
     let publication = message(
         owner,
@@ -1417,10 +1368,7 @@ async fn routing_publication_forwards_signed_transports_but_native_dials_only_qu
         .into_iter()
         .find(|entry| entry.record == signed)
         .unwrap();
-    let verified = forwarded
-        .record
-        .verify(DhtNetworkManager::address_time())
-        .unwrap();
+    let verified = forwarded.record.verify().unwrap();
     assert_eq!(verified.records(), records);
     assert_eq!(verified.records()[1].decode_known().unwrap(), Some(browser));
 
@@ -1444,5 +1392,270 @@ async fn routing_publication_forwards_signed_transports_but_native_dials_only_qu
             .signed_address_record_for_peer(&owner)
             .await
             .is_none()
+    );
+}
+
+#[tokio::test]
+async fn publication_order_preserves_independent_quic_and_v2_versions() {
+    for order in [
+        [0, 1, 2],
+        [0, 2, 1],
+        [1, 0, 2],
+        [1, 2, 0],
+        [2, 0, 1],
+        [2, 1, 0],
+    ] {
+        let receiver = test_node().await;
+        let manager = receiver.dht_manager();
+        let identity = crate::identity::NodeIdentity::generate().unwrap();
+        let owner = *identity.peer_id();
+        seed_peer(manager, owner, "/ip4/8.8.8.8/udp/9000/quic").await;
+        let old_quic = quic_record("/ip4/9.9.9.9/udp/9000/quic");
+        let new_quic: MultiAddr = "/ip4/1.1.1.1/udp/9001/quic".parse().unwrap();
+        let browser = TransportAddressRecord::from_multiaddr(
+            &browser_address(owner),
+            KnownReachability::Unverified,
+        )
+        .unwrap()
+        .unwrap();
+        let old = SignedAddressRecord::sign(&identity, 10, vec![old_quic.clone()]).unwrap();
+        let latest = SignedAddressRecord::sign(&identity, 11, vec![old_quic, browser]).unwrap();
+        let publications = [
+            message(
+                owner,
+                DhtNetworkOperation::PublishAddressSetV2 { record: old },
+            ),
+            message(
+                owner,
+                DhtNetworkOperation::PublishAddressSet {
+                    seq: 12,
+                    addresses: vec![(new_quic.clone(), AddressType::Direct)],
+                },
+            ),
+            message(
+                owner,
+                DhtNetworkOperation::PublishAddressSetV2 {
+                    record: latest.clone(),
+                },
+            ),
+        ];
+        for index in order {
+            manager
+                .handle_dht_request(&publications[index], &owner, None)
+                .await
+                .unwrap();
+        }
+        let native = peer_view(manager, owner).await;
+        assert_eq!(native.addresses, vec![new_quic.clone()], "order {order:?}");
+        assert_eq!(dht_node_publish_seq(&native), 12);
+        assert_eq!(
+            manager.supplemental_addresses_for_peer(&owner).await,
+            vec![browser_address(owner)]
+        );
+        assert_eq!(
+            manager.signed_address_record_for_peer(&owner).await,
+            Some(latest.clone())
+        );
+        let forwarded = manager
+            .handle_find_node_v2_request(owner.as_bytes(), manager.peer_id())
+            .await
+            .unwrap();
+        let DhtNetworkResult::NodesFoundV2 { nodes, .. } = forwarded else {
+            panic!("V2 response")
+        };
+        assert!(nodes.iter().any(|node| node.record == latest));
+        let view = manager
+            .normalize_v2_nodes(
+                vec![TransportDhtNode {
+                    record: latest.clone(),
+                    reliability: 1.0,
+                }],
+                None,
+            )
+            .await
+            .remove(0);
+        assert_eq!(view.addresses, vec![new_quic.clone()]);
+        let authority = view.address_authority.unwrap();
+        assert_eq!(authority.quic_sequence(), 12);
+        assert_eq!(authority.publication().unwrap().signed(), &latest);
+
+        // Only a newer V2 replacement can withdraw the supplemental address.
+        let replacement =
+            SignedAddressRecord::sign(&identity, 13, vec![quic_record(&new_quic.to_string())])
+                .unwrap();
+        assert!(
+            manager
+                .apply_signed_address_set(replacement.verify().unwrap(), None, true)
+                .await
+        );
+        assert!(
+            !manager
+                .apply_signed_address_set(latest.verify().unwrap(), None, true)
+                .await
+        );
+        assert!(
+            manager
+                .supplemental_addresses_for_peer(&owner)
+                .await
+                .is_empty()
+        );
+        assert_eq!(
+            manager.signed_address_record_for_peer(&owner).await,
+            Some(replacement)
+        );
+    }
+}
+
+#[tokio::test]
+async fn authenticated_v1_lookup_reply_preserves_signed_v2_publication() {
+    let receiver = test_node().await;
+    let publisher = test_node().await;
+    receiver.start().await.unwrap();
+    publisher.start().await.unwrap();
+    let address = publisher
+        .listen_addrs()
+        .await
+        .into_iter()
+        .find(MultiAddr::is_ipv4)
+        .unwrap();
+    let channel = receiver.connect_peer(&address).await.unwrap();
+    receiver
+        .wait_for_peer_identity(&channel, Duration::from_secs(2))
+        .await
+        .unwrap();
+    let manager = receiver.dht_manager();
+    let owner = *publisher.peer_id();
+    let identity = publisher.dht_manager().transport.node_identity();
+    let record = SignedAddressRecord::sign(
+        identity,
+        10,
+        vec![
+            quic_record("/ip4/9.9.9.9/udp/9000/quic"),
+            TransportAddressRecord::from_multiaddr(
+                &browser_address(owner),
+                KnownReachability::Unverified,
+            )
+            .unwrap()
+            .unwrap(),
+        ],
+    )
+    .unwrap();
+    assert!(
+        manager
+            .apply_signed_address_set(record.verify().unwrap(), None, true)
+            .await
+    );
+    let operation = DhtNetworkOperation::FindNode { key: [0; 32] };
+    let rx = track_request(manager, owner, operation.clone());
+    let mut reply = message(owner, operation);
+    reply.message_type = DhtMessageType::Response;
+    let new_quic: MultiAddr = "/ip4/1.1.1.1/udp/9001/quic".parse().unwrap();
+    reply.result = Some(DhtNetworkResult::NodesFound {
+        key: [0; 32],
+        nodes: vec![DHTNode {
+            peer_id: owner,
+            addresses: vec![new_quic.clone()],
+            address_types: vec![AddressType::Direct],
+            distance: encode_publish_seq_distance(12),
+            reliability: 1.0,
+            address_authority: None,
+        }],
+    });
+    manager
+        .handle_dht_response(&reply, &owner, None)
+        .await
+        .unwrap();
+    let DhtNetworkResult::NodesFound { nodes, .. } = rx.await.unwrap().result else {
+        panic!("V1 response")
+    };
+    assert_eq!(nodes[0].addresses, vec![new_quic.clone()]);
+    assert_eq!(peer_view(manager, owner).await.addresses, vec![new_quic]);
+    assert_eq!(
+        manager.supplemental_addresses_for_peer(&owner).await,
+        vec![browser_address(owner)]
+    );
+    assert_eq!(
+        manager.signed_address_record_for_peer(&owner).await,
+        Some(record)
+    );
+    // Invalid or non-QUIC V1 self-reports must not advance either view.
+    for address in [
+        "/ip4/0.0.0.0/udp/9000/quic".parse().unwrap(),
+        nodes[0].addresses[0]
+            .clone()
+            .with_peer_id(*receiver.peer_id()),
+        browser_address(owner),
+    ] {
+        let mut invalid = nodes[0].clone();
+        invalid.addresses = vec![address];
+        assert!(
+            manager
+                .apply_native_self_report(&invalid, 14, None)
+                .await
+                .is_none()
+        );
+    }
+    assert_eq!(dht_node_publish_seq(&peer_view(manager, owner).await), 12);
+    assert_eq!(
+        manager.supplemental_addresses_for_peer(&owner).await,
+        vec![browser_address(owner)]
+    );
+    receiver.stop().await.unwrap();
+    publisher.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn supplemental_only_v2_keeps_native_contacts_and_accepts_delayed_quic() {
+    let receiver = test_node().await;
+    let manager = receiver.dht_manager();
+    let identity = crate::identity::NodeIdentity::generate().unwrap();
+    let owner = *identity.peer_id();
+    let initial: MultiAddr = "/ip4/8.8.8.8/udp/9000/quic".parse().unwrap();
+    seed_peer(manager, owner, &initial.to_string()).await;
+    let publication = SignedAddressRecord::sign(
+        &identity,
+        13,
+        vec![
+            TransportAddressRecord::from_multiaddr(
+                &browser_address(owner),
+                KnownReachability::Unverified,
+            )
+            .unwrap()
+            .unwrap(),
+        ],
+    )
+    .unwrap();
+    let view = manager
+        .normalize_v2_nodes(
+            vec![TransportDhtNode {
+                record: publication.clone(),
+                reliability: 1.0,
+            }],
+            None,
+        )
+        .await
+        .remove(0);
+    assert_eq!(view.addresses, vec![initial]);
+    let mut combined = view.clone();
+    combined.merge_from(view);
+    assert_eq!(combined.addresses.len(), 1);
+    let quic = quic_record("/ip4/9.9.9.9/udp/9001/quic");
+    let delayed = SignedAddressRecord::sign(&identity, 12, vec![quic.clone()]).unwrap();
+    assert!(
+        manager
+            .apply_signed_address_set(delayed.verify().unwrap(), None, true)
+            .await
+    );
+    assert_eq!(
+        peer_view(manager, owner).await.addresses,
+        vec![quic.decode_known().unwrap().unwrap()]
+    );
+    assert_eq!(
+        manager.signed_address_record_for_peer(&owner).await,
+        Some(publication)
+    );
+    assert_eq!(
+        manager.supplemental_addresses_for_peer(&owner).await,
+        vec![browser_address(owner)]
     );
 }

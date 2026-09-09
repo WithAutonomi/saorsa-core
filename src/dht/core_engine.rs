@@ -942,7 +942,6 @@ impl KademliaRoutingTable {
         }
         let publication = self.address_publications.entry(*node_id).or_default();
         if set.seq == 0
-            || set.seq < publication.seq
             || publication
                 .transport
                 .as_ref()
@@ -1027,10 +1026,7 @@ impl KademliaRoutingTable {
         }
 
         if let Some(stored) = self.address_publications.get(node_id)
-            && seq
-                <= stored
-                    .seq
-                    .max(stored.transport.as_ref().map_or(0, |set| set.seq))
+            && seq <= stored.seq
         {
             return false;
         }
@@ -1047,13 +1043,9 @@ impl KademliaRoutingTable {
                 .replace_node_addresses_from_gossip(node_id, typed_addresses),
         };
         if applied {
-            self.address_publications.insert(
-                *node_id,
-                AddressPublication {
-                    seq,
-                    transport: None,
-                },
-            );
+            // V1 can replace only the native projection. Retain the latest
+            // V2 publication and its unchanged owner proof independently.
+            self.address_publications.entry(*node_id).or_default().seq = seq;
         }
         applied
     }
