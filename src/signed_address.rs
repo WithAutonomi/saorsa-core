@@ -16,6 +16,9 @@ use serde::{
 };
 use std::{fmt, marker::PhantomData, sync::Arc};
 
+/// Capability token for the extensible address protocol with mandatory owner proofs.
+pub const ADDRESS_V2_CAPABILITY: &str = "addr-v2";
+
 /// Maximum lifetime and permitted clock skew for a signed publication.
 pub const ADDRESS_RECORD_LIFETIME_SECS: u64 = 60 * 60;
 /// Republish unchanged records before their signatures expire.

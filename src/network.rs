@@ -100,8 +100,8 @@ enum ListenMode {
 
 /// Returns the default user agent string for the given mode.
 ///
-/// - `Node` → `"node/<saorsa-core-version>;addr-v2;addr-signed-v1"`
-/// - `Client` → `"client/<saorsa-core-version>;addr-v2;addr-signed-v1"`
+/// - `Node` → `"node/<saorsa-core-version>;addr-v2"`
+/// - `Client` → `"client/<saorsa-core-version>;addr-v2"`
 pub fn user_agent_for_mode(mode: NodeMode) -> String {
     let prefix = match mode {
         NodeMode::Node => "node",
@@ -112,24 +112,14 @@ pub fn user_agent_for_mode(mode: NodeMode) -> String {
 
 /// Signed identity-announcement capability token for the extensible address
 /// publication and lookup plane.
-pub(crate) const ADDRESS_V2_CAPABILITY: &str = "addr-v2";
+pub(crate) use crate::signed_address::ADDRESS_V2_CAPABILITY;
 
 fn with_address_v2_capability(mut user_agent: String) -> String {
     if !supports_address_v2(&user_agent) {
         user_agent.push(';');
         user_agent.push_str(ADDRESS_V2_CAPABILITY);
     }
-    if !supports_signed_addresses(&user_agent) {
-        user_agent.push_str(";addr-signed-v1");
-    }
     user_agent
-}
-
-pub(crate) fn supports_signed_addresses(user_agent: &str) -> bool {
-    user_agent
-        .split(';')
-        .skip(1)
-        .any(|cap| cap == "addr-signed-v1")
 }
 
 pub(crate) fn supports_address_v2(user_agent: &str) -> bool {
@@ -2854,10 +2844,6 @@ mod tests {
         assert!(client.starts_with("client/"));
         assert!(supports_address_v2(&node));
         assert!(supports_address_v2(&client));
-        assert!(supports_signed_addresses(&node));
-        assert!(supports_signed_addresses(&client));
-        assert!(!supports_signed_addresses("node/1;addr-signed-v10"));
-        assert!(!supports_signed_addresses("node/1;addr-v2"));
     }
 
     #[test]
