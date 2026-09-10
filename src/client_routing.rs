@@ -56,9 +56,9 @@ fn report_signature(node: &DHTNode) -> Vec<(MultiAddr, u8)> {
 ///
 /// Rules (applied in order):
 ///
-///   1. **Owner-proven information** — combine the newest QUIC projection and
-///      newest signed V2 publication. An intermediary's unsigned sequence has
-///      no authority over either view.
+///   1. **Owner-proven information** — prefer the newest signed V2 publication,
+///      then the newest authenticated V1 owner report when no V2 is known.
+///      An intermediary's unsigned sequence has no replacement authority.
 ///   2. **Self-report** — among unsequenced hints, prefer the subject itself.
 ///   3. **Quorum** — among the top `QUORUM_TOP_N` closest-XOR
 ///      responders, if `QUORUM_THRESHOLD`+ agree on the address set
@@ -96,8 +96,8 @@ pub fn compute_winner(subject_id: &PeerId, reports: &SubjectReports) -> Option<(
         .iter()
         .filter(|(_, node, _, _)| dht_node_publish_seq(node) != 0)
         .max_by(|a, b| {
-            dht_node_publish_seq(a.1)
-                .cmp(&dht_node_publish_seq(b.1))
+            owner_view_version(a.1)
+                .cmp(&owner_view_version(b.1))
                 .then_with(|| b.2.cmp(&a.2))
                 .then_with(|| b.3.cmp(&a.3))
         })
@@ -299,23 +299,23 @@ pub fn build_witnessed_close_group(
     }
 }
 
+// Protocol precedence comes before sequence: V1 cannot outrank a V2 proof.
+fn owner_view_version(node: &DHTNode) -> (bool, u64) {
+    let publication = node
+        .address_authority
+        .as_ref()
+        .and_then(crate::signed_address::AddressAuthority::publication);
+    (
+        publication.is_some(),
+        publication.map_or_else(|| dht_node_publish_seq(node), |proof| proof.sequence()),
+    )
+}
+
 /// Whether an incoming lookup view may replace an already owner-proven view.
-/// Unsigned hints cannot displace a publication or raise its accepted sequence.
-/// If neither view supersedes both scopes, use [`DHTNode::merge_from`] instead.
+/// V2 supersedes V1 regardless of sequence; subsequent V1 views are ignored.
+/// Within a protocol, older owner-proven sequences cannot replace newer ones.
 pub fn may_replace_owner_view(current: &DHTNode, incoming: &DHTNode) -> bool {
-    use crate::signed_address::AddressAuthority;
-    let versions = |node: &DHTNode| {
-        let authority = node.address_authority.as_ref();
-        (
-            authority.map_or(0, AddressAuthority::quic_sequence),
-            authority
-                .and_then(AddressAuthority::publication)
-                .map_or(0, |proof| proof.sequence()),
-        )
-    };
-    let (current_quic, current_v2) = versions(current);
-    let (incoming_quic, incoming_v2) = versions(incoming);
-    incoming_quic >= current_quic && incoming_v2 >= current_v2
+    owner_view_version(incoming) >= owner_view_version(current)
 }
 
 #[cfg(test)]
@@ -335,7 +335,7 @@ mod tests {
     }
 
     #[test]
-    fn portable_lookup_merges_quic_and_signed_transports_in_either_order() {
+    fn portable_lookup_prefers_v2_over_v1_in_every_order() {
         use crate::identity::NodeIdentity;
         use crate::signed_address::{AddressAuthority, SignedAddressRecord};
         use crate::{
@@ -378,7 +378,7 @@ mod tests {
         native.peer_id = owner;
         native.address_authority = Some(AddressAuthority::AuthenticatedOwner(12));
         assert!(!may_replace_owner_view(&latest.peer_record(1.0), &native));
-        assert!(!may_replace_owner_view(&native, &latest.peer_record(1.0)));
+        assert!(may_replace_owner_view(&native, &latest.peer_record(1.0)));
         let expected_browser = latest
             .peer_record(1.0)
             .addresses
@@ -401,12 +401,9 @@ mod tests {
             let mut merged = views[order[0]].clone();
             merged.merge_from(views[order[1]].clone());
             merged.merge_from(views[order[2]].clone());
-            assert_eq!(
-                merged.addresses,
-                vec![native.addresses[0].clone(), expected_browser.clone()]
-            );
+            assert_eq!(merged.addresses, latest.peer_record(1.0).addresses);
             let authority = merged.address_authority.as_ref().unwrap();
-            assert_eq!(authority.quic_sequence(), 12);
+            assert_eq!(authority.quic_sequence(), 11);
             assert_eq!(authority.publication(), Some(&latest));
             let decoded: DHTNode =
                 postcard::from_bytes(&postcard::to_stdvec(&merged).unwrap()).unwrap();
@@ -418,7 +415,7 @@ mod tests {
         ]);
         let winner = compute_winner(&owner, &reports).unwrap().1;
         assert!(winner.addresses.contains(&expected_browser));
-        assert!(winner.addresses.contains(&native.addresses[0]));
+        assert!(!winner.addresses.contains(&native.addresses[0]));
         let result = apply_lookup_report_winners(
             vec![native.clone()],
             &HashMap::from([(owner, reports)]),
@@ -427,16 +424,20 @@ mod tests {
         )
         .remove(0);
         assert_eq!(result.addresses, winner.addresses);
-        // A conflicting V2 proof at the same QUIC sequence cannot be attached.
+        // V2 also replaces a conflicting V1 projection at the same sequence.
         let mut equal_conflict = native.clone();
-        equal_conflict.merge_from(signed(12, true).peer_record(1.0));
-        assert_eq!(equal_conflict.addresses, native.addresses);
+        let same_sequence = signed(12, true);
+        equal_conflict.merge_from(same_sequence.peer_record(1.0));
+        assert_eq!(
+            equal_conflict.addresses,
+            same_sequence.peer_record(1.0).addresses
+        );
         assert!(
             equal_conflict
                 .address_authority
                 .unwrap()
                 .publication()
-                .is_none()
+                .is_some()
         );
         let mut removed = winner;
         removed.merge_from(signed(13, false).peer_record(1.0));

@@ -929,26 +929,48 @@ impl KademliaRoutingTable {
         self.address_publications.get(node_id)?.transport.as_ref()
     }
 
-    fn store_transport_address_set(&mut self, node_id: &PeerId, set: TransportAddressSet) -> bool {
+    fn store_transport_address_set(
+        &mut self,
+        node_id: &PeerId,
+        mut set: TransportAddressSet,
+        native: Vec<(MultiAddr, AddressType)>,
+        mode: AddressReplaceMode,
+    ) -> bool {
         let Some(index) = self.get_bucket_index(node_id) else {
             return false;
         };
-        if !self.buckets[index]
-            .nodes
-            .iter()
-            .any(|node| &node.id == node_id)
-        {
-            return false;
-        }
-        let publication = self.address_publications.entry(*node_id).or_default();
         if set.seq == 0
-            || publication
-                .transport
-                .as_ref()
+            || self
+                .transport_address_set(node_id)
                 .is_some_and(|old| set.seq <= old.seq)
         {
             return false;
         }
+        // V2 owns the whole address view. Ignore the previous V1 sequence,
+        // including equal/conflicting V1 records. An empty QUIC projection is
+        // valid for a nonempty publication containing only other transports.
+        if !self.buckets[index].replace_node_addresses_with_mode(node_id, native, mode) {
+            return false;
+        }
+        let Some(node) = self.buckets[index]
+            .nodes
+            .iter()
+            .find(|node| &node.id == node_id)
+        else {
+            return false;
+        };
+        // Keep local caps in sync with the native projection while forwarding
+        // the original owner proof unchanged.
+        set.records.retain(|record| {
+            record.transport != crate::KnownTransport::Quic.id()
+                || record
+                    .decode_known()
+                    .ok()
+                    .flatten()
+                    .is_some_and(|address| node.addresses.contains(&address))
+        });
+        let publication = self.address_publications.entry(*node_id).or_default();
+        publication.seq = set.seq;
         publication.transport = Some(Arc::new(set));
         true
     }
@@ -965,7 +987,7 @@ impl KademliaRoutingTable {
         node_id: &PeerId,
         address: &MultiAddr,
     ) -> bool {
-        if self.publish_seq_for(node_id) != 0 {
+        if self.publish_seq_for(node_id) != 0 || self.transport_address_set(node_id).is_some() {
             return false;
         }
         self.touch_node(node_id, Some(address), AddressType::Relay)
@@ -1026,7 +1048,7 @@ impl KademliaRoutingTable {
         }
 
         if let Some(stored) = self.address_publications.get(node_id)
-            && seq <= stored.seq
+            && (stored.transport.is_some() || seq <= stored.seq)
         {
             return false;
         }
@@ -1043,8 +1065,7 @@ impl KademliaRoutingTable {
                 .replace_node_addresses_from_gossip(node_id, typed_addresses),
         };
         if applied {
-            // V1 can replace only the native projection. Retain the latest
-            // V2 publication and its unchanged owner proof independently.
+            // V1 is accepted only until the first V2 publication is stored.
             self.address_publications.entry(*node_id).or_default().seq = seq;
         }
         applied
@@ -1681,11 +1702,18 @@ impl DhtCoreEngine {
         &self,
         node_id: &PeerId,
         set: TransportAddressSet,
+        native: Vec<(MultiAddr, AddressType)>,
+        authoritative: bool,
     ) -> bool {
+        let mode = if authoritative {
+            AddressReplaceMode::AuthenticatedSelfPublish
+        } else {
+            AddressReplaceMode::GossipedRecord
+        };
         self.routing_table
             .write()
             .await
-            .store_transport_address_set(node_id, set)
+            .store_transport_address_set(node_id, set, native, mode)
     }
 
     /// Find nodes closest to a key, including self as a candidate.
@@ -1945,7 +1973,7 @@ impl DhtCoreEngine {
     ///     share the same outcome.
     /// - `seq` must be non-zero and strictly exceed the last sequence
     ///   observed from `node_id`; zero, older, or duplicate sequences are
-    ///   ignored.
+    ///   ignored. Once a V2 publication is stored, all V1 replacements are ignored.
     ///
     /// Returns `true` when the peer's addresses were replaced, `false`
     /// otherwise (peer absent, stale sequence, empty input list, or a

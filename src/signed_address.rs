@@ -21,9 +21,6 @@ use serde::{
 };
 use std::{fmt, marker::PhantomData, sync::Arc};
 
-/// Capability token for the extensible address protocol with mandatory owner proofs.
-pub const ADDRESS_V2_CAPABILITY: &str = "addr-v2";
-
 /// Upper bound for one encoded signed address record.
 pub const MAX_SIGNED_ADDRESS_BYTES: usize = 40 * 1024;
 const DOMAIN: &str = "saorsa/address-record/2";
@@ -54,15 +51,6 @@ pub enum AddressAuthority {
     AuthenticatedOwner(u64),
     /// A portable owner signature, independently checked by this process.
     Signed(VerifiedAddressRecord),
-    /// A local view combining independently versioned QUIC and V2 information.
-    /// The signature covers only `publication`, never the combined address list.
-    Combined {
-        /// Sequence of the owner-proven QUIC projection, or zero for an
-        /// unsequenced routing contact retained alongside a supplemental record.
-        quic_sequence: u64,
-        /// Latest unchanged owner-signed V2 publication.
-        publication: VerifiedAddressRecord,
-    },
 }
 
 impl AddressAuthority {
@@ -71,10 +59,6 @@ impl AddressAuthority {
         match self {
             Self::AuthenticatedOwner(seq) => *seq,
             Self::Signed(record) => record.sequence(),
-            Self::Combined {
-                quic_sequence,
-                publication,
-            } => (*quic_sequence).max(publication.sequence()),
         }
     }
 
@@ -93,31 +77,14 @@ impl AddressAuthority {
                     0
                 }
             }
-            Self::Combined { quic_sequence, .. } => *quic_sequence,
         }
     }
 
-    /// Original signed V2 publication, independent of newer QUIC-only updates.
+    /// Original signed V2 publication, which takes precedence over V1 information.
     pub fn publication(&self) -> Option<&VerifiedAddressRecord> {
         match self {
             Self::AuthenticatedOwner(_) => None,
-            Self::Signed(record)
-            | Self::Combined {
-                publication: record,
-                ..
-            } => Some(record),
-        }
-    }
-
-    pub(crate) fn with_publication(quic_sequence: u64, publication: VerifiedAddressRecord) -> Self {
-        let signed = Self::Signed(publication.clone());
-        if signed.quic_sequence() == quic_sequence {
-            signed
-        } else {
-            Self::Combined {
-                quic_sequence,
-                publication,
-            }
+            Self::Signed(record) => Some(record),
         }
     }
 }

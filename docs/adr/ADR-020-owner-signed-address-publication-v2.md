@@ -25,11 +25,13 @@ them. A sequence reported by an intermediary does not prove that the owner
 published it. V2 therefore needs an extensible address set with a portable
 owner signature that survives forwarding.
 
-V1 and V2 coexist. Treating a V1 QUIC list as a complete V2 replacement would
-erase WebRTC addresses simply because V1 cannot represent them. A single shared
-version gate would also discard useful delayed V2 information after a newer V1
-update. Expiring the latest known publication would remove potentially usable
-addresses without providing any newer information.
+V1 and V2 coexist without capability negotiation. A user-agent identifies the
+software and its node/client role; customizing it must not change the address
+protocol. Every peer is contacted through both address protocols. Receiving a
+valid V2 record establishes that its owner publishes V2, so V2 must take
+precedence over all V1 information about that owner, regardless of arrival order
+or V1 sequence. Expiring the latest known publication would remove potentially
+usable addresses without providing any newer information.
 
 Address knowledge also has to reach consumers: automatic reconnect previously
 preferred saved connection addresses even when a newer publication had replaced
@@ -68,7 +70,9 @@ cannot be created by deserializing peer-supplied provenance.
 
 Direct V2 publications must come over the authenticated owner's connection.
 Native storage still requires routing-table admission; a publication from an
-unadmitted peer receives `PeerRejected`, allowing a retry after admission.
+unadmitted peer receives `PeerRejected` for compatibility with older senders.
+New senders do not wait for that response or retry the publication; a later
+ordinary publication may arrive after admission.
 Lookup replies must match a live request from the authenticated responder.
 An independently verified signature permits a third party to forward a record;
 it does not grant the owner routing-table membership by itself.
@@ -97,36 +101,45 @@ routing membership. Eviction or restart can remove that knowledge. A receiver
 without a newer record can accept an old valid publication; this is an accepted
 trade-off, not a persistent anti-replay guarantee or proof of global freshness.
 
-### 3. Replace QUIC and complete V2 views independently
+### 3. V2 replaces V1 and owns the complete address view
 
-For an admitted native routing peer, retain two independently versioned views
-in the routing table: the QUIC address list and its sequence, and the latest
-complete V2 publication with its original proof. Apply replacements within
-their scope, rather than accumulating obsolete addresses indefinitely.
+For an admitted native routing peer, retain its address view and the latest
+accepted V2 publication with its original proof. Commit the full publication
+and its QUIC projection atomically in the routing table. The protocol version
+takes precedence over sequence: compare V1 sequences only until V2 is learned,
+and compare only V2 sequences thereafter.
 
-| Incoming information | QUIC view | Complete V2 view, including WebRTC |
-|----------------------|-----------|-----------------------------------|
-| Newer authenticated V1 publication or V1 owner self-report | Replace the QUIC view | Preserve the existing V2 publication and supplemental addresses |
-| Valid V2 publication newer than both stored views, with QUIC addresses | Replace the QUIC view | Replace the complete V2 view |
-| V2 newer than stored V2 but older than stored QUIC | Preserve newer QUIC | Accept the newer V2 view |
-| V2 with a QUIC sequence already accepted through V1 | Require its nonempty QUIC projection to agree | Fill in V2 information if newer than stored V2 |
-| Newer V2 containing only supplemental or unknown transports | Preserve existing QUIC and its sequence | Replace the complete V2 view |
-| Duplicate or older information for a view | Do not roll that view back | Do not roll that view back |
-| Unsigned third-party V1 report claiming a higher sequence | Cannot replace an accepted owner-proven view | Cannot replace an accepted owner-proven view |
+| Incoming information | Result |
+|----------------------|--------|
+| Newer authenticated V1 publication or V1 owner self-report, with no accepted V2 | Replace the QUIC view |
+| First valid V2 publication | Replace the complete view, even if its sequence is lower than or equal to the stored V1 sequence and its QUIC addresses disagree |
+| Newer valid V2 publication | Replace the complete view and original proof |
+| Any V1 publication, self-report, or third-party hint after V2 | Ignore its address changes, regardless of sequence |
+| Duplicate or older V2 publication | Preserve the accepted V2 view |
+| Invalid V2 record | Reject it without changing addresses or establishing V2 precedence |
 
-A newer V2 replacement that omits WebRTC removes the previous WebRTC addresses.
-A V1 message that omits WebRTC never removes them. Empty V2 sets are invalid;
-the publication APIs send no empty replacement and define no V2 withdrawal.
-An unsupported-only input that produces no complete records is a no-op, not an
-empty withdrawal. Existing inbound V1 replacement handling remains QUIC-scoped.
-Rejected replacements do not advance the affected version, so a corrected
+Precedence belongs to the **address owner**, not the forwarding responder. An
+owner-signed record learned through a correlated V2 lookup has the same
+precedence as a direct publication. A responder returning V2 entries does not
+make all V1-only subjects in its other response V2 peers. Merely sending a V2
+request, acknowledgement, or invalid proof does not establish an owner's V2
+address view.
+
+A V2 replacement removes all omitted addresses, including old QUIC addresses
+when the new publication contains only WebRTC or unknown transports. The local
+QUIC projection can therefore be empty while the complete publication remains
+nonempty. Empty complete V2 sets remain invalid. An input rejected entirely by
+validation or local filtering does not advance the sequence; a corrected
 publication at that sequence can still be accepted.
 
-For example, V2 sequence 10 publishes QUIC A and WebRTC W1. V1 sequence 12
-changes QUIC to B: the local view becomes B plus W1. A delayed V2 sequence 11
-containing A and W2 updates WebRTC to W2 while QUIC remains B. V2 sequence 13
-containing only QUIC C then removes W2. Replaying V2 sequence 11 cannot restore
-it while the newer V2 record is retained.
+For example, V1 sequence 12 publishes QUIC A. V2 sequence 10 publishes QUIC B
+and WebRTC W1: the view becomes B plus W1. V1 sequence 100 is ignored. V2
+sequence 11 containing only W2 replaces the view with W2 and clears QUIC B.
+Replaying V2 sequence 10 cannot restore B or W1 while sequence 11 is retained.
+
+V2 precedence has the same lifetime as the stored proof: it is bounded by
+routing membership, eviction, and restart. Lookup-local views use the same
+precedence until discarded; discovery alone does not create routing membership.
 
 ### 4. Preserve owner proof through lookups and forwarding
 
@@ -136,16 +149,14 @@ views; they never rewrite or re-sign the owner's proof. LAN, loopback, address
 validity, and native address-cap policies continue to apply locally.
 
 Native and browser report selection share the same provenance-aware merge.
-Only owner-proven sequence information can replace an accepted owner view.
-Authenticated owner self-reports remain supported for V1 compatibility;
-unsigned third-party V1 entries are discovery hints under the existing quorum
-policy. Their advertised sequence alone grants no replacement authority.
-
-`AddressAuthority::Combined` represents a newer QUIC view alongside a different
-signed V2 publication. It is local provenance, not a signature over the combined
-list. Forwarders may therefore send a valid V2 proof containing older QUIC
-addresses; recipients that know newer QUIC information keep it. V1 information
-never becomes a synthetic V2 publication.
+A signed V2 view outranks an authenticated V1 owner report even when the V1
+sequence is higher. Authenticated owner self-reports remain supported until V2
+is learned; unsigned third-party V1 entries are discovery hints under the
+existing quorum policy. Their advertised sequence alone grants no replacement
+authority. `AddressAuthority::Signed` describes the accepted V2 view;
+`AuthenticatedOwner` describes V1. The former independently combined V1/V2
+provenance variant is removed. V1 information never becomes a synthetic V2
+publication.
 
 V2 lookup replies include only peers with owner proofs. Peers known solely
 through V1 or restored QUIC candidates are omitted until a proof is learned.
@@ -164,13 +175,31 @@ publication to the appropriate close peers. Complete V2 records combine those
 registered endpoints with the canonical QUIC set. The reachability driver
 also constructs that complete set before sending it.
 
-After establishing the recipient's capability, a V2 peer receives the full
-signed record; a V1 peer receives only its QUIC projection with the same
-publication sequence. If there is no QUIC projection, skip V1 recipients.
-Empty complete sets are not sent or recorded as acknowledged publications.
-Reachability retries track acknowledgements against the exact complete set,
-including supplemental endpoints, so a changed WebRTC endpoint cannot be
-mistaken for an already acknowledged update.
+Send the full signed V2 record and its V1 QUIC projection concurrently to every
+recipient, with the same publication sequence and independent request IDs.
+If there is no QUIC projection, send only V2 because V1 cannot represent that
+publication. Empty complete sets are not sent or acknowledged.
+
+Publications are send-only: attempt each applicable version once per distinct
+recipient, without creating response waiters. Keep the existing request wire
+format so older receivers can process it; any acknowledgement or rejection
+they send is ignored. The API returns peers for which all applicable transport
+writes succeeded. This confirms sending, not remote processing or storage.
+Silence from a peer, including one unable to process V2, has no trust cost.
+
+Do not retry failed publication sends, reconnect to resend them, or maintain
+an unacknowledged-publication queue. The reachability driver remembers attempts
+against the complete record and target set, including failed attempts. Changed
+addresses or browser certificates, new targets, and relay state transitions
+can cause new publications. Ordinary periodic republication (every 5–10 minutes)
+continues independently of individual send outcomes.
+
+Connection and identity failures use the existing connection coordinator's
+trust handling without an additional publication penalty. Once connected,
+transport send failures produce at most one failure observation per recipient
+per publication, even if both versions fail. Local encoding or signing errors
+do not penalize the remote peer. Lookup requests still require responses and
+retain the separate policy below.
 
 ### 6. Reconnect using the latest published QUIC addresses
 
@@ -233,26 +262,51 @@ addresses would not provide the owner proof required to forward them in V2.
 Snapshot age checks are local bootstrap policy and remain unchanged. They do
 not reintroduce an expiration field or age-based rejection for V2 publications.
 
-### 8. Capability negotiation, compatibility, and bounds
+### 8. Concurrent protocols, compatibility, and bounds
 
-The signed identity announcement advertises `addr-v2`. V2 uses
-`/dht/address/2.0.0` with `PublishAddressSetV2` and `FindNodeV2`; owner signatures
-are mandatory in publications and lookup entries. The unsigned V2 draft never
-shipped and is not retained as a second mode or capability.
+No `addr-v2` user-agent token, version-number inference, capability field, or
+V1-only switch selects the address protocol. Default node/client user-agents
+contain the software identifier; custom user-agents are returned unchanged.
+The existing `node/` role prefix still controls DHT routing participation.
+V2 uses `/dht/address/2.0.0` with `PublishAddressSetV2` and `FindNodeV2`;
+owner signatures are mandatory in publications and lookup entries. V1 keeps
+its existing operations, topic, and wire discriminants for older peers.
 
-Removing timestamps changes the draft V2 signed wire format and signing domain;
-native and browser consumers must upgrade together. `SignedAddressRecord::sign`
-and `verify` no longer take a clock argument. `compute_winner` returns an owned
-peer view because it may combine reports. V1 keeps its existing operations and
-wire discriminants for older peers.
+Native bootstrap, iterative lookup, and witness re-queries issue V1 and V2
+FIND_NODE concurrently to each peer. Responses have independent live-request
+correlation and authentication checks. Merge their per-owner results using V2
+precedence, retaining V1-only subjects omitted from the proof-only V2 reply.
+An empty V2 reply is not a withdrawal of every subject in the V1 response.
 
-Browser FIND_NODE requests opt into a length-delimited binary proof bundle.
-The authenticated HELLO advertises `addr-v2`; proof-enabled replies contain
-only proven peers, and ant-core rejects entries without owner proof. Browser
-adapters use the portable verifier and preserve original publication bytes.
-Older browser servers without the capability can still supply legacy hints.
-Upgrading a forwarder does not fix an older consumer that trusts arbitrary
-third-party sequence claims.
+Both requests use the existing bounded request timeout and are never attempted
+serially. Iterative lookup and witness batches collect each protocol's replies
+as they arrive, then apply the existing five-second grace window after the
+first completed probe. A successful V1 reply remains in the result even if its
+V2 sibling is cancelled at that deadline. Cancelled requests immediately lose
+their live correlation state. Bootstrap lookup pairs wait for both outcomes,
+so an unsupported version can delay those calls until its timeout.
+A successful reply from one version remains usable if the other fails or is
+unsupported. An unanswered protocol version does not
+cause a trust penalty when the other request succeeds; if both fail, the pair
+records one RPC failure. Authentication and dial failures retain their existing
+handling. V2 records are accepted only after their own validation; a V1 reply
+cannot authorize unsigned V2 data.
+
+Address publications do not use these response timeouts or paired RPC failure
+rules; they follow the send-only policy in section 5.
+
+Browser adapters must follow the same policy: request the legacy hints and
+length-delimited owner-proof representation without gating on a HELLO
+capability token, verify proofs with the portable verifier, and apply the same
+per-owner V2 precedence. The adapter/HELLO implementation lives outside this
+repository and must be updated by its consumers. The shared verifier and
+report-selection implementation here enforce the new precedence. The unsigned
+V2 draft never shipped and remains unsupported.
+
+Native and browser consumers of the draft format must upgrade together.
+`SignedAddressRecord::sign` and `verify` take no clock argument, and
+`compute_winner` returns an owned peer view. Consumers must also remove imports
+of `ADDRESS_V2_CAPABILITY` and uses of `AddressAuthority::Combined`.
 
 Bound record collections, address payloads, keys, signatures, and response
 decoding. Current limits include 16 transport records, 2 KiB per address
@@ -267,8 +321,9 @@ records rather than truncating addresses inside a proof.
 
 - QUIC and WebRTC discovery share a portable owner-authenticated protocol,
   including forwarding through nodes that cannot dial every transport.
-- V1 compatibility cannot accidentally erase supplemental V2 addresses, and
-  message reordering cannot roll back a view whose newer version is retained.
+- Upgraded peers use V2 automatically without capability advertisement.
+- V1 cannot overwrite any accepted V2 addresses, and reordered V2 messages
+  cannot roll back the newest retained V2 publication.
 - Usable address knowledge is not discarded solely because time passed.
 - Automatic reconnect sees published address changes, and both V1 and V2 QUIC
   updates reach the existing disk snapshots without a new persistence format.
@@ -279,8 +334,13 @@ records rather than truncating addresses inside a proof.
   no expiry-based freshness guarantee.
 - Restart and eviction lose proof and sequence knowledge, allowing old valid
   records to be accepted again and temporarily reducing V2 discovery coverage.
+- Sending both versions increases traffic and in-flight lookup operations.
+  A peer supporting only one version can make bootstrap lookup pairs wait for
+  the other version's timeout; iterative batches retain their grace bound.
+- Publications have no storage confirmation or failure-driven retries. A lost
+  or unapplied update may remain missing until a later ordinary publication.
 - Signatures increase message sizes. Consumers of the earlier draft V2 wire
-  format need coordinated upgrades.
+  format and browser adapters need coordinated upgrades.
 
 ### Neutral
 
@@ -294,8 +354,16 @@ records rather than truncating addresses inside a proof.
 - **Expire V2 records or renew signatures on a timer.** Rejected: time passing
   provides no replacement addresses. Retain the latest known publication and
   accept that dialing determines current usability.
-- **Use one replacement sequence for V1 and V2.** Rejected: a newer QUIC-only
-  update must not erase or block independently useful supplemental information.
+- **Negotiate V2 through user-agent or HELLO capability tokens.** Rejected:
+  use both protocols automatically and derive address precedence from accepted
+  owner-signed V2 records.
+- **Let V1 and V2 update independently.** Rejected: after V2 is known, a V1
+  update must not change any part of that owner's address view.
+- **Wait for publication acknowledgements and retry failures.** Rejected:
+  publish each version once, score connection/send failures, and let normal
+  later publications disseminate the current addresses again.
+- **Compare V1 and V2 sequences without protocol precedence.** Rejected: even
+  a higher V1 sequence cannot block the first valid V2 publication.
 - **Trust an intermediary's sequence or re-sign its merged view.** Rejected:
   preserve the owner's original proof and track derived views locally.
 - **Treat absent or unsupported inputs as an empty V2 withdrawal.** Rejected:
@@ -311,9 +379,11 @@ records rather than truncating addresses inside a proof.
 ## Validation and references
 
 Existing regressions cover owner/signature validation, response correlation,
-publication ordering, V1 preservation of V2, supplemental-only replacement,
+publication ordering, V2 precedence over V1, supplemental-only replacement,
 unchanged-signature reuse, forwarding, response bounds, and reconnect source
-selection. Persistence tests cover snapshot encoding, validity, and bounded
+selection. Publication regressions cover receivers that never reply, absence
+of response tracking, one penalty for failed delivery, and suppression of
+failed-send retries. Persistence tests cover snapshot encoding, validity, and bounded
 dial-candidate selection. These do not establish a time bound for relearning
 WebRTC addresses after restart.
 

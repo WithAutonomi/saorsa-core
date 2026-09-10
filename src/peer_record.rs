@@ -185,8 +185,8 @@ impl DHTNode {
 
     /// Combine lookup views without contaminating an owner-proven replacement.
     ///
-    /// QUIC projections and signed V2 publications advance independently, so
-    /// a V1 update cannot withdraw supplemental addresses or their proof.
+    /// A signed V2 publication replaces the entire V1 view regardless of its
+    /// sequence. Once V2 is known, only a newer V2 publication can replace it.
     /// Unsigned hints cannot change an owner-proven view. When both views are
     /// unsequenced, merge addresses and retain the strongest duplicate tag.
     pub fn merge_from(&mut self, other: DHTNode) {
@@ -248,85 +248,21 @@ impl DHTNode {
     fn merge_owner_views(&mut self, other: &Self) {
         use crate::signed_address::AddressAuthority;
 
-        let current_quic = self
-            .address_authority
-            .as_ref()
-            .map_or(0, AddressAuthority::quic_sequence);
-        let other_quic = other
-            .address_authority
-            .as_ref()
-            .map_or(0, AddressAuthority::quic_sequence);
-        if current_quic != 0 && current_quic == other_quic {
-            let current: Vec<_> = self
-                .typed_addresses()
-                .into_iter()
-                .filter(|(a, _)| a.is_quic())
-                .collect();
-            let incoming: Vec<_> = other
-                .typed_addresses()
-                .into_iter()
-                .filter(|(a, _)| a.is_quic())
-                .collect();
-            if current.len() != incoming.len()
-                || incoming.iter().any(|entry| !current.contains(entry))
-            {
-                // Equal sequences must describe the same QUIC projection.
-                // Do not attach a conflicting V2 proof to the accepted view.
-                return;
-            }
-        }
-        let quic_source = if other_quic > current_quic
-            || (current_quic == 0 && self.address_authority.is_none())
-        {
-            other
+        let publication_sequence = |node: &Self| {
+            node.address_authority
+                .as_ref()
+                .and_then(AddressAuthority::publication)
+                .map_or(0, |proof| proof.sequence())
+        };
+        let current_v2 = publication_sequence(self);
+        let other_v2 = publication_sequence(other);
+        let replace = if current_v2 != 0 || other_v2 != 0 {
+            other_v2 > current_v2
         } else {
-            &*self
+            dht_node_publish_seq(other) > dht_node_publish_seq(self)
         };
-        let current_publication = self
-            .address_authority
-            .as_ref()
-            .and_then(AddressAuthority::publication);
-        let other_publication = other
-            .address_authority
-            .as_ref()
-            .and_then(AddressAuthority::publication);
-        let (publication, supplemental_source) = if other_publication.map_or(0, |p| p.sequence())
-            > current_publication.map_or(0, |p| p.sequence())
-        {
-            (other_publication, other)
-        } else {
-            (current_publication, &*self)
-        };
-        let quic_sequence = current_quic.max(other_quic);
-        let mut typed: Vec<_> = quic_source
-            .typed_addresses()
-            .into_iter()
-            .filter(|(address, _)| quic_source.address_authority.is_some() && address.is_quic())
-            .collect();
-        if publication.is_some() {
-            typed.extend(
-                supplemental_source
-                    .typed_addresses()
-                    .into_iter()
-                    .filter(|(address, _)| !address.is_quic()),
-            );
-        }
-        let authority = match publication {
-            Some(proof) if quic_sequence == 0 && typed.iter().any(|(a, _)| a.is_quic()) => {
-                AddressAuthority::Combined {
-                    quic_sequence,
-                    publication: proof.clone(),
-                }
-            }
-            Some(proof) => AddressAuthority::with_publication(quic_sequence, proof.clone()),
-            None => AddressAuthority::AuthenticatedOwner(quic_sequence),
-        };
-        typed.sort_by_key(|(_, ty)| ty.priority());
-        (self.addresses, self.address_types) = typed.into_iter().unzip();
-        self.distance = encode_publish_seq_distance(authority.sequence());
-        self.address_authority = Some(authority);
-        if other_quic > current_quic {
-            self.reliability = other.reliability;
+        if replace {
+            *self = other.clone();
         }
     }
 }

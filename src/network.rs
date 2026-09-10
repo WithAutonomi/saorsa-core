@@ -98,35 +98,16 @@ enum ListenMode {
     Local,
 }
 
-/// Returns the default user agent string for the given mode.
+/// Returns the default software identifier for the given mode.
 ///
-/// - `Node` → `"node/<saorsa-core-version>;addr-v2"`
-/// - `Client` → `"client/<saorsa-core-version>;addr-v2"`
+/// - `Node` → `"node/<saorsa-core-version>"`
+/// - `Client` → `"client/<saorsa-core-version>"`
 pub fn user_agent_for_mode(mode: NodeMode) -> String {
     let prefix = match mode {
         NodeMode::Node => "node",
         NodeMode::Client => "client",
     };
-    with_address_v2_capability(format!("{prefix}/{}", env!("CARGO_PKG_VERSION")))
-}
-
-/// Signed identity-announcement capability token for the extensible address
-/// publication and lookup plane.
-pub(crate) use crate::signed_address::ADDRESS_V2_CAPABILITY;
-
-fn with_address_v2_capability(mut user_agent: String) -> String {
-    if !supports_address_v2(&user_agent) {
-        user_agent.push(';');
-        user_agent.push_str(ADDRESS_V2_CAPABILITY);
-    }
-    user_agent
-}
-
-pub(crate) fn supports_address_v2(user_agent: &str) -> bool {
-    user_agent
-        .split(';')
-        .skip(1)
-        .any(|capability| capability == ADDRESS_V2_CAPABILITY)
+    format!("{prefix}/{}", env!("CARGO_PKG_VERSION"))
 }
 
 /// Returns `true` if the user agent identifies a full DHT participant (prefix `"node/"`).
@@ -412,11 +393,9 @@ impl NodeConfig {
     /// If a custom user agent was set, returns that. Otherwise, derives
     /// the user agent from the node's [`NodeMode`].
     pub fn user_agent(&self) -> String {
-        with_address_v2_capability(
-            self.custom_user_agent
-                .clone()
-                .unwrap_or_else(|| user_agent_for_mode(self.mode)),
-        )
+        self.custom_user_agent
+            .clone()
+            .unwrap_or_else(|| user_agent_for_mode(self.mode))
     }
 
     /// Compute the listen addresses from the configuration fields.
@@ -2849,20 +2828,20 @@ mod tests {
     }
 
     #[test]
-    fn default_user_agents_advertise_address_v2() {
-        let node = user_agent_for_mode(NodeMode::Node);
-        let client = user_agent_for_mode(NodeMode::Client);
-        assert!(node.starts_with("node/"));
-        assert!(client.starts_with("client/"));
-        assert!(supports_address_v2(&node));
-        assert!(supports_address_v2(&client));
-    }
-
-    #[test]
-    fn address_v2_capability_is_an_exact_token() {
-        assert!(supports_address_v2("node/1.0;addr-v2"));
-        assert!(!supports_address_v2("node/1.0"));
-        assert!(!supports_address_v2("node/1.0;addr-v20"));
+    fn user_agents_identify_software_without_capability_tokens() {
+        assert_eq!(
+            user_agent_for_mode(NodeMode::Node),
+            format!("node/{}", env!("CARGO_PKG_VERSION"))
+        );
+        assert_eq!(
+            user_agent_for_mode(NodeMode::Client),
+            format!("client/{}", env!("CARGO_PKG_VERSION"))
+        );
+        let mut config = NodeConfig::default();
+        for custom in ["my-app/1.0", "", "node/custom;custom-feature"] {
+            config.custom_user_agent = Some(custom.to_owned());
+            assert_eq!(config.user_agent(), custom);
+        }
     }
 
     // Test tool handler for network tests
@@ -2910,8 +2889,12 @@ mod tests {
         };
         let receiver = P2PNode::new(config()).await.unwrap();
         let publisher = P2PNode::new(config()).await.unwrap();
-        receiver.start().await.unwrap();
-        publisher.start().await.unwrap();
+        // Keep the publication sequence controlled by this test. Starting the
+        // publisher's DHT would allow an automatic V2 publication to correctly
+        // suppress the initial V1 fixture before it can be observed.
+        receiver.transport.start_network_listeners().await.unwrap();
+        receiver.dht_manager().start().await.unwrap();
+        publisher.transport.start_network_listeners().await.unwrap();
         let old_address = publisher
             .listen_addrs()
             .await
@@ -2957,7 +2940,7 @@ mod tests {
                 DhtNetworkOperation::PublishAddressSetV2 {
                     record: SignedAddressRecord::sign(
                         publisher.transport.node_identity(),
-                        sequence + 1,
+                        sequence - 1,
                         vec![
                             TransportAddressRecord::from_multiaddr(
                                 &second,
@@ -2968,6 +2951,14 @@ mod tests {
                         ],
                     )
                     .unwrap(),
+                },
+            ),
+            (
+                "/dht/1.0.0",
+                second.clone(),
+                DhtNetworkOperation::PublishAddressSet {
+                    seq: u64::MAX,
+                    addresses: vec![(first.clone(), AddressType::Direct)],
                 },
             ),
         ];

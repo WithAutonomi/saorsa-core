@@ -102,10 +102,6 @@ const RELAY_REVALIDATION_INTERVAL: Duration = Duration::from_secs(2 * 60 * 60);
 /// probe burst after a rolling deployment.
 const RELAY_REVALIDATION_JITTER_MAX: Duration = RELAY_REVALIDATION_INTERVAL;
 
-/// Retry interval for authoritative address publications that were not
-/// acknowledged by every current close peer.
-const PUBLISH_RETRY_INTERVAL: Duration = Duration::from_secs(15);
-
 /// Initial delay before the first retry after a failed acquisition walk.
 const BACKOFF_INITIAL: Duration = Duration::from_secs(30);
 
@@ -141,7 +137,7 @@ pub(crate) fn spawn_acquisition_driver(
             relay_address,
             shutdown,
             current_backoff: BACKOFF_INITIAL,
-            last_published_address_set: None,
+            last_publication_attempt: None,
             canary_rejected_relayers: HashSet::new(),
         };
         driver.run().await;
@@ -158,19 +154,18 @@ struct AcquisitionDriver {
     relay_address: Arc<RwLock<Option<SocketAddr>>>,
     shutdown: CancellationToken,
     current_backoff: Duration,
-    last_published_address_set: Option<PublishedAddressSet>,
+    last_publication_attempt: Option<PublicationAttempt>,
     canary_rejected_relayers: HashSet<PeerId>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-struct PublishedAddressSet {
+struct PublicationAttempt {
     records: Vec<TransportAddressRecord>,
     target_peers: HashSet<PeerId>,
-    pending_peers: HashSet<PeerId>,
 }
 
-fn pending_publication_targets(
-    previous: Option<&PublishedAddressSet>,
+fn publication_targets(
+    previous: Option<&PublicationAttempt>,
     records: &[TransportAddressRecord],
     target_peers: &HashSet<PeerId>,
     force: bool,
@@ -181,13 +176,10 @@ fn pending_publication_targets(
         return target_peers.clone();
     };
 
-    let mut pending: HashSet<_> = previous
-        .pending_peers
-        .intersection(target_peers)
+    target_peers
+        .difference(&previous.target_peers)
         .copied()
-        .collect();
-    pending.extend(target_peers.difference(&previous.target_peers).copied());
-    pending
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -410,8 +402,8 @@ impl AcquisitionDriver {
     /// 2. On a multi-NAT host, one external being proven Direct does not
     ///    promote unrelated externals.
     ///
-    /// Tracks the complete transport record for retries, including certificate
-    /// changes to supplemental browser endpoints in nonempty replacement sets.
+    /// Tracks attempted complete transport records, including certificate
+    /// changes to supplemental browser endpoints. Failed sends are not retried.
     async fn publish_typed_set(&mut self, relay: Option<SocketAddr>) {
         self.publish_typed_set_with_policy(relay, false).await;
     }
@@ -471,30 +463,31 @@ impl AcquisitionDriver {
             .map(|node| node.peer_id)
             .filter(|peer| peer != self.dht.peer_id())
             .collect();
-        let mut pending_peers = pending_publication_targets(
-            self.last_published_address_set.as_ref(),
+        let attempted_peers = publication_targets(
+            self.last_publication_attempt.as_ref(),
             &records,
             &target_peers,
             force,
         );
-        if pending_peers.is_empty() {
+        // Remember every target, including failures. Only a changed record,
+        // a new target, or an explicit state transition causes a fresh attempt.
+        self.last_publication_attempt = Some(PublicationAttempt {
+            records: records.clone(),
+            target_peers,
+        });
+        if attempted_peers.is_empty() {
             debug!(
                 peers = all_peers.len(),
                 typed_addresses = ?typed,
                 relay = ?relay,
                 "driver: publish skipped, complete self address set unchanged"
             );
-            self.last_published_address_set = Some(PublishedAddressSet {
-                records,
-                target_peers,
-                pending_peers,
-            });
             return;
         }
 
         let peers_to_publish: Vec<_> = all_peers
             .into_iter()
-            .filter(|peer| pending_peers.contains(&peer.peer_id))
+            .filter(|peer| attempted_peers.contains(&peer.peer_id))
             .collect();
 
         debug!(
@@ -509,27 +502,9 @@ impl AcquisitionDriver {
             relay = ?relay,
             "driver: publishing typed address set to all routing table peers"
         );
-        let confirmed = self
-            .dht
-            .publish_address_records_to_peers(records.clone(), &peers_to_publish)
+        self.dht
+            .publish_address_records_to_peers(records, &peers_to_publish)
             .await;
-        for peer in confirmed {
-            pending_peers.remove(&peer);
-        }
-        let missing = pending_peers.len();
-        if missing > 0 {
-            debug!(
-                missing,
-                targets = target_peers.len(),
-                relay = ?relay,
-                "driver: address publication incomplete; unacknowledged peers will be retried"
-            );
-        }
-        self.last_published_address_set = Some(PublishedAddressSet {
-            records,
-            target_peers,
-            pending_peers,
-        });
     }
 
     /// Hold the acquired relay until positive failure evidence forces a rebind.
@@ -632,7 +607,6 @@ impl AcquisitionDriver {
                         // the same as shutdown.
                         Err(RecvError::Closed) => return true,
                         Err(RecvError::Lagged(skipped)) => {
-                            self.last_published_address_set = None;
                             let relay = *self.relay_address.read().await;
                             self.publish_typed_set(relay).await;
                             debug!(
@@ -647,10 +621,6 @@ impl AcquisitionDriver {
                         info!("driver: relay tunnel unhealthy, rebinding");
                         return false;
                     }
-                    // Also retries any peers that did not acknowledge the
-                    // latest full address-set publication.
-                    let relay = *self.relay_address.read().await;
-                    self.publish_typed_set(relay).await;
                 }
                 _ = &mut revalidation => {
                     let relayer = *self.relayer_peer_id.read().await;
@@ -733,7 +703,7 @@ impl AcquisitionDriver {
 
         // Withdrawal and transport teardown start together. Peers are told to
         // stop using the allocation without waiting for local QUIC/MASQUE
-        // shutdown, while teardown does not wait on DHT acknowledgements.
+        // shutdown. Neither publication nor teardown waits for DHT replies.
         let transport = Arc::clone(&self.transport);
         let teardown = async move { transport.abort_proactive_relay_session(allocation).await };
         let (teardown_result, ()) = tokio::join!(teardown, self.force_publish_typed_set(None));
@@ -753,8 +723,6 @@ impl AcquisitionDriver {
         let mut events = self.dht.subscribe_events();
         let sleep = tokio::time::sleep(self.current_backoff);
         tokio::pin!(sleep);
-        let mut publish_retry = tokio::time::interval(PUBLISH_RETRY_INTERVAL);
-        publish_retry.tick().await;
 
         loop {
             tokio::select! {
@@ -763,9 +731,6 @@ impl AcquisitionDriver {
                 _ = &mut sleep => {
                     trace!(window = ?self.current_backoff, "driver: backoff window expired");
                     return false;
-                }
-                _ = publish_retry.tick() => {
-                    self.publish_typed_set(None).await;
                 }
                 promoted = self.transport.recv_direct_address_promoted() => {
                     match promoted {
@@ -800,14 +765,12 @@ impl AcquisitionDriver {
                 event = events.recv() => {
                     match event {
                         Ok(DhtNetworkEvent::KClosestPeersChanged { .. }) => {
-                            self.last_published_address_set = None;
-                            debug!("driver: K-closest changed, retrying early");
+                            debug!("driver: K-closest changed, retrying relay acquisition early");
                             return false;
                         }
                         Ok(_) => continue,
                         Err(RecvError::Closed) => return true,
                         Err(RecvError::Lagged(skipped)) => {
-                            self.last_published_address_set = None;
                             self.publish_typed_set(None).await;
                             debug!(
                                 skipped,
@@ -849,42 +812,37 @@ mod tests {
     }
 
     #[test]
-    fn publication_targets_only_retry_pending_and_new_peers() {
+    fn publication_targets_only_include_new_peers_for_unchanged_records() {
         let departed = peer_id(1);
         let retained = peer_id(2);
         let joined = peer_id(3);
-        let previous = PublishedAddressSet {
+        let previous = PublicationAttempt {
             records: Vec::new(),
             target_peers: HashSet::from([departed, retained]),
-            pending_peers: HashSet::from([departed]),
         };
         let current = HashSet::from([retained, joined]);
 
         assert_eq!(
-            pending_publication_targets(Some(&previous), &[], &current, false),
+            publication_targets(Some(&previous), &[], &current, false),
             HashSet::from([joined])
         );
     }
 
     #[test]
-    fn invalidated_publication_retries_rejoined_peer_id() {
+    fn first_publication_attempt_includes_current_peers() {
         let peer = peer_id(1);
         let current = HashSet::from([peer]);
 
-        assert_eq!(
-            pending_publication_targets(None, &[], &current, false),
-            current
-        );
+        assert_eq!(publication_targets(None, &[], &current, false), current);
     }
 
     #[test]
     fn changed_or_forced_publication_targets_every_current_peer() {
         let first = peer_id(1);
         let second = peer_id(2);
-        let previous = PublishedAddressSet {
+        let previous = PublicationAttempt {
             records: Vec::new(),
             target_peers: HashSet::from([first, second]),
-            pending_peers: HashSet::new(),
         };
         let current = HashSet::from([first, second]);
         let changed = [TransportAddressRecord::from_multiaddr(
@@ -895,11 +853,11 @@ mod tests {
         .unwrap()];
 
         assert_eq!(
-            pending_publication_targets(Some(&previous), &changed, &current, false),
+            publication_targets(Some(&previous), &changed, &current, false),
             current
         );
         assert_eq!(
-            pending_publication_targets(Some(&previous), &[], &current, true),
+            publication_targets(Some(&previous), &[], &current, true),
             current
         );
     }
@@ -919,7 +877,7 @@ mod tests {
     }
 
     #[test]
-    fn browser_certificate_updates_retry_failed_replicas_with_unchanged_quic() {
+    fn browser_certificate_changes_allow_new_attempts_without_retrying_failed_sends() {
         let peers = HashSet::from([peer_id(1), peer_id(2)]);
         let quic = TransportAddressRecord::from_multiaddr(
             &"/ip4/203.0.113.7/udp/9000/quic".parse().unwrap(),
@@ -927,31 +885,24 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let mut previous = PublishedAddressSet {
+        let mut previous = PublicationAttempt {
             records: vec![quic.clone(), browser_record(1)],
             target_peers: peers.clone(),
-            pending_peers: HashSet::new(),
         };
         let rotated = vec![quic.clone(), browser_record(2)];
         assert_eq!(
-            pending_publication_targets(Some(&previous), &rotated, &peers, false),
+            publication_targets(Some(&previous), &rotated, &peers, false),
             peers
         );
 
-        // Only one replica acknowledges the new certificate. Ordinary retry
-        // ticks must keep scheduling the missing replica until it acknowledges.
+        // All targets are remembered after the attempt, even if neither send
+        // succeeded. Re-evaluating unchanged records must not retry them.
         previous.records = rotated.clone();
-        previous.pending_peers = HashSet::from([peer_id(2)]);
-        assert_eq!(
-            pending_publication_targets(Some(&previous), &rotated, &peers, false),
-            previous.pending_peers
-        );
-        previous.pending_peers.clear();
-        assert!(pending_publication_targets(Some(&previous), &rotated, &peers, false).is_empty());
+        assert!(publication_targets(Some(&previous), &rotated, &peers, false).is_empty());
 
-        // Withdrawing the browser endpoint must also invalidate all old ACKs.
+        // Withdrawing the browser endpoint is a changed publication for all targets.
         assert_eq!(
-            pending_publication_targets(Some(&previous), &[quic], &peers, false),
+            publication_targets(Some(&previous), &[quic], &peers, false),
             peers
         );
     }
@@ -975,7 +926,7 @@ mod tests {
             relay_address: Arc::new(RwLock::new(None)),
             shutdown: CancellationToken::new(),
             current_backoff: BACKOFF_INITIAL,
-            last_published_address_set: None,
+            last_publication_attempt: None,
             canary_rejected_relayers: HashSet::new(),
         };
         let address = browser_record(1)
@@ -987,7 +938,7 @@ mod tests {
             .set_supplemental_self_addresses(vec![address.clone()])
             .await;
         driver.publish_typed_set(None).await;
-        let published = driver.last_published_address_set.as_ref().unwrap();
+        let published = driver.last_publication_attempt.as_ref().unwrap();
         assert_eq!(published.records.len(), 1);
         assert_eq!(
             published.records[0].decode_known().unwrap(),
@@ -999,7 +950,7 @@ mod tests {
             .await;
         for force in [false, true] {
             driver.publish_typed_set_with_policy(None, force).await;
-            let published = driver.last_published_address_set.as_ref().unwrap();
+            let published = driver.last_publication_attempt.as_ref().unwrap();
             assert_eq!(published.records.len(), 1);
             assert_eq!(
                 published.records[0].decode_known().unwrap(),
