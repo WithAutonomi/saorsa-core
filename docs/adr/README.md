@@ -57,6 +57,7 @@ An Architecture Decision Record (ADR) is a document that captures an important a
 |-----|-------|--------|---------|
 | [ADR-014](./ADR-014-proactive-relay-first-nat-traversal.md) | Proactive Relay-First NAT Traversal | Superseded | Initial proactive-relay design replaced by canary-gated publication |
 | [ADR-016](./ADR-016-canary-gated-proactive-relays.md) | Canary-Gated Proactive Relays | Accepted | Signed allocation receipts, isolated witnesses, stable relay lifecycle, and sequenced publication |
+| [ADR-020](./ADR-020-owner-signed-address-publication-v2.md) | Owner-signed Address Publication V2 | Accepted | Non-expiring QUIC and WebRTC publications, independent V1/V2 replacement, reconnect precedence, and QUIC-only persistence |
 
 ### Operations
 
