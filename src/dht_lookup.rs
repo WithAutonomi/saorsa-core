@@ -38,6 +38,10 @@ pub const DEFAULT_ALPHA_VALUE: usize = 3;
 /// Bounds slow dial cascades while allowing already-connected peers to reply.
 pub const ITERATION_GRACE_TIMEOUT_SECS: u64 = 5;
 
+/// Overall lookup budget shared by native and browser clients, in seconds.
+/// Request and round grace timeouts still apply inside this ceiling.
+pub const LOOKUP_TIMEOUT_SECS: u32 = 120;
+
 /// Canonical 256-bit DHT key or peer identity.
 pub type LookupKey = [u8; 32];
 
@@ -102,6 +106,8 @@ pub enum LookupTermination {
     Exhausted,
     /// The configured round limit was reached.
     IterationLimit,
+    /// The overall deadline elapsed; in-flight queries were cancelled.
+    TimedOut,
 }
 
 /// Result of completing or attempting to begin a lookup round.
@@ -194,6 +200,8 @@ impl<N> LookupQueryOutcome<N> {
 /// Implementations receive a complete α-sized batch so they can execute its
 /// queries concurrently using transport-specific cancellation and timeout
 /// facilities. Only validated candidates should be returned to the engine.
+/// The shared runner may drop any pending adapter future at its overall
+/// deadline. Implementations must support cancellation without detached work.
 pub trait LookupQuery<N: LookupNode> {
     /// Error returned by the transport adapter.
     type Error;
@@ -236,7 +244,9 @@ pub trait LookupQuery<N: LookupNode> {
 /// iterative lookup round open indefinitely.
 ///
 /// The first result is awaited without a grace deadline because the lookup
-/// cannot make progress until at least one query finishes. Once it arrives,
+/// cannot make progress until at least one query finishes. Use this collector
+/// inside [`run_iterative_lookup`] so its overall deadline bounds that wait.
+/// Once the first result arrives,
 /// `grace` is created and the remaining results are accepted only until that
 /// future completes. Dropping the supplied stream cancels any futures that are
 /// still pending.
@@ -270,6 +280,8 @@ pub enum LookupRunError<E> {
     Lookup(LookupError),
     /// The transport adapter failed the complete lookup.
     Query(E),
+    /// The overall deadline elapsed before the lookup completed.
+    TimedOut,
     /// An adapter returned an outcome for a peer outside the active batch or
     /// returned more than one outcome for the same peer.
     UnexpectedResponder(LookupKey),
@@ -280,6 +292,7 @@ impl<E: fmt::Display> fmt::Display for LookupRunError<E> {
         match self {
             Self::Lookup(error) => write!(formatter, "lookup state error: {error}"),
             Self::Query(error) => write!(formatter, "lookup query error: {error}"),
+            Self::TimedOut => formatter.write_str("lookup deadline elapsed"),
             Self::UnexpectedResponder(peer) => write!(
                 formatter,
                 "lookup adapter returned unexpected responder {}",
@@ -294,7 +307,7 @@ impl<E: Error + 'static> Error for LookupRunError<E> {
         match self {
             Self::Lookup(error) => Some(error),
             Self::Query(error) => Some(error),
-            Self::UnexpectedResponder(_) => None,
+            Self::UnexpectedResponder(_) | Self::TimedOut => None,
         }
     }
 }
@@ -638,7 +651,49 @@ impl<N: LookupNode> IterativeLookup<N> {
 /// validated candidates, bounded-queue eviction, convergence, exhaustion,
 /// and the iteration limit. The adapter owns only address eligibility,
 /// concurrent request execution, and response validation.
-pub async fn run_iterative_lookup<N, Q>(
+///
+/// `deadline` must complete when the overall budget elapses. Callers supply
+/// their runtime's timer using [`LOOKUP_TIMEOUT_SECS`]. The timer covers every
+/// adapter await, including eligibility checks and the first batch response.
+/// Expiration drops the walk and its pending adapter future, marks waiting
+/// peers unresponsive, and returns [`LookupRunError::TimedOut`]. Previously
+/// successful results remain available through [`IterativeLookup::results`].
+/// Like other async deadlines, this requires futures to yield when pending.
+pub async fn run_iterative_lookup<N, Q, D>(
+    lookup: &mut IterativeLookup<N>,
+    query: &mut Q,
+    deadline: D,
+) -> Result<LookupTermination, LookupRunError<Q::Error>>
+where
+    N: LookupNode,
+    Q: LookupQuery<N>,
+    D: Future<Output = ()>,
+{
+    if lookup.termination() == Some(LookupTermination::TimedOut) {
+        return Err(LookupRunError::TimedOut);
+    }
+    let result = {
+        let walk = Box::pin(run_lookup_rounds(lookup, query));
+        match select(walk, Box::pin(deadline)).await {
+            Either::Left((result, _)) => Some(result),
+            Either::Right(((), _walk)) => None,
+        }
+    };
+    match result {
+        Some(result) => result,
+        None => {
+            for (peer, _) in lookup.in_flight.drain() {
+                lookup
+                    .peer_states
+                    .insert(peer, LookupPeerState::Unresponsive);
+            }
+            lookup.finish(LookupTermination::TimedOut);
+            Err(LookupRunError::TimedOut)
+        }
+    }
+}
+
+async fn run_lookup_rounds<N, Q>(
     lookup: &mut IterativeLookup<N>,
     query: &mut Q,
 ) -> Result<LookupTermination, LookupRunError<Q::Error>>
@@ -958,8 +1013,12 @@ mod tests {
         }
         let mut query = MockQuery::default();
 
-        let reason = futures::executor::block_on(run_iterative_lookup(&mut lookup, &mut query))
-            .expect("run lookup");
+        let reason = futures::executor::block_on(run_iterative_lookup(
+            &mut lookup,
+            &mut query,
+            std::future::pending(),
+        ))
+        .expect("run lookup");
 
         assert_eq!(reason, LookupTermination::Exhausted);
         assert_eq!(
@@ -1002,8 +1061,12 @@ mod tests {
         lookup.add_candidate(node(1));
         lookup.add_candidate(node(2));
 
-        futures::executor::block_on(run_iterative_lookup(&mut lookup, &mut MissingOutcomeQuery))
-            .expect("run lookup");
+        futures::executor::block_on(run_iterative_lookup(
+            &mut lookup,
+            &mut MissingOutcomeQuery,
+            std::future::pending(),
+        ))
+        .expect("run lookup");
 
         assert_eq!(
             lookup.peer_state(&peer(1)),
@@ -1044,14 +1107,87 @@ mod tests {
         lookup.add_known_result(node(1));
         lookup.add_candidate(node(2));
         let mut query = MockQuery::default();
-        let reason =
-            futures::executor::block_on(run_iterative_lookup(&mut lookup, &mut query)).unwrap();
+        let reason = futures::executor::block_on(run_iterative_lookup(
+            &mut lookup,
+            &mut query,
+            std::future::pending(),
+        ))
+        .unwrap();
 
         assert_eq!(reason, LookupTermination::Converged);
         assert!(lookup.results().is_empty());
         assert!(lookup.queried_peers().is_empty());
         assert!(query.batches.is_empty());
         assert_eq!(lookup.iterations(), 0);
+    }
+
+    struct StalledQuery<'a> {
+        eligibility_stalls: bool,
+        cancelled: &'a std::cell::Cell<bool>,
+    }
+
+    struct CancellationFlag<'a>(&'a std::cell::Cell<bool>);
+
+    impl Drop for CancellationFlag<'_> {
+        fn drop(&mut self) {
+            self.0.set(true);
+        }
+    }
+
+    impl LookupQuery<Node> for StalledQuery<'_> {
+        type Error = Infallible;
+
+        async fn is_candidate_eligible(&mut self, _: &Node) -> Result<bool, Self::Error> {
+            if self.eligibility_stalls {
+                let _flag = CancellationFlag(self.cancelled);
+                std::future::pending::<()>().await;
+            }
+            Ok(true)
+        }
+
+        async fn query_batch(
+            &mut self,
+            _: LookupKey,
+            _: usize,
+            _: usize,
+            _: Vec<Node>,
+        ) -> Result<Vec<LookupQueryOutcome<Node>>, Self::Error> {
+            let _flag = CancellationFlag(self.cancelled);
+            // No first response ever arrives: the round grace timer cannot help.
+            let queries = futures::stream::pending::<LookupQueryOutcome<Node>>();
+            Ok(collect_after_first_with_grace(queries, || ready(())).await)
+        }
+    }
+
+    #[test]
+    fn deadline_cancels_stalled_eligibility_and_all_pending_batches() {
+        for eligibility_stalls in [true, false] {
+            let mut lookup = IterativeLookup::new([0; 32], LookupConfig::saorsa(2)).unwrap();
+            lookup.add_known_result(node(0));
+            lookup.add_candidate(node(1));
+            let cancelled = std::cell::Cell::new(false);
+            let mut query = StalledQuery {
+                eligibility_stalls,
+                cancelled: &cancelled,
+            };
+            let result = futures::executor::block_on(run_iterative_lookup(
+                &mut lookup,
+                &mut query,
+                ready(()),
+            ));
+            assert!(matches!(result, Err(LookupRunError::TimedOut)));
+            assert!(cancelled.get());
+            assert_eq!(lookup.termination(), Some(LookupTermination::TimedOut));
+            assert!(!lookup.round_active());
+            assert!(lookup.in_flight.is_empty());
+            assert_eq!(lookup.results(), vec![node(0)]);
+            if !eligibility_stalls {
+                assert_eq!(
+                    lookup.peer_state(&peer(1)),
+                    Some(LookupPeerState::Unresponsive)
+                );
+            }
+        }
     }
 
     #[test]
