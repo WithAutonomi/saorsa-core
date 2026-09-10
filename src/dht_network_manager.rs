@@ -2871,7 +2871,7 @@ impl DhtNetworkManager {
     /// empty `addresses` vec. That is intentional: it tells consumers "I
     /// don't know how to be reached yet" rather than guessing a bind-side
     /// wildcard address that peers cannot route to.
-    async fn local_dht_node(&self) -> DHTNode {
+    pub async fn local_dht_node(&self) -> DHTNode {
         let observed = self.transport.non_relay_external_addresses();
         let listen = self.transport.listen_addrs().await;
         let relay = self.transport.relay_external_address();
