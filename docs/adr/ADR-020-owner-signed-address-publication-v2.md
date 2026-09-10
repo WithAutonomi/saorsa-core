@@ -165,8 +165,13 @@ An unsigned entry cannot substitute for a missing proof.
 ### 5. Publish both transports through the existing native entry points
 
 `publish_address_set_to_peers` is used for V2 as well as V1. Its supplied
-`typed_addresses` are the native QUIC projection; non-QUIC values in that
-argument are not a supplemental-address registration mechanism.
+`typed_addresses` may contain QUIC and WebRTC endpoints. Supplied endpoints
+are merged with registered supplemental endpoints and deduplicated. WebRTC
+endpoints without a peer suffix are bound to the local identity and always
+carry unverified reachability. Unsupported transports, invalid destinations,
+foreign owner bindings, and sets exceeding the wire limits return an error
+before signing or sending anything. Supplied endpoints apply to this snapshot;
+persistent supplemental registration remains a separate operation.
 
 Register self-owned WebRTC endpoints through `set_supplemental_self_addresses`.
 That call replaces the supplemental set, binds missing peer IDs to the local

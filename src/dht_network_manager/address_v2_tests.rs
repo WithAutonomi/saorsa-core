@@ -735,7 +735,10 @@ async fn supplemental_self_addresses_bind_missing_peer_ids_before_deduplication(
             .await,
         vec![bound.clone()]
     );
-    let records = manager.complete_transport_address_records(&[]).await;
+    let records = manager
+        .complete_transport_address_records(&[])
+        .await
+        .unwrap();
     assert_eq!(records.len(), 1);
     let (received, _) = manager
         .validate_transport_address_records(node.peer_id(), records, None)
@@ -2043,4 +2046,95 @@ async fn both_lookup_versions_are_sent_and_one_unsupported_version_does_not_pena
         requester.stop().await.unwrap();
         responder.stop().await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn public_publisher_preserves_supplied_and_registered_transports() {
+    let node = test_node().await;
+    let manager = node.dht_manager();
+    let browser = browser_address(*node.peer_id());
+    manager
+        .set_supplemental_self_addresses(vec![browser.clone()])
+        .await;
+    let supplied_browser = MultiAddr::webrtc_direct(
+        WebRtcDirectAddr::new(
+            "203.0.113.8:42768".parse().unwrap(),
+            WebRtcCertificateHash::new([0x66; 32]),
+        )
+        .unwrap(),
+    );
+    let quic: MultiAddr = "/ip4/9.9.9.9/udp/9000/quic".parse().unwrap();
+    let sent = manager
+        .publish_address_set_to_peers(
+            vec![
+                (quic.clone(), AddressType::Direct),
+                (supplied_browser.clone(), AddressType::Direct),
+                (browser.clone(), AddressType::Direct),
+            ],
+            &[],
+        )
+        .await
+        .unwrap();
+    assert!(sent.is_empty());
+    let cached = manager.local_signed_addresses.read().await;
+    let proof = cached.as_ref().unwrap();
+    assert_eq!(proof.records().len(), 3);
+    let decoded: Vec<_> = proof
+        .records()
+        .iter()
+        .map(|r| r.decode_known().unwrap().unwrap())
+        .collect();
+    assert!(decoded.contains(&quic));
+    assert!(decoded.contains(&browser));
+    assert!(decoded.contains(&supplied_browser.with_peer_id(*node.peer_id())));
+    assert!(
+        proof
+            .records()
+            .iter()
+            .filter(|r| r.transport == KnownTransport::WebRtcDirect.id())
+            .all(|r| r.reachability == KnownReachability::Unverified.id())
+    );
+}
+
+#[tokio::test]
+async fn public_publisher_rejects_invalid_snapshots_before_signing_or_sending() {
+    let node = test_node().await;
+    let manager = node.dht_manager();
+    let quic: MultiAddr = "/ip4/9.9.9.9/udp/9000/quic".parse().unwrap();
+    for invalid in [
+        "/ip4/9.9.9.9/tcp/9000".parse().unwrap(),
+        "/ip4/9.9.9.9/udp/9000".parse().unwrap(),
+        "/ip4/0.0.0.0/udp/9000/quic".parse().unwrap(),
+        browser_address(PeerId::from_bytes([0x55; 32])),
+    ] {
+        for addresses in [
+            vec![(invalid.clone(), AddressType::Direct)],
+            vec![
+                (quic.clone(), AddressType::Direct),
+                (invalid, AddressType::Direct),
+            ],
+        ] {
+            let result = manager.publish_address_set_to_peers(addresses, &[]).await;
+            assert!(matches!(
+                result,
+                Err(P2PError::Network(NetworkError::InvalidAddress(_)))
+            ));
+            assert!(manager.local_signed_addresses.read().await.is_none());
+        }
+    }
+    let oversized = (0..=MAX_TRANSPORT_ADDRESS_RECORDS)
+        .map(|i| {
+            (
+                format!("/ip4/9.9.9.9/udp/{}/quic", 9000 + i)
+                    .parse()
+                    .unwrap(),
+                AddressType::Direct,
+            )
+        })
+        .collect();
+    assert!(matches!(
+        manager.publish_address_set_to_peers(oversized, &[]).await,
+        Err(P2PError::InvalidInput(_))
+    ));
+    assert!(manager.local_signed_addresses.read().await.is_none());
 }

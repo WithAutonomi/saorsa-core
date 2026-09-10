@@ -1757,7 +1757,9 @@ impl DhtNetworkManager {
                         // and routing membership are unchanged, reusing its signature.
                         let local = this.local_dht_node().await;
                         let peers = this.routing_table_peers().await;
-                        this.publish_address_set_to_peers(local.typed_addresses(), &peers).await;
+                        if let Err(error) = this.publish_address_set_to_peers(local.typed_addresses(), &peers).await {
+                            warn!(%error, "Periodic address publication rejected");
+                        }
                         if let Err(e) = this.trigger_self_lookup().await {
                             warn!("Periodic self-lookup failed: {e}");
                         }
@@ -2933,38 +2935,66 @@ impl DhtNetworkManager {
         let peers = self
             .find_closest_nodes_local(&own_key, self.k_value())
             .await;
-        self.publish_address_set_to_peers(local.typed_addresses(), &peers)
-            .await;
+        if let Err(error) = self
+            .publish_address_set_to_peers(local.typed_addresses(), &peers)
+            .await
+        {
+            warn!(%error, "Supplemental address publication rejected");
+        }
     }
 
-    /// Encode the complete current V2 record from the canonical QUIC
-    /// reachability set plus independently registered transports.
+    /// Encode and validate supplied addresses plus registered supplemental
+    /// endpoints before publishing any part of the replacement snapshot.
     pub(crate) async fn complete_transport_address_records(
         &self,
-        native: &[(MultiAddr, AddressType)],
-    ) -> Vec<TransportAddressRecord> {
+        supplied: &[(MultiAddr, AddressType)],
+    ) -> Result<Vec<TransportAddressRecord>> {
+        let supplemental = self.supplemental_self_addresses.read().await;
+        let addresses = supplied
+            .iter()
+            .map(|(address, reachability)| (address, KnownReachability::from_legacy(*reachability)))
+            .chain(
+                supplemental
+                    .iter()
+                    .map(|address| (address, KnownReachability::Unverified)),
+            );
         let mut records = Vec::new();
-        for (address, reachability) in native {
-            match TransportAddressRecord::from_multiaddr(
-                address,
-                KnownReachability::from_legacy(*reachability),
-            ) {
-                Ok(Some(record)) => records.push(record),
-                Ok(None) => {}
-                Err(error) => warn!(address = %address, %error, "failed to encode V2 QUIC address"),
+        for (address, reachability) in addresses {
+            if address
+                .peer_id()
+                .is_some_and(|owner| owner != self.peer_id())
+            {
+                return Err(P2PError::Network(NetworkError::InvalidAddress(
+                    format!("publication address belongs to another peer: {address}").into(),
+                )));
             }
-        }
-        for address in self.supplemental_self_addresses.read().await.iter() {
-            match TransportAddressRecord::from_multiaddr(address, KnownReachability::Unverified) {
-                Ok(Some(record)) if !records.contains(&record) => records.push(record),
-                Ok(_) => {}
-                Err(error) => {
-                    warn!(address = %address, %error, "failed to encode supplemental V2 address")
+            // WebRTC requires an owner binding; callers may omit our own suffix.
+            let address = if address.is_webrtc_direct() {
+                address.clone().with_peer_id(*self.peer_id())
+            } else {
+                address.clone()
+            };
+            let record = TransportAddressRecord::from_multiaddr(&address, reachability)?
+                .ok_or_else(|| {
+                    P2PError::Network(NetworkError::InvalidAddress(
+                        format!("unsupported publication transport: {address}").into(),
+                    ))
+                })?;
+            if !address.is_storable() || !record.is_within_wire_bounds() {
+                return Err(P2PError::Network(NetworkError::InvalidAddress(
+                    format!("invalid publication destination or payload: {address}").into(),
+                )));
+            }
+            if !records.contains(&record) {
+                records.push(record);
+                if records.len() > MAX_TRANSPORT_ADDRESS_RECORDS {
+                    return Err(P2PError::InvalidInput(format!(
+                        "address publication exceeds {MAX_TRANSPORT_ADDRESS_RECORDS} records",
+                    )));
                 }
             }
         }
-        records.truncate(MAX_TRANSPORT_ADDRESS_RECORDS);
-        records
+        Ok(records)
     }
 
     /// Return decoded, non-QUIC V2 addresses and reachability currently known
@@ -3323,7 +3353,8 @@ impl DhtNetworkManager {
             let local = self.local_dht_node().await;
             let records = self
                 .complete_transport_address_records(&local.typed_addresses())
-                .await;
+                .await
+                .ok()?;
             return self.local_signed_address_record(records).await;
         }
         let dht = self.dht.read().await;
@@ -6186,11 +6217,12 @@ impl DhtNetworkManager {
         &self.config.peer_id
     }
 
-    /// Publish this node's QUIC addresses and registered supplemental endpoints.
+    /// Publish supplied QUIC and WebRTC addresses plus registered supplemental endpoints.
     ///
-    /// `typed_addresses` supplies the native QUIC projection. Other transports
-    /// come from [`Self::set_supplemental_self_addresses`]. Every peer receives
-    /// the signed V2 record and, when nonempty, its V1 QUIC projection.
+    /// Every peer receives the signed V2 record and, when nonempty, its V1 QUIC
+    /// projection. WebRTC reachability is always unverified. Unsupported address
+    /// types, invalid destinations, foreign owner bindings, and oversized sets
+    /// return an error before signing or sending any publication.
     ///
     /// Used by periodic self-lookup and supplemental endpoint registration.
     /// Changed snapshots receive a new monotonic sequence; unchanged snapshots
@@ -6202,16 +6234,11 @@ impl DhtNetworkManager {
         &self,
         typed_addresses: Vec<(crate::MultiAddr, AddressType)>,
         peers: &[DHTNode],
-    ) -> Vec<PeerId> {
-        let legacy_addresses: Vec<_> = typed_addresses
-            .iter()
-            .filter(|(address, _)| address.is_quic())
-            .cloned()
-            .collect();
+    ) -> Result<Vec<PeerId>> {
         let records = self
-            .complete_transport_address_records(&legacy_addresses)
-            .await;
-        self.publish_address_records_to_peers(records, peers).await
+            .complete_transport_address_records(&typed_addresses)
+            .await?;
+        Ok(self.publish_address_records_to_peers(records, peers).await)
     }
 
     /// Publish a nonempty replacement snapshot. Empty snapshots are ignored.
