@@ -14,6 +14,21 @@ env:
 # - unit-tests.yml: Unit and integration tests (all platforms)
 
 jobs:
+  compiler-baseline:
+    name: Rust 1.91 native and WASM
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.91.0
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Check native library on the declared compiler baseline
+        run: cargo check --locked --lib --all-features
+      - name: Check portable client library on the declared compiler baseline
+        run: cargo check --locked --lib --no-default-features --target wasm32-unknown-unknown
+
   portable-core-wasm:
     name: Portable core WASM
     runs-on: ubuntu-latest
