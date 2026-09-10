@@ -447,7 +447,13 @@ impl AcquisitionDriver {
         });
 
         let typed = self_addresses.into_typed_vec();
-        let records = self.dht.complete_transport_address_records(&typed).await;
+        let records = match self.dht.complete_transport_address_records(&typed).await {
+            Ok(records) => records,
+            Err(error) => {
+                warn!(%error, "driver: address publication rejected");
+                return;
+            }
+        };
         if records.is_empty() {
             debug!("driver: publish skipped, no self addresses");
             return;
