@@ -4202,6 +4202,24 @@ impl DhtNetworkManager {
         }
     }
 
+    /// Return the latest owner-published QUIC projection for reconnects.
+    ///
+    /// `None` means no authoritative QUIC publication is known. `Some`, even
+    /// when empty after dialability filtering, supersedes saved connection
+    /// addresses. Keep the DHT read guard across the sequence and address reads
+    /// so publication handlers cannot replace the set between them.
+    pub(crate) async fn published_peer_addresses_for_dial_typed(
+        &self,
+        peer_id: &PeerId,
+    ) -> Option<Vec<(MultiAddr, AddressType)>> {
+        let dht = self.dht.read().await;
+        if dht.publish_seq_for_node(peer_id).await == 0 {
+            return None;
+        }
+        let typed = dht.get_node_addresses_typed(peer_id).await;
+        Some(Self::dialable_addresses_typed(&typed))
+    }
+
     /// Look up connectable typed addresses for `peer_id`.
     ///
     /// Checks the DHT routing table first (source of truth for DHT peer
