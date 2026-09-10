@@ -50,7 +50,7 @@ pub trait LookupNode: Clone {
 /// Iterative lookup limits shared by all transports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LookupConfig {
-    /// Number of closest successful responders returned.
+    /// Number of closest successful responders returned. Zero completes without queries.
     pub count: usize,
     /// Maximum queries issued concurrently in one round.
     pub alpha: usize,
@@ -73,11 +73,6 @@ impl LookupConfig {
     }
 
     fn validate(self) -> Result<Self, LookupError> {
-        if self.count == 0 {
-            return Err(LookupError::InvalidConfig(
-                "lookup result count must be greater than zero",
-            ));
-        }
         if self.alpha == 0 {
             return Err(LookupError::InvalidConfig(
                 "lookup alpha must be greater than zero",
@@ -357,7 +352,7 @@ impl<N: LookupNode> IterativeLookup<N> {
             iterations: 0,
             round_active: false,
             round_queries: 0,
-            termination: None,
+            termination: (config.count == 0).then_some(LookupTermination::Converged),
         })
     }
 
@@ -1041,6 +1036,22 @@ mod tests {
         }));
 
         assert_eq!(results, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn zero_count_completes_without_querying_even_with_candidates() {
+        let mut lookup = IterativeLookup::new([0; 32], LookupConfig::saorsa(0)).unwrap();
+        lookup.add_known_result(node(1));
+        lookup.add_candidate(node(2));
+        let mut query = MockQuery::default();
+        let reason =
+            futures::executor::block_on(run_iterative_lookup(&mut lookup, &mut query)).unwrap();
+
+        assert_eq!(reason, LookupTermination::Converged);
+        assert!(lookup.results().is_empty());
+        assert!(lookup.queried_peers().is_empty());
+        assert!(query.batches.is_empty());
+        assert_eq!(lookup.iterations(), 0);
     }
 
     #[test]
