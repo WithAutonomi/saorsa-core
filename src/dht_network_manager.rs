@@ -1312,6 +1312,7 @@ fn map_iterative_lookup_error(error: crate::dht_lookup::LookupError) -> P2PError
 fn map_iterative_lookup_run_error(error: LookupRunError<P2PError>) -> P2PError {
     match error {
         LookupRunError::Query(error) => error,
+        LookupRunError::TimedOut => P2PError::Dht(DhtError::QueryTimeout),
         LookupRunError::Lookup(error) => map_iterative_lookup_error(error),
         LookupRunError::UnexpectedResponder(peer) => P2PError::Dht(DhtError::RoutingError(
             format!(
@@ -2591,9 +2592,15 @@ impl DhtNetworkManager {
         }
 
         let mut query = NativeFindNodeQuery::new(self, transcript_view_count);
-        let termination = run_iterative_lookup(&mut lookup, &mut query)
-            .await
-            .map_err(map_iterative_lookup_run_error)?;
+        let termination = run_iterative_lookup(
+            &mut lookup,
+            &mut query,
+            tokio::time::sleep(Duration::from_secs(u64::from(
+                crate::dht_lookup::LOOKUP_TIMEOUT_SECS,
+            ))),
+        )
+        .await
+        .map_err(map_iterative_lookup_run_error)?;
         if termination == LookupTermination::Converged {
             info!(
                 "[NETWORK] {}: Top-K converged after {} iterations",
