@@ -75,7 +75,7 @@ dashmap = { version = "6", optional = true }
 # Networking
 # Cross-repository WebRTC Direct support. Pin the draft dependency so this
 # branch builds in CI until the corresponding saorsa-transport release lands.
-saorsa-transport = { version = "0.36.3", git = "https://github.com/WithAutonomi/saorsa-transport", rev = "c6e3ee21d41caf332b3a64dd15d32123e486f8ac", default-features = false }
+saorsa-transport = { version = "0.36.3", git = "https://github.com/WithAutonomi/saorsa-transport", rev = "c079c8aa839feb6684a9a79f0557703a41c6d6b7", default-features = false }
 
 # Core-specific dependencies
 dirs = { version = "6.0", optional = true }
