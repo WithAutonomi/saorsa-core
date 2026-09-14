@@ -188,7 +188,6 @@ impl DHTNode {
             .collect()
     }
 
-
     /// Pair each address with its type tag.
     ///
     /// Local-scope IP addresses are always returned as [`AddressType::Lan`],
@@ -226,9 +225,10 @@ impl DHTNode {
     /// dial or pass addresses to a consumer that will try them in order
     /// (e.g., `send_message`, `reconnect_and_send`).
     pub fn addresses_by_priority(&self) -> Vec<MultiAddr> {
-        let mut typed = self.typed_addresses();
-        typed.sort_by_key(|(_, ty)| ty.priority());
-        typed.into_iter().map(|(addr, _)| addr).collect()
+        self.typed_addresses_by_priority()
+            .into_iter()
+            .map(|(address, _)| address)
+            .collect()
     }
 
     /// Combine lookup views without contaminating an owner-proven replacement.
