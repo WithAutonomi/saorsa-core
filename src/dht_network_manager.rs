@@ -77,16 +77,15 @@ const MIN_CONCURRENT_OPERATIONS: usize = 10;
 /// nodes that predate extensible transport-address publication.
 const DHT_V1_TOPIC: &str = "/dht/1.0.0";
 
-/// Capability-gated extensible address protocol with mandatory owner signatures.
+/// Extensible address publication protocol with mandatory owner signatures.
 const DHT_V2_TOPIC: &str = "/dht/address/2.0.0";
 
 /// Maximum size for incoming legacy DHT messages (64 KB) to prevent memory exhaustion DoS
 /// Messages larger than this are rejected before deserialization
 const MAX_MESSAGE_SIZE: usize = 64 * 1024;
-/// Signed proofs need more space to carry a complete closest-peer response.
-// Leave room for the transport envelope within its default 1 MiB limit.
-const MAX_V2_MESSAGE_SIZE: usize = 960 * 1024;
-const MAX_V2_LOOKUP_NODES: usize = 256;
+/// Optional signed-record trailer on the unchanged FIND_NODE response.
+const LOOKUP_EXTENSION_MARKER: &[u8; 8] = b"ADDRSIG1";
+const MAX_LOOKUP_EXTENSION_RECORDS: usize = 256;
 
 /// Request timeout for DHT message handlers (10 seconds)
 /// Prevents long-running handlers from starving the semaphore permit pool
@@ -449,28 +448,12 @@ const IDENTITY_FAILURE_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 /// address to the original peer) within a single browsing session.
 const IDENTITY_MISMATCH_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
 
-/// One peer record returned by the extensible V2 address lookup plane.
-///
-/// Unlike [`DHTNode`], the records use open numeric transport and
-/// reachability identifiers. This type is sent only on [`DHT_V2_TOPIC`].
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TransportDhtNode {
-    record: SignedAddressRecord,
-    reliability: f64,
-}
-
 #[cfg(test)]
 use crate::peer_record::dht_node_publish_seq;
 #[allow(unused_imports)]
 pub use crate::peer_record::{DHTNode, ResponderView, SerializableDHTNode, WitnessedCloseGroup};
 use crate::peer_record::{advertised_publish_seq, encode_publish_seq_distance};
 use crate::signed_address::{AddressAuthority, SignedAddressRecord, VerifiedAddressRecord};
-
-fn bounded_v2_nodes<'de, D: serde::Deserializer<'de>>(
-    d: D,
-) -> std::result::Result<Vec<TransportDhtNode>, D::Error> {
-    crate::signed_address::bounded_vec::<_, _, MAX_V2_LOOKUP_NODES>(d)
-}
 
 /// DHT Network Manager Configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -515,9 +498,6 @@ pub enum DhtNetworkOperation {
         seq: u64,
         addresses: Vec<(crate::MultiAddr, AddressType)>,
     },
-    /// Find nodes through the extensible address plane, sent alongside V1
-    /// to every peer without capability negotiation.
-    FindNodeV2 { key: Key },
     /// Publish the sender's complete nonempty, owner-signed extensible address set.
     PublishAddressSetV2 { record: SignedAddressRecord },
 }
@@ -548,12 +528,6 @@ pub enum DhtNetworkResult {
     PublishAddressAck,
     /// Operation failed
     Error { operation: String, error: String },
-    /// Owner-signed peer records found through the extensible address plane.
-    NodesFoundV2 {
-        key: Key,
-        #[serde(deserialize_with = "bounded_v2_nodes")]
-        nodes: Vec<TransportDhtNode>,
-    },
 }
 
 /// DHT message envelope for network transmission
@@ -577,6 +551,9 @@ pub struct DhtNetworkMessage {
     pub ttl: u8,
     /// Hop count for routing
     pub hop_count: u8,
+    /// Optional signed records carried after the legacy Postcard message.
+    #[serde(skip)]
+    pub(crate) signed_records: Vec<SignedAddressRecord>,
 }
 
 /// DHT message types
@@ -1596,30 +1573,6 @@ impl DhtNetworkManager {
         })
     }
 
-    async fn handle_find_node_v2_request(
-        &self,
-        key: &Key,
-        requester: &PeerId,
-    ) -> Result<DhtNetworkResult> {
-        let candidates = Self::filter_response_nodes(
-            self.find_closest_nodes_local(key, self.k_value()).await,
-            requester,
-        );
-        let mut nodes = Vec::with_capacity(candidates.len());
-        for candidate in candidates {
-            if let Some(record) = self
-                .signed_address_record_for_peer(&candidate.peer_id)
-                .await
-            {
-                nodes.push(TransportDhtNode {
-                    record,
-                    reliability: candidate.reliability,
-                });
-            }
-        }
-        Ok(DhtNetworkResult::NodesFoundV2 { key: *key, nodes })
-    }
-
     /// Create a new DHT Network Manager using an existing transport handle.
     ///
     /// The caller is responsible for the transport lifecycle and must stop
@@ -2069,7 +2022,14 @@ impl DhtNetworkManager {
         // entirely for clients. Node-mode dials are issued serially below.
         let mut to_dial: Vec<(PeerId, Vec<(MultiAddr, AddressType)>)> = Vec::new();
         for peer_id in peers {
-            match self.send_find_node_both_versions(peer_id, key, None).await {
+            match self
+                .send_dht_request_with_response_context(
+                    peer_id,
+                    DhtNetworkOperation::FindNode { key },
+                    None,
+                )
+                .await
+            {
                 Ok(DhtResponseEnvelope {
                     result: DhtNetworkResult::NodesFound { nodes, .. },
                     transport_source,
@@ -2645,32 +2605,25 @@ impl DhtNetworkManager {
     ) -> Vec<(PeerId, Result<DhtResponseEnvelope>)> {
         let stream: FuturesUnordered<_> = batch
             .iter()
-            .flat_map(|node| {
-                [
-                    DhtNetworkOperation::FindNode { key },
-                    DhtNetworkOperation::FindNodeV2 { key },
-                ]
-                .into_iter()
-                .map(move |operation| {
-                    let failure_rx = self.lookup_failures.subscribe();
-                    async move {
-                        let outcome = self
-                            .send_find_node_lookup_request(
-                                node.peer_id,
-                                node.typed_addresses(),
-                                operation,
-                                failure_rx,
-                            )
-                            .await;
-                        if outcome.response.is_ok() {
-                            self.merge_trusted_gossiped_typed_addresses(node).await;
-                        }
-                        outcome
+            .map(|node| {
+                let failure_rx = self.lookup_failures.subscribe();
+                async move {
+                    let outcome = self
+                        .send_find_node_lookup_request(
+                            node.peer_id,
+                            node.typed_addresses(),
+                            DhtNetworkOperation::FindNode { key },
+                            failure_rx,
+                        )
+                        .await;
+                    if outcome.response.is_ok() {
+                        self.merge_trusted_gossiped_typed_addresses(node).await;
                     }
-                })
+                    outcome
+                }
             })
             .collect();
-        self.collect_iteration_results(key, stream).await
+        self.collect_iteration_results(stream).await
     }
 
     /// Send one iterative FIND_NODE probe, aborting early if another active
@@ -2678,7 +2631,7 @@ impl DhtNetworkManager {
     ///
     /// This is the closest analogue to libp2p feeding a dial/connection
     /// failure into every active query that is waiting on that peer. The
-    /// collector reports failure only when both protocol probes fail.
+    /// collector reports a failed probe once.
     /// Externally cancelled probes do not rebroadcast failure.
     async fn send_find_node_lookup_request(
         &self,
@@ -2799,12 +2752,9 @@ impl DhtNetworkManager {
 
     /// Drain an iteration's α queries with a bounded wait after first response.
     ///
-    /// Retain replies from either protocol as they arrive. After the first
-    /// reply, apply the existing iteration grace window to remaining probes,
-    /// so an unsupported version cannot discard a successful sibling response.
+    /// After the first reply, retain the existing grace window for stragglers.
     async fn collect_iteration_results<S>(
         &self,
-        key: Key,
         stream: S,
     ) -> Vec<(PeerId, Result<DhtResponseEnvelope>)>
     where
@@ -2814,26 +2764,14 @@ impl DhtNetworkManager {
         let replies =
             crate::dht_lookup::collect_after_first_with_grace(stream, || tokio::time::sleep(grace))
                 .await;
-        let mut by_peer: HashMap<PeerId, Vec<FindNodeProbeOutcome>> = HashMap::new();
+        let mut results = Vec::with_capacity(replies.len());
         for reply in replies {
-            by_peer.entry(reply.peer_id).or_default().push(reply);
-        }
-        let mut results = Vec::with_capacity(by_peer.len());
-        for (peer, replies) in by_peer {
-            if replies.len() == 2
-                && replies
-                    .iter()
-                    .all(|reply| reply.response.is_err() && !reply.externally_cancelled)
-            {
-                self.record_peer_failure(&peer, TRUST_REASON_DHT_REQUEST_FAILED)
+            if reply.response.is_err() && !reply.externally_cancelled {
+                self.record_peer_failure(&reply.peer_id, TRUST_REASON_DHT_REQUEST_FAILED)
                     .await;
-                self.notify_lookup_peer_failed(peer);
+                self.notify_lookup_peer_failed(reply.peer_id);
             }
-            let mut normalized = Vec::with_capacity(replies.len());
-            for reply in replies {
-                normalized.push(self.filter_find_node_response(reply.response).await);
-            }
-            results.push((peer, Self::merge_find_node_responses(key, normalized)));
+            results.push((reply.peer_id, reply.response));
         }
         results
     }
@@ -3248,17 +3186,14 @@ impl DhtNetworkManager {
         applied
     }
 
-    // Verify every V2 record before accepting any addresses or sequence metadata.
-    async fn normalize_v2_nodes(
+    // Apply local address policy to owner-verified lookup records.
+    async fn normalize_signed_lookup_nodes(
         &self,
-        nodes: Vec<TransportDhtNode>,
+        nodes: Vec<(VerifiedAddressRecord, f64)>,
         transport_source: Option<&MultiAddr>,
     ) -> Vec<DHTNode> {
         let mut normalized = Vec::with_capacity(nodes.len());
-        for node in nodes {
-            let Ok(proof) = node.record.verify() else {
-                continue;
-            };
+        for (proof, reliability) in nodes {
             let Some((_, native)) = self
                 .validate_transport_address_records(
                     &proof.owner(),
@@ -3279,7 +3214,7 @@ impl DhtNetworkManager {
                     addresses,
                     address_types,
                     distance: None,
-                    reliability: node.reliability,
+                    reliability,
                     address_authority: Some(AddressAuthority::Signed(proof)),
                 })
                 .await,
@@ -3968,125 +3903,6 @@ impl DhtNetworkManager {
             .result)
     }
 
-    // Every peer receives both versions. Unsupported versions are allowed to
-    // time out without a trust penalty when the other request succeeds.
-    async fn send_address_requests_both_versions(
-        &self,
-        peer_id: &PeerId,
-        v1: Option<DhtNetworkOperation>,
-        v2: DhtNetworkOperation,
-        candidates: Option<&[(MultiAddr, AddressType)]>,
-    ) -> (
-        Option<Result<DhtResponseEnvelope>>,
-        Result<DhtResponseEnvelope>,
-    ) {
-        let legacy = async {
-            if let Some(operation) = v1 {
-                Some(
-                    self.send_dht_request_inner(peer_id, operation, candidates, false)
-                        .await,
-                )
-            } else {
-                None
-            }
-        };
-        let (v1, v2) = tokio::join!(
-            legacy,
-            self.send_dht_request_inner(peer_id, v2, candidates, false)
-        );
-        if !v1.as_ref().is_some_and(Result::is_ok) && v2.is_err() {
-            self.record_peer_failure(peer_id, TRUST_REASON_DHT_REQUEST_FAILED)
-                .await;
-        }
-        (v1, v2)
-    }
-
-    async fn send_find_node_both_versions(
-        &self,
-        peer_id: &PeerId,
-        key: Key,
-        candidates: Option<&[(MultiAddr, AddressType)]>,
-    ) -> Result<DhtResponseEnvelope> {
-        let (v1, v2) = self
-            .send_address_requests_both_versions(
-                peer_id,
-                Some(DhtNetworkOperation::FindNode { key }),
-                DhtNetworkOperation::FindNodeV2 { key },
-                candidates,
-            )
-            .await;
-        let mut replies = Vec::new();
-        for response in v1.into_iter().chain(std::iter::once(v2)) {
-            replies.push(self.filter_find_node_response(response).await);
-        }
-        Self::merge_find_node_responses(key, replies)
-    }
-
-    async fn filter_find_node_response(
-        &self,
-        mut response: Result<DhtResponseEnvelope>,
-    ) -> Result<DhtResponseEnvelope> {
-        // Filter each reply against its own authenticated transport source
-        // before combining views from potentially different peer channels.
-        if let Ok(DhtResponseEnvelope {
-            result: DhtNetworkResult::NodesFound { nodes, .. },
-            transport_source,
-        }) = &mut response
-        {
-            for node in nodes.iter_mut() {
-                *node = self
-                    .gossiped_node_with_trusted_addresses(node.clone(), transport_source.as_ref())
-                    .await;
-            }
-        }
-        response
-    }
-
-    fn merge_find_node_responses(
-        key: Key,
-        replies: Vec<Result<DhtResponseEnvelope>>,
-    ) -> Result<DhtResponseEnvelope> {
-        let mut by_peer: HashMap<PeerId, DHTNode> = HashMap::new();
-        let mut found = false;
-        let mut transport_source = None;
-        let mut fallback = Err(P2PError::Network(NetworkError::Timeout));
-        for reply in replies {
-            match reply {
-                Ok(DhtResponseEnvelope {
-                    result: DhtNetworkResult::NodesFound { nodes, .. },
-                    transport_source: source,
-                }) => {
-                    found = true;
-                    transport_source = source;
-                    for node in nodes {
-                        match by_peer.entry(node.peer_id) {
-                            std::collections::hash_map::Entry::Occupied(mut entry) => {
-                                entry.get_mut().merge_from(node)
-                            }
-                            std::collections::hash_map::Entry::Vacant(entry) => {
-                                entry.insert(node);
-                            }
-                        }
-                    }
-                }
-                other => {
-                    if fallback.is_err() || other.is_ok() {
-                        fallback = other;
-                    }
-                }
-            }
-        }
-        if !found {
-            return fallback;
-        }
-        let mut nodes: Vec<_> = by_peer.into_values().collect();
-        nodes.sort_by_key(|node| node.peer_id.xor_distance(&PeerId::from_bytes(key)));
-        Ok(DhtResponseEnvelope {
-            result: DhtNetworkResult::NodesFound { key, nodes },
-            transport_source,
-        })
-    }
-
     async fn send_dht_request_with_response_context(
         &self,
         peer_id: &PeerId,
@@ -4119,6 +3935,7 @@ impl DhtNetworkManager {
                 .as_secs(),
             ttl: 10,
             hop_count: 0,
+            signed_records: Vec::new(),
         })
     }
 
@@ -4220,8 +4037,7 @@ impl DhtNetworkManager {
                 // successful send so they share the same "confirmed sent"
                 // semantics as wire_tx_*.
                 match &message.payload {
-                    DhtNetworkOperation::FindNode { .. }
-                    | DhtNetworkOperation::FindNodeV2 { .. } => {
+                    DhtNetworkOperation::FindNode { .. } => {
                         self.transport
                             .traffic
                             .find_node_tx_count
@@ -4260,7 +4076,7 @@ impl DhtNetworkManager {
                         std::mem::discriminant(&r.result)
                     ),
                     Err(e) if !record_failure => debug!(peer = %peer_id, error = %e,
-                        "address protocol probe failed; the sibling version may still succeed"),
+                        "lookup probe failed; the batch collector records the failure"),
                     Err(e) => warn!(
                         "[STEP 6 FAILED] {} <- {}: Response error: {}",
                         self.config.peer_id.to_hex(),
@@ -4604,11 +4420,7 @@ impl DhtNetworkManager {
         transport_source: Option<&MultiAddr>,
         topic: &str,
     ) -> Result<Option<Vec<u8>>> {
-        let max_size = if topic == DHT_V2_TOPIC {
-            MAX_V2_MESSAGE_SIZE
-        } else {
-            MAX_MESSAGE_SIZE
-        };
+        let max_size = MAX_MESSAGE_SIZE;
         // Reject oversized messages before deserialization.
         if data.len() > max_size {
             warn!(
@@ -4625,21 +4437,15 @@ impl DhtNetworkManager {
         }
 
         // Deserialize message
-        let message: DhtNetworkMessage = postcard::from_bytes(data)
-            .map_err(|e| P2PError::Serialization(e.to_string().into()))?;
+        let message = Self::decode_message(data)?;
 
         if topic == DHT_V2_TOPIC
             && !matches!(
                 (&message.message_type, &message.payload, &message.result),
                 (
                     DhtMessageType::Request,
-                    DhtNetworkOperation::FindNodeV2 { .. }
-                        | DhtNetworkOperation::PublishAddressSetV2 { .. },
+                    DhtNetworkOperation::PublishAddressSetV2 { .. },
                     None
-                ) | (
-                    DhtMessageType::Response,
-                    DhtNetworkOperation::FindNodeV2 { .. },
-                    Some(DhtNetworkResult::NodesFoundV2 { .. } | DhtNetworkResult::PeerRejected)
                 ) | (
                     DhtMessageType::Response,
                     DhtNetworkOperation::PublishAddressSetV2 { .. },
@@ -4690,10 +4496,7 @@ impl DhtNetworkManager {
                 // *produced* (serialised) rather than confirmed sends — the
                 // actual transmit happens later in the caller. The wire bytes
                 // are still accounted separately via wire_tx_* at send time.
-                let is_nodes_found = matches!(
-                    &result,
-                    DhtNetworkResult::NodesFound { .. } | DhtNetworkResult::NodesFoundV2 { .. }
-                );
+                let is_nodes_found = matches!(&result, DhtNetworkResult::NodesFound { .. });
                 let response = self.create_response_message(&message, result)?;
                 let response_bytes = Self::encode_response_message(response)?;
                 if is_nodes_found {
@@ -4764,14 +4567,6 @@ impl DhtNetworkManager {
                 self.apply_signed_address_set(proof, transport_source, true)
                     .await;
                 Ok(DhtNetworkResult::PublishAddressAck)
-            }
-            DhtNetworkOperation::FindNodeV2 { key } => {
-                debug!(
-                    "Handling FIND_NODE_V2 request for key: {}",
-                    hex::encode(key)
-                );
-                self.handle_find_node_v2_request(key, authenticated_sender)
-                    .await
             }
             DhtNetworkOperation::Ping => {
                 debug!("Handling PING request from: {}", authenticated_sender);
@@ -5059,8 +4854,7 @@ impl DhtNetworkManager {
 
     fn topic_for_operation(operation: &DhtNetworkOperation) -> &'static str {
         match operation {
-            DhtNetworkOperation::FindNodeV2 { .. }
-            | DhtNetworkOperation::PublishAddressSetV2 { .. } => DHT_V2_TOPIC,
+            DhtNetworkOperation::PublishAddressSetV2 { .. } => DHT_V2_TOPIC,
             _ => DHT_V1_TOPIC,
         }
     }
@@ -5135,15 +4929,8 @@ impl DhtNetworkManager {
                 (
                     DhtNetworkOperation::FindNode { key: expected },
                     DhtNetworkResult::NodesFound { key, .. },
-                )
-                | (
-                    DhtNetworkOperation::FindNodeV2 { key: expected },
-                    DhtNetworkResult::NodesFoundV2 { key, .. },
                 ) if expected == key => {}
-                (
-                    _,
-                    DhtNetworkResult::NodesFound { .. } | DhtNetworkResult::NodesFoundV2 { .. },
-                ) => {
+                (_, DhtNetworkResult::NodesFound { .. }) => {
                     warn!(
                         "Ignoring lookup response for a different protocol, operation or key: {message_id}"
                     );
@@ -5164,6 +4951,29 @@ impl DhtNetworkManager {
 
         let result = match result {
             DhtNetworkResult::NodesFound { key, nodes } => {
+                let base_peers: HashMap<_, _> = nodes
+                    .iter()
+                    .map(|node| (node.peer_id, node.reliability))
+                    .collect();
+                let verified = message
+                    .signed_records
+                    .iter()
+                    .filter_map(|record| {
+                        let proof = record.verify().ok()?;
+                        let reliability = *base_peers.get(&proof.owner())?;
+                        Some((proof, reliability))
+                    })
+                    .collect();
+                let mut signed_by_owner = HashMap::new();
+                for node in self
+                    .normalize_signed_lookup_nodes(verified, transport_source)
+                    .await
+                {
+                    signed_by_owner
+                        .entry(node.peer_id)
+                        .and_modify(|current: &mut DHTNode| current.merge_from(node.clone()))
+                        .or_insert(node);
+                }
                 let mut normalized = Vec::new();
                 for mut node in nodes {
                     let claimed_seq = advertised_publish_seq(&node);
@@ -5182,6 +4992,9 @@ impl DhtNetworkManager {
                             node.address_types.clear();
                         }
                     }
+                    if let Some(signed) = signed_by_owner.remove(&node.peer_id) {
+                        node.merge_from(signed);
+                    }
                     normalized.push(self.protect_owner_view(node).await);
                 }
                 DhtNetworkResult::NodesFound {
@@ -5189,10 +5002,6 @@ impl DhtNetworkManager {
                     nodes: normalized,
                 }
             }
-            DhtNetworkResult::NodesFoundV2 { key, nodes } => DhtNetworkResult::NodesFound {
-                key,
-                nodes: self.normalize_v2_nodes(nodes, transport_source).await,
-            },
             result => result,
         };
         let response = DhtResponseEnvelope {
@@ -5213,42 +5022,69 @@ impl DhtNetworkManager {
         Ok(())
     }
 
-    /// Encode a response within the receiver's message limit, retaining the
-    /// closest complete V2 peer records. Truncating addresses within a record
-    /// would turn a sequenced full replacement into an accidental withdrawal.
-    fn encode_response_message(mut response: DhtNetworkMessage) -> Result<Vec<u8>> {
-        fn encoded_size(value: &impl Serialize) -> Result<usize> {
-            postcard::serialize_with_flavor(value, postcard::ser_flavors::Size::default())
-                .map_err(|error| P2PError::Serialization(error.to_string().into()))
+    /// Decode the unchanged legacy message and an optional bounded lookup trailer.
+    /// Unknown or malformed trailers never invalidate the usable legacy response.
+    fn decode_message(data: &[u8]) -> Result<DhtNetworkMessage> {
+        let (mut message, trailing): (DhtNetworkMessage, _) = postcard::take_from_bytes(data)
+            .map_err(|error| P2PError::Serialization(error.to_string().into()))?;
+        if matches!(message.message_type, DhtMessageType::Response)
+            && matches!(message.result, Some(DhtNetworkResult::NodesFound { .. }))
+            && let Some(bundle) = trailing.strip_prefix(LOOKUP_EXTENSION_MARKER)
+        {
+            message.signed_records =
+                crate::signed_address::decode_record_bundle(bundle, MAX_LOOKUP_EXTENSION_RECORDS)
+                    .unwrap_or_default();
         }
+        Ok(message)
+    }
 
-        let max_size = if matches!(response.result, Some(DhtNetworkResult::NodesFoundV2 { .. })) {
-            MAX_V2_MESSAGE_SIZE
-        } else {
-            MAX_MESSAGE_SIZE
-        };
-        if let Some(DhtNetworkResult::NodesFoundV2 { nodes, .. }) = &mut response.result {
-            nodes.truncate(MAX_V2_LOOKUP_NODES);
-        }
-        let mut size = encoded_size(&response)?;
-        if let Some(DhtNetworkResult::NodesFoundV2 { nodes, .. }) = &mut response.result {
-            while size > max_size {
-                let Some(node) = nodes.pop() else {
-                    break;
-                };
-                size = size.saturating_sub(encoded_size(&node)?);
+    /// Preserve the complete QUIC-only legacy response, then append as many
+    /// complete owner-signed records as fit within the legacy 64 KiB limit.
+    fn encode_response_message(mut response: DhtNetworkMessage) -> Result<Vec<u8>> {
+        let mut records = std::mem::take(&mut response.signed_records);
+        if let Some(DhtNetworkResult::NodesFound { nodes, .. }) = &mut response.result {
+            for node in nodes {
+                if let Some(proof) = node
+                    .address_authority
+                    .as_ref()
+                    .and_then(AddressAuthority::publication)
+                    && !records.contains(proof.signed())
+                {
+                    records.push(proof.signed().clone());
+                }
+                if node.addresses.iter().any(|address| !address.is_quic()) {
+                    (node.addresses, node.address_types) = node
+                        .typed_addresses()
+                        .into_iter()
+                        .filter(|(address, _)| address.is_quic())
+                        .unzip();
+                }
             }
         }
-        // Removing nodes can also shrink the vector's length prefix; retaining
-        // its original size gives a conservative upper bound without repeatedly
-        // serializing the whole response. The envelope is included in this bound.
-        if size > max_size {
+        let mut bytes = postcard::to_stdvec(&response)
+            .map_err(|error| P2PError::Serialization(error.to_string().into()))?;
+        if bytes.len() > MAX_MESSAGE_SIZE {
             return Err(P2PError::Validation(
                 "DHT response exceeds the message size limit".into(),
             ));
         }
-        postcard::to_stdvec(&response)
-            .map_err(|error| P2PError::Serialization(error.to_string().into()))
+        if matches!(response.result, Some(DhtNetworkResult::NodesFound { .. })) {
+            let mut extension = Vec::new();
+            for record in records.into_iter().take(MAX_LOOKUP_EXTENSION_RECORDS) {
+                let encoded = crate::signed_address::encode_record_bundle(&[record])
+                    .map_err(|error| P2PError::Serialization(error.into()))?;
+                if bytes.len() + LOOKUP_EXTENSION_MARKER.len() + extension.len() + encoded.len()
+                    <= MAX_MESSAGE_SIZE
+                {
+                    extension.extend_from_slice(&encoded);
+                }
+            }
+            if !extension.is_empty() {
+                bytes.extend_from_slice(LOOKUP_EXTENSION_MARKER);
+                bytes.extend_from_slice(&extension);
+            }
+        }
+        Ok(bytes)
     }
 
     /// Create response message
@@ -5261,9 +5097,6 @@ impl DhtNetworkManager {
         // Each variant explicitly extracts its key to avoid silent fallbacks
         let payload = match &result {
             DhtNetworkResult::NodesFound { key, .. } => DhtNetworkOperation::FindNode { key: *key },
-            DhtNetworkResult::NodesFoundV2 { key, .. } => {
-                DhtNetworkOperation::FindNodeV2 { key: *key }
-            }
             DhtNetworkResult::PongReceived { .. } => DhtNetworkOperation::Ping,
             DhtNetworkResult::JoinSuccess { .. } => DhtNetworkOperation::Join,
             DhtNetworkResult::LeaveSuccess => DhtNetworkOperation::Leave,
@@ -5295,6 +5128,7 @@ impl DhtNetworkManager {
                 .as_secs(),
             ttl: request.ttl.saturating_sub(1),
             hop_count: request.hop_count.saturating_add(1),
+            signed_records: Vec::new(),
         })
     }
 
@@ -6541,7 +6375,6 @@ mod tests {
             addresses: Vec::new(),
         })
         .unwrap();
-        let v2_find = postcard::to_stdvec(&DhtNetworkOperation::FindNodeV2 { key }).unwrap();
         let identity = crate::identity::NodeIdentity::generate().unwrap();
         let record = SignedAddressRecord::sign(
             &identity,
@@ -6558,15 +6391,10 @@ mod tests {
 
         assert_eq!(legacy_find[0], 0);
         assert_eq!(legacy_publish[0], 4);
-        assert_eq!(v2_find[0], 5);
-        assert_eq!(v2_publish[0], 6);
+        assert_eq!(v2_publish[0], 5);
         assert_eq!(
             DhtNetworkManager::topic_for_operation(&DhtNetworkOperation::FindNode { key }),
             DHT_V1_TOPIC
-        );
-        assert_eq!(
-            DhtNetworkManager::topic_for_operation(&DhtNetworkOperation::FindNodeV2 { key }),
-            DHT_V2_TOPIC
         );
 
         let decoded: LegacyDhtNetworkOperation = postcard::from_bytes(&legacy_publish).unwrap();
@@ -8649,6 +8477,7 @@ mod tests {
             timestamp: 0,
             ttl: 10,
             hop_count: 0,
+            signed_records: Vec::new(),
         };
 
         // Serialize & deserialize the full response message to verify
@@ -8663,6 +8492,7 @@ mod tests {
             timestamp: 0,
             ttl: request.ttl.saturating_sub(1),
             hop_count: request.hop_count.saturating_add(1),
+            signed_records: Vec::new(),
         };
 
         let bytes = postcard::to_stdvec(&response).expect("serialize response");
