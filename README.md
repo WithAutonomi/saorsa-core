@@ -27,7 +27,7 @@ Key design decisions are documented in [docs/adr/](docs/adr/):
 | [ADR-008](docs/adr/ADR-008-bootstrap-delegation.md) | Bootstrap Delegation | Historical bootstrap design |
 | [ADR-009](docs/adr/ADR-009-sybil-protection.md) | Sybil Protection | Multi-layered defense against identity attacks |
 | [ADR-012](docs/adr/ADR-012-identity-without-pow.md) | Identity without PoW | Pure cryptographic identity using ML-DSA |
-| [ADR-016](docs/adr/ADR-016-transport-independent-iterative-lookups.md) | Transport-independent iterative lookups | One complete Kademlia lookup engine for native QUIC and browser WebTransport |
+| [ADR-021](docs/adr/ADR-021-transport-independent-iterative-lookups.md) | Transport-independent iterative lookups | One complete Kademlia lookup engine for native QUIC and browser WebTransport |
 
 ## Features
 

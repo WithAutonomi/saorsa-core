@@ -906,6 +906,10 @@ impl KademliaRoutingTable {
     }
 
     fn add_node(&mut self, node: NodeInfo) -> Result<()> {
+        if self.has_address_publication(&node.id) {
+            self.touch_node(&node.id, None, AddressType::Unverified);
+            return Ok(());
+        }
         let bucket_index = self
             .get_bucket_index(&node.id)
             .ok_or_else(|| anyhow!("cannot insert self into routing table"))?;
@@ -923,6 +927,12 @@ impl KademliaRoutingTable {
         self.address_publications
             .get(node_id)
             .map_or(0, |stored| stored.seq)
+    }
+
+    /// Connection observations may refresh liveness, but only a newer owner
+    /// publication may change an authoritative address snapshot.
+    fn has_address_publication(&self, node_id: &PeerId) -> bool {
+        self.publish_seq_for(node_id) != 0 || self.transport_address_set(node_id).is_some()
     }
 
     fn transport_address_set(&self, node_id: &PeerId) -> Option<&Arc<TransportAddressSet>> {
@@ -1073,12 +1083,14 @@ impl KademliaRoutingTable {
 
     /// Update `last_seen` (and optionally merge a typed address) for a node and
     /// move it to the tail of its k-bucket. Returns `true` if the node was found.
+    /// Once an owner publication is stored, observations only refresh liveness.
     fn touch_node(
         &mut self,
         node_id: &PeerId,
         address: Option<&MultiAddr>,
         addr_type: AddressType,
     ) -> bool {
+        let address = address.filter(|_| !self.has_address_publication(node_id));
         match self.get_bucket_index(node_id) {
             Some(bucket_index) => {
                 self.buckets[bucket_index].touch_node_typed(node_id, address, addr_type)
@@ -1102,6 +1114,9 @@ impl KademliaRoutingTable {
         address: &MultiAddr,
         addr_type: AddressType,
     ) -> bool {
+        if self.has_address_publication(node_id) {
+            return false;
+        }
         match self.get_bucket_index(node_id) {
             Some(bucket_index) => self.buckets[bucket_index]
                 .merge_typed_address_upgrade_only(node_id, address, addr_type),
@@ -1127,6 +1142,7 @@ impl KademliaRoutingTable {
         address: Option<&MultiAddr>,
         addr_type: AddressType,
     ) -> Option<bool> {
+        let address = address.filter(|_| !self.has_address_publication(node_id));
         let bucket_index = self.get_bucket_index(node_id)?;
         self.buckets[bucket_index].touch_last_seen_if_merge_noop(node_id, address, addr_type)
     }
@@ -1858,6 +1874,8 @@ impl DhtCoreEngine {
     }
 
     /// Touch a peer's routing-table entry with an optional typed address.
+    /// After an owner publication, only liveness is updated; the published
+    /// address snapshot remains unchanged until a newer publication arrives.
     ///
     /// **Fast path (read lock + atomic store):** If the peer is in the
     /// routing table and the address merge would be a no-op (address is
@@ -1879,9 +1897,11 @@ impl DhtCoreEngine {
         address: Option<&MultiAddr>,
         addr_type: AddressType,
     ) -> bool {
-        // Fast path: read lock + atomic last_seen store. The fast path
-        // ALSO requires the address (if any) to already be present with
-        // the same type classification — see `touch_last_seen_if_merge_noop`.
+        // Fast path: read lock + atomic last_seen store. For unsequenced peers,
+        // the address (if any) must already be present with the same type
+        // classification — see `touch_last_seen_if_merge_noop`. Observations
+        // cannot mutate an authoritative publication, so those are always no-op
+        // address merges.
         // Promotion of an existing address from one classification to
         // another (e.g. Direct → Relay) is intentionally pushed to the
         // slow path so the bucket-level `merge_typed_address` can re-order.
@@ -2450,32 +2470,15 @@ impl DhtCoreEngine {
         // The update path doesn't change membership, just position within a bucket.
         // K-closest computation is distance-based, not position-based, so the set
         // won't change. Return an empty events vec.
-        if let Some(pos) = routing.buckets[bucket_idx]
+        if routing.buckets[bucket_idx]
             .nodes
             .iter()
-            .position(|n| n.id == node.id)
+            .any(|n| n.id == node.id)
         {
-            let existing = &mut routing.buckets[bucket_idx].nodes[pos];
-            existing.last_seen.store_now();
-            // Merge each address from the candidate, respecting loopback injection prevention
+            routing.touch_node(&peer_id, None, AddressType::Unverified);
             for (i, addr) in node.addresses.iter().enumerate() {
-                let addr_is_loopback = addr
-                    .ip()
-                    .is_some_and(|ip| canonicalize_ip(ip).is_loopback());
-                let existing_has_non_loopback = existing
-                    .addresses
-                    .iter()
-                    .any(|a| a.ip().is_some_and(|ip| !canonicalize_ip(ip).is_loopback()));
-                // Don't merge loopback addresses into a non-loopback-admitted peer
-                if addr_is_loopback && existing_has_non_loopback {
-                    continue;
-                }
-                existing.merge_typed_address(addr.clone(), node.address_type_at(i));
+                routing.touch_node(&peer_id, Some(addr), node.address_type_at(i));
             }
-            // Move to tail (most recently seen)
-            let updated = routing.buckets[bucket_idx].nodes.remove(pos);
-            routing.buckets[bucket_idx].nodes.push(updated);
-            routing.buckets[bucket_idx].last_refreshed_by_live_peer = Instant::now();
             return Ok(AdmissionResult::Admitted(Vec::new()));
         }
 
@@ -3244,6 +3247,59 @@ mod tests {
         );
         assert_eq!(node.address_types, vec![AddressType::Direct]);
         assert_eq!(table.publish_seq_for(&peer), 20);
+    }
+
+    #[test]
+    fn owner_publications_survive_observations_while_liveness_and_new_publications_advance() {
+        let mut table = KademliaRoutingTable::new(PeerId::from_bytes([0; 32]), 8);
+        let peer = PeerId::from_bytes([1; 32]);
+        let observed = make_node(1, "/ip4/1.1.1.1/udp/9000/quic");
+        table.add_node(observed.clone()).unwrap();
+        let published = vec![(
+            "/ip4/9.9.9.9/udp/9000/quic".parse().unwrap(),
+            AddressType::Direct,
+        )];
+        assert!(table.replace_node_addresses(&peer, published.clone(), 20));
+        let index = table.get_bucket_index(&peer).unwrap();
+        let old = Instant::now() - Duration::from_secs(3600);
+        table.buckets[index]
+            .find_node(&peer)
+            .unwrap()
+            .last_seen
+            .store(old);
+        // Fast touches, slow touches, gossip and re-insertion share the same
+        // publication invariant, while an actual interaction proves liveness.
+        assert_eq!(
+            table.try_touch_last_seen(&peer, observed.addresses.first(), AddressType::Unverified),
+            Some(true)
+        );
+        assert!(
+            table.buckets[index]
+                .find_node(&peer)
+                .unwrap()
+                .last_seen
+                .load()
+                > old
+        );
+        assert!(table.touch_node(&peer, observed.addresses.first(), AddressType::Relay));
+        assert!(!table.merge_typed_address_upgrade_only(
+            &peer,
+            &observed.addresses[0],
+            AddressType::Direct
+        ));
+        table.add_node(observed).unwrap();
+        let node = table.buckets[index].find_node(&peer).unwrap();
+        assert_eq!(node.addresses, vec![published[0].0.clone()]);
+        assert_eq!(node.address_types, vec![AddressType::Direct]);
+        let replacement = vec![(
+            "/ip4/8.8.8.8/udp/9000/quic".parse().unwrap(),
+            AddressType::Relay,
+        )];
+        assert!(table.replace_node_addresses(&peer, replacement.clone(), 21));
+        assert_eq!(
+            table.buckets[index].find_node(&peer).unwrap().addresses,
+            vec![replacement[0].0.clone()]
+        );
     }
 
     #[test]

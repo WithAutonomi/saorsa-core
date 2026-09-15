@@ -95,7 +95,10 @@ pub use dht_lookup::{
     LookupTermination, collect_after_first_with_grace, run_iterative_lookup, xor_distance,
 };
 #[cfg(feature = "native")]
-pub use dht_network_manager::DhtNetworkEvent;
+pub use dht_network_manager::{
+    DhtNetworkEvent, RejectedSupplementalAddress, SupplementalAddressRegistration,
+    SupplementalAddressRejection,
+};
 pub use peer_record::{AddressType, DHTNode, ResponderView, WitnessedCloseGroup};
 pub use transport_address::{
     KnownReachability, KnownTransport, MAX_TRANSPORT_ADDRESS_PAYLOAD,

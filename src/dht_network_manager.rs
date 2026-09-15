@@ -46,7 +46,7 @@ use crate::{
         relay_canary_source_network_rate_limit_config, validate_relay_canary_request,
     },
     security::canonicalize_ip,
-    self_address::build_self_address_set,
+    self_address::{MAX_SELF_QUIC_ADDRESSES, build_self_address_set},
     transport_address::{
         KnownReachability, KnownTransport, MAX_TRANSPORT_ADDRESS_RECORDS, TransportAddressRecord,
     },
@@ -86,6 +86,44 @@ const MAX_MESSAGE_SIZE: usize = 64 * 1024;
 /// Optional signed-record trailer on the unchanged FIND_NODE response.
 const LOOKUP_EXTENSION_MARKER: &[u8; 8] = b"ADDRSIG1";
 const MAX_LOOKUP_EXTENSION_RECORDS: usize = 256;
+
+/// Keep room for the largest native self-address set, including future relay
+/// acquisition and IPv4/IPv6 reachability changes.
+const MAX_SUPPLEMENTAL_SELF_ADDRESSES: usize =
+    MAX_TRANSPORT_ADDRESS_RECORDS - MAX_SELF_QUIC_ADDRESSES;
+
+/// Result of replacing the node's supplemental address registration.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SupplementalAddressRegistration {
+    /// Endpoints installed for subsequent publications, bound to this node.
+    pub accepted: Vec<MultiAddr>,
+    /// Inputs that were not installed, in input order.
+    pub rejected: Vec<RejectedSupplementalAddress>,
+}
+
+/// A supplemental endpoint that could not be registered.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RejectedSupplementalAddress {
+    /// The original input address.
+    pub address: MultiAddr,
+    /// Why this input was not installed.
+    pub reason: SupplementalAddressRejection,
+}
+
+/// Reasons a supplemental endpoint can be rejected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SupplementalAddressRejection {
+    /// The endpoint cannot be stored or encoded within the wire bounds.
+    InvalidAddress,
+    /// Supplemental registration currently supports only WebRTC Direct.
+    UnsupportedTransport,
+    /// The endpoint explicitly names a different owner.
+    ForeignPeer,
+    /// An earlier input already registered this endpoint.
+    Duplicate,
+    /// The record budget is full after reserving native QUIC capacity.
+    CapacityExceeded,
+}
 
 /// Request timeout for DHT message handlers (10 seconds)
 /// Prevents long-running handlers from starving the semaphore permit pool
@@ -159,6 +197,10 @@ const STALE_REVALIDATION_PING_RTT: Duration = Duration::from_secs(1);
 // — well outside any realistic input range here.
 const STALE_REVALIDATION_BUDGET: Duration =
     IDENTITY_EXCHANGE_TIMEOUT.saturating_add(STALE_REVALIDATION_PING_RTT);
+
+/// Bound bootstrap's wait for asynchronous routing admission after dialing.
+/// Candidates still awaiting admission at this deadline retain no cached proof.
+const BOOTSTRAP_ADMISSION_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Buffer size for the broadcast channel that
 /// [`DhtNetworkManager::ensure_peer_channel`] uses to fan a single
@@ -1139,12 +1181,6 @@ struct DhtResponseEnvelope {
     transport_source: Option<MultiAddr>,
 }
 
-struct FindNodeProbeOutcome {
-    peer_id: PeerId,
-    response: Result<DhtResponseEnvelope>,
-    externally_cancelled: bool,
-}
-
 /// DHT network events
 #[derive(Debug, Clone)]
 pub enum DhtNetworkEvent {
@@ -2020,7 +2056,7 @@ impl DhtNetworkManager {
         let mut seen = HashSet::new();
         // Collect peers that are worth dialing so the dial step can be skipped
         // entirely for clients. Node-mode dials are issued serially below.
-        let mut to_dial: Vec<(PeerId, Vec<(MultiAddr, AddressType)>)> = Vec::new();
+        let mut to_dial: Vec<(DHTNode, Option<MultiAddr>)> = Vec::new();
         for peer_id in peers {
             match self
                 .send_dht_request_with_response_context(
@@ -2057,10 +2093,13 @@ impl DhtNetworkManager {
                         // landing in our own K-closest PublishAddressSet
                         // fan-out. No-op when the peer isn't already in the
                         // routing table; upgrade-only on existing entries.
-                        self.merge_trusted_gossiped_typed_addresses(&trusted_node)
-                            .await;
+                        self.merge_trusted_gossiped_typed_addresses_from_source(
+                            &trusted_node,
+                            transport_source.as_ref(),
+                        )
+                        .await;
                         if seen.insert(trusted_node.peer_id) && dialable_count > 0 {
-                            to_dial.push((trusted_node.peer_id, typed));
+                            to_dial.push((trusted_node, transport_source.clone()));
                         }
                     }
                 }
@@ -2083,9 +2122,8 @@ impl DhtNetworkManager {
         // its own table — `maybe_rebootstrap` would rediscover the same
         // gossiped peers and skip them again, forever. Dial just enough of
         // them to lift the table over the threshold. Admission runs
-        // asynchronously on the peer-connected event, so the size check may
-        // lag a dial by one iteration and over-dial slightly; that is
-        // harmless (the connections are usable) and bounded by `to_dial`.
+        // asynchronously on the peer-connected event. Wait boundedly for each
+        // admission so its proof can be stored before dropping the candidate.
         if matches!(self.config.node_config.mode, NodeMode::Client) {
             if self.get_routing_table_size().await >= AUTO_REBOOTSTRAP_THRESHOLD {
                 debug!(
@@ -2095,11 +2133,11 @@ impl DhtNetworkManager {
             } else {
                 let candidates = to_dial.len();
                 let mut dialed = 0usize;
-                for (peer_id, typed) in to_dial {
+                for (node, source) in to_dial {
                     if self.get_routing_table_size().await >= AUTO_REBOOTSTRAP_THRESHOLD {
                         break;
                     }
-                    self.dial_addresses(&peer_id, &typed).await;
+                    self.dial_bootstrap_candidate(node, source.as_ref()).await;
                     dialed += 1;
                 }
                 info!(
@@ -2107,8 +2145,8 @@ impl DhtNetworkManager {
                 );
             }
         } else {
-            for (peer_id, typed) in to_dial {
-                self.dial_addresses(&peer_id, &typed).await;
+            for (node, source) in to_dial {
+                self.dial_bootstrap_candidate(node, source.as_ref()).await;
             }
         }
 
@@ -2125,6 +2163,45 @@ impl DhtNetworkManager {
         info!("Routing table ready: {rt_size} peers (reachability classification pending)");
 
         Ok(seen.len())
+    }
+
+    /// Carry verified discovery information through normal connection-driven
+    /// admission. Rejected or timed-out candidates leave no pending proof cache.
+    async fn dial_bootstrap_candidate(&self, node: DHTNode, source: Option<&MultiAddr>) {
+        // Subscribe before dialing so admission cannot race the subscription.
+        let mut events = self.subscribe_events();
+        if let Err(error) = self
+            .ensure_peer_channel(&node.peer_id, &node.typed_addresses())
+            .await
+        {
+            debug!(peer = %node.peer_id, %error, "Bootstrap candidate dial failed");
+            return;
+        }
+        let admitted = tokio::time::timeout(BOOTSTRAP_ADMISSION_TIMEOUT, async {
+            loop {
+                // Check membership even after lagged events: only the routing
+                // table can confirm admission, and it may already have happened.
+                if self.is_in_routing_table(&node.peer_id).await {
+                    return true;
+                }
+                tokio::select! {
+                    () = self.shutdown.cancelled() => return false,
+                    event = events.recv() => {
+                        if matches!(event, Err(broadcast::error::RecvError::Closed)) {
+                            return false;
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+        if admitted {
+            self.merge_trusted_gossiped_typed_addresses_from_source(&node, source)
+                .await;
+        } else {
+            debug!(peer = %node.peer_id, "Bootstrap candidate was not admitted before deadline");
+        }
     }
 
     /// Stop the DHT network manager.
@@ -2505,6 +2582,10 @@ impl DhtNetworkManager {
     /// 3. Query the returned nodes, repeat
     /// 4. Stop when converged (same or worse answers)
     ///
+    /// On the overall lookup deadline, return the best results from completed
+    /// rounds (including the local node when it ranks), which may be fewer than
+    /// `count`. Other lookup errors are propagated.
+    ///
     /// This makes network requests and should NOT be called from request handlers.
     pub async fn find_closest_nodes_network(
         &self,
@@ -2522,6 +2603,24 @@ impl DhtNetworkManager {
         key: &Key,
         count: usize,
         transcript_view_count: Option<usize>,
+    ) -> Result<FindNodeLookupOutcome> {
+        self.find_closest_nodes_network_with_deadline(
+            key,
+            count,
+            transcript_view_count,
+            tokio::time::sleep(Duration::from_secs(u64::from(
+                crate::dht_lookup::LOOKUP_TIMEOUT_SECS,
+            ))),
+        )
+        .await
+    }
+
+    async fn find_closest_nodes_network_with_deadline(
+        &self,
+        key: &Key,
+        count: usize,
+        transcript_view_count: Option<usize>,
+        deadline: impl std::future::Future<Output = ()>,
     ) -> Result<FindNodeLookupOutcome> {
         debug!(
             "[NETWORK] Finding {} closest nodes to key: {}",
@@ -2554,15 +2653,14 @@ impl DhtNetworkManager {
         }
 
         let mut query = NativeFindNodeQuery::new(self, transcript_view_count);
-        let termination = run_iterative_lookup(
-            &mut lookup,
-            &mut query,
-            tokio::time::sleep(Duration::from_secs(u64::from(
-                crate::dht_lookup::LOOKUP_TIMEOUT_SECS,
-            ))),
-        )
-        .await
-        .map_err(map_iterative_lookup_run_error)?;
+        let termination = match run_iterative_lookup(&mut lookup, &mut query, deadline).await {
+            Ok(termination) => termination,
+            // Preserve the native API's best-effort behavior. The shared runner
+            // retains completed rounds and cancels outstanding probes; callers
+            // requiring a witnessed close group still validate the transcript.
+            Err(LookupRunError::TimedOut) => LookupTermination::TimedOut,
+            Err(error) => return Err(map_iterative_lookup_run_error(error)),
+        };
         if termination == LookupTermination::Converged {
             info!(
                 "[NETWORK] {}: Top-K converged after {} iterations",
@@ -2616,7 +2714,7 @@ impl DhtNetworkManager {
                             failure_rx,
                         )
                         .await;
-                    if outcome.response.is_ok() {
+                    if outcome.1.is_ok() {
                         self.merge_trusted_gossiped_typed_addresses(node).await;
                     }
                     outcome
@@ -2631,15 +2729,16 @@ impl DhtNetworkManager {
     ///
     /// This is the closest analogue to libp2p feeding a dial/connection
     /// failure into every active query that is waiting on that peer. The
-    /// collector reports a failed probe once.
-    /// Externally cancelled probes do not rebroadcast failure.
+    /// dial coordinator owns connection penalties and the RPC path owns
+    /// request penalties. Completed failures are broadcast immediately;
+    /// externally cancelled probes neither score nor rebroadcast failure.
     async fn send_find_node_lookup_request(
         &self,
         peer_id: PeerId,
         typed: Vec<(MultiAddr, AddressType)>,
         operation: DhtNetworkOperation,
         failure_rx: broadcast::Receiver<PeerId>,
-    ) -> FindNodeProbeOutcome {
+    ) -> (PeerId, Result<DhtResponseEnvelope>) {
         let request = async {
             // Pass the same typed candidate list to both ensure_peer_channel
             // and send_dht_request so the request path doesn't pay a redundant
@@ -2651,7 +2750,7 @@ impl DhtNetworkManager {
             // the peer-dial coordinator, so concurrent iterative lookups that
             // happen to batch the same peer join this dial rather than racing it.
             self.ensure_peer_channel(&peer_id, &typed).await?;
-            self.send_dht_request_inner(&peer_id, operation, Some(&typed), false)
+            self.send_dht_request_with_response_context(&peer_id, operation, Some(&typed))
                 .await
         };
         tokio::pin!(request);
@@ -2659,17 +2758,17 @@ impl DhtNetworkManager {
         let external_failure = Self::wait_for_lookup_failure_signal(peer_id, failure_rx);
         tokio::pin!(external_failure);
 
-        tokio::select! {
+        let response = tokio::select! {
             biased;
-            response = &mut request => FindNodeProbeOutcome {
-                peer_id, response, externally_cancelled: false,
+            response = &mut request => {
+                if response.is_err() {
+                    self.notify_lookup_peer_failed(peer_id);
+                }
+                response
             },
-            () = &mut external_failure => FindNodeProbeOutcome {
-                peer_id,
-                response: Err(Self::active_lookup_peer_failed_error(&peer_id)),
-                externally_cancelled: true,
-            },
-        }
+            () = &mut external_failure => Err(Self::active_lookup_peer_failed_error(&peer_id)),
+        };
+        (peer_id, response)
     }
 
     /// Wait until the active-lookup failure bus reports `peer_id`.
@@ -2758,22 +2857,11 @@ impl DhtNetworkManager {
         stream: S,
     ) -> Vec<(PeerId, Result<DhtResponseEnvelope>)>
     where
-        S: futures::Stream<Item = FindNodeProbeOutcome> + Unpin,
+        S: futures::Stream<Item = (PeerId, Result<DhtResponseEnvelope>)> + Unpin,
     {
         let grace = Duration::from_secs(ITERATION_GRACE_TIMEOUT_SECS);
-        let replies =
-            crate::dht_lookup::collect_after_first_with_grace(stream, || tokio::time::sleep(grace))
-                .await;
-        let mut results = Vec::with_capacity(replies.len());
-        for reply in replies {
-            if reply.response.is_err() && !reply.externally_cancelled {
-                self.record_peer_failure(&reply.peer_id, TRUST_REASON_DHT_REQUEST_FAILED)
-                    .await;
-                self.notify_lookup_peer_failed(reply.peer_id);
-            }
-            results.push((reply.peer_id, reply.response));
-        }
-        results
+        crate::dht_lookup::collect_after_first_with_grace(stream, || tokio::time::sleep(grace))
+            .await
     }
 
     /// Return the K-closest candidate nodes, excluding the requester.
@@ -2839,34 +2927,46 @@ impl DhtNetworkManager {
     /// Reachability of a native QUIC socket is deliberately not reused for a
     /// different transport or UDP port.
     /// Addresses without a peer suffix are bound to this node's identity;
-    /// addresses explicitly bound to a different peer are discarded.
-    pub async fn set_supplemental_self_addresses(&self, addresses: Vec<MultiAddr>) {
-        let mut filtered = Vec::new();
+    /// addresses explicitly bound to a different peer are rejected. Valid
+    /// WebRTC Direct endpoints are accepted in input order, up to 11 distinct
+    /// endpoints, reserving five slots for the native self-address set.
+    /// The returned report lists every accepted and rejected input. Publication
+    /// delivery is best effort; accepted endpoints remain registered for retry.
+    pub async fn set_supplemental_self_addresses(
+        &self,
+        addresses: Vec<MultiAddr>,
+    ) -> SupplementalAddressRegistration {
+        let mut report = SupplementalAddressRegistration::default();
         for address in addresses {
-            if !crate::dht::core_engine::is_storable_address(&address) {
-                continue;
-            }
-            if address.dialable_socket_addr().is_some() {
-                warn!(
-                    address = %address,
-                    "ignoring native-dialable supplemental self address"
-                );
-                continue;
-            }
-            if address.peer_id().is_some_and(|peer| peer != self.peer_id()) {
-                warn!(
-                    address = %address,
-                    peer = %self.peer_id().to_hex(),
-                    "ignoring supplemental self address bound to another peer"
-                );
-                continue;
-            }
-            let address = address.with_peer_id(*self.peer_id());
-            if !filtered.contains(&address) {
-                filtered.push(address);
+            let bound = address.clone().with_peer_id(*self.peer_id());
+            let rejection = if !address.is_storable() {
+                Some(SupplementalAddressRejection::InvalidAddress)
+            } else if address.peer_id().is_some_and(|peer| peer != self.peer_id()) {
+                Some(SupplementalAddressRejection::ForeignPeer)
+            } else if !address.is_webrtc_direct() {
+                Some(SupplementalAddressRejection::UnsupportedTransport)
+            } else if !TransportAddressRecord::from_multiaddr(&bound, KnownReachability::Unverified)
+                .ok()
+                .flatten()
+                .is_some_and(|record| record.is_within_wire_bounds())
+            {
+                Some(SupplementalAddressRejection::InvalidAddress)
+            } else if report.accepted.contains(&bound) {
+                Some(SupplementalAddressRejection::Duplicate)
+            } else if report.accepted.len() == MAX_SUPPLEMENTAL_SELF_ADDRESSES {
+                Some(SupplementalAddressRejection::CapacityExceeded)
+            } else {
+                None
+            };
+            if let Some(reason) = rejection {
+                report
+                    .rejected
+                    .push(RejectedSupplementalAddress { address, reason });
+            } else {
+                report.accepted.push(bound);
             }
         }
-        *self.supplemental_self_addresses.write().await = filtered;
+        *self.supplemental_self_addresses.write().await = report.accepted.clone();
 
         let local = self.local_dht_node().await;
         let own_key = *self.peer_id().to_bytes();
@@ -2879,6 +2979,7 @@ impl DhtNetworkManager {
         {
             warn!(%error, "Supplemental address publication rejected");
         }
+        report
     }
 
     /// Encode and validate supplied addresses plus registered supplemental
@@ -3909,7 +4010,7 @@ impl DhtNetworkManager {
         operation: DhtNetworkOperation,
         candidates: Option<&[(MultiAddr, AddressType)]>,
     ) -> Result<DhtResponseEnvelope> {
-        self.send_dht_request_inner(peer_id, operation, candidates, true)
+        self.send_dht_request_inner(peer_id, operation, candidates)
             .await
     }
 
@@ -3944,7 +4045,6 @@ impl DhtNetworkManager {
         peer_id: &PeerId,
         operation: DhtNetworkOperation,
         candidates: Option<&[(MultiAddr, AddressType)]>,
-        record_failure: bool,
     ) -> Result<DhtResponseEnvelope> {
         // Sweep stale entries left by dropped futures before adding a new one
         self.sweep_expired_operations();
@@ -4075,8 +4175,6 @@ impl DhtNetworkManager {
                         peer_id.to_hex(),
                         std::mem::discriminant(&r.result)
                     ),
-                    Err(e) if !record_failure => debug!(peer = %peer_id, error = %e,
-                        "lookup probe failed; the batch collector records the failure"),
                     Err(e) => warn!(
                         "[STEP 6 FAILED] {} <- {}: Response error: {}",
                         self.config.peer_id.to_hex(),
@@ -4098,7 +4196,7 @@ impl DhtNetworkManager {
 
         // Record trust failure at the RPC level so every failed request
         // (send error, response timeout, etc.) is counted exactly once.
-        if record_failure && result.is_err() {
+        if result.is_err() {
             self.record_peer_failure(peer_id, TRUST_REASON_DHT_REQUEST_FAILED)
                 .await;
         }
@@ -5928,6 +6026,15 @@ impl DhtNetworkManager {
     }
 
     async fn merge_trusted_gossiped_typed_addresses(&self, node: &DHTNode) {
+        self.merge_trusted_gossiped_typed_addresses_from_source(node, None)
+            .await;
+    }
+
+    async fn merge_trusted_gossiped_typed_addresses_from_source(
+        &self,
+        node: &DHTNode,
+        source: Option<&MultiAddr>,
+    ) {
         if let Some(proof) = node
             .address_authority
             .as_ref()
@@ -5935,7 +6042,7 @@ impl DhtNetworkManager {
         {
             // A lookup result carries its proof through discovery. Persist it
             // only if normal admission has since installed the routing peer.
-            self.apply_signed_address_set(proof.clone(), None, false)
+            self.apply_signed_address_set(proof.clone(), source, false)
                 .await;
             // The signed store path owns validation of the complete view.
             return;

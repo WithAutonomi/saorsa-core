@@ -6,7 +6,7 @@ Proposed (2026-09-08)
 
 ## Context
 
-Extracting the lookup driver (ADR-016) made browser discovery possible, but did
+Extracting the lookup driver (ADR-021) made browser discovery possible, but did
 not make saorsa-core itself portable. Browser clients consequently depended on
 separate identity, protocol, payment, and transfer adapters. Native socket,
 certificate, filesystem, and runtime dependencies prevented importing the normal
@@ -20,7 +20,7 @@ lookup transcripts, and iterative lookup APIs remain in saorsa-core on both
 targets. The lookup engine lives in the always-available `saorsa_core::dht_lookup` module,
 with its existing root re-exports retained. The separate `saorsa-dht-lookup`
 package and workspace membership are removed: the portable core now provides
-the isolation for which ADR-016 originally introduced that crate.
+the isolation for which ADR-021 originally introduced that crate.
 Move peer-record definitions out of the native DHT manager and re-export their
 old native paths. Use saorsa-pqc keys directly, converting only at the native
 transport's keypair boundary.
