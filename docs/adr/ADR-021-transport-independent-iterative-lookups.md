@@ -1,4 +1,4 @@
-# ADR-016: Transport-independent iterative DHT lookups
+# ADR-021: Transport-independent iterative DHT lookups
 
 ## Status
 

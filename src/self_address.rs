@@ -47,6 +47,10 @@ use crate::MultiAddr;
 use crate::address::is_lan_ip;
 use crate::dht::AddressType;
 
+/// One relay, one WAN endpoint per IP family, and one LAN endpoint per family.
+/// Supplemental transport registration reserves this many native record slots.
+pub(crate) const MAX_SELF_QUIC_ADDRESSES: usize = 5;
+
 pub(crate) fn build_self_address_set<F>(
     observed: impl IntoIterator<Item = SocketAddr>,
     listen: impl IntoIterator<Item = MultiAddr>,
