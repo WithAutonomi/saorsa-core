@@ -63,7 +63,7 @@ bytes = { version = "1.10", optional = true }
 hex = "0.4"
 
 # Cryptography - Primary source of truth: saorsa-pqc
-saorsa-pqc = { version = "0.5", git = "https://github.com/saorsa-labs/saorsa-pqc", rev = "6d57e9dd73d537182fe85b0050e809a224f21154" }
+saorsa-pqc = { version = "0.5", git = "https://github.com/saorsa-labs/saorsa-pqc", rev = "29a2b272c4ee8b72c17102da00033dbfe1ddcd37" }
 rand = "0.8"
 blake3 = "1.6"
 
@@ -75,7 +75,7 @@ dashmap = { version = "6", optional = true }
 # Networking
 # Cross-repository WebRTC Direct support. Pin the draft dependency so this
 # branch builds in CI until the corresponding saorsa-transport release lands.
-saorsa-transport = { version = "0.36.3", git = "https://github.com/WithAutonomi/saorsa-transport", rev = "a35d5b2a083f7fe18016d7b63ea89e2d796b5bfb", default-features = false }
+saorsa-transport = { version = "0.36.3", git = "https://github.com/WithAutonomi/saorsa-transport", rev = "bc6dcd80aa26ea6a4a557c05dd1af1ff2adf279f", default-features = false }
 
 # Core-specific dependencies
 dirs = { version = "6.0", optional = true }
