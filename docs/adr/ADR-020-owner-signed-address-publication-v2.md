@@ -5,7 +5,8 @@
 
 ## Status
 
-Accepted (2026-09-10).
+Accepted (2026-09-10). Updated before release (2026-09-15): retain one
+FIND_NODE operation and forward signed records in an optional response trailer.
 
 Promoted from `docs/architecture/owner-signed-address-records.md` to record the
 implemented protocol and the agreed replacement, reconnect, and persistence
@@ -27,7 +28,8 @@ owner signature that survives forwarding.
 
 V1 and V2 coexist without capability negotiation. A user-agent identifies the
 software and its node/client role; customizing it must not change the address
-protocol. Every peer is contacted through both address protocols. Receiving a
+protocol. Publications use both address versions; lookups use the existing
+FIND_NODE request only, with optional signed records in the response. Receiving a
 valid V2 record establishes that its owner publishes V2, so V2 must take
 precedence over all V1 information about that owner, regardless of arrival order
 or V1 sequence. Expiring the latest known publication would remove potentially
@@ -119,7 +121,7 @@ and compare only V2 sequences thereafter.
 | Invalid V2 record | Reject it without changing addresses or establishing V2 precedence |
 
 Precedence belongs to the **address owner**, not the forwarding responder. An
-owner-signed record learned through a correlated V2 lookup has the same
+owner-signed record learned through a correlated lookup trailer has the same
 precedence as a direct publication. A responder returning V2 entries does not
 make all V1-only subjects in its other response V2 peers. Merely sending a V2
 request, acknowledgement, or invalid proof does not establish an owner's V2
@@ -158,9 +160,11 @@ authority. `AddressAuthority::Signed` describes the accepted V2 view;
 provenance variant is removed. V1 information never becomes a synthetic V2
 publication.
 
-V2 lookup replies include only peers with owner proofs. Peers known solely
-through V1 or restored QUIC candidates are omitted until a proof is learned.
-An unsigned entry cannot substitute for a missing proof.
+The ordinary lookup response retains all selected peers, including peers known
+solely through V1 or restored QUIC candidates. Its address fields contain only
+QUIC endpoints. An optional trailer carries available owner proofs for those
+same peers. An unsigned entry cannot substitute for a missing proof, and an
+absent trailer record never withdraws addresses or erases a base peer entry.
 
 ### 5. Publish both transports through the existing native entry points
 
@@ -256,7 +260,7 @@ members. Reconnection verifies the expected peer identity and uses normal
 admission. Node-mode routing snapshot restoration, bounds, and protections
 remain as specified in ADR-017; client mode skips that snapshot.
 
-WebRTC address knowledge returns through ordinary V2 lookup responses and owner
+WebRTC address knowledge returns through ordinary lookup trailers and owner
 republication. Bootstrap may recover it promptly for some peers, but does not
 guarantee immediate recovery for every restored peer. Until their signed
 records are relearned, those peers cannot be advertised in V2 discovery replies.
@@ -267,58 +271,73 @@ addresses would not provide the owner proof required to forward them in V2.
 Snapshot age checks are local bootstrap policy and remain unchanged. They do
 not reintroduce an expiration field or age-based rejection for V2 publications.
 
-### 8. Concurrent protocols, compatibility, and bounds
+### 8. One FIND_NODE operation, compatibility, and bounds
 
-No `addr-v2` user-agent token, version-number inference, capability field, or
-V1-only switch selects the address protocol. Default node/client user-agents
-contain the software identifier; custom user-agents are returned unchanged.
-The existing `node/` role prefix still controls DHT routing participation.
-V2 uses `/dht/address/2.0.0` with `PublishAddressSetV2` and `FindNodeV2`;
-owner signatures are mandatory in publications and lookup entries. V1 keeps
-its existing operations, topic, and wire discriminants for older peers.
+No user-agent token, version inference, capability field, or fallback request
+selects a lookup version. Native bootstrap, iterative lookup, and witness
+re-queries send exactly one existing `FindNode` request per queried peer on
+`/dht/1.0.0`. The reply remains `NodesFound`. The unreleased `FindNodeV2` and
+`NodesFoundV2` variants are removed, with no reserved wire slots. Existing V1
+operation and result discriminants are unchanged; `PublishAddressSetV2` now
+occupies operation discriminant 5. V2 publications alone use
+`/dht/address/2.0.0`, with their existing send-only behavior.
 
-Native bootstrap, iterative lookup, and witness re-queries issue V1 and V2
-FIND_NODE concurrently to each peer. Responses have independent live-request
-correlation and authentication checks. Merge their per-owner results using V2
-precedence, retaining V1-only subjects omitted from the proof-only V2 reply.
-An empty V2 reply is not a withdrawal of every subject in the V1 response.
+The response body is:
 
-Both requests use the existing bounded request timeout and are never attempted
-serially. Iterative lookup and witness batches collect each protocol's replies
-as they arrive, then apply the existing five-second grace window after the
-first completed probe. A successful V1 reply remains in the result even if its
-V2 sibling is cancelled at that deadline. Cancelled requests immediately lose
-their live correlation state. Bootstrap lookup pairs wait for both outcomes,
-so an unsupported version can delay those calls until its timeout.
-A successful reply from one version remains usable if the other fails or is
-unsupported. An unanswered protocol version does not
-cause a trust penalty when the other request succeeds; if both fail, the pair
-records one RPC failure. Authentication and dial failures retain their existing
-handling. V2 records are accepted only after their own validation; a V1 reply
-cannot authorize unsigned V2 data.
+```text
+Postcard(DhtNetworkMessage with NodesFound and QUIC-only addresses)
+[ optional: ASCII "ADDRSIG1" + signed-record bundle ]
+```
 
-Address publications do not use these response timeouts or paired RPC failure
-rules; they follow the send-only policy in section 5.
+The bundle is a concatenation of `[u32 big-endian byte length][Postcard
+SignedAddressRecord]` entries, with no count prefix. Each entry is an unchanged
+owner-signed publication, including unknown transport records. This is the
+same bundle representation exposed by `signed_address::encode_record_bundle`
+and `decode_record_bundle`. The marker identifies extension format 1; it does
+not change the signed publication format or its domain separator.
 
-Browser adapters must follow the same policy: request the legacy hints and
-length-delimited owner-proof representation without gating on a HELLO
-capability token, verify proofs with the portable verifier, and apply the same
-per-owner V2 precedence. The adapter/HELLO implementation lives outside this
-repository and must be updated by its consumers. The shared verifier and
-report-selection implementation here enforce the new precedence. The unsigned
-V2 draft never shipped and remains unsupported.
+Pre-upgrade readers use `postcard::from_bytes`, which ignores bytes after the
+legacy message. They receive the same QUIC peer entries and publication-sequence
+metadata and do not interpret the trailer. Upgraded readers use
+`postcard::take_from_bytes`, recognize the trailer marker, and decode the bounded
+bundle. An absent, unknown, or malformed trailer leaves the legacy reply usable.
+A malformed bundle is ignored as a whole; individually invalid signatures are
+ignored without losing other valid entries. No new fields are appended to the
+serialized Postcard struct or its per-peer records.
 
-Native and browser consumers of the draft format must upgrade together.
-`SignedAddressRecord::sign` and `verify` take no clock argument, and
-`compute_winner` returns an owned peer view. Consumers must also remove imports
-of `ADDRESS_V2_CAPABILITY` and uses of `AddressAuthority::Combined`.
+Before verifying or storing any trailer proof, the receiver requires the live
+request, matching key, and authenticated responder identity. A verified proof
+must name a peer present in the base `NodesFound` list. A matching proof upgrades
+that peer's derived view under the existing V2-over-V1 precedence; it cannot
+introduce unrelated peers through the trailer. LAN and reachability policies
+still apply, and only admitted routing peers retain proofs beyond the lookup.
+Older intermediaries do not retain or forward trailer proofs, so supplemental
+address propagation depends on upgraded responders.
 
-Bound record collections, address payloads, keys, signatures, and response
-decoding. Current limits include 16 transport records, 2 KiB per address
-payload, 40 KiB for an encoded signed record, and 256 V2 lookup entries. V2
-envelopes allow 960 KiB within the transport's 1 MiB envelope; V1 retains its
-64 KiB limit. When bounding a V2 response, retain complete closest-peer signed
-records rather than truncating addresses inside a proof.
+The entire response, including trailer, remains within **64 KiB**. First encode
+the complete base peer list; never remove a base peer to make room for a proof.
+Then consider proofs in response order, appending complete records that fit the
+remaining budget. Skip records that do not fit and continue considering later
+ones. Never truncate or re-sign a publication. If no proof fits, send the legacy
+response alone. An oversized base response is rejected as before. A missing
+proof is incomplete supplemental discovery, not a withdrawal.
+
+The existing request timeout and iterative/witness grace window apply to the
+single query per peer. A failed query is scored once; cancellation due to another
+lookup's failure does not score it again. Bootstrap does not wait for an
+unsupported sibling version. Publications retain their separate send-only
+failure policy from section 5.
+
+Browser adapters must send the same `FindNode`, decode the optional trailer,
+verify the original signed publications, match owners to base peers, and apply
+the shared precedence rules. Those adapters live outside this repository and
+must upgrade with this unreleased wire change. `SignedAddressRecord::sign` and
+`verify` take no clock argument; `compute_winner` returns an owned peer view.
+
+Bounds remain 16 transport records per publication, 2 KiB per address payload,
+40 KiB per encoded signed publication, and at most 256 trailer records, also
+constrained by the total 64 KiB message limit. V2 publication messages use the
+same 64 KiB envelope limit; the former 960 KiB lookup envelope is removed.
 
 ## Consequences
 
@@ -326,7 +345,8 @@ records rather than truncating addresses inside a proof.
 
 - QUIC and WebRTC discovery share a portable owner-authenticated protocol,
   including forwarding through nodes that cannot dial every transport.
-- Upgraded peers use V2 automatically without capability advertisement.
+- Upgraded peers forward signed records automatically without duplicate lookup
+  requests or capability advertisement.
 - V1 cannot overwrite any accepted V2 addresses, and reordered V2 messages
   cannot roll back the newest retained V2 publication.
 - Usable address knowledge is not discarded solely because time passed.
@@ -339,9 +359,10 @@ records rather than truncating addresses inside a proof.
   no expiry-based freshness guarantee.
 - Restart and eviction lose proof and sequence knowledge, allowing old valid
   records to be accepted again and temporarily reducing V2 discovery coverage.
-- Sending both versions increases traffic and in-flight lookup operations.
-  A peer supporting only one version can make bootstrap lookup pairs wait for
-  the other version's timeout; iterative batches retain their grace bound.
+- The 64 KiB response budget may omit some signed records, especially large
+  publications. The complete base peer list remains available, but a lookup
+  does not guarantee browser endpoints for every returned peer.
+- Older intermediaries ignore supplemental records rather than forwarding them.
 - Publications have no storage confirmation or failure-driven retries. A lost
   or unapplied update may remain missing until a later ordinary publication.
 - Signatures increase message sizes. Consumers of the earlier draft V2 wire
@@ -355,6 +376,15 @@ records rather than truncating addresses inside a proof.
   are outside this decision. Existing lookup and publication paths relearn them.
 
 ## Alternatives considered
+
+- **Send separate V1 and V2 FIND_NODE requests.** Rejected before release:
+  duplicate probes increase traffic and delay bootstrap against older peers.
+  The optional trailer forwards signed records through one existing request.
+- **Put browser endpoints in legacy address fields.** Rejected: older address
+  parsers reject these strings and lose the entire lookup response.
+- **Repurpose the per-peer `distance` metadata field.** Rejected: preserving the
+  existing sequence marker and metadata semantics avoids changing legacy
+  freshness handling. A trailer leaves those bytes untouched.
 
 - **Expire V2 records or renew signatures on a timer.** Rejected: time passing
   provides no replacement addresses. Retain the latest known publication and
@@ -386,7 +416,9 @@ records rather than truncating addresses inside a proof.
 Existing regressions cover owner/signature validation, response correlation,
 publication ordering, V2 precedence over V1, supplemental-only replacement,
 unchanged-signature reuse, forwarding, response bounds, and reconnect source
-selection. Publication regressions cover receivers that never reply, absence
+selection. Lookup regressions cover legacy decoding with trailing bytes, missing
+and malformed trailers, retention of every base peer under the size budget,
+and single-query operation against legacy and upgraded responders. Publication regressions cover receivers that never reply, absence
 of response tracking, one penalty for failed delivery, and suppression of
 failed-send retries. Persistence tests cover snapshot encoding, validity, and bounded
 dial-candidate selection. These do not establish a time bound for relearning

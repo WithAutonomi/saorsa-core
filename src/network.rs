@@ -3278,6 +3278,7 @@ mod tests {
                 timestamp: 1,
                 ttl: 10,
                 hop_count: 0,
+                signed_records: Vec::new(),
             };
             publisher
                 .transport

@@ -72,6 +72,7 @@ fn message(owner: PeerId, operation: DhtNetworkOperation) -> DhtNetworkMessage {
         timestamp: 1,
         ttl: 10,
         hop_count: 0,
+        signed_records: Vec::new(),
     }
 }
 
@@ -80,7 +81,7 @@ fn response(
     identity: &crate::identity::NodeIdentity,
     seq: u64,
 ) -> DhtNetworkMessage {
-    let mut response = message(sender, DhtNetworkOperation::FindNodeV2 { key: [0; 32] });
+    let mut response = message(sender, DhtNetworkOperation::FindNode { key: [0; 32] });
     response.message_type = DhtMessageType::Response;
     let records = vec![
         TransportAddressRecord::from_multiaddr(
@@ -90,14 +91,32 @@ fn response(
         .unwrap()
         .unwrap(),
     ];
-    response.result = Some(DhtNetworkResult::NodesFoundV2 {
+    let record = SignedAddressRecord::sign(identity, seq, records).unwrap();
+    let mut base = record.verify().unwrap().peer_record(1.0);
+    base.addresses.clear();
+    base.address_types.clear();
+    base.address_authority = None;
+    response.result = Some(DhtNetworkResult::NodesFound {
         key: [0; 32],
-        nodes: vec![TransportDhtNode {
-            record: SignedAddressRecord::sign(identity, seq, records).unwrap(),
-            reliability: 1.0,
-        }],
+        nodes: vec![base],
     });
+    response.signed_records = vec![record];
     response
+}
+
+async fn lookup_reply(
+    manager: &DhtNetworkManager,
+    key: Key,
+    requester: &PeerId,
+) -> DhtNetworkMessage {
+    let request = message(*requester, DhtNetworkOperation::FindNode { key });
+    let result = manager
+        .handle_find_node_request(&key, requester)
+        .await
+        .unwrap();
+    let response = manager.create_response_message(&request, result).unwrap();
+    let bytes = DhtNetworkManager::encode_response_message(response).unwrap();
+    DhtNetworkManager::decode_message(&bytes).unwrap()
 }
 
 fn track_request(
@@ -121,7 +140,7 @@ fn track_request(
 }
 
 #[tokio::test]
-async fn unauthenticated_v2_response_cannot_populate_address_cache() {
+async fn unauthenticated_lookup_extension_cannot_populate_address_cache() {
     let node = test_node().await;
     let identity = crate::identity::NodeIdentity::generate().unwrap();
     let owner = *identity.peer_id();
@@ -129,7 +148,7 @@ async fn unauthenticated_v2_response_cannot_populate_address_cache() {
     let _rx = track_request(
         node.dht_manager(),
         sender,
-        DhtNetworkOperation::FindNodeV2 { key: [0; 32] },
+        DhtNetworkOperation::FindNode { key: [0; 32] },
     );
     node.dht_manager()
         .handle_dht_response(&response(sender, &identity, u64::MAX), &sender, None)
@@ -144,7 +163,7 @@ async fn unauthenticated_v2_response_cannot_populate_address_cache() {
 }
 
 #[tokio::test]
-async fn authenticated_v2_response_requires_a_live_matching_request() {
+async fn lookup_extension_requires_a_live_matching_request() {
     let receiver = test_node().await;
     let sender = test_node().await;
     receiver.start().await.unwrap();
@@ -186,9 +205,9 @@ async fn authenticated_v2_response_requires_a_live_matching_request() {
     // Neither another peer's request nor the wrong operation/key authorizes
     // a response. Rejection must leave the waiter available for a valid reply.
     for (expected_peer, operation) in [
-        (owner, DhtNetworkOperation::FindNodeV2 { key: [0; 32] }),
+        (owner, DhtNetworkOperation::FindNode { key: [0; 32] }),
         (sender_id, DhtNetworkOperation::Ping),
-        (sender_id, DhtNetworkOperation::FindNodeV2 { key: [1; 32] }),
+        (sender_id, DhtNetworkOperation::FindNode { key: [1; 32] }),
     ] {
         let mut rx = track_request(manager, expected_peer, operation);
         manager
@@ -207,7 +226,7 @@ async fn authenticated_v2_response_requires_a_live_matching_request() {
         );
     }
 
-    let operation = DhtNetworkOperation::FindNodeV2 { key: [0; 32] };
+    let operation = DhtNetworkOperation::FindNode { key: [0; 32] };
     drop(track_request(manager, sender_id, operation.clone()));
     manager
         .handle_dht_response(&wire_response, &sender_id, None)
@@ -220,11 +239,52 @@ async fn authenticated_v2_response_requires_a_live_matching_request() {
             .is_empty()
     );
 
+    // Invalid signatures and proofs for owners absent from the base list
+    // cannot populate routing state, even on a correctly correlated response.
+    let unrelated_identity = crate::identity::NodeIdentity::generate().unwrap();
+    let unrelated_owner = *unrelated_identity.peer_id();
+    seed_peer(manager, unrelated_owner, "/ip4/3.3.3.3/udp/9000/quic").await;
+    let unrelated = SignedAddressRecord::sign(
+        &unrelated_identity,
+        20,
+        vec![quic_record("/ip4/4.4.4.4/udp/9000/quic")],
+    )
+    .unwrap();
+    let mut tampered = wire_response.signed_records[0].encode().unwrap();
+    *tampered.last_mut().unwrap() ^= 1;
+    let tampered = SignedAddressRecord::decode(&tampered).unwrap();
+    assert!(tampered.verify().is_err());
+    for record in [tampered, unrelated] {
+        let rx = track_request(manager, sender_id, operation.clone());
+        let mut reply = wire_response.clone();
+        reply.signed_records = vec![record];
+        let reply = DhtNetworkManager::decode_message(
+            &DhtNetworkManager::encode_response_message(reply).unwrap(),
+        )
+        .unwrap();
+        manager
+            .handle_dht_response(&reply, &sender_id, None)
+            .await
+            .unwrap();
+        assert!(matches!(
+            rx.await.unwrap().result,
+            DhtNetworkResult::NodesFound { .. }
+        ));
+        for subject in [owner, unrelated_owner] {
+            assert!(
+                manager
+                    .signed_address_record_for_peer(&subject)
+                    .await
+                    .is_none()
+            );
+        }
+    }
+
     let mut rx = track_request(manager, sender_id, operation);
     let mut downgraded = wire_response.clone();
     downgraded.payload = DhtNetworkOperation::FindNode { key: [0; 32] };
     downgraded.result = Some(DhtNetworkResult::NodesFound {
-        key: [0; 32],
+        key: [1; 32],
         nodes: Vec::new(),
     });
     manager
@@ -413,40 +473,32 @@ async fn supplemental_replacements_remove_native_addresses_and_reject_empty_sets
 }
 
 #[test]
-fn v2_wire_records_and_publications_require_an_owner_signature() {
-    let unsigned = serde_json::json!({
-        "peer_id": PeerId::from_bytes([0x22; 32]), "records": [], "publish_seq": u64::MAX, "reliability": 1.0
-    });
-    assert!(serde_json::from_value::<TransportDhtNode>(unsigned).is_err());
+fn v2_publications_require_an_owner_signature() {
     let unsigned = serde_json::json!({"PublishAddressSetV2": {"seq": 1, "records": []}});
     assert!(serde_json::from_value::<DhtNetworkOperation>(unsigned).is_err());
-    // V1 discriminants remain unchanged; V2 replaces the unpublished format.
     assert_eq!(
         postcard::to_stdvec(&DhtNetworkOperation::Ping).unwrap(),
         vec![1]
     );
     assert_eq!(
-        postcard::to_stdvec(&DhtNetworkOperation::FindNodeV2 { key: [0; 32] }).unwrap()[0],
-        5
+        postcard::to_stdvec(&DhtNetworkOperation::FindNode { key: [0; 32] }).unwrap()[0],
+        0
     );
 }
 
 #[tokio::test]
-async fn v2_lookup_omits_peers_without_current_owner_proofs() {
+async fn lookup_preserves_unsigned_peers_and_adds_available_proofs() {
     let node = test_node().await;
     let manager = node.dht_manager();
     let identity = crate::identity::NodeIdentity::generate().unwrap();
     let owner = *identity.peer_id();
     seed_peer(manager, owner, "/ip4/8.8.8.8/udp/9000/quic").await;
     let requester = PeerId::from_bytes([0x33; 32]);
-    let DhtNetworkResult::NodesFoundV2 { nodes, .. } = manager
-        .handle_find_node_v2_request(&[0; 32], &requester)
-        .await
-        .unwrap()
-    else {
-        panic!("V2 response");
-    };
-    assert!(nodes.is_empty());
+    let reply = lookup_reply(manager, [0; 32], &requester).await;
+    assert!(
+        matches!(reply.result, Some(DhtNetworkResult::NodesFound { nodes, .. }) if nodes.len() == 1)
+    );
+    assert!(reply.signed_records.is_empty());
     let proof = SignedAddressRecord::sign(
         &identity,
         10,
@@ -456,15 +508,11 @@ async fn v2_lookup_omits_peers_without_current_owner_proofs() {
     manager
         .apply_signed_address_set(proof.verify().unwrap(), None, false)
         .await;
-    let DhtNetworkResult::NodesFoundV2 { nodes, .. } = manager
-        .handle_find_node_v2_request(&[0; 32], &requester)
-        .await
-        .unwrap()
-    else {
-        panic!("V2 response");
-    };
-    assert_eq!(nodes.len(), 1);
-    assert_eq!(nodes[0].record, proof);
+    let reply = lookup_reply(manager, [0; 32], &requester).await;
+    assert!(
+        matches!(reply.result, Some(DhtNetworkResult::NodesFound { nodes, .. }) if nodes.len() == 1)
+    );
+    assert_eq!(reply.signed_records, vec![proof]);
 }
 
 #[tokio::test]
@@ -621,7 +669,7 @@ async fn v2_overwrites_a_conflicting_legacy_projection_at_the_same_sequence() {
 }
 
 #[tokio::test]
-async fn v2_lookup_bounds_the_full_envelope_and_preserves_complete_closest_records() {
+async fn lookup_bounds_the_full_envelope_and_preserves_all_base_peers() {
     let node = test_node().await;
     let manager = node.dht_manager();
     let mut expected = Vec::new();
@@ -648,7 +696,7 @@ async fn v2_lookup_bounds_the_full_envelope_and_preserves_complete_closest_recor
                 &postcard::to_stdvec(&publish).unwrap(),
                 &owner,
                 None,
-                DHT_V2_TOPIC,
+                DHT_V1_TOPIC,
             )
             .await
             .unwrap();
@@ -656,51 +704,103 @@ async fn v2_lookup_bounds_the_full_envelope_and_preserves_complete_closest_recor
     }
     expected.sort_by_key(|(owner, _)| *owner.as_bytes());
     let requester = PeerId::from_bytes([0x77; 32]);
-    for id_len in [32, 300_000] {
-        let mut request = message(requester, DhtNetworkOperation::FindNodeV2 { key: [0; 32] });
+    for id_len in [32, 30_000] {
+        let mut request = message(requester, DhtNetworkOperation::FindNode { key: [0; 32] });
         request.message_id = "x".repeat(id_len);
         let bytes = manager
             .handle_dht_message_on_topic(
                 &postcard::to_stdvec(&request).unwrap(),
                 &requester,
                 None,
-                DHT_V2_TOPIC,
+                DHT_V1_TOPIC,
             )
             .await
             .unwrap()
             .unwrap();
-        assert!(bytes.len() <= MAX_V2_MESSAGE_SIZE);
+        assert!(bytes.len() <= MAX_MESSAGE_SIZE);
         let response: DhtNetworkMessage = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(response.message_id, request.message_id);
-        let Some(DhtNetworkResult::NodesFoundV2 { nodes, .. }) = response.result else {
-            panic!("V2 response");
+        let Some(DhtNetworkResult::NodesFound { nodes, .. }) = response.result else {
+            panic!("lookup response");
         };
+        assert_eq!(nodes.len(), 20);
+        let response = DhtNetworkManager::decode_message(&bytes).unwrap();
         if id_len == 32 {
-            assert_eq!(nodes.len(), 20);
-        } else {
-            assert!(!nodes.is_empty() && nodes.len() < 20);
+            assert!(!response.signed_records.is_empty());
         }
-        for (actual, (_, record)) in nodes.iter().zip(&expected) {
-            assert_eq!(actual.record, *record);
+        assert!(response.signed_records.len() < 20);
+        for record in response.signed_records {
+            assert!(expected.iter().any(|(_, original)| original == &record));
         }
     }
 }
 
+#[test]
+fn v1_response_encoding_projects_browser_addresses_without_losing_peers_or_tags() {
+    let owner = PeerId::from_bytes([0x31; 32]);
+    let quic: MultiAddr = "/ip4/9.9.9.9/udp/9000/quic".parse().unwrap();
+    let mixed = DHTNode {
+        peer_id: owner,
+        addresses: vec![browser_address(owner), quic.clone()],
+        address_types: vec![AddressType::Unverified, AddressType::Relay],
+        distance: None,
+        reliability: 1.0,
+        address_authority: None,
+    };
+    let browser_owner = PeerId::from_bytes([0x32; 32]);
+    let browser_only = DHTNode {
+        peer_id: browser_owner,
+        addresses: vec![browser_address(browser_owner)],
+        address_types: vec![AddressType::Unverified],
+        ..mixed.clone()
+    };
+    let legacy = DHTNode {
+        peer_id: PeerId::from_bytes([0x33; 32]),
+        addresses: vec![quic.clone()],
+        address_types: Vec::new(),
+        ..mixed.clone()
+    };
+    let mut wire = message(owner, DhtNetworkOperation::FindNode { key: [0; 32] });
+    wire.message_type = DhtMessageType::Response;
+    wire.result = Some(DhtNetworkResult::NodesFound {
+        key: [0; 32],
+        nodes: vec![mixed.clone(), browser_only.clone(), legacy.clone()],
+    });
+    let encoded = DhtNetworkManager::encode_response_message(wire.clone()).unwrap();
+    wire.result = Some(DhtNetworkResult::NodesFound {
+        key: [0; 32],
+        nodes: vec![
+            DHTNode {
+                addresses: vec![quic],
+                address_types: vec![AddressType::Relay],
+                ..mixed
+            },
+            DHTNode {
+                addresses: Vec::new(),
+                address_types: Vec::new(),
+                ..browser_only
+            },
+            legacy,
+        ],
+    });
+    assert_eq!(encoded, postcard::to_stdvec(&wire).unwrap());
+}
+
 #[tokio::test]
-async fn v2_response_rejects_an_envelope_that_cannot_fit_even_without_nodes() {
+async fn lookup_rejects_an_envelope_that_cannot_fit_even_without_nodes() {
     let node = test_node().await;
     let identity = crate::identity::NodeIdentity::generate().unwrap();
     let owner = *identity.peer_id();
     let mut response = response(owner, &identity, 10);
-    response.message_id = "x".repeat(MAX_V2_MESSAGE_SIZE);
+    response.message_id = "x".repeat(MAX_MESSAGE_SIZE);
     assert!(DhtNetworkManager::encode_response_message(response).is_err());
 
-    let request = message(owner, DhtNetworkOperation::FindNodeV2 { key: [0; 32] });
+    let request = message(owner, DhtNetworkOperation::FindNode { key: [0; 32] });
     let empty = node
         .dht_manager()
         .create_response_message(
             &request,
-            DhtNetworkResult::NodesFoundV2 {
+            DhtNetworkResult::NodesFound {
                 key: [0; 32],
                 nodes: Vec::new(),
             },
@@ -838,16 +938,18 @@ async fn signed_gossip_survives_forwarding_and_unsigned_downgrade_attempts() {
         .unwrap()
         .last_seen
         .load();
-    let operation = DhtNetworkOperation::FindNodeV2 { key: [0; 32] };
+    let operation = DhtNetworkOperation::FindNode { key: [0; 32] };
     let mut wire = message(sender, operation.clone());
     wire.message_type = DhtMessageType::Response;
-    wire.result = Some(DhtNetworkResult::NodesFoundV2 {
+    wire.result = Some(DhtNetworkResult::NodesFound {
         key: [0; 32],
-        nodes: vec![TransportDhtNode {
-            record: proof.clone(),
-            reliability: 1.0,
-        }],
+        nodes: vec![proof.verify().unwrap().peer_record(1.0)],
     });
+    wire.signed_records = vec![proof.clone()];
+    let wire = DhtNetworkManager::decode_message(
+        &DhtNetworkManager::encode_response_message(wire).unwrap(),
+    )
+    .unwrap();
     // Neither an unsolicited proof nor a mismatched live lookup may mutate caches.
     manager
         .handle_dht_response(&wire, &sender, None)
@@ -864,7 +966,7 @@ async fn signed_gossip_survives_forwarding_and_unsigned_downgrade_attempts() {
     );
     let rx = track_request(manager, sender, operation);
     let mut wrong_key = wire.clone();
-    if let Some(DhtNetworkResult::NodesFoundV2 { key, .. }) = &mut wrong_key.result {
+    if let Some(DhtNetworkResult::NodesFound { key, .. }) = &mut wrong_key.result {
         *key = [1; 32];
     }
     manager
@@ -1007,13 +1109,7 @@ async fn signed_discovery_precedes_admission_and_blocks_newer_v1_publication() {
         DhtNetworkResult::PeerRejected
     ));
     let view = manager
-        .normalize_v2_nodes(
-            vec![TransportDhtNode {
-                record: signed.clone(),
-                reliability: 1.0,
-            }],
-            None,
-        )
+        .normalize_signed_lookup_nodes(vec![(signed.verify().unwrap(), 1.0)], None)
         .await
         .remove(0);
     assert_eq!(
@@ -1072,67 +1168,90 @@ async fn signed_discovery_precedes_admission_and_blocks_newer_v1_publication() {
 }
 
 #[tokio::test]
-async fn signed_envelope_keeps_full_close_group_and_enforces_topic_and_collection_bounds() {
+async fn lookup_extension_is_optional_bounded_and_only_valid_on_lookup_responses() {
     let node = test_node().await;
-    let manager = node.dht_manager();
     let identity = crate::identity::NodeIdentity::generate().unwrap();
-    let proof = SignedAddressRecord::sign(
+    let response = response(*identity.peer_id(), &identity, 1);
+    let base = postcard::to_stdvec(&response).unwrap();
+    assert!(
+        DhtNetworkManager::decode_message(&base)
+            .unwrap()
+            .signed_records
+            .is_empty()
+    );
+    let extended = DhtNetworkManager::encode_response_message(response).unwrap();
+    assert!(extended.len() <= MAX_MESSAGE_SIZE);
+    // Freeze the pre-upgrade lookup wire shape independently of the current
+    // message type. Both legacy lookup variants occupy discriminant zero.
+    #[derive(Serialize, Deserialize)]
+    enum LegacyOperation {
+        FindNode { key: Key },
+    }
+    #[derive(Serialize, Deserialize)]
+    struct LegacyPeer {
+        peer_id: PeerId,
+        addresses: Vec<String>,
+        address_types: Vec<AddressType>,
+        distance: Option<Vec<u8>>,
+        reliability: f64,
+    }
+    #[derive(Serialize, Deserialize)]
+    enum LegacyResult {
+        NodesFound { key: Key, nodes: Vec<LegacyPeer> },
+    }
+    #[derive(Serialize, Deserialize)]
+    struct LegacyMessage {
+        message_id: String,
+        source: PeerId,
+        target: Option<PeerId>,
+        message_type: DhtMessageType,
+        payload: LegacyOperation,
+        result: Option<LegacyResult>,
+        timestamp: u64,
+        ttl: u8,
+        hop_count: u8,
+    }
+    let legacy: LegacyMessage = postcard::from_bytes(&extended).unwrap();
+    assert_eq!(postcard::to_stdvec(&legacy).unwrap(), base);
+    assert_eq!(
+        DhtNetworkManager::decode_message(&extended)
+            .unwrap()
+            .signed_records
+            .len(),
+        1
+    );
+    for tail in [
+        b"UNKNOWN1".to_vec(),
+        [LOOKUP_EXTENSION_MARKER.as_slice(), &[0, 0, 0, 255, 1]].concat(),
+    ] {
+        let mut bytes = base.clone();
+        bytes.extend(tail);
+        assert!(
+            DhtNetworkManager::decode_message(&bytes)
+                .unwrap()
+                .signed_records
+                .is_empty()
+        );
+    }
+    assert!(
+        node.dht_manager()
+            .handle_dht_message_on_topic(&extended, identity.peer_id(), None, DHT_V2_TOPIC)
+            .await
+            .is_err()
+    );
+    let record = SignedAddressRecord::sign(
         &identity,
         1,
         vec![quic_record("/ip4/9.9.9.9/udp/9000/quic")],
     )
     .unwrap();
-    let entry = TransportDhtNode {
-        record: proof,
-        reliability: 1.0,
-    };
-    let mut response = message(
-        *identity.peer_id(),
-        DhtNetworkOperation::FindNodeV2 { key: [0; 32] },
-    );
-    response.message_type = DhtMessageType::Response;
-    response.result = Some(DhtNetworkResult::NodesFoundV2 {
-        key: [0; 32],
-        nodes: vec![entry.clone(); 20],
-    });
-    let encoded = DhtNetworkManager::encode_response_message(response.clone()).unwrap();
-    assert!(encoded.len() > MAX_MESSAGE_SIZE);
-    assert!(encoded.len() < MAX_V2_MESSAGE_SIZE);
-    let decoded: DhtNetworkMessage = postcard::from_bytes(&encoded).unwrap();
+    let bundle = crate::signed_address::encode_record_bundle(&vec![
+        record;
+        MAX_LOOKUP_EXTENSION_RECORDS + 1
+    ])
+    .unwrap();
     assert!(
-        matches!(decoded.result, Some(DhtNetworkResult::NodesFoundV2 { nodes, .. }) if nodes.len() == 20)
-    );
-    assert!(
-        manager
-            .handle_dht_message(&encoded, identity.peer_id(), None)
-            .await
-            .is_err()
-    );
-    assert!(
-        manager
-            .handle_dht_message_on_topic(&encoded, identity.peer_id(), None, DHT_V2_TOPIC)
-            .await
-            .is_ok()
-    );
-    response.payload = DhtNetworkOperation::FindNode { key: [0; 32] };
-    assert!(
-        manager
-            .handle_dht_message_on_topic(
-                &postcard::to_stdvec(&response).unwrap(),
-                identity.peer_id(),
-                None,
-                DHT_V2_TOPIC
-            )
-            .await
-            .is_err()
-    );
-    response.result = Some(DhtNetworkResult::NodesFoundV2 {
-        key: [0; 32],
-        nodes: vec![entry; MAX_V2_LOOKUP_NODES + 1],
-    });
-    assert!(
-        postcard::from_bytes::<DhtNetworkMessage>(&postcard::to_stdvec(&response).unwrap())
-            .is_err()
+        crate::signed_address::decode_record_bundle(&bundle, MAX_LOOKUP_EXTENSION_RECORDS).is_err()
     );
 }
 
@@ -1577,20 +1696,13 @@ async fn routing_publication_forwards_signed_transports_but_native_dials_only_qu
 
     // A client receives the unchanged signed QUIC + WebRTC record and can
     // verify/decode it using the same portable types exposed on WASM.
-    let result = manager
-        .handle_find_node_v2_request(owner.as_bytes(), node.peer_id())
-        .await
-        .unwrap();
-    let encoded = postcard::to_stdvec(&result).unwrap();
-    let DhtNetworkResult::NodesFoundV2 { nodes, .. } = postcard::from_bytes(&encoded).unwrap()
-    else {
-        panic!("expected a V2 lookup response");
-    };
-    let forwarded = nodes
+    let reply = lookup_reply(manager, *owner.as_bytes(), node.peer_id()).await;
+    let forwarded = reply
+        .signed_records
         .into_iter()
-        .find(|entry| entry.record == signed)
+        .find(|record| record == &signed)
         .unwrap();
-    let verified = forwarded.record.verify().unwrap();
+    let verified = forwarded.verify().unwrap();
     assert_eq!(verified.records(), records);
     assert_eq!(verified.records()[1].decode_known().unwrap(), Some(browser));
 
@@ -1682,22 +1794,10 @@ async fn publication_order_always_prefers_newest_v2_over_v1() {
             manager.signed_address_record_for_peer(&owner).await,
             Some(latest.clone())
         );
-        let forwarded = manager
-            .handle_find_node_v2_request(owner.as_bytes(), manager.peer_id())
-            .await
-            .unwrap();
-        let DhtNetworkResult::NodesFoundV2 { nodes, .. } = forwarded else {
-            panic!("V2 response")
-        };
-        assert!(nodes.iter().any(|node| node.record == latest));
+        let forwarded = lookup_reply(manager, *owner.as_bytes(), manager.peer_id()).await;
+        assert!(forwarded.signed_records.contains(&latest));
         let view = manager
-            .normalize_v2_nodes(
-                vec![TransportDhtNode {
-                    record: latest.clone(),
-                    reliability: 1.0,
-                }],
-                None,
-            )
+            .normalize_signed_lookup_nodes(vec![(latest.verify().unwrap(), 1.0)], None)
             .await
             .remove(0);
         assert_eq!(view.addresses, native.addresses);
@@ -1853,13 +1953,7 @@ async fn supplemental_only_v2_removes_native_contacts_and_rejects_delayed_quic()
     )
     .unwrap();
     let view = manager
-        .normalize_v2_nodes(
-            vec![TransportDhtNode {
-                record: publication.clone(),
-                reliability: 1.0,
-            }],
-            None,
-        )
+        .normalize_signed_lookup_nodes(vec![(publication.verify().unwrap(), 1.0)], None)
         .await
         .remove(0);
     assert!(view.addresses.is_empty());
@@ -1884,70 +1978,10 @@ async fn supplemental_only_v2_removes_native_contacts_and_rejects_delayed_quic()
     );
 }
 
-#[test]
-fn paired_lookup_keeps_legacy_subjects_and_prefers_v2_in_either_arrival_order() {
-    let identity = crate::identity::NodeIdentity::generate().unwrap();
-    let owner = *identity.peer_id();
-    let proof = SignedAddressRecord::sign(
-        &identity,
-        1,
-        vec![quic_record("/ip4/9.9.9.9/udp/9000/quic")],
-    )
-    .unwrap()
-    .verify()
-    .unwrap();
-    let mut legacy = proof.peer_record(1.0);
-    legacy.addresses = vec!["/ip4/1.1.1.1/udp/9000/quic".parse().unwrap()];
-    legacy.address_authority = Some(AddressAuthority::AuthenticatedOwner(u64::MAX));
-    let mut legacy_only = legacy.clone();
-    legacy_only.peer_id = PeerId::from_bytes([0x33; 32]);
-    legacy_only.address_authority = None;
-    let reply = |nodes| {
-        Ok(DhtResponseEnvelope {
-            result: DhtNetworkResult::NodesFound {
-                key: [0; 32],
-                nodes,
-            },
-            transport_source: None,
-        })
-    };
-    for v2_first in [false, true] {
-        let mut replies = vec![
-            reply(vec![legacy.clone(), legacy_only.clone()]),
-            reply(vec![proof.peer_record(1.0)]),
-        ];
-        if v2_first {
-            replies.reverse();
-        }
-        let result = DhtNetworkManager::merge_find_node_responses([0; 32], replies).unwrap();
-        let DhtNetworkResult::NodesFound { nodes, .. } = result.result else {
-            panic!("lookup response")
-        };
-        assert_eq!(nodes.len(), 2);
-        assert_eq!(
-            nodes
-                .iter()
-                .find(|node| node.peer_id == owner)
-                .unwrap()
-                .addresses,
-            proof.peer_record(1.0).addresses
-        );
-        assert!(nodes.iter().any(|node| node.peer_id == legacy_only.peer_id));
-    }
-    // An empty V2 reply does not erase legacy-only subjects.
-    let result = DhtNetworkManager::merge_find_node_responses(
-        [0; 32],
-        vec![reply(vec![legacy_only]), reply(vec![])],
-    )
-    .unwrap();
-    assert!(
-        matches!(result.result, DhtNetworkResult::NodesFound { nodes, .. } if nodes.len() == 1)
-    );
-}
-
 #[tokio::test]
-async fn both_lookup_versions_are_sent_and_one_unsupported_version_does_not_penalize_peer() {
-    for supported_v2 in [false, true] {
+async fn single_lookup_request_supports_legacy_and_extended_responders() {
+    for (with_extension, bootstrap) in [(false, false), (true, false), (false, true), (true, true)]
+    {
         let requester = test_node().await;
         let responder = test_node().await;
         requester
@@ -1957,7 +1991,7 @@ async fn both_lookup_versions_are_sent_and_one_unsupported_version_does_not_pena
             .await
             .unwrap();
         requester.dht_manager().start().await.unwrap();
-        // Run a transport-only responder that deliberately understands one version.
+        // Run a transport-only responder with or without trailer support.
         let remote = responder.dht_manager();
         let mut events = remote.transport.subscribe_events();
         remote.transport.start_network_listeners().await.unwrap();
@@ -1976,8 +2010,7 @@ async fn both_lookup_versions_are_sent_and_one_unsupported_version_does_not_pena
         let trust = manager.trust_engine.as_ref().unwrap();
         let score = trust.score(responder.peer_id());
         let serve = async {
-            let mut received = HashSet::new();
-            while received.len() < 2 {
+            loop {
                 let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
                     .await
                     .unwrap()
@@ -1995,28 +2028,27 @@ async fn both_lookup_versions_are_sent_and_one_unsupported_version_does_not_pena
                     continue;
                 }
                 let request: DhtNetworkMessage = postcard::from_bytes(&data).unwrap();
-                let (v2, key) = match request.payload {
-                    DhtNetworkOperation::FindNode { key } => (false, key),
-                    DhtNetworkOperation::FindNodeV2 { key } => (true, key),
-                    _ => continue,
-                };
-                received.insert(v2);
-                if v2 != supported_v2 {
+                let DhtNetworkOperation::FindNode { key } = request.payload else {
                     continue;
-                }
-                let result = if v2 {
-                    DhtNetworkResult::NodesFoundV2 { key, nodes: vec![] }
-                } else {
-                    DhtNetworkResult::NodesFound { key, nodes: vec![] }
                 };
+                assert_eq!(topic, DHT_V1_TOPIC);
+                let result = DhtNetworkResult::NodesFound { key, nodes: vec![] };
                 let response = remote.create_response_message(&request, result).unwrap();
+                let bytes = if with_extension {
+                    // Empty but recognized extension; legacy peers omit it entirely.
+                    let mut bytes = DhtNetworkManager::encode_response_message(response).unwrap();
+                    bytes.extend_from_slice(LOOKUP_EXTENSION_MARKER);
+                    bytes
+                } else {
+                    postcard::to_stdvec(&response).unwrap()
+                };
                 remote
                     .transport
-                    .send_message(&source, &topic, postcard::to_stdvec(&response).unwrap())
+                    .send_message(&source, &topic, bytes)
                     .await
                     .unwrap();
+                break;
             }
-            received
         };
         let target = DHTNode {
             peer_id: *responder.peer_id(),
@@ -2027,21 +2059,44 @@ async fn both_lookup_versions_are_sent_and_one_unsupported_version_does_not_pena
             address_authority: None,
         };
         let targets = [target];
-        let (responses, received) =
-            tokio::join!(manager.query_find_node_batch(&targets, [0; 32]), serve);
-        let response = responses
-            .into_iter()
-            .find(|(peer, _)| peer == responder.peer_id())
-            .unwrap()
-            .1;
-        assert_eq!(received, HashSet::from([false, true]));
-        assert!(matches!(
-            response.unwrap().result,
-            DhtNetworkResult::NodesFound { .. }
-        ));
+        let before = manager
+            .transport
+            .traffic
+            .find_node_tx_count
+            .load(Ordering::Relaxed);
+        let query = async {
+            if bootstrap {
+                assert_eq!(
+                    manager
+                        .bootstrap_from_peers(&[*responder.peer_id()])
+                        .await
+                        .unwrap(),
+                    0
+                );
+            } else {
+                let responses = manager.query_find_node_batch(&targets, [0; 32]).await;
+                assert_eq!(responses.len(), 1);
+                assert!(matches!(
+                    &responses[0].1.as_ref().unwrap().result,
+                    DhtNetworkResult::NodesFound { .. }
+                ));
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(2), async { tokio::join!(query, serve) })
+            .await
+            .unwrap();
+        assert_eq!(
+            manager
+                .transport
+                .traffic
+                .find_node_tx_count
+                .load(Ordering::Relaxed)
+                - before,
+            1
+        );
         assert_eq!(trust.score(responder.peer_id()), score);
         assert!(manager.active_operations.lock().unwrap().values().all(|operation| {
-            !matches!(operation.operation, DhtNetworkOperation::FindNode { key } | DhtNetworkOperation::FindNodeV2 { key } if key == [0; 32])
+            !matches!(operation.operation, DhtNetworkOperation::FindNode { key } if key == [0; 32])
         }));
         requester.stop().await.unwrap();
         responder.stop().await.unwrap();
