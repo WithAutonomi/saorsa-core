@@ -5043,9 +5043,8 @@ impl DhtNetworkManager {
     /// Reconcile already-connected peers into DHT bookkeeping/routing.
     ///
     /// Looks up each peer's actual user agent from the transport layer.
-    /// Peers whose user agent is not yet known (e.g. identity announce still
-    /// in flight) are skipped — they will be handled by the normal
-    /// `PeerConnected` event path once authentication completes.
+    /// In normal transport operation, a peer from this snapshot without an
+    /// agent has disconnected since the snapshot was taken and is skipped.
     async fn reconcile_connected_peers(self: &Arc<Self>) {
         let connected = self.transport.connected_peers().await;
         if connected.is_empty() {
@@ -5063,14 +5062,14 @@ impl DhtNetworkManager {
             } else {
                 skipped += 1;
                 debug!(
-                    "Skipping reconciliation for peer {} — user agent not yet known",
+                    "Skipping reconciliation for peer {}: disconnected since the snapshot",
                     peer_id.to_hex()
                 );
             }
         }
         if skipped > 0 {
             info!(
-                "Skipped {} peers during reconciliation (user agent unknown, will arrive via PeerConnected)",
+                "Skipped {} peers during reconciliation (disconnected since the snapshot)",
                 skipped
             );
         }

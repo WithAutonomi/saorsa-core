@@ -891,6 +891,10 @@ impl TransportHandle {
     }
 
     /// Get the user agent string for a connected peer, if known.
+    ///
+    /// A connected peer always has one: it is recorded and dropped together with the peer's
+    /// entry in `peer_to_channel`. `None` therefore means the peer is not connected, for
+    /// example because it disconnected after a [`Self::connected_peers`] snapshot was taken.
     pub async fn peer_user_agent(&self, peer_id: &PeerId) -> Option<String> {
         self.peer_user_agents
             .get(peer_id)
@@ -1177,6 +1181,9 @@ impl TransportHandle {
                     let channels = entry.get_mut();
                     channels.remove(channel_id);
                     if channels.is_empty() {
+                        // Under the entry lock, so a registration for the same peer cannot
+                        // land between the two and be left without its agent.
+                        peer_user_agents.remove(app_peer);
                         entry.remove();
                         true
                     } else {
@@ -1186,7 +1193,6 @@ impl TransportHandle {
                 DashEntry::Vacant(_) => false,
             };
             if became_empty {
-                peer_user_agents.remove(app_peer);
                 let _ = event_tx.send(P2PEvent::PeerDisconnected(*app_peer));
             }
         }
@@ -1259,6 +1265,9 @@ impl TransportHandle {
             DashEntry::Occupied(mut entry) => entry.get_mut().insert(channel_id.to_string()),
             DashEntry::Vacant(entry) => {
                 is_new_peer = true;
+                // Under the entry lock, before the peer becomes visible: removal drops the
+                // agent under the same lock, so a connected peer always has one.
+                peer_user_agents.insert(app_id, peer_user_agent.to_string());
                 let mut set = HashSet::new();
                 set.insert(channel_id.to_string());
                 entry.insert(set);
@@ -1273,9 +1282,10 @@ impl TransportHandle {
         }
 
         if is_new_peer {
-            let peer_user_agent = peer_user_agent.to_string();
-            peer_user_agents.insert(app_id, peer_user_agent.clone());
-            broadcast_event(event_tx, P2PEvent::PeerConnected(app_id, peer_user_agent));
+            broadcast_event(
+                event_tx,
+                P2PEvent::PeerConnected(app_id, peer_user_agent.to_string()),
+            );
         }
     }
 }
@@ -1588,12 +1598,19 @@ impl TransportHandle {
         // Remove this peer from the bidirectional maps, collecting channels
         // that have no remaining peers and should be closed at QUIC level.
         let orphaned_channels = {
-            let Some((_, channel_ids)) = self.peer_to_channel.remove(peer_id) else {
-                info!(
-                    "Peer {} has no tracked channels, nothing to disconnect",
-                    peer_id
-                );
-                return Ok(());
+            let channel_ids = match self.peer_to_channel.entry(*peer_id) {
+                DashEntry::Occupied(entry) => {
+                    // Under the entry lock, as in `remove_channel_mappings_static`.
+                    self.peer_user_agents.remove(peer_id);
+                    entry.remove()
+                }
+                DashEntry::Vacant(_) => {
+                    info!(
+                        "Peer {} has no tracked channels, nothing to disconnect",
+                        peer_id
+                    );
+                    return Ok(());
+                }
             };
 
             let mut orphaned = Vec::new();
@@ -1622,7 +1639,6 @@ impl TransportHandle {
             orphaned
         };
 
-        self.peer_user_agents.remove(peer_id);
         let _ = self.event_tx.send(P2PEvent::PeerDisconnected(*peer_id));
 
         // Close QUIC connections for channels with no remaining peers.
