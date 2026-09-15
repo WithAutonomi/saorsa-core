@@ -113,8 +113,15 @@ authoritative address set to peers newly entering the replication set.
 
 ### Publication and teardown ordering
 
-On relay loss, local published-relay state is cleared first. DHT withdrawal and
-transport teardown then run concurrently, so neither waits for the other.
+On relay loss, local published-relay state is cleared first. Publishing a
+nonempty replacement address set and transport teardown then run concurrently,
+so neither waits for the other. An empty publication is skipped, including on
+forced retries; replicas retain their previous addresses until a nonempty
+replacement arrives. V2 adds extensible transport records to these replacement
+semantics. Empty or fully rejected V2 sets do not advance the sequence or change
+stored addresses. A record containing only WebRTC or unknown future transports
+cannot clear the existing native QUIC projection; nonempty QUIC projections use
+the same replacement methods as V1.
 Relay allocation resources are owned by a small lifecycle actor. The actor
 serializes short state transitions; relay acquisition and teardown awaits run
 outside it. Generation numbers prevent a late acquisition or canary verdict
@@ -155,7 +162,7 @@ release process and are not decided here.
   isolated concurrency budget strictly bound that service. Canary work cannot
   exhaust the general handler pool.
 - Healthy relay sessions avoid churn when routing-table responsibility moves.
-- DHT withdrawal begins without waiting for local transport shutdown.
+- Nonempty DHT replacement publication begins without waiting for local transport shutdown.
 - Mixed-version witnesses do not block admission merely because they lack the
   canary protocol; their missing protocol response is temporarily counted as
   positive.

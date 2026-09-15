@@ -73,6 +73,7 @@ pub fn peer_id_from_public_key_bytes(bytes: &[u8]) -> Result<PeerId> {
 /// completed QUIC/TLS handshake as DER-encoded SubjectPublicKeyInfo. Validate
 /// the DER shape, algorithm identifier, absent ML-DSA parameters, and
 /// byte-aligned key before deriving the overlay identity from the raw key.
+#[cfg(feature = "native")]
 pub(crate) fn peer_id_from_public_key_spki(spki_bytes: &[u8]) -> Result<PeerId> {
     let public_key =
         saorsa_transport::crypto::raw_public_keys::pqc::extract_public_key_from_spki(spki_bytes)
@@ -249,6 +250,7 @@ impl NodeIdentity {
 
 impl NodeIdentity {
     /// Save identity to a JSON file (async)
+    #[cfg(feature = "native")]
     pub async fn save_to_file(&self, path: &std::path::Path) -> Result<()> {
         use tokio::fs;
         let data = self.export();
@@ -275,6 +277,7 @@ impl NodeIdentity {
     }
 
     /// Load identity from a JSON file (async)
+    #[cfg(feature = "native")]
     pub async fn load_from_file(path: &std::path::Path) -> Result<Self> {
         let json = tokio::fs::read_to_string(path).await.map_err(|e| {
             P2PError::Identity(crate::error::IdentityError::InvalidFormat(
@@ -344,6 +347,7 @@ impl NodeIdentity {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "native")]
     fn ml_dsa_65_spki(public_key: &[u8]) -> Vec<u8> {
         const OID: [u8; 9] = [0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x12];
         let bit_string_len = public_key.len() + 1;
@@ -390,6 +394,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "native")]
     fn transport_spki_derives_same_peer_id_as_raw_key() {
         let (public_key, _secret_key) = crate::quantum_crypto::generate_ml_dsa_keypair()
             .expect("ML-DSA key generation should succeed");
@@ -402,6 +407,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "native")]
     fn transport_spki_rejects_wrong_algorithm() {
         let (public_key, _secret_key) = crate::quantum_crypto::generate_ml_dsa_keypair()
             .expect("ML-DSA key generation should succeed");
@@ -413,6 +419,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "native")]
     fn transport_spki_rejects_raw_public_key_bytes() {
         let (public_key, _secret_key) = crate::quantum_crypto::generate_ml_dsa_keypair()
             .expect("ML-DSA key generation should succeed");

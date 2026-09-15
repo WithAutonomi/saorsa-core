@@ -98,7 +98,7 @@ enum ListenMode {
     Local,
 }
 
-/// Returns the default user agent string for the given mode.
+/// Returns the default software identifier for the given mode.
 ///
 /// - `Node` → `"node/<saorsa-core-version>"`
 /// - `Client` → `"client/<saorsa-core-version>"`
@@ -672,8 +672,8 @@ impl Default for NodeConfig {
 
 impl DHTConfig {
     /// Default K value (bucket size) for Kademlia routing.
-    pub const DEFAULT_K_VALUE: usize = 20;
-    const DEFAULT_ALPHA_VALUE: usize = 3;
+    pub const DEFAULT_K_VALUE: usize = crate::dht_lookup::DEFAULT_K_VALUE;
+    const DEFAULT_ALPHA_VALUE: usize = crate::dht_lookup::DEFAULT_ALPHA_VALUE;
     const DEFAULT_REFRESH_INTERVAL_SECS: u64 = 600;
     /// Minimum k_value — values below this produce degenerate routing behavior.
     const MIN_K_VALUE: usize = 4;
@@ -1804,9 +1804,10 @@ impl P2PNode {
     /// session, peer not found, etc.), resolves a dial address from:
     ///
     /// 1. Caller-provided `addrs` (highest priority)
-    /// 2. Addresses cached in the transport layer (snapshotted before the
+    /// 2. Latest owner-published QUIC addresses in the DHT routing table
+    /// 3. Addresses cached in the transport layer (snapshotted before the
     ///    send attempt, since stale-channel cleanup removes them)
-    /// 3. DHT routing table
+    /// 4. Other DHT routing-table or live transport addresses
     ///
     /// Then dials, waits for identity exchange, and retries the send exactly
     /// once on the fresh connection.  Concurrent reconnects to the same peer
@@ -1908,7 +1909,8 @@ impl P2PNode {
     /// Ensure an identity-authenticated channel to `peer_id` exists, dialing a
     /// fresh connection when necessary.
     ///
-    /// Resolves a dial address (caller-provided > saved > DHT routing table),
+    /// Resolves dial addresses from explicit caller input, the latest owner
+    /// publication, or saved connection and discovery addresses in that order,
     /// tears down any stale channels, dials, waits for the identity exchange,
     /// and verifies the authenticated peer matches `peer_id`. On success the
     /// transport's `peer_to_channel` map is populated, so a subsequent
@@ -1967,11 +1969,13 @@ impl P2PNode {
         self.transport.send_message(peer_id, protocol, data).await
     }
 
-    /// Resolve typed dial candidates for `peer_id`, preferring caller-provided
-    /// addresses over cached/DHT sources.
+    /// Resolve typed dial candidates for `peer_id`. Explicit caller input wins;
+    /// otherwise an owner-published QUIC set supersedes saved connection addresses.
     ///
-    /// Returns every dialable (QUIC, non-unspecified) address from the first
-    /// non-empty source. Caller-provided / saved addresses inherit the
+    /// Returns every dialable (QUIC, non-unspecified) address from the chosen
+    /// source. An authoritative set does not fall back to superseded
+    /// cached addresses if none of its endpoints are dialable.
+    /// Caller-provided / saved addresses inherit the
     /// [`AddressType`] from the DHT when possible and otherwise fall back to
     /// [`AddressType::Unverified`] — the same default the routing table
     /// applies to legacy peers that never asserted reachability.
@@ -1981,6 +1985,14 @@ impl P2PNode {
         caller_addrs: &[MultiAddr],
         saved_addrs: &[MultiAddr],
     ) -> Vec<(MultiAddr, AddressType)> {
+        if caller_addrs.is_empty()
+            && let Some(published) = self
+                .dht_manager()
+                .published_peer_addresses_for_dial_typed(peer_id)
+                .await
+        {
+            return published;
+        }
         let dht_candidates = self
             .adaptive_dht
             .peer_addresses_for_dial_typed(peer_id)
@@ -2968,6 +2980,23 @@ mod tests {
         assert!(bootstrap_peer_identity_matches(None, other));
     }
 
+    #[test]
+    fn user_agents_identify_software_without_capability_tokens() {
+        assert_eq!(
+            user_agent_for_mode(NodeMode::Node),
+            format!("node/{}", env!("CARGO_PKG_VERSION"))
+        );
+        assert_eq!(
+            user_agent_for_mode(NodeMode::Client),
+            format!("client/{}", env!("CARGO_PKG_VERSION"))
+        );
+        let mut config = NodeConfig::default();
+        for custom in ["my-app/1.0", "", "node/custom;custom-feature"] {
+            config.custom_user_agent = Some(custom.to_owned());
+            assert_eq!(config.user_agent(), custom);
+        }
+    }
+
     // Test tool handler for network tests
 
     // MCP removed
@@ -3146,6 +3175,156 @@ mod tests {
         assert_eq!(
             classify_peer_route_from_typed(Some(&src), &typed),
             PeerRouteKind::Direct
+        );
+    }
+
+    #[tokio::test]
+    async fn reconnect_uses_latest_v1_and_v2_publications_over_saved_addresses() {
+        use crate::dht_network_manager::{DhtMessageType, DhtNetworkMessage, DhtNetworkOperation};
+        use crate::signed_address::SignedAddressRecord;
+        use crate::{KnownReachability, TransportAddressRecord};
+
+        let config = || {
+            NodeConfig::builder()
+                .local(true)
+                .port(0)
+                .ipv6(false)
+                .build()
+                .unwrap()
+        };
+        let receiver = P2PNode::new(config()).await.unwrap();
+        let publisher = P2PNode::new(config()).await.unwrap();
+        // Keep the publication sequence controlled by this test. Starting the
+        // publisher's DHT would allow an automatic V2 publication to correctly
+        // suppress the initial V1 fixture before it can be observed.
+        receiver.transport.start_network_listeners().await.unwrap();
+        receiver.dht_manager().start().await.unwrap();
+        publisher.transport.start_network_listeners().await.unwrap();
+        let old_address = publisher
+            .listen_addrs()
+            .await
+            .into_iter()
+            .find(MultiAddr::is_ipv4)
+            .unwrap();
+        let channel = receiver.connect_peer(&old_address).await.unwrap();
+        receiver
+            .wait_for_peer_identity(&channel, Duration::from_secs(2))
+            .await
+            .unwrap();
+        let owner = *publisher.peer_id();
+        timeout(Duration::from_secs(2), async {
+            while !publisher.is_peer_connected(receiver.peer_id()).await
+                || !receiver.dht_manager().is_in_routing_table(&owner).await
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let saved = receiver
+            .transport
+            .peer_info(&owner)
+            .await
+            .unwrap()
+            .addresses;
+        let first: MultiAddr = "/ip4/9.9.9.9/udp/9001/quic".parse().unwrap();
+        let second: MultiAddr = "/ip4/1.1.1.1/udp/9002/quic".parse().unwrap();
+        let sequence = u64::MAX - 2;
+        let operations = [
+            (
+                "/dht/1.0.0",
+                first.clone(),
+                DhtNetworkOperation::PublishAddressSet {
+                    seq: sequence,
+                    addresses: vec![(first.clone(), AddressType::Direct)],
+                },
+            ),
+            (
+                "/dht/address/2.0.0",
+                second.clone(),
+                DhtNetworkOperation::PublishAddressSetV2 {
+                    record: SignedAddressRecord::sign(
+                        publisher.transport.node_identity(),
+                        sequence - 1,
+                        vec![
+                            TransportAddressRecord::from_multiaddr(
+                                &second,
+                                KnownReachability::Direct,
+                            )
+                            .unwrap()
+                            .unwrap(),
+                        ],
+                    )
+                    .unwrap(),
+                },
+            ),
+            (
+                "/dht/1.0.0",
+                second.clone(),
+                DhtNetworkOperation::PublishAddressSet {
+                    seq: u64::MAX,
+                    addresses: vec![(first.clone(), AddressType::Direct)],
+                },
+            ),
+        ];
+        for (topic, expected, operation) in operations {
+            let message = DhtNetworkMessage {
+                message_id: "reconnect-publication".into(),
+                source: owner,
+                target: None,
+                message_type: DhtMessageType::Request,
+                payload: operation,
+                result: None,
+                timestamp: 1,
+                ttl: 10,
+                hop_count: 0,
+                signed_records: Vec::new(),
+            };
+            publisher
+                .transport
+                .send_message(
+                    receiver.peer_id(),
+                    topic,
+                    postcard::to_stdvec(&message).unwrap(),
+                )
+                .await
+                .unwrap();
+            timeout(Duration::from_secs(2), async {
+                loop {
+                    let candidates = receiver.resolve_dial_candidates(&owner, &[], &saved).await;
+                    if candidates == vec![(expected.clone(), AddressType::Direct)] {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("reconnect must use the published endpoint without the old cached endpoint");
+        }
+        // Explicit caller overrides still take priority.
+        let explicit = receiver
+            .resolve_dial_candidates(&owner, std::slice::from_ref(&old_address), &saved)
+            .await;
+        assert_eq!(explicit, vec![(old_address, AddressType::Unverified)]);
+        receiver.stop().await.unwrap();
+        publisher.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reconnect_uses_saved_addresses_without_an_owner_publication() {
+        let node = P2PNode::new(create_test_node_config()).await.unwrap();
+        let peer = PeerId::random();
+        let saved: MultiAddr = "/ip4/9.9.9.9/udp/9001/quic".parse().unwrap();
+        assert_eq!(
+            node.dht_manager()
+                .published_peer_addresses_for_dial_typed(&peer)
+                .await,
+            None
+        );
+        assert_eq!(
+            node.resolve_dial_candidates(&peer, &[], std::slice::from_ref(&saved))
+                .await,
+            vec![(saved, AddressType::Unverified)]
         );
     }
 
