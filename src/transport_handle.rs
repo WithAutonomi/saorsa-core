@@ -252,6 +252,52 @@ pub(crate) struct TrafficCounters {
     pub identity_announce_tx_bytes: AtomicU64,
     /// Identity announces sent.
     pub identity_announce_tx_count: AtomicU64,
+
+    // ---- V2-834: the failure branches, so tx and rx sum by construction ----
+    /// Wire bytes of messages whose transport send failed (never counted in
+    /// `wire_tx_bytes`; may or may not have partially reached the wire).
+    /// Covers `send_on_channel` and the identity-announce path.
+    pub wire_failed_tx_bytes: AtomicU64,
+    /// Messages whose transport send failed.
+    pub wire_failed_tx_count: AtomicU64,
+    /// Inbound frame bytes that reached a shard consumer but failed to decode
+    /// or failed ML-DSA signature verification (rejected before dispatch).
+    pub wire_rejected_rx_bytes: AtomicU64,
+    /// Inbound frames rejected at decode/verify.
+    pub wire_rejected_rx_count: AtomicU64,
+    /// Inbound frame bytes dropped by the dispatcher before parsing because
+    /// the target shard's channel was full or its consumer had exited.
+    /// `wire_rx_bytes + wire_rejected_rx_bytes + wire_dropped_rx_bytes` is
+    /// every frame the transport handed to saorsa-core.
+    pub wire_dropped_rx_bytes: AtomicU64,
+    /// Inbound frames dropped by the dispatcher.
+    pub wire_dropped_rx_count: AtomicU64,
+}
+
+impl TrafficCounters {
+    /// Record a message whose transport send returned an error.
+    #[inline]
+    pub fn record_failed_tx(&self, wire_len: u64) {
+        self.wire_failed_tx_bytes
+            .fetch_add(wire_len, Ordering::Relaxed);
+        self.wire_failed_tx_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record an inbound frame rejected at decode/verify.
+    #[inline]
+    pub fn record_rejected_rx(&self, wire_len: u64) {
+        self.wire_rejected_rx_bytes
+            .fetch_add(wire_len, Ordering::Relaxed);
+        self.wire_rejected_rx_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record an inbound frame dropped by the dispatcher before parsing.
+    #[inline]
+    pub fn record_dropped_rx(&self, wire_len: u64) {
+        self.wire_dropped_rx_bytes
+            .fetch_add(wire_len, Ordering::Relaxed);
+        self.wire_dropped_rx_count.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// Encapsulates transport-level concerns: QUIC connections, peer registry,
@@ -1846,6 +1892,8 @@ impl TransportHandle {
                 channel_id
             );
         } else {
+            // V2-834: itemise what was attempted but not confirmed sent.
+            self.traffic.record_failed_tx(message_data.len() as u64);
             warn!("Failed to send message to channel {}", channel_id);
             // Clean up the optimistic active_connections entry so stale
             // entries don't accumulate for unknown channels.
@@ -2407,6 +2455,7 @@ impl TransportHandle {
         // routing to the other healthy shards. The dispatcher only exits
         // when its upstream channel closes (i.e. transport shutdown).
         let drop_counter = Arc::new(AtomicU64::new(0));
+        let dispatcher_traffic = Arc::clone(&self.traffic);
         handles.push(tokio::spawn(async move {
             info!(
                 "Message dispatcher loop started (sharded across {} consumers)",
@@ -2416,7 +2465,8 @@ impl TransportHandle {
                 let shard_idx = shard_index_for_addr(&from_addr);
                 match shard_txs[shard_idx].try_send((from_addr, bytes)) {
                     Ok(()) => {}
-                    Err(tokio::sync::mpsc::error::TrySendError::Full(_dropped)) => {
+                    Err(tokio::sync::mpsc::error::TrySendError::Full((_, dropped))) => {
+                        dispatcher_traffic.record_dropped_rx(dropped.len() as u64);
                         // Backpressure: this shard is overloaded. Drop the
                         // message rather than blocking the dispatcher and
                         // starving the other shards. Per-shard ordering for
@@ -2432,7 +2482,8 @@ impl TransportHandle {
                             );
                         }
                     }
-                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_dropped)) => {
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed((_, dropped))) => {
+                        dispatcher_traffic.record_dropped_rx(dropped.len() as u64);
                         // Shard consumer task has exited (likely panic).
                         // Drop this message but keep routing to the other
                         // shards — fault isolation, not cascade failure.
@@ -2606,6 +2657,9 @@ impl TransportHandle {
                     broadcast_event(&event_tx, event);
                 }
                 None => {
+                    // V2-834: decode failure or ML-DSA verify failure (both
+                    // collapse to `None` in `parse_protocol_message`).
+                    traffic.record_rejected_rx(bytes.len() as u64);
                     warn!(
                         shard = shard_idx,
                         "Failed to parse protocol message ({} bytes)",
@@ -2795,6 +2849,7 @@ impl TransportHandle {
                                                 .send_to_peer_optimized(&remote_address, &announce_bytes)
                                                 .await
                                             {
+                                                traffic.record_failed_tx(announce_len);
                                                 if e
                                                     .downcast_ref::<saorsa_transport::p2p_endpoint::EndpointError>()
                                                     .is_some_and(|error| matches!(
