@@ -2005,6 +2005,15 @@ impl DhtNetworkManager {
                                 t.identity_announce_tx_bytes.load(Ordering::Relaxed),
                             identity_announce_tx_count =
                                 t.identity_announce_tx_count.load(Ordering::Relaxed),
+                            // V2-834: failure branches so tx/rx sum by construction.
+                            wire_failed_tx_bytes = t.wire_failed_tx_bytes.load(Ordering::Relaxed),
+                            wire_failed_tx_count = t.wire_failed_tx_count.load(Ordering::Relaxed),
+                            wire_rejected_rx_bytes =
+                                t.wire_rejected_rx_bytes.load(Ordering::Relaxed),
+                            wire_rejected_rx_count =
+                                t.wire_rejected_rx_count.load(Ordering::Relaxed),
+                            wire_dropped_rx_bytes = t.wire_dropped_rx_bytes.load(Ordering::Relaxed),
+                            wire_dropped_rx_count = t.wire_dropped_rx_count.load(Ordering::Relaxed),
                             "wire traffic summary (cumulative)"
                         );
                     }
