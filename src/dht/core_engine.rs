@@ -1,11 +1,21 @@
+// Copyright 2024 Saorsa Labs Limited
+//
+// This software is licensed under the MIT license <LICENSE-MIT or
+// https://opensource.org/licenses/MIT> or the Apache License, Version 2.0
+// <LICENSE-APACHE or https://www.apache.org/licenses/LICENSE-2.0>, at your
+// option. This file may not be copied, modified, or distributed except
+// according to those terms.
+
 //! DHT Core Engine with Kademlia routing
 //!
 //! Provides peer discovery and routing via a Kademlia DHT with k=8 buckets,
 //! trust-weighted peer selection, and security-hardened maintenance tasks.
 
 use crate::PeerId;
-use crate::address::{MultiAddr, is_lan_ip};
+use crate::address::MultiAddr;
 use crate::security::{IP_EXACT_LIMIT, IPDiversityConfig, canonicalize_ip, ip_subnet_limit};
+use crate::signed_address::VerifiedAddressRecord;
+use crate::transport_address::TransportAddressRecord;
 use anyhow::{Result, anyhow};
 use parking_lot::Mutex as PlMutex;
 use serde::{Deserialize, Serialize};
@@ -104,64 +114,11 @@ fn xor_distance_bytes(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
 /// Maximum addresses stored per node to prevent memory exhaustion.
 /// This cap is the last-line guard; in normal operation the per-IP-family
 /// cap ([`NodeInfo::enforce_per_ip_family_cap`]) holds each external peer
-/// to at most 2 IP addresses per family. Non-IP transports (Bluetooth,
+/// to at most 3 IP addresses per family. Non-IP transports (Bluetooth,
 /// LoRa) are outside the per-family cap and rely on this bound.
 const MAX_ADDRESSES_PER_NODE: usize = 8;
 
-/// Address classification for priority ordering and staleness eviction.
-///
-/// Priority: Relay > Direct > Unverified > Lan. The `merge_typed_address`
-/// method uses this for insertion ordering and the eviction of excess
-/// `Lan` / `Unverified` entries.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum AddressType {
-    /// Address through a MASQUE relay server (always reachable)
-    Relay,
-    /// Direct public IP address verified reachable without NAT traversal
-    Direct,
-    /// Self-published observed external address whose reachability has not
-    /// been confirmed by the local classifier. Published by cold-start nodes
-    /// that have not yet accepted an unsolicited inbound handshake and have
-    /// not yet acquired a relay. Dialers try these after Relay/Direct and
-    /// before LAN-only fallback
-    /// and must accept the possibility of a timeout.
-    Unverified,
-    /// LAN or other local-scope address. This reuses the old `NATted`
-    /// variant slot for wire compatibility with older nodes.
-    #[serde(alias = "NATted")]
-    Lan,
-}
-
-impl AddressType {
-    /// Priority index for ordering addresses by type. Lower is preferred.
-    ///
-    /// Relay (0) → Direct (1) → Unverified (2) → Lan (3).
-    ///
-    /// Used by [`NodeInfo::merge_typed_address`], [`KBucket::replace_node_addresses`],
-    /// [`DHTNode::addresses_by_priority`], and [`DhtNetworkManager::dialable_addresses_typed`]
-    /// to maintain a consistent ordering invariant.
-    pub const fn priority(self) -> u8 {
-        match self {
-            Self::Relay => 0,
-            Self::Direct => 1,
-            Self::Unverified => 2,
-            Self::Lan => 3,
-        }
-    }
-
-    /// Canonicalize an advertised type against the address itself.
-    ///
-    /// A local-scope IP address is never accepted as Relay, Direct, or
-    /// Unverified, even if that is what a peer advertised. It may still be
-    /// stored as [`AddressType::Lan`] so same-LAN/same-WAN peers can use it.
-    pub(crate) fn for_advertised_address(addr: &MultiAddr, advertised: Self) -> Self {
-        if addr.ip().is_some_and(is_lan_ip) {
-            Self::Lan
-        } else {
-            advertised
-        }
-    }
-}
+pub use crate::peer_record::AddressType;
 
 /// Whether `addr` is worth storing in a peer's address record.
 ///
@@ -184,10 +141,7 @@ impl AddressType {
 /// store loopback addresses, and the per-node `allow_loopback` config lives
 /// at [`DhtCoreEngine::replace_node_addresses`].
 pub(crate) fn is_storable_address(addr: &MultiAddr) -> bool {
-    let Some(sa) = addr.socket_addr() else {
-        return true;
-    };
-    !sa.ip().is_unspecified() && sa.port() != 0
+    addr.is_storable()
 }
 
 /// Convenience alias for the internal callers that predate the method form.
@@ -388,7 +342,6 @@ impl NodeInfo {
     /// same-family tier (Direct) — they add no useful WAN dial option once
     /// the stronger one is known. A dual-stack peer may therefore hold
     /// up to 6 IP addresses (3 per family).
-    ///
     /// Non-IP transport addresses (Bluetooth, LoRa) are left alone — they
     /// have no IP family and are governed only by [`MAX_ADDRESSES_PER_NODE`].
     ///
@@ -524,7 +477,7 @@ pub(crate) struct BucketRefreshCandidate {
 }
 
 #[derive(Debug, Clone, Copy)]
-enum AddressReplaceMode {
+pub(crate) enum AddressReplaceMode {
     /// The subject peer sent the address set over an authenticated channel.
     /// This proves liveness, so the peer and bucket recency are refreshed.
     AuthenticatedSelfPublish,
@@ -872,7 +825,7 @@ impl KBucket {
         // If filtering emptied a non-empty input (publisher sent only
         // wildcards or other non-storable addresses), refuse the replace
         // entirely. The caller (KademliaRoutingTable::replace_node_addresses_with_mode)
-        // gates `last_publish_seqs` on this return value, so refusing here
+        // gates `address_publications` on this return value, so refusing here
         // preserves the peer's prior good addresses AND leaves the door
         // open for a subsequent CORRECT publish at the same sequence number
         // to land. Without this guard we would (a) wipe a working address
@@ -909,17 +862,33 @@ impl KBucket {
     }
 }
 
+/// Full transport publication retained for an admitted routing peer.
+/// The proof remains unchanged for forwarding; records are the filtered local view.
+#[derive(Debug, Clone)]
+pub(crate) struct TransportAddressSet {
+    pub(crate) seq: u64,
+    pub(crate) records: Vec<TransportAddressRecord>,
+    pub(crate) proof: Option<VerifiedAddressRecord>,
+}
+
+#[derive(Debug, Default)]
+struct AddressPublication {
+    // Sequence of the native address projection (legacy V1 compatibility).
+    seq: u64,
+    transport: Option<Arc<TransportAddressSet>>,
+}
+
 /// Kademlia routing table
 pub struct KademliaRoutingTable {
     buckets: Vec<KBucket>,
     node_id: PeerId,
-    /// Highest `PublishAddressSet` sequence number received from each peer.
+    /// Publication sequence and complete transport record for each admitted peer.
     ///
     /// Republishes with a lower-or-equal sequence than the stored value are
     /// discarded to close the "relay-lost → relay-acquired" reorder race.
     /// Stored alongside the routing table so the sequence check and the
     /// address replacement are atomic under the same write lock.
-    last_publish_seqs: HashMap<PeerId, u64>,
+    address_publications: HashMap<PeerId, AddressPublication>,
 }
 
 impl KademliaRoutingTable {
@@ -932,11 +901,15 @@ impl KademliaRoutingTable {
         Self {
             buckets,
             node_id,
-            last_publish_seqs: HashMap::new(),
+            address_publications: HashMap::new(),
         }
     }
 
     fn add_node(&mut self, node: NodeInfo) -> Result<()> {
+        if self.has_address_publication(&node.id) {
+            self.touch_node(&node.id, None, AddressType::Unverified);
+            return Ok(());
+        }
         let bucket_index = self
             .get_bucket_index(&node.id)
             .ok_or_else(|| anyhow!("cannot insert self into routing table"))?;
@@ -947,11 +920,69 @@ impl KademliaRoutingTable {
         if let Some(bucket_index) = self.get_bucket_index(node_id) {
             self.buckets[bucket_index].remove_node(node_id);
         }
-        self.last_publish_seqs.remove(node_id);
+        self.address_publications.remove(node_id);
     }
 
     fn publish_seq_for(&self, node_id: &PeerId) -> u64 {
-        self.last_publish_seqs.get(node_id).copied().unwrap_or(0)
+        self.address_publications
+            .get(node_id)
+            .map_or(0, |stored| stored.seq)
+    }
+
+    /// Connection observations may refresh liveness, but only a newer owner
+    /// publication may change an authoritative address snapshot.
+    fn has_address_publication(&self, node_id: &PeerId) -> bool {
+        self.publish_seq_for(node_id) != 0 || self.transport_address_set(node_id).is_some()
+    }
+
+    fn transport_address_set(&self, node_id: &PeerId) -> Option<&Arc<TransportAddressSet>> {
+        self.address_publications.get(node_id)?.transport.as_ref()
+    }
+
+    fn store_transport_address_set(
+        &mut self,
+        node_id: &PeerId,
+        mut set: TransportAddressSet,
+        native: Vec<(MultiAddr, AddressType)>,
+        mode: AddressReplaceMode,
+    ) -> bool {
+        let Some(index) = self.get_bucket_index(node_id) else {
+            return false;
+        };
+        if set.seq == 0
+            || self
+                .transport_address_set(node_id)
+                .is_some_and(|old| set.seq <= old.seq)
+        {
+            return false;
+        }
+        // V2 owns the whole address view. Ignore the previous V1 sequence,
+        // including equal/conflicting V1 records. An empty QUIC projection is
+        // valid for a nonempty publication containing only other transports.
+        if !self.buckets[index].replace_node_addresses_with_mode(node_id, native, mode) {
+            return false;
+        }
+        let Some(node) = self.buckets[index]
+            .nodes
+            .iter()
+            .find(|node| &node.id == node_id)
+        else {
+            return false;
+        };
+        // Keep local caps in sync with the native projection while forwarding
+        // the original owner proof unchanged.
+        set.records.retain(|record| {
+            record.transport != crate::KnownTransport::Quic.id()
+                || record
+                    .decode_known()
+                    .ok()
+                    .flatten()
+                    .is_some_and(|address| node.addresses.contains(&address))
+        });
+        let publication = self.address_publications.entry(*node_id).or_default();
+        publication.seq = set.seq;
+        publication.transport = Some(Arc::new(set));
+        true
     }
 
     /// Merge a legacy relay hint only while the peer has no authoritative
@@ -966,7 +997,7 @@ impl KademliaRoutingTable {
         node_id: &PeerId,
         address: &MultiAddr,
     ) -> bool {
-        if self.publish_seq_for(node_id) != 0 {
+        if self.publish_seq_for(node_id) != 0 || self.transport_address_set(node_id).is_some() {
             return false;
         }
         self.touch_node(node_id, Some(address), AddressType::Relay)
@@ -1026,8 +1057,8 @@ impl KademliaRoutingTable {
             return false;
         }
 
-        if let Some(&stored) = self.last_publish_seqs.get(node_id)
-            && seq <= stored
+        if let Some(stored) = self.address_publications.get(node_id)
+            && (stored.transport.is_some() || seq <= stored.seq)
         {
             return false;
         }
@@ -1044,19 +1075,22 @@ impl KademliaRoutingTable {
                 .replace_node_addresses_from_gossip(node_id, typed_addresses),
         };
         if applied {
-            self.last_publish_seqs.insert(*node_id, seq);
+            // V1 is accepted only until the first V2 publication is stored.
+            self.address_publications.entry(*node_id).or_default().seq = seq;
         }
         applied
     }
 
     /// Update `last_seen` (and optionally merge a typed address) for a node and
     /// move it to the tail of its k-bucket. Returns `true` if the node was found.
+    /// Once an owner publication is stored, observations only refresh liveness.
     fn touch_node(
         &mut self,
         node_id: &PeerId,
         address: Option<&MultiAddr>,
         addr_type: AddressType,
     ) -> bool {
+        let address = address.filter(|_| !self.has_address_publication(node_id));
         match self.get_bucket_index(node_id) {
             Some(bucket_index) => {
                 self.buckets[bucket_index].touch_node_typed(node_id, address, addr_type)
@@ -1080,6 +1114,9 @@ impl KademliaRoutingTable {
         address: &MultiAddr,
         addr_type: AddressType,
     ) -> bool {
+        if self.has_address_publication(node_id) {
+            return false;
+        }
         match self.get_bucket_index(node_id) {
             Some(bucket_index) => self.buckets[bucket_index]
                 .merge_typed_address_upgrade_only(node_id, address, addr_type),
@@ -1105,6 +1142,7 @@ impl KademliaRoutingTable {
         address: Option<&MultiAddr>,
         addr_type: AddressType,
     ) -> Option<bool> {
+        let address = address.filter(|_| !self.has_address_publication(node_id));
         let bucket_index = self.get_bucket_index(node_id)?;
         self.buckets[bucket_index].touch_last_seen_if_merge_noop(node_id, address, addr_type)
     }
@@ -1283,7 +1321,7 @@ fn mask_ipv6(addr: Ipv6Addr, prefix_len: u8) -> Ipv6Addr {
 /// Default K parameter — number of closest nodes per bucket.
 /// Used only by test helpers; production code reads from config.
 #[cfg(test)]
-const DEFAULT_K: usize = 20;
+const DEFAULT_K: usize = crate::dht_lookup::DEFAULT_K_VALUE;
 
 // IP_EXACT_LIMIT and ip_subnet_limit are imported from crate::security
 // to keep a single source of truth for diversity constants.
@@ -1657,6 +1695,43 @@ impl DhtCoreEngine {
         Ok(routing.find_closest_nodes_with_publish_seq(key, count))
     }
 
+    /// Latest authoritative address-set sequence known for `node_id`.
+    pub async fn publish_seq_for_node(&self, node_id: &PeerId) -> u64 {
+        self.routing_table.read().await.publish_seq_for(node_id)
+    }
+
+    /// Complete publication for an admitted peer, with its original owner proof.
+    pub(crate) async fn transport_address_set(
+        &self,
+        node_id: &PeerId,
+    ) -> Option<Arc<TransportAddressSet>> {
+        self.routing_table
+            .read()
+            .await
+            .transport_address_set(node_id)
+            .cloned()
+    }
+
+    /// Retain a publication only for an existing routing peer. Removal of that
+    /// peer also removes its publication; discovery alone never admits an owner.
+    pub(crate) async fn store_transport_address_set(
+        &self,
+        node_id: &PeerId,
+        set: TransportAddressSet,
+        native: Vec<(MultiAddr, AddressType)>,
+        authoritative: bool,
+    ) -> bool {
+        let mode = if authoritative {
+            AddressReplaceMode::AuthenticatedSelfPublish
+        } else {
+            AddressReplaceMode::GossipedRecord
+        };
+        self.routing_table
+            .write()
+            .await
+            .store_transport_address_set(node_id, set, native, mode)
+    }
+
     /// Find nodes closest to a key, including self as a candidate.
     /// Used by consumers for storage responsibility determination.
     #[allow(dead_code)]
@@ -1799,6 +1874,8 @@ impl DhtCoreEngine {
     }
 
     /// Touch a peer's routing-table entry with an optional typed address.
+    /// After an owner publication, only liveness is updated; the published
+    /// address snapshot remains unchanged until a newer publication arrives.
     ///
     /// **Fast path (read lock + atomic store):** If the peer is in the
     /// routing table and the address merge would be a no-op (address is
@@ -1820,9 +1897,11 @@ impl DhtCoreEngine {
         address: Option<&MultiAddr>,
         addr_type: AddressType,
     ) -> bool {
-        // Fast path: read lock + atomic last_seen store. The fast path
-        // ALSO requires the address (if any) to already be present with
-        // the same type classification — see `touch_last_seen_if_merge_noop`.
+        // Fast path: read lock + atomic last_seen store. For unsequenced peers,
+        // the address (if any) must already be present with the same type
+        // classification — see `touch_last_seen_if_merge_noop`. Observations
+        // cannot mutate an authoritative publication, so those are always no-op
+        // address merges.
         // Promotion of an existing address from one classification to
         // another (e.g. Direct → Relay) is intentionally pushed to the
         // slow path so the bucket-level `merge_typed_address` can re-order.
@@ -1915,18 +1994,18 @@ impl DhtCoreEngine {
     ///     if stripping loopback empties a non-empty input, the **empty set
     ///     is still applied**. A publisher that legitimately drops to zero
     ///     reachable addresses must not keep stale ones alive, and
-    ///     `last_publish_seqs` advances normally.
+    ///     `address_publications` advances normally.
     ///   - *Wildcard / port-zero* ([`KBucket::replace_node_addresses_with_mode`]
     ///     via `is_storable_address`): if this empties a non-empty input the
     ///     replace is **refused** — prior good addresses are preserved and
-    ///     `last_publish_seqs` is NOT advanced, so a corrected republish at
+    ///     `address_publications` is NOT advanced, so a corrected republish at
     ///     the same `seq` can still land. Wildcard-only is treated as a
     ///     malformed publish, not an intentional "I have no addresses", so
     ///     callers and tests must not assume all filter-empty publishes
     ///     share the same outcome.
     /// - `seq` must be non-zero and strictly exceed the last sequence
     ///   observed from `node_id`; zero, older, or duplicate sequences are
-    ///   ignored.
+    ///   ignored. Once a V2 publication is stored, all V1 replacements are ignored.
     ///
     /// Returns `true` when the peer's addresses were replaced, `false`
     /// otherwise (peer absent, stale sequence, empty input list, or a
@@ -2391,32 +2470,15 @@ impl DhtCoreEngine {
         // The update path doesn't change membership, just position within a bucket.
         // K-closest computation is distance-based, not position-based, so the set
         // won't change. Return an empty events vec.
-        if let Some(pos) = routing.buckets[bucket_idx]
+        if routing.buckets[bucket_idx]
             .nodes
             .iter()
-            .position(|n| n.id == node.id)
+            .any(|n| n.id == node.id)
         {
-            let existing = &mut routing.buckets[bucket_idx].nodes[pos];
-            existing.last_seen.store_now();
-            // Merge each address from the candidate, respecting loopback injection prevention
+            routing.touch_node(&peer_id, None, AddressType::Unverified);
             for (i, addr) in node.addresses.iter().enumerate() {
-                let addr_is_loopback = addr
-                    .ip()
-                    .is_some_and(|ip| canonicalize_ip(ip).is_loopback());
-                let existing_has_non_loopback = existing
-                    .addresses
-                    .iter()
-                    .any(|a| a.ip().is_some_and(|ip| !canonicalize_ip(ip).is_loopback()));
-                // Don't merge loopback addresses into a non-loopback-admitted peer
-                if addr_is_loopback && existing_has_non_loopback {
-                    continue;
-                }
-                existing.merge_typed_address(addr.clone(), node.address_type_at(i));
+                routing.touch_node(&peer_id, Some(addr), node.address_type_at(i));
             }
-            // Move to tail (most recently seen)
-            let updated = routing.buckets[bucket_idx].nodes.remove(pos);
-            routing.buckets[bucket_idx].nodes.push(updated);
-            routing.buckets[bucket_idx].last_refreshed_by_live_peer = Instant::now();
             return Ok(AdmissionResult::Admitted(Vec::new()));
         }
 
@@ -3188,6 +3250,59 @@ mod tests {
     }
 
     #[test]
+    fn owner_publications_survive_observations_while_liveness_and_new_publications_advance() {
+        let mut table = KademliaRoutingTable::new(PeerId::from_bytes([0; 32]), 8);
+        let peer = PeerId::from_bytes([1; 32]);
+        let observed = make_node(1, "/ip4/1.1.1.1/udp/9000/quic");
+        table.add_node(observed.clone()).unwrap();
+        let published = vec![(
+            "/ip4/9.9.9.9/udp/9000/quic".parse().unwrap(),
+            AddressType::Direct,
+        )];
+        assert!(table.replace_node_addresses(&peer, published.clone(), 20));
+        let index = table.get_bucket_index(&peer).unwrap();
+        let old = Instant::now() - Duration::from_secs(3600);
+        table.buckets[index]
+            .find_node(&peer)
+            .unwrap()
+            .last_seen
+            .store(old);
+        // Fast touches, slow touches, gossip and re-insertion share the same
+        // publication invariant, while an actual interaction proves liveness.
+        assert_eq!(
+            table.try_touch_last_seen(&peer, observed.addresses.first(), AddressType::Unverified),
+            Some(true)
+        );
+        assert!(
+            table.buckets[index]
+                .find_node(&peer)
+                .unwrap()
+                .last_seen
+                .load()
+                > old
+        );
+        assert!(table.touch_node(&peer, observed.addresses.first(), AddressType::Relay));
+        assert!(!table.merge_typed_address_upgrade_only(
+            &peer,
+            &observed.addresses[0],
+            AddressType::Direct
+        ));
+        table.add_node(observed).unwrap();
+        let node = table.buckets[index].find_node(&peer).unwrap();
+        assert_eq!(node.addresses, vec![published[0].0.clone()]);
+        assert_eq!(node.address_types, vec![AddressType::Direct]);
+        let replacement = vec![(
+            "/ip4/8.8.8.8/udp/9000/quic".parse().unwrap(),
+            AddressType::Relay,
+        )];
+        assert!(table.replace_node_addresses(&peer, replacement.clone(), 21));
+        assert_eq!(
+            table.buckets[index].find_node(&peer).unwrap().addresses,
+            vec![replacement[0].0.clone()]
+        );
+    }
+
+    #[test]
     fn replace_addresses_from_gossip_does_not_refresh_liveness() {
         let local_id = PeerId::from_bytes([0u8; 32]);
         let mut table = KademliaRoutingTable::new(local_id, 8);
@@ -3254,7 +3369,7 @@ mod tests {
         assert!(table.replace_node_addresses(&peer, typed.clone(), 100));
 
         table.remove_node(&peer);
-        assert!(!table.last_publish_seqs.contains_key(&peer));
+        assert!(!table.address_publications.contains_key(&peer));
 
         // Re-add and verify the seq counter was cleared (lower seq now accepted).
         table
@@ -4919,6 +5034,17 @@ mod tests {
         assert!(AddressType::Relay.priority() < AddressType::Direct.priority());
         assert!(AddressType::Direct.priority() < AddressType::Unverified.priority());
         assert!(AddressType::Unverified.priority() < AddressType::Lan.priority());
+    }
+
+    #[test]
+    fn legacy_address_type_postcard_discriminants_remain_unchanged() {
+        assert_eq!(postcard::to_stdvec(&AddressType::Relay).unwrap(), vec![0]);
+        assert_eq!(postcard::to_stdvec(&AddressType::Direct).unwrap(), vec![1]);
+        assert_eq!(
+            postcard::to_stdvec(&AddressType::Unverified).unwrap(),
+            vec![2]
+        );
+        assert_eq!(postcard::to_stdvec(&AddressType::Lan).unwrap(), vec![3]);
     }
 
     #[test]

@@ -47,6 +47,10 @@ use crate::MultiAddr;
 use crate::address::is_lan_ip;
 use crate::dht::AddressType;
 
+/// One relay, one WAN endpoint per IP family, and one LAN endpoint per family.
+/// Supplemental transport registration reserves this many native record slots.
+pub(crate) const MAX_SELF_QUIC_ADDRESSES: usize = 5;
+
 pub(crate) fn build_self_address_set<F>(
     observed: impl IntoIterator<Item = SocketAddr>,
     listen: impl IntoIterator<Item = MultiAddr>,
@@ -111,14 +115,6 @@ pub(crate) struct SelfAddressSet {
 }
 
 impl SelfAddressSet {
-    pub(crate) fn is_empty(&self) -> bool {
-        self.relay.is_none()
-            && self.wan_v4.is_none()
-            && self.wan_v6.is_none()
-            && self.lan_v4.is_none()
-            && self.lan_v6.is_none()
-    }
-
     pub(crate) fn into_typed_vec(self) -> Vec<(MultiAddr, AddressType)> {
         let mut typed = Vec::with_capacity(self.len());
         if let Some(relay) = self.relay {
@@ -130,6 +126,7 @@ impl SelfAddressSet {
         typed
     }
 
+    #[cfg(test)]
     pub(crate) fn into_parallel_vecs(self) -> (Vec<MultiAddr>, Vec<AddressType>) {
         let mut addresses = Vec::with_capacity(self.len());
         let mut address_types = Vec::with_capacity(self.len());
