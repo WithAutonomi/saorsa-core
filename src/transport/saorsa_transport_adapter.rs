@@ -561,6 +561,14 @@ impl P2PNetworkNode<P2pLinkTransport> {
         // restarts (ADR-011). Without it the endpoint generates a fresh keypair
         // each process start.
         if let Some((public_key, secret_key)) = keypair {
+            let public_key = saorsa_transport::crypto::pqc::types::MlDsaPublicKey::from_bytes(
+                public_key.as_bytes(),
+            )
+            .map_err(|e| anyhow::anyhow!("Invalid transport public key: {e}"))?;
+            let secret_key = saorsa_transport::crypto::pqc::types::MlDsaSecretKey::from_bytes(
+                secret_key.as_bytes(),
+            )
+            .map_err(|e| anyhow::anyhow!("Invalid transport secret key: {e}"))?;
             builder = builder.keypair(public_key, secret_key);
         }
         let config = builder

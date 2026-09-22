@@ -44,6 +44,7 @@ An Architecture Decision Record (ADR) is a document that captures an important a
 | [ADR-008](./ADR-008-bootstrap-delegation.md) | Bootstrap Peer Discovery Scope | Superseded | Historical peer discovery design replaced by configured peers plus DHT discovery |
 | [ADR-016](./ADR-016-close-group-cache-validity.md) | Age-Bounded, Periodically Refreshed Close-Group Cache | Proposed | Bound persisted close-group age and refresh it safely during normal running |
 | [ADR-017](./ADR-017-routing-table-snapshot-across-restart.md) | Persist the Whole Routing Table Across a Restart | Proposed | Restore every bucket as dial candidates so a restarted node stops claiming most of the keyspace |
+| [ADR-021](./ADR-021-transport-independent-iterative-lookups.md) | Transport-independent iterative lookups | Accepted | Shared Kademlia walk for native and browser clients |
 
 ### Messaging
 
@@ -57,6 +58,7 @@ An Architecture Decision Record (ADR) is a document that captures an important a
 |-----|-------|--------|---------|
 | [ADR-014](./ADR-014-proactive-relay-first-nat-traversal.md) | Proactive Relay-First NAT Traversal | Superseded | Initial proactive-relay design replaced by canary-gated publication |
 | [ADR-016](./ADR-016-canary-gated-proactive-relays.md) | Canary-Gated Proactive Relays | Accepted | Signed allocation receipts, isolated witnesses, stable relay lifecycle, and sequenced publication |
+| [ADR-020](./ADR-020-owner-signed-address-publication-v2.md) | Owner-signed Address Publication V2 | Accepted | Non-expiring QUIC and WebRTC publications, independent V1/V2 replacement, reconnect precedence, and QUIC-only persistence |
 
 ### Operations
 
