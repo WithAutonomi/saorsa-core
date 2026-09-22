@@ -42,6 +42,7 @@ use crate::error::{GeoRejectionError, GeographicConfig};
 use crate::security::canonicalize_ip;
 use crate::transport::external_addresses::ExternalAddresses;
 use anyhow::{Context, Result};
+use bytes::Bytes;
 use dashmap::{DashMap, DashSet};
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr, SocketAddrV6};
@@ -633,6 +634,22 @@ impl P2PNetworkNode<P2pLinkTransport> {
             .send(addr, data)
             .await
             .with_context(|| format!("QUIC send to {} ({} bytes) failed", addr, data.len()))
+    }
+
+    /// Like [`send_to_peer_optimized`](Self::send_to_peer_optimized), but hands
+    /// the owned buffer to the QUIC stream instead of copying it, so a large
+    /// frame is held once for the duration of the transfer.
+    pub async fn send_bytes_to_peer_optimized(&self, addr: &SocketAddr, data: Bytes) -> Result<()> {
+        let len = data.len();
+        trace!(
+            "[QUIC SEND] endpoint().send_bytes() to {} ({} bytes)",
+            addr, len
+        );
+        self.transport
+            .endpoint()
+            .send_bytes(addr, data)
+            .await
+            .with_context(|| format!("QUIC send to {} ({} bytes) failed", addr, len))
     }
 
     /// Disconnect a specific peer, closing the underlying QUIC connection.
@@ -2031,6 +2048,38 @@ impl DualStackNetworkNode<P2pLinkTransport> {
                 });
         }
 
+        // Neither stack can take this target. This is unreachable on a
+        // correctly-configured dual-stack node but guarded for safety.
+        self.unroutable(addr)
+    }
+
+    /// Owned-buffer variant of [`send_to_peer_optimized`](Self::send_to_peer_optimized)
+    /// with the same address-family routing rules.
+    pub async fn send_bytes_to_peer_optimized(&self, addr: &SocketAddr, data: Bytes) -> Result<()> {
+        if addr.is_ipv4()
+            && let Some(v4) = &self.v4
+        {
+            return v4
+                .send_bytes_to_peer_optimized(addr, data)
+                .await
+                .map_err(|e| e.context(format!("IPv4 send to {} failed", addr)));
+        }
+
+        if let Some(v6) = &self.v6 {
+            let wire_addr = self.to_mapped_if_needed(addr);
+            return v6
+                .send_bytes_to_peer_optimized(&wire_addr, data)
+                .await
+                .map_err(|e| {
+                    e.context(format!("IPv6 send to {} (wire {}) failed", addr, wire_addr))
+                });
+        }
+
+        self.unroutable(addr)
+    }
+
+    /// Error for a target neither bound stack can reach.
+    fn unroutable(&self, addr: &SocketAddr) -> Result<()> {
         // Neither stack can take this target. This is unreachable on a
         // correctly-configured dual-stack node but guarded for safety.
         Err(anyhow::anyhow!(
