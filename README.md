@@ -34,7 +34,7 @@ Key design decisions are documented in [docs/adr/](docs/adr/):
 - **DHT (Distributed Hash Table)**: Peer phonebook and routing with geographic awareness
 - **QUIC Transport**: High-performance networking with saorsa-transport
 - **Post-Quantum Cryptography**: Future-ready cryptographic algorithms (ML-DSA-65, ML-KEM-768)
-- **Trust System**: Response-rate scoring with time decay and binary peer blocking
+- **Trust System**: Response-rate scoring with time decay, lazy swap-out, and close-group quarantine
 
 ## Quick Start
 
@@ -80,7 +80,7 @@ saorsa-core does **not** replicate application data. saorsa-node:
 
 1. **Network Layer**: QUIC-based P2P networking with automatic NAT traversal (saorsa-transport 0.26)
 2. **DHT**: Kademlia-based peer phonebook with geographic awareness
-3. **Trust System**: Response-rate scoring with time decay and binary peer blocking
+3. **Trust System**: Response-rate scoring with time decay, lazy swap-out, and close-group quarantine
 
 ### Cryptographic Architecture
 
@@ -159,11 +159,11 @@ Saorsa Core implements defense-in-depth security designed for adversarial decent
 
 | Protection | Implementation |
 |------------|----------------|
-| **Node Monitoring** | Automatic eviction after 3 consecutive failures |
+| **Node Monitoring** | Trust-score quarantine for bad close-group peers |
 | **Reputation System** | Response-rate scoring with time decay |
 | **Sybil Resistance** | IP diversity limits (/64: 1, /48: 3, /32: 10, ASN: 20) |
 | **Geographic Diversity** | Regional diversity in routing |
-| **Routing Validation** | Trust-based peer blocking and eviction |
+| **Routing Validation** | Trust-based swap-out and close-group quarantine |
 
 ### Anti-Centralization
 
