@@ -1805,8 +1805,9 @@ impl TransportHandle {
 
         let raw_data_len = data.len();
         let message_data = self.create_protocol_message(protocol, &data)?;
-        // The payload is framed now; drop our handle so the frame is the only
-        // copy alive during the transfer.
+        // The payload is framed now; release this function's handle so it
+        // holds nothing but the frame during the transfer. (The caller keeps
+        // its own handle for retries, sharing the same allocation.)
         drop(data);
         let wire_len = message_data.len();
         debug!(
