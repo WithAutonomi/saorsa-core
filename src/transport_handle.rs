@@ -25,8 +25,8 @@ use crate::identity::node_identity::{NodeIdentity, peer_id_from_public_key_spki}
 use crate::network::{
     ConnectionStatus, MAX_ACTIVE_REQUESTS, MAX_REQUEST_TIMEOUT, MESSAGE_RECV_CHANNEL_CAPACITY,
     NetworkSender, P2PEvent, ParsedMessage, PeerInfo, PeerResponse, PendingRequest,
-    RequestResponseEnvelope, WireMessage, broadcast_event, normalize_wildcard_to_loopback,
-    parse_protocol_message, register_new_channel,
+    RequestResponseEnvelope, WireMessage, WireMessageRef, broadcast_event,
+    normalize_wildcard_to_loopback, parse_protocol_message, register_new_channel,
 };
 use crate::reachability::{RelaySessionEstablishError, RelaySessionEstablisher};
 use crate::transport::external_addresses::ExternalAddresses;
@@ -35,6 +35,7 @@ use crate::transport::saorsa_transport_adapter::{
 };
 use crate::validation::{RateLimitConfig, RateLimiter};
 
+use bytes::Bytes;
 use dashmap::mapref::entry::Entry as DashEntry;
 use dashmap::{DashMap, DashSet};
 use saorsa_transport::nat_traversal_api::PreparedRelay;
@@ -1687,8 +1688,9 @@ impl TransportHandle {
         &self,
         peer_id: &PeerId,
         protocol: &str,
-        data: Vec<u8>,
+        data: impl Into<Bytes>,
     ) -> Result<()> {
+        let data: Bytes = data.into();
         let peer_hex = peer_id.to_hex();
         let channels: Vec<String> = self
             .peer_to_channel
@@ -1748,8 +1750,9 @@ impl TransportHandle {
         &self,
         channel_id: &str,
         protocol: &str,
-        data: Vec<u8>,
+        data: impl Into<Bytes>,
     ) -> Result<()> {
+        let data: Bytes = data.into();
         debug!(
             "Sending message to channel {} on protocol {}",
             channel_id, protocol
@@ -1801,13 +1804,14 @@ impl TransportHandle {
         }
 
         let raw_data_len = data.len();
-        let message_data = self.create_protocol_message(protocol, data)?;
+        let message_data = self.create_protocol_message(protocol, &data)?;
+        // The payload is framed now; drop our handle so the frame is the only
+        // copy alive during the transfer.
+        drop(data);
+        let wire_len = message_data.len();
         debug!(
             "Sending {} bytes to channel {} on protocol {} (raw data: {} bytes)",
-            message_data.len(),
-            channel_id,
-            protocol,
-            raw_data_len
+            wire_len, channel_id, protocol, raw_data_len
         );
 
         let addr: SocketAddr = channel_id.parse().map_err(|e: std::net::AddrParseError| {
@@ -1817,7 +1821,7 @@ impl TransportHandle {
         })?;
         let send_result = self
             .dual_node
-            .send_to_peer_optimized(&addr, &message_data)
+            .send_bytes_to_peer_optimized(&addr, message_data)
             .await;
         let result = send_result.map_err(|e| {
             let kind = classify_send_error(&e);
@@ -1831,7 +1835,7 @@ impl TransportHandle {
             // V2-623: cumulative wire-traffic accounting. Count only bytes we
             // actually put on the wire. `overhead` is the signature + ML-DSA-65
             // public-key + framing cost (wire − payload).
-            let wire_len = message_data.len() as u64;
+            let wire_len = wire_len as u64;
             let overhead = wire_len.saturating_sub(raw_data_len as u64);
             self.traffic
                 .wire_tx_bytes
@@ -1842,8 +1846,7 @@ impl TransportHandle {
                 .fetch_add(overhead, Ordering::Relaxed);
             debug!(
                 "Successfully sent {} bytes to channel {}",
-                message_data.len(),
-                channel_id
+                wire_len, channel_id
             );
         } else {
             warn!("Failed to send message to channel {}", channel_id);
@@ -2042,21 +2045,41 @@ impl TransportHandle {
 
     /// Create a protocol message wrapper (WireMessage serialized with postcard).
     ///
-    /// Signs the message with the node's ML-DSA-65 key.
-    fn create_protocol_message(&self, protocol: &str, data: Vec<u8>) -> Result<Vec<u8>> {
-        let mut message = WireMessage {
-            protocol: protocol.to_string(),
+    /// Signs the message with the node's ML-DSA-65 key. The payload is only
+    /// borrowed: it is signed and framed in place through [`WireMessageRef`],
+    /// and the frame is serialized into an exactly-sized buffer, so a large
+    /// message costs one allocation of its final size and nothing more.
+    fn create_protocol_message(&self, protocol: &str, data: &[u8]) -> Result<Bytes> {
+        let from = *self.node_identity.peer_id();
+        let timestamp = Self::current_timestamp_secs()?;
+        let signable =
+            Self::compute_signable_bytes(protocol, data, &from, timestamp, &self.user_agent)?;
+        let sig = self.node_identity.sign(&signable).map_err(|e| {
+            P2PError::Network(NetworkError::ProtocolError(
+                format!("Failed to sign message: {e}").into(),
+            ))
+        })?;
+        drop(signable);
+        let message = WireMessageRef {
+            protocol,
             data,
-            from: *self.node_identity.peer_id(),
-            timestamp: Self::current_timestamp_secs()?,
-            user_agent: self.user_agent.clone(),
-            public_key: Vec::new(),
-            signature: Vec::new(),
+            from: &from,
+            timestamp,
+            user_agent: &self.user_agent,
+            public_key: self.node_identity.public_key().as_bytes(),
+            signature: sig.as_bytes(),
         };
-
-        Self::sign_wire_message(&mut message, &self.node_identity)?;
-
-        Self::serialize_wire_message(&message)
+        let size = postcard::experimental::serialized_size(&message).map_err(|e| {
+            P2PError::Transport(crate::error::TransportError::StreamError(
+                format!("Failed to size wire message: {e}").into(),
+            ))
+        })?;
+        let frame = postcard::to_extend(&message, Vec::with_capacity(size)).map_err(|e| {
+            P2PError::Transport(crate::error::TransportError::StreamError(
+                format!("Failed to serialize wire message: {e}").into(),
+            ))
+        })?;
+        Ok(Bytes::from(frame))
     }
 
     /// Build a signed identity announce as serialized bytes (static — no `&self`).
