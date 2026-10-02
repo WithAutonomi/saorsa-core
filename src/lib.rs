@@ -83,6 +83,10 @@ pub mod identity;
 
 // Networking
 pub use address::{MultiAddr, WebRtcCertificateHash, WebRtcDirectAddr};
+/// Payload type accepted by [`P2PNode::send_message`], re-exported so callers
+/// need not depend on the `bytes` crate to name it.
+#[cfg(feature = "native")]
+pub use bytes::Bytes;
 #[cfg(feature = "native")]
 pub use network::{NodeConfig, NodeMode, P2PEvent, P2PNode, PeerRouteKind};
 
