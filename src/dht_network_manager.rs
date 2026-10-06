@@ -1362,12 +1362,26 @@ fn split_witnessed_transcript_views(
     (responder_node_views, missing_responders)
 }
 
+/// Observes a network lookup while it runs.
+///
+/// Callbacks run inline on the lookup task, so they must return quickly and
+/// must not block. They see the same trusted views the lookup itself uses.
+pub trait LookupObserver: Send + Sync {
+    /// FIND_NODE is about to be sent to `node` in round `iteration`.
+    fn on_query(&self, _iteration: usize, _node: &DHTNode) {}
+
+    /// `responder` answered FIND_NODE in round `iteration` with `candidates`,
+    /// its trusted closer peers that the lookup has not contacted yet.
+    fn on_response(&self, _iteration: usize, _responder: &DHTNode, _candidates: &[DHTNode]) {}
+}
+
 struct NativeFindNodeQuery<'a> {
     manager: &'a DhtNetworkManager,
     transcript_view_count: Option<usize>,
     transcript: FindNodeLookupTranscript,
     subject_reports: HashMap<PeerId, SubjectReports>,
     contacted: HashSet<PeerId>,
+    observer: Option<Arc<dyn LookupObserver>>,
 }
 
 impl<'a> NativeFindNodeQuery<'a> {
@@ -1378,7 +1392,13 @@ impl<'a> NativeFindNodeQuery<'a> {
             transcript: FindNodeLookupTranscript::default(),
             subject_reports: HashMap::new(),
             contacted: HashSet::from([manager.config.peer_id]),
+            observer: None,
         }
+    }
+
+    fn with_observer(mut self, observer: Option<Arc<dyn LookupObserver>>) -> Self {
+        self.observer = observer;
+        self
     }
 }
 
@@ -1409,6 +1429,11 @@ impl LookupQuery<DHTNode> for NativeFindNodeQuery<'_> {
         );
 
         self.contacted.extend(batch.iter().map(|node| node.peer_id));
+        if let Some(observer) = &self.observer {
+            for node in &batch {
+                observer.on_query(iteration, node);
+            }
+        }
         let manager = self.manager;
         let results = manager.query_find_node_batch(&batch, target).await;
         let mut outcomes = Vec::with_capacity(results.len());
@@ -1455,6 +1480,12 @@ impl LookupQuery<DHTNode> for NativeFindNodeQuery<'_> {
                         if let Some((_, winner)) = compute_winner(&subject_id, reports) {
                             candidates.push(winner);
                         }
+                    }
+
+                    if let Some(observer) = &self.observer
+                        && let Some(responder) = batch.iter().find(|node| node.peer_id == peer_id)
+                    {
+                        observer.on_response(iteration, responder, &candidates);
                     }
 
                     outcomes.push(LookupQueryOutcome::Succeeded {
@@ -2607,6 +2638,28 @@ impl DhtNetworkManager {
             .closest_nodes)
     }
 
+    /// [`Self::find_closest_nodes_network`], reporting each query and each
+    /// answer to `observer` as the lookup runs.
+    pub async fn find_closest_nodes_observed(
+        &self,
+        key: &Key,
+        count: usize,
+        observer: Arc<dyn LookupObserver>,
+    ) -> Result<Vec<DHTNode>> {
+        Ok(self
+            .find_closest_nodes_network_with_deadline(
+                key,
+                count,
+                None,
+                Some(observer),
+                tokio::time::sleep(Duration::from_secs(u64::from(
+                    crate::dht_lookup::LOOKUP_TIMEOUT_SECS,
+                ))),
+            )
+            .await?
+            .closest_nodes)
+    }
+
     async fn find_closest_nodes_network_with_transcript(
         &self,
         key: &Key,
@@ -2617,6 +2670,7 @@ impl DhtNetworkManager {
             key,
             count,
             transcript_view_count,
+            None,
             tokio::time::sleep(Duration::from_secs(u64::from(
                 crate::dht_lookup::LOOKUP_TIMEOUT_SECS,
             ))),
@@ -2629,6 +2683,7 @@ impl DhtNetworkManager {
         key: &Key,
         count: usize,
         transcript_view_count: Option<usize>,
+        observer: Option<Arc<dyn LookupObserver>>,
         deadline: impl std::future::Future<Output = ()>,
     ) -> Result<FindNodeLookupOutcome> {
         debug!(
@@ -2661,7 +2716,8 @@ impl DhtNetworkManager {
             }
         }
 
-        let mut query = NativeFindNodeQuery::new(self, transcript_view_count);
+        let mut query =
+            NativeFindNodeQuery::new(self, transcript_view_count).with_observer(observer);
         let termination = match run_iterative_lookup(&mut lookup, &mut query, deadline).await {
             Ok(termination) => termination,
             // Preserve the native API's best-effort behavior. The shared runner

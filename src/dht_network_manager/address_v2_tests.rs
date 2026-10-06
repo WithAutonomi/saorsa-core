@@ -523,7 +523,7 @@ async fn native_lookup_deadline_returns_completed_rounds_and_transcript() {
     };
     let lookup = requester
         .dht_manager()
-        .find_closest_nodes_network_with_deadline(&[0; 32], 3, Some(3), async {
+        .find_closest_nodes_network_with_deadline(&[0; 32], 3, Some(3), None, async {
             expired.await.unwrap();
         });
     let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
@@ -557,6 +557,79 @@ async fn native_lookup_deadline_returns_completed_rounds_and_transcript() {
         !matches!(operation.operation, DhtNetworkOperation::FindNode { key } if key == [0; 32])
     }));
     for node in [&requester, &responder, &stalled] {
+        node.stop().await.unwrap();
+    }
+}
+
+#[derive(Default)]
+struct RecordingObserver {
+    queries: Mutex<Vec<(usize, PeerId)>>,
+    responses: Mutex<Vec<(usize, PeerId)>>,
+}
+
+impl LookupObserver for RecordingObserver {
+    fn on_query(&self, iteration: usize, node: &DHTNode) {
+        self.queries.lock().unwrap().push((iteration, node.peer_id));
+    }
+
+    fn on_response(&self, iteration: usize, responder: &DHTNode, _candidates: &[DHTNode]) {
+        self.responses
+            .lock()
+            .unwrap()
+            .push((iteration, responder.peer_id));
+    }
+}
+
+#[tokio::test]
+async fn lookup_observer_sees_each_query_and_answer() {
+    let requester = test_node().await;
+    let responder = test_node().await;
+    for node in [&requester, &responder] {
+        node.dht_manager()
+            .transport
+            .start_network_listeners()
+            .await
+            .unwrap();
+        node.dht_manager().start().await.unwrap();
+    }
+    let responder_address = responder
+        .listen_addrs()
+        .await
+        .into_iter()
+        .find(MultiAddr::is_ipv4)
+        .unwrap();
+    let channel = requester.connect_peer(&responder_address).await.unwrap();
+    requester
+        .wait_for_peer_identity(&channel, Duration::from_secs(2))
+        .await
+        .unwrap();
+    seed_peer(
+        requester.dht_manager(),
+        *responder.peer_id(),
+        &responder_address.to_string(),
+    )
+    .await;
+
+    let observer = Arc::new(RecordingObserver::default());
+    let found = tokio::time::timeout(
+        Duration::from_secs(10),
+        requester
+            .dht_manager()
+            .find_closest_nodes_observed(&[0; 32], 3, observer.clone()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert!(
+        found
+            .iter()
+            .any(|node| node.peer_id == *responder.peer_id())
+    );
+    let first_round = vec![(1, *responder.peer_id())];
+    assert_eq!(*observer.queries.lock().unwrap(), first_round);
+    assert_eq!(*observer.responses.lock().unwrap(), first_round);
+    for node in [&requester, &responder] {
         node.stop().await.unwrap();
     }
 }

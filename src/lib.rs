@@ -96,7 +96,7 @@ pub use dht_lookup::{
 };
 #[cfg(feature = "native")]
 pub use dht_network_manager::{
-    DhtNetworkEvent, RejectedSupplementalAddress, SupplementalAddressRegistration,
+    DhtNetworkEvent, LookupObserver, RejectedSupplementalAddress, SupplementalAddressRegistration,
     SupplementalAddressRejection,
 };
 pub use peer_record::{AddressType, DHTNode, ResponderView, WitnessedCloseGroup};
