@@ -69,6 +69,8 @@ use uuid::Uuid;
 
 #[cfg(test)]
 mod address_v2_tests;
+#[cfg(test)]
+mod closer_peers_tests;
 
 /// Minimum concurrent operations for semaphore backpressure
 const MIN_CONCURRENT_OPERATIONS: usize = 10;
@@ -86,6 +88,9 @@ const MAX_MESSAGE_SIZE: usize = 64 * 1024;
 /// Optional signed-record trailer on the unchanged FIND_NODE response.
 const LOOKUP_EXTENSION_MARKER: &[u8; 8] = b"ADDRSIG1";
 const MAX_LOOKUP_EXTENSION_RECORDS: usize = 256;
+/// Format byte leading an encoded closer-peers payload, so the format can
+/// change without being mistaken for this one.
+const CLOSER_PEERS_FORMAT: u8 = 1;
 
 /// Keep room for the largest native self-address set, including future relay
 /// acquisition and IPv4/IPv6 reachability changes.
@@ -1362,6 +1367,14 @@ fn split_witnessed_transcript_views(
     (responder_node_views, missing_responders)
 }
 
+/// The body of an encoded closer-peers payload: a FIND_NODE answer without
+/// the DHT message around it.
+#[derive(Serialize, Deserialize)]
+struct CloserPeers {
+    key: Key,
+    nodes: Vec<SerializableDHTNode>,
+}
+
 struct NativeFindNodeQuery<'a> {
     manager: &'a DhtNetworkManager,
     transcript_view_count: Option<usize>,
@@ -1466,15 +1479,7 @@ impl LookupQuery<DHTNode> for NativeFindNodeQuery<'_> {
                     result: DhtNetworkResult::PeerRejected,
                     ..
                 }) => {
-                    info!(
-                        "[NETWORK] Peer {} rejected us — removing from routing table",
-                        peer_id.to_hex()
-                    );
-                    let mut dht = manager.dht.write().await;
-                    let rt_events = dht.remove_node_by_id(&peer_id).await;
-                    drop(dht);
-                    manager.broadcast_routing_events(&rt_events);
-                    let _ = manager.transport.disconnect_peer(&peer_id).await;
+                    manager.forget_rejecting_peer(&peer_id).await;
                     outcomes.push(LookupQueryOutcome::Failed {
                         responder: *peer_id.as_bytes(),
                     });
@@ -1590,8 +1595,7 @@ impl DhtNetworkManager {
             hex::encode(key)
         );
 
-        let candidate_nodes = self.find_closest_nodes_local(key, self.k_value()).await;
-        let closer_nodes = Self::filter_response_nodes(candidate_nodes, requester);
+        let closer_nodes = self.find_node_answer(key, requester).await;
 
         // Log addresses being returned in FIND_NODE response
         for node in &closer_nodes {
@@ -1607,6 +1611,184 @@ impl DhtNetworkManager {
             key: *key,
             nodes: closer_nodes,
         })
+    }
+
+    /// The K closest routing-table peers to `key`, without `requester`: what
+    /// this node answers a FIND_NODE with.
+    async fn find_node_answer(&self, key: &Key, requester: &PeerId) -> Vec<DHTNode> {
+        let candidate_nodes = self.find_closest_nodes_local(key, self.k_value()).await;
+        Self::filter_response_nodes(candidate_nodes, requester)
+    }
+
+    /// Encode this node's FIND_NODE answer for `key` to `requester`, for an
+    /// application response that returns closer peers in place of a value
+    /// (Kademlia's FIND_VALUE). [`Self::decode_closer_peers`] reads it.
+    ///
+    /// It holds what a FIND_NODE answer would: the K closest routing-table
+    /// peers other than `requester`, their QUIC addresses, and as many of
+    /// their owner-signed address records as fit the FIND_NODE size limit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the answer cannot be encoded within that limit.
+    pub async fn encode_closer_peers(&self, key: &Key, requester: &PeerId) -> Result<Vec<u8>> {
+        let mut nodes = self.find_node_answer(key, requester).await;
+        let records = Self::split_lookup_publications(&mut nodes);
+        let mut bytes = vec![CLOSER_PEERS_FORMAT];
+        let body = CloserPeers { key: *key, nodes };
+        bytes = postcard::to_extend(&body, bytes)
+            .map_err(|error| P2PError::Serialization(error.to_string().into()))?;
+        if bytes.len() > MAX_MESSAGE_SIZE {
+            return Err(P2PError::Validation(
+                "closer peers exceed the message size limit".into(),
+            ));
+        }
+        Self::append_lookup_extension(&mut bytes, records)?;
+        Ok(bytes)
+    }
+
+    /// Lookup candidates from closer peers that `responder` encoded for `key`
+    /// with [`Self::encode_closer_peers`].
+    ///
+    /// The payload is checked as a FIND_NODE answer from `responder` would
+    /// be:
+    /// - owner-signed address records are verified
+    /// - the responder's own report and locally proven owner views are
+    ///   applied
+    /// - LAN addresses are filtered against `transport_source`
+    /// - peers whose every address is in the dial-failure cache are left out
+    ///
+    /// The caller must have received `payload` from `responder` over an
+    /// authenticated channel. Combining reports from several responders,
+    /// and skipping peers already queried, is left to the caller's lookup.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the payload is not in this format or answers a
+    /// different key.
+    pub async fn decode_closer_peers(
+        &self,
+        responder: &PeerId,
+        key: &Key,
+        payload: &[u8],
+        transport_source: Option<&MultiAddr>,
+    ) -> Result<Vec<DHTNode>> {
+        let Some((&CLOSER_PEERS_FORMAT, body)) = payload.split_first() else {
+            return Err(P2PError::Validation(
+                "unsupported closer-peers format".into(),
+            ));
+        };
+        let (decoded, trailing): (CloserPeers, _) = postcard::take_from_bytes(body)
+            .map_err(|error| P2PError::Serialization(error.to_string().into()))?;
+        if decoded.key != *key {
+            return Err(P2PError::Validation(
+                "closer peers answer a different key".into(),
+            ));
+        }
+        let records = Self::decode_lookup_extension(trailing);
+        let nodes = self
+            .normalize_lookup_answer(decoded.nodes, &records, responder, transport_source)
+            .await;
+        Ok(self
+            .usable_lookup_candidates(nodes, transport_source, key)
+            .await)
+    }
+
+    /// Ask one peer for its closest peers to `key`: one step of a lookup the
+    /// caller drives itself. Returns lookup candidates checked as
+    /// [`Self::decode_closer_peers`] checks them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the peer cannot be reached, does not answer, or
+    /// rejects us. A rejecting peer is removed from the routing table, as in
+    /// a network lookup.
+    pub async fn find_node_on_peer(&self, node: &DHTNode, key: &Key) -> Result<Vec<DHTNode>> {
+        let (peer_id, response) = self
+            .send_find_node_lookup_request(
+                node.peer_id,
+                node.typed_addresses(),
+                DhtNetworkOperation::FindNode { key: *key },
+                self.lookup_failures.subscribe(),
+            )
+            .await;
+        match response? {
+            DhtResponseEnvelope {
+                result: DhtNetworkResult::NodesFound { nodes, .. },
+                transport_source,
+                ..
+            } => {
+                self.merge_trusted_gossiped_typed_addresses(node).await;
+                Ok(self
+                    .usable_lookup_candidates(nodes, transport_source.as_ref(), key)
+                    .await)
+            }
+            DhtResponseEnvelope {
+                result: DhtNetworkResult::PeerRejected,
+                ..
+            } => {
+                self.forget_rejecting_peer(&peer_id).await;
+                Err(P2PError::Network(NetworkError::PeerNotFound(
+                    format!("peer {} rejected the lookup", peer_id.to_hex()).into(),
+                )))
+            }
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    /// Connect to `node` as a lookup query would, so its identity and user
+    /// agent are known before the caller chooses what to send it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no address of `node` can be dialled or its
+    /// identity cannot be confirmed.
+    pub async fn connect_lookup_peer(&self, node: &DHTNode) -> Result<()> {
+        self.ensure_peer_channel(&node.peer_id, &node.typed_addresses())
+            .await
+    }
+
+    /// Whether a lookup may query `node`: it is connected, or not every
+    /// address it would be dialled on is in the dial-failure cache.
+    pub async fn is_lookup_candidate_dialable(&self, node: &DHTNode) -> bool {
+        !self.lookup_candidate_dial_plan_is_exhausted(node).await
+    }
+
+    /// The K closest trusted candidates in a normalized lookup answer, less
+    /// those that cannot be dialled now, with their addresses merged into
+    /// the routing table where the peers are already known.
+    async fn usable_lookup_candidates(
+        &self,
+        nodes: Vec<DHTNode>,
+        transport_source: Option<&MultiAddr>,
+        key: &Key,
+    ) -> Vec<DHTNode> {
+        let (candidates, _) = self
+            .trusted_find_node_response_nodes(nodes, transport_source, key, self.k_value(), 0)
+            .await;
+        let mut usable = Vec::with_capacity(candidates.len());
+        for node in candidates {
+            if self.lookup_candidate_dial_plan_is_exhausted(&node).await {
+                continue;
+            }
+            self.merge_trusted_gossiped_typed_addresses(&node).await;
+            usable.push(node);
+        }
+        usable
+    }
+
+    /// Remove a peer that rejected a lookup from the routing table and drop
+    /// its connection.
+    async fn forget_rejecting_peer(&self, peer_id: &PeerId) {
+        info!(
+            "[NETWORK] Peer {} rejected us — removing from routing table",
+            peer_id.to_hex()
+        );
+        let mut dht = self.dht.write().await;
+        let rt_events = dht.remove_node_by_id(peer_id).await;
+        drop(dht);
+        self.broadcast_routing_events(&rt_events);
+        let _ = self.transport.disconnect_peer(peer_id).await;
     }
 
     /// Create a new DHT Network Manager using an existing transport handle.
@@ -5057,58 +5239,17 @@ impl DhtNetworkManager {
         };
 
         let result = match result {
-            DhtNetworkResult::NodesFound { key, nodes } => {
-                let base_peers: HashMap<_, _> = nodes
-                    .iter()
-                    .map(|node| (node.peer_id, node.reliability))
-                    .collect();
-                let verified = message
-                    .signed_records
-                    .iter()
-                    .filter_map(|record| {
-                        let proof = record.verify().ok()?;
-                        let reliability = *base_peers.get(&proof.owner())?;
-                        Some((proof, reliability))
-                    })
-                    .collect();
-                let mut signed_by_owner = HashMap::new();
-                for node in self
-                    .normalize_signed_lookup_nodes(verified, transport_source)
-                    .await
-                {
-                    signed_by_owner
-                        .entry(node.peer_id)
-                        .and_modify(|current: &mut DHTNode| current.merge_from(node.clone()))
-                        .or_insert(node);
-                }
-                let mut normalized = Vec::new();
-                for mut node in nodes {
-                    let claimed_seq = advertised_publish_seq(&node);
-                    node.address_authority = None;
-                    node.distance = None;
-                    if node.peer_id == sender_app_id && claimed_seq != 0 {
-                        if let Some(typed) = self
-                            .apply_native_self_report(&node, claimed_seq, transport_source)
-                            .await
-                        {
-                            (node.addresses, node.address_types) = typed.into_iter().unzip();
-                            node.address_authority =
-                                Some(AddressAuthority::AuthenticatedOwner(claimed_seq));
-                        } else {
-                            node.addresses.clear();
-                            node.address_types.clear();
-                        }
-                    }
-                    if let Some(signed) = signed_by_owner.remove(&node.peer_id) {
-                        node.merge_from(signed);
-                    }
-                    normalized.push(self.protect_owner_view(node).await);
-                }
-                DhtNetworkResult::NodesFound {
-                    key,
-                    nodes: normalized,
-                }
-            }
+            DhtNetworkResult::NodesFound { key, nodes } => DhtNetworkResult::NodesFound {
+                key,
+                nodes: self
+                    .normalize_lookup_answer(
+                        nodes,
+                        &message.signed_records,
+                        &sender_app_id,
+                        transport_source,
+                    )
+                    .await,
+            },
             result => result,
         };
         let response = DhtResponseEnvelope {
@@ -5120,6 +5261,64 @@ impl DhtNetworkManager {
         }
 
         Ok(())
+    }
+
+    /// Normalize the nodes of a FIND_NODE answer from authenticated
+    /// `responder`: verify owner-signed records, apply the responder's own
+    /// report, and protect locally proven owner views.
+    async fn normalize_lookup_answer(
+        &self,
+        nodes: Vec<DHTNode>,
+        signed_records: &[SignedAddressRecord],
+        responder: &PeerId,
+        transport_source: Option<&MultiAddr>,
+    ) -> Vec<DHTNode> {
+        let base_peers: HashMap<_, _> = nodes
+            .iter()
+            .map(|node| (node.peer_id, node.reliability))
+            .collect();
+        let verified = signed_records
+            .iter()
+            .filter_map(|record| {
+                let proof = record.verify().ok()?;
+                let reliability = *base_peers.get(&proof.owner())?;
+                Some((proof, reliability))
+            })
+            .collect();
+        let mut signed_by_owner = HashMap::new();
+        for node in self
+            .normalize_signed_lookup_nodes(verified, transport_source)
+            .await
+        {
+            signed_by_owner
+                .entry(node.peer_id)
+                .and_modify(|current: &mut DHTNode| current.merge_from(node.clone()))
+                .or_insert(node);
+        }
+        let mut normalized = Vec::new();
+        for mut node in nodes {
+            let claimed_seq = advertised_publish_seq(&node);
+            node.address_authority = None;
+            node.distance = None;
+            if node.peer_id == *responder && claimed_seq != 0 {
+                if let Some(typed) = self
+                    .apply_native_self_report(&node, claimed_seq, transport_source)
+                    .await
+                {
+                    (node.addresses, node.address_types) = typed.into_iter().unzip();
+                    node.address_authority =
+                        Some(AddressAuthority::AuthenticatedOwner(claimed_seq));
+                } else {
+                    node.addresses.clear();
+                    node.address_types.clear();
+                }
+            }
+            if let Some(signed) = signed_by_owner.remove(&node.peer_id) {
+                node.merge_from(signed);
+            }
+            normalized.push(self.protect_owner_view(node).await);
+        }
+        normalized
     }
 
     /// Handle DHT broadcast message
@@ -5136,13 +5335,69 @@ impl DhtNetworkManager {
             .map_err(|error| P2PError::Serialization(error.to_string().into()))?;
         if matches!(message.message_type, DhtMessageType::Response)
             && matches!(message.result, Some(DhtNetworkResult::NodesFound { .. }))
-            && let Some(bundle) = trailing.strip_prefix(LOOKUP_EXTENSION_MARKER)
         {
-            message.signed_records =
-                crate::signed_address::decode_record_bundle(bundle, MAX_LOOKUP_EXTENSION_RECORDS)
-                    .unwrap_or_default();
+            message.signed_records = Self::decode_lookup_extension(trailing);
         }
         Ok(message)
+    }
+
+    /// Owner-signed records from a lookup answer's trailer. Unknown or
+    /// malformed trailers yield none rather than invalidating the answer.
+    fn decode_lookup_extension(trailing: &[u8]) -> Vec<SignedAddressRecord> {
+        trailing
+            .strip_prefix(LOOKUP_EXTENSION_MARKER)
+            .and_then(|bundle| {
+                crate::signed_address::decode_record_bundle(bundle, MAX_LOOKUP_EXTENSION_RECORDS)
+                    .ok()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Take each node's owner publication out as a signed record and keep
+    /// only its QUIC addresses, as the legacy lookup answer requires.
+    fn split_lookup_publications(nodes: &mut [DHTNode]) -> Vec<SignedAddressRecord> {
+        let mut records = Vec::new();
+        for node in nodes {
+            if let Some(proof) = node
+                .address_authority
+                .as_ref()
+                .and_then(AddressAuthority::publication)
+                && !records.contains(proof.signed())
+            {
+                records.push(proof.signed().clone());
+            }
+            if node.addresses.iter().any(|address| !address.is_quic()) {
+                (node.addresses, node.address_types) = node
+                    .typed_addresses()
+                    .into_iter()
+                    .filter(|(address, _)| address.is_quic())
+                    .unzip();
+            }
+        }
+        records
+    }
+
+    /// Append as many complete owner-signed records as fit within the legacy
+    /// message size limit.
+    fn append_lookup_extension(
+        bytes: &mut Vec<u8>,
+        records: Vec<SignedAddressRecord>,
+    ) -> Result<()> {
+        let mut extension = Vec::new();
+        for record in records.into_iter().take(MAX_LOOKUP_EXTENSION_RECORDS) {
+            let encoded = crate::signed_address::encode_record_bundle(&[record])
+                .map_err(|error| P2PError::Serialization(error.into()))?;
+            if bytes.len() + LOOKUP_EXTENSION_MARKER.len() + extension.len() + encoded.len()
+                <= MAX_MESSAGE_SIZE
+            {
+                extension.extend_from_slice(&encoded);
+            }
+        }
+        if !extension.is_empty() {
+            bytes.extend_from_slice(LOOKUP_EXTENSION_MARKER);
+            bytes.extend_from_slice(&extension);
+        }
+        Ok(())
     }
 
     /// Preserve the complete QUIC-only legacy response, then append as many
@@ -5150,21 +5405,9 @@ impl DhtNetworkManager {
     fn encode_response_message(mut response: DhtNetworkMessage) -> Result<Vec<u8>> {
         let mut records = std::mem::take(&mut response.signed_records);
         if let Some(DhtNetworkResult::NodesFound { nodes, .. }) = &mut response.result {
-            for node in nodes {
-                if let Some(proof) = node
-                    .address_authority
-                    .as_ref()
-                    .and_then(AddressAuthority::publication)
-                    && !records.contains(proof.signed())
-                {
-                    records.push(proof.signed().clone());
-                }
-                if node.addresses.iter().any(|address| !address.is_quic()) {
-                    (node.addresses, node.address_types) = node
-                        .typed_addresses()
-                        .into_iter()
-                        .filter(|(address, _)| address.is_quic())
-                        .unzip();
+            for record in Self::split_lookup_publications(nodes) {
+                if !records.contains(&record) {
+                    records.push(record);
                 }
             }
         }
@@ -5176,20 +5419,7 @@ impl DhtNetworkManager {
             ));
         }
         if matches!(response.result, Some(DhtNetworkResult::NodesFound { .. })) {
-            let mut extension = Vec::new();
-            for record in records.into_iter().take(MAX_LOOKUP_EXTENSION_RECORDS) {
-                let encoded = crate::signed_address::encode_record_bundle(&[record])
-                    .map_err(|error| P2PError::Serialization(error.into()))?;
-                if bytes.len() + LOOKUP_EXTENSION_MARKER.len() + extension.len() + encoded.len()
-                    <= MAX_MESSAGE_SIZE
-                {
-                    extension.extend_from_slice(&encoded);
-                }
-            }
-            if !extension.is_empty() {
-                bytes.extend_from_slice(LOOKUP_EXTENSION_MARKER);
-                bytes.extend_from_slice(&extension);
-            }
+            Self::append_lookup_extension(&mut bytes, records)?;
         }
         Ok(bytes)
     }
