@@ -9,6 +9,10 @@
 use super::*;
 use crate::P2PNode;
 
+/// Copies of one peer in a closer-peers body no honest encoder produces: well
+/// over the FIND_NODE size limit.
+const OVERSIZED_NODES: usize = 2_000;
+
 async fn test_node() -> P2PNode {
     P2PNode::new(
         NodeConfig::builder()
@@ -168,4 +172,48 @@ async fn closer_peers_reject_another_key_or_format() {
         .decode_closer_peers(&responder, &key, &[], None)
         .await;
     assert!(empty.is_err());
+}
+
+#[tokio::test]
+async fn closer_peers_over_the_size_limit_are_rejected_before_parsing() {
+    let node = test_node().await;
+    let key = [1; 32];
+    let responder = PeerId::from_bytes([2; 32]);
+    let address: MultiAddr = "/ip4/127.0.0.1/udp/9/quic".parse().unwrap();
+    let nodes = vec![lookup_node(PeerId::from_bytes([4; 32]), &address); OVERSIZED_NODES];
+    let payload =
+        postcard::to_extend(&CloserPeers { key, nodes }, vec![CLOSER_PEERS_FORMAT]).unwrap();
+    assert!(payload.len() > MAX_MESSAGE_SIZE);
+
+    let decoded = node
+        .dht_manager()
+        .decode_closer_peers(&responder, &key, &payload, None)
+        .await;
+    assert!(decoded.is_err());
+}
+
+#[tokio::test]
+async fn closer_peers_are_read_up_to_the_size_limit() {
+    let node = test_node().await;
+    let key = [1; 32];
+    let responder = PeerId::from_bytes([2; 32]);
+    let mut payload = node
+        .dht_manager()
+        .encode_closer_peers(&key, &PeerId::from_bytes([3; 32]))
+        .await
+        .unwrap();
+    // An unknown trailer is ignored, so padding reaches the limit exactly.
+    payload.resize(MAX_MESSAGE_SIZE, 0);
+    let at_limit = node
+        .dht_manager()
+        .decode_closer_peers(&responder, &key, &payload, None)
+        .await;
+    assert!(at_limit.is_ok());
+
+    payload.push(0);
+    let over_limit = node
+        .dht_manager()
+        .decode_closer_peers(&responder, &key, &payload, None)
+        .await;
+    assert!(over_limit.is_err());
 }
