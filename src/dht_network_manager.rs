@@ -1652,6 +1652,8 @@ impl DhtNetworkManager {
     ///
     /// The payload is checked as a FIND_NODE answer from `responder` would
     /// be:
+    /// - a payload larger than a FIND_NODE answer may be is rejected before
+    ///   it is parsed
     /// - owner-signed address records are verified
     /// - the responder's own report and locally proven owner views are
     ///   applied
@@ -1664,8 +1666,8 @@ impl DhtNetworkManager {
     ///
     /// # Errors
     ///
-    /// Returns an error if the payload is not in this format or answers a
-    /// different key.
+    /// Returns an error if the payload is larger than a FIND_NODE answer may
+    /// be, is not in this format, or answers a different key.
     pub async fn decode_closer_peers(
         &self,
         responder: &PeerId,
@@ -1673,6 +1675,18 @@ impl DhtNetworkManager {
         payload: &[u8],
         transport_source: Option<&MultiAddr>,
     ) -> Result<Vec<DHTNode>> {
+        // The encoder keeps the whole answer, trailer included, within the
+        // FIND_NODE limit. The application message carrying it may be far
+        // larger, so check the limit here, before deserialization.
+        if payload.len() > MAX_MESSAGE_SIZE {
+            return Err(P2PError::Validation(
+                format!(
+                    "closer peers of {} bytes exceed the message size limit of {MAX_MESSAGE_SIZE} bytes",
+                    payload.len()
+                )
+                .into(),
+            ));
+        }
         let Some((&CLOSER_PEERS_FORMAT, body)) = payload.split_first() else {
             return Err(P2PError::Validation(
                 "unsupported closer-peers format".into(),
