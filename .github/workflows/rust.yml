@@ -13,13 +13,24 @@ env:
 
 jobs:
   compiler-baseline:
-    name: Rust 1.91 native and WASM
+    name: MSRV native and WASM
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.91.0
+      # The baseline is Cargo.toml's `rust-version` — the single source of
+      # truth. Raising the floor is a one-line manifest change; this job fails
+      # when the declared floor no longer builds (own code or a dependency's).
+      - name: Read declared rust-version
+        id: msrv
+        run: |
+          msrv=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "saorsa-core") | .rust_version')
+          test -n "$msrv" && test "$msrv" != null || { echo "::error::rust-version missing from Cargo.toml"; exit 1; }
+          echo "Declared rust-version: $msrv"
+          echo "version=$msrv" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ steps.msrv.outputs.version }}
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
       - name: Check native library on the declared compiler baseline
