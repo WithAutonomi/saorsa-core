@@ -119,6 +119,21 @@ fn address_kind_label(kind: Option<AddressType>) -> &'static str {
     }
 }
 
+/// Replace `addr`'s IP in `text` with `<ip>`, in both plain and IPv4-mapped form.
+///
+/// Callers log send errors next to the peer ID, so the channel's socket
+/// address must not travel inside the error text.
+fn redact_ip(text: &str, addr: SocketAddr) -> String {
+    let ip = addr.ip();
+    let canonical = ip.to_canonical();
+    let redacted = text.replace(&ip.to_string(), "<ip>");
+    if canonical == ip {
+        redacted
+    } else {
+        redacted.replace(&canonical.to_string(), "<ip>")
+    }
+}
+
 fn classify_send_error(error: &anyhow::Error) -> SendFailureKind {
     for cause in error.chain() {
         if let Some(endpoint_error) = cause.downcast_ref::<saorsa_transport::EndpointError>() {
@@ -1509,10 +1524,12 @@ impl TransportHandle {
                     let addrs = self.listen_addrs.read().await;
                     addrs.iter().any(|a| a.socket_addr() == Some(addr))
                 };
+                // `address.transport()` rather than `address`: a MultiAddr's
+                // Display appends `/p2p/<peer id>` when it carries one.
                 if is_self {
                     warn!(
                         kind = kind_label,
-                        %address,
+                        address = %address.transport(),
                         channel_id = %connected_peer_id,
                         "Detected self-connection to own address, rejecting"
                     );
@@ -1524,7 +1541,7 @@ impl TransportHandle {
 
                 info!(
                     kind = kind_label,
-                    %address,
+                    address = %address.transport(),
                     channel_id = %connected_peer_id,
                     "Successfully connected to channel"
                 );
@@ -1533,7 +1550,7 @@ impl TransportHandle {
             Err(e) => {
                 warn!(
                     kind = kind_label,
-                    %address,
+                    address = %address.transport(),
                     error = %e,
                     "connect_happy_eyeballs failed"
                 );
@@ -1788,10 +1805,11 @@ impl TransportHandle {
                 .await
             {
                 Ok(()) => return Ok(()),
+                // The channel ID (and the send error) carry the peer's socket
+                // address, so these lines leave out the peer ID.
                 Err(e) => {
                     if e.is_stale_channel_send_failure() {
                         warn!(
-                            peer = %peer_hex,
                             channel = %channel_id,
                             error = %e,
                             "Stale channel send failed, removing and trying next",
@@ -1803,14 +1821,12 @@ impl TransportHandle {
 
                     if self.remove_channel_after_send_failure(channel_id, &e).await {
                         warn!(
-                            peer = %peer_hex,
                             channel = %channel_id,
                             error = %e,
                             "Channel send failed during active send, removing without retry",
                         );
                     } else {
                         warn!(
-                            peer = %peer_hex,
                             channel = %channel_id,
                             error = %e,
                             "Channel send failed during active send, keeping channel (connection still open)",
@@ -1913,7 +1929,7 @@ impl TransportHandle {
             let kind = classify_send_error(&e);
             P2PError::Transport(TransportError::SendFailed {
                 kind,
-                reason: e.to_string().into(),
+                reason: redact_ip(&e.to_string(), addr).into(),
             })
         });
 
@@ -2010,11 +2026,12 @@ impl TransportHandle {
             // active, the connection has been torn down and the identity
             // exchange can never complete — bail immediately with a
             // dedicated error so the caller stops waiting.
+            // The message leaves out the channel ID (the peer's socket
+            // address): callers log this error next to the peer ID.
             if !self.is_connection_active(channel_id).await {
                 return Err(P2PError::Transport(
                     crate::error::TransportError::StreamError(
-                        format!("channel {channel_id} closed before identity exchange completed")
-                            .into(),
+                        "channel closed before identity exchange completed".into(),
                     ),
                 ));
             }
@@ -2705,10 +2722,11 @@ impl TransportHandle {
                         // identity matches. Channel IDs identify connections,
                         // not peers, so they are not checked here.
                         if authenticated_node_id.as_ref() != Some(&expected_peer) {
+                            // No channel ID here: it is the sender's socket
+                            // address, and `authenticated` is its peer ID.
                             warn!(
                                 message_id = %envelope.message_id,
                                 expected = %expected_peer,
-                                actual_channel = %channel_id,
                                 authenticated = ?authenticated_node_id,
                                 "Response origin mismatch — ignoring"
                             );
@@ -3093,6 +3111,39 @@ impl RelaySessionEstablisher for Arc<TransportHandle> {
         relay_addr: SocketAddr,
     ) -> std::result::Result<PreparedRelay, RelaySessionEstablishError> {
         self.setup_proactive_relay_session(relay_addr).await
+    }
+}
+
+#[cfg(test)]
+mod redact_ip_tests {
+    use super::*;
+
+    #[test]
+    fn redacts_plain_and_mapped_ipv4() {
+        let addr: SocketAddr = "203.0.113.7:4242".parse().expect("test addr");
+        let text = "IPv6 send to 203.0.113.7:4242 (wire [::ffff:203.0.113.7]:4242) failed";
+        assert_eq!(
+            redact_ip(text, addr),
+            "IPv6 send to <ip>:4242 (wire [::ffff:<ip>]:4242) failed"
+        );
+    }
+
+    #[test]
+    fn redacts_ipv4_when_channel_is_mapped() {
+        let addr: SocketAddr = "[::ffff:203.0.113.7]:4242".parse().expect("test addr");
+        assert_eq!(
+            redact_ip("IPv4 send to 203.0.113.7:4242 failed", addr),
+            "IPv4 send to <ip>:4242 failed"
+        );
+    }
+
+    #[test]
+    fn redacts_ipv6() {
+        let addr: SocketAddr = "[2001:db8::7]:4242".parse().expect("test addr");
+        assert_eq!(
+            redact_ip("QUIC send to [2001:db8::7]:4242 (12 bytes) failed", addr),
+            "QUIC send to [<ip>]:4242 (12 bytes) failed"
+        );
     }
 }
 

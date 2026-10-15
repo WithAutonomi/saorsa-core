@@ -572,6 +572,22 @@ pub enum DhtNetworkResult {
     Error { operation: String, error: String },
 }
 
+impl DhtNetworkResult {
+    /// Variant name, for logging a result without its contents: node lists
+    /// pair other peers' IDs with their addresses.
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::NodesFound { .. } => "NodesFound",
+            Self::PongReceived { .. } => "PongReceived",
+            Self::JoinSuccess { .. } => "JoinSuccess",
+            Self::LeaveSuccess => "LeaveSuccess",
+            Self::PeerRejected => "PeerRejected",
+            Self::PublishAddressAck => "PublishAddressAck",
+            Self::Error { .. } => "Error",
+        }
+    }
+}
+
 /// DHT message envelope for network transmission
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DhtNetworkMessage {
@@ -2382,9 +2398,9 @@ impl DhtNetworkManager {
                 }
                 Ok(other) => {
                     warn!(
-                        "Witnessed close-group FIND_NODE from {} returned unexpected result: {:?}",
+                        "Witnessed close-group FIND_NODE from {} returned unexpected result: {}",
                         responder.to_hex(),
-                        other
+                        other.result.kind()
                     );
                 }
                 Err(e) => {
@@ -2450,7 +2466,7 @@ impl DhtNetworkManager {
                 Ok(DhtNetworkResult::PongReceived { responder, latency })
             }
             Ok(result) => {
-                warn!("Unexpected ping result: {:?}", result);
+                warn!("Unexpected ping result: {}", result.kind());
                 Err(P2PError::Dht(crate::error::DhtError::RoutingError(
                     "Unexpected ping response".to_string().into(),
                 )))
@@ -4634,7 +4650,17 @@ impl DhtNetworkManager {
                 Ok(None)
             }
             DhtMessageType::Error => {
-                warn!("Received DHT error message: {:?}", message);
+                // Not the whole message: its payload can carry the sender's
+                // addresses, and `signed_records` other peers' IDs and addresses.
+                warn!(
+                    "Received DHT error message {} from {}: {}",
+                    message.message_id,
+                    message.source,
+                    message
+                        .result
+                        .as_ref()
+                        .map_or("no result", DhtNetworkResult::kind)
+                );
                 Ok(None)
             }
         }
