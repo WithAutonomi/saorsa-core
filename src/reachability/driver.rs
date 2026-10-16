@@ -246,6 +246,8 @@ impl AcquisitionDriver {
             .await;
             match outcome {
                 RelayAcquisitionOutcome::Acquired(relay) => {
+                    // Lines that name the relayer log only the relay's port, so
+                    // they don't tie its peer ID to its IP.
                     let relay_addr = relay.allocation.public_addr();
                     match verify_relay_with_canaries(
                         &self.dht,
@@ -266,7 +268,7 @@ impl AcquisitionDriver {
                             {
                                 warn!(
                                     relayer = ?relay.relayer,
-                                    allocated = %relay_addr,
+                                    relay_port = relay_addr.port(),
                                     %error,
                                     "driver: failed to commit canary-verified relay"
                                 );
@@ -293,7 +295,7 @@ impl AcquisitionDriver {
                             self.force_publish_typed_set(Some(relay_addr)).await;
                             info!(
                                 relayer = ?relay.relayer,
-                                allocated = %relay_addr,
+                                relay_port = relay_addr.port(),
                                 successes,
                                 attempts,
                                 "driver: relay canary verified and published"
@@ -315,7 +317,7 @@ impl AcquisitionDriver {
                         } => {
                             warn!(
                                 relayer = ?relay.relayer,
-                                allocated = %relay_addr,
+                                relay_port = relay_addr.port(),
                                 successes,
                                 attempts,
                                 "driver: relay failed canary quorum, entering backoff before trying next candidate"
@@ -338,7 +340,7 @@ impl AcquisitionDriver {
                         } => {
                             warn!(
                                 relayer = ?relay.relayer,
-                                allocated = %relay_addr,
+                                relay_port = relay_addr.port(),
                                 successes,
                                 failures,
                                 unavailable,
@@ -646,7 +648,7 @@ impl AcquisitionDriver {
                         RelayCanaryVerdict::Verified { successes, attempts } => {
                             info!(
                                 relayer = %relayer.to_hex(),
-                                relay = %relay,
+                                relay_port = relay.port(),
                                 successes,
                                 attempts,
                                 "driver: established relay passed periodic canary revalidation"
@@ -656,7 +658,7 @@ impl AcquisitionDriver {
                         RelayCanaryVerdict::Rejected { successes, attempts } => {
                             warn!(
                                 relayer = %relayer.to_hex(),
-                                relay = %relay,
+                                relay_port = relay.port(),
                                 successes,
                                 attempts,
                                 "driver: established relay failed periodic canary revalidation; withdrawing"
@@ -674,7 +676,7 @@ impl AcquisitionDriver {
                         } => {
                             info!(
                                 relayer = %relayer.to_hex(),
-                                relay = %relay,
+                                relay_port = relay.port(),
                                 successes,
                                 failures,
                                 unavailable,

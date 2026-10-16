@@ -194,10 +194,12 @@ impl<E: RelaySessionEstablisher> RelayAcquisition<E> {
         );
 
         for (index, candidate) in candidates.into_iter().enumerate() {
+            // Lines that name the relayer log no IP, so they don't tie its
+            // peer ID to its address.
             let Some(socket) = candidate.direct_address.dialable_socket_addr() else {
                 warn!(
                     relayer = ?candidate.peer_id,
-                    address = %candidate.direct_address,
+                    address_kind = %candidate.direct_address.transport().kind(),
                     "candidate has no dialable socket address, skipping"
                 );
                 continue;
@@ -207,7 +209,7 @@ impl<E: RelaySessionEstablisher> RelayAcquisition<E> {
                 Ok(allocated) => {
                     info!(
                         relayer = ?candidate.peer_id,
-                        allocated = %allocated.public_addr(),
+                        relay_port = allocated.public_addr().port(),
                         index = index,
                         "acquired proactive relay session"
                     );

@@ -2110,10 +2110,9 @@ pub(crate) fn parse_protocol_message(bytes: &[u8], source: &str) -> Option<Parse
                 Some(peer_id)
             }
             Err(e) => {
-                warn!(
-                    "Rejecting message from {}: signature verification failed: {}",
-                    source, e
-                );
+                // `source` (the channel's socket address) is left out: the
+                // error names the sender's peer ID.
+                warn!("Rejecting message: signature verification failed: {}", e);
                 return None;
             }
         }
@@ -2320,7 +2319,10 @@ impl P2PNode {
             );
             for multiaddr in &self.config.bootstrap_peers {
                 let Some(socket_addr) = multiaddr.dialable_socket_addr() else {
-                    warn!("Skipping non-QUIC bootstrap peer: {}", multiaddr);
+                    warn!(
+                        "Skipping non-QUIC bootstrap peer: {}",
+                        multiaddr.transport()
+                    );
                     continue;
                 };
                 seen_addresses.insert(socket_addr);
@@ -2574,6 +2576,9 @@ impl P2PNode {
         expected_peer_id: Option<PeerId>,
     ) -> Option<PeerId> {
         for addr in addrs {
+            // Log the transport part only: a MultiAddr's Display appends
+            // `/p2p/<peer id>`, and no line here may tie a peer ID to its IP.
+            let log_addr = addr.transport();
             // Bootstrap addresses come from operator-supplied seeds (CLI
             // flags or config file). The local reachability classifier hasn't
             // proven them yet, so log them as `Unverified` rather than
@@ -2592,9 +2597,7 @@ impl P2PNode {
                         if !bootstrap_peer_identity_matches(expected_peer_id, real_peer_id) {
                             warn!(
                                 bootstrap_source = source,
-                                address = %addr,
-                                expected_peer_id = ?expected_peer_id,
-                                actual_peer_id = %real_peer_id,
+                                address = %log_addr,
                                 "Bootstrap cache identity mismatch; rejecting connection"
                             );
                             self.disconnect_channel(&channel_id).await;
@@ -2603,8 +2606,7 @@ impl P2PNode {
                         info!(
                             bootstrap_source = source,
                             outcome = "ok",
-                            address = %addr,
-                            peer_id = %real_peer_id,
+                            address = %log_addr,
                             "Bootstrap dial completed"
                         );
                         return Some(real_peer_id);
@@ -2613,14 +2615,14 @@ impl P2PNode {
                         info!(
                             bootstrap_source = source,
                             outcome = "identity_timeout",
-                            address = %addr,
+                            address = %log_addr,
                             error = %e,
                             "Bootstrap dial failed"
                         );
                         warn!(
                             "Timeout waiting for identity from bootstrap peer {}: {}, \
                              closing channel {}",
-                            addr, e, channel_id
+                            log_addr, e, channel_id
                         );
                         self.disconnect_channel(&channel_id).await;
                     }
@@ -2629,11 +2631,11 @@ impl P2PNode {
                     info!(
                         bootstrap_source = source,
                         outcome = "connect_error",
-                        address = %addr,
+                        address = %log_addr,
                         error = %e,
                         "Bootstrap dial failed"
                     );
-                    warn!("Failed to connect to bootstrap peer {}: {}", addr, e);
+                    warn!("Failed to connect to bootstrap peer {}: {}", log_addr, e);
                 }
             }
         }
