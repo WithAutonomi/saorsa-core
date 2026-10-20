@@ -146,9 +146,10 @@ pub(crate) async fn run_relay_acquisition(
     let coordinator = RelayAcquisition::new(Arc::clone(transport));
     match coordinator.acquire(candidates).await {
         Ok(relay) => {
+            // No address or port: next to the relayer's peer ID, either
+            // would tie it to the relay's IP.
             info!(
                 relayer = ?relay.relayer,
-                allocated = %relay.allocation.public_addr(),
                 "relay acquisition: session established"
             );
             RelayAcquisitionOutcome::Acquired(relay)
