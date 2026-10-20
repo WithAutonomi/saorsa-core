@@ -487,12 +487,12 @@ pub(crate) async fn verify_relay_with_canaries(
     policy: RelayCanaryPolicy,
 ) -> RelayCanaryVerdict {
     let target_peer_id = *dht.peer_id();
-    // INFO+ lines log only the relay's port: next to `relayer`, the full
-    // address would tie the relayer's peer ID to its IP.
+    // INFO+ lines log no part of the relay's address next to `relayer`:
+    // even the allocated port would tie its peer ID to its IP, which the
+    // relay-preparation log pairs with that port. The invalid-address line
+    // leaves out `relayer` instead, as its reason can name the IP.
     if let Err(reason) = validate_relay_canary_address(relay_addr) {
         warn!(
-            relayer = %relayer.to_hex(),
-            relay_port = relay_addr.port(),
             reason = %reason.summary(),
             "relay canary: refusing invalid relay address"
         );
@@ -506,7 +506,6 @@ pub(crate) async fn verify_relay_with_canaries(
         Err(reason) => {
             warn!(
                 relayer = %relayer.to_hex(),
-                relay_port = relay_addr.port(),
                 reason = %reason.summary(),
                 "relay canary: refusing request with invalid system clock"
             );
@@ -541,7 +540,6 @@ pub(crate) async fn verify_relay_with_canaries(
     if witnesses.len() < policy.required_successes() {
         warn!(
             relayer = %relayer.to_hex(),
-            relay_port = relay_addr.port(),
             available = witnesses.len(),
             required = policy.required_successes(),
             ?policy,
@@ -626,7 +624,6 @@ pub(crate) async fn verify_relay_with_canaries(
             attempts,
         } => info!(
             relayer = %relayer.to_hex(),
-            relay_port = relay_addr.port(),
             successes,
             attempts,
             responses = summary.responses,
@@ -641,7 +638,6 @@ pub(crate) async fn verify_relay_with_canaries(
             attempts,
         } => warn!(
             relayer = %relayer.to_hex(),
-            relay_port = relay_addr.port(),
             successes,
             attempts,
             responses = summary.responses,
@@ -658,7 +654,6 @@ pub(crate) async fn verify_relay_with_canaries(
         } => match policy {
             RelayCanaryPolicy::Admission => warn!(
                 relayer = %relayer.to_hex(),
-                relay_port = relay_addr.port(),
                 successes,
                 failures,
                 unavailable,
@@ -670,7 +665,6 @@ pub(crate) async fn verify_relay_with_canaries(
             ),
             RelayCanaryPolicy::Maintenance => info!(
                 relayer = %relayer.to_hex(),
-                relay_port = relay_addr.port(),
                 successes,
                 failures,
                 unavailable,

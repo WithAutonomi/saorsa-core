@@ -1655,15 +1655,23 @@ impl TransportHandle {
     }
 
     /// Commit a canary-verified proactive relay and advertise it to peers.
+    ///
+    /// The returned error names no address: the caller logs it next to the
+    /// relayer's peer ID. The transport error, which can carry the relay's
+    /// address, is logged here at debug level instead.
     pub async fn publish_proactive_relay_session(&self, allocation: PreparedRelay) -> Result<()> {
         let relay_public_addr = allocation.public_addr();
         self.dual_node
             .publish_proactive_relay(allocation)
             .await
             .map_err(|error| {
+                debug!(
+                    relay = %relay_public_addr,
+                    %error,
+                    "failed to publish proactive relay"
+                );
                 P2PError::Transport(TransportError::SetupFailed(
-                    format!("Failed to publish proactive relay {relay_public_addr}: {error}")
-                        .into(),
+                    "failed to publish proactive relay".into(),
                 ))
             })
     }

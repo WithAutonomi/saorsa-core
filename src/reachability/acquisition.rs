@@ -194,8 +194,9 @@ impl<E: RelaySessionEstablisher> RelayAcquisition<E> {
         );
 
         for (index, candidate) in candidates.into_iter().enumerate() {
-            // Lines that name the relayer log no IP, so they don't tie its
-            // peer ID to its address.
+            // Lines that name the relayer log no part of its address, not even
+            // the allocated port: the relay-preparation log pairs that port
+            // with the relay's IP, so it would tie the two.
             let Some(socket) = candidate.direct_address.dialable_socket_addr() else {
                 warn!(
                     relayer = ?candidate.peer_id,
@@ -209,7 +210,6 @@ impl<E: RelaySessionEstablisher> RelayAcquisition<E> {
                 Ok(allocated) => {
                     info!(
                         relayer = ?candidate.peer_id,
-                        relay_port = allocated.public_addr().port(),
                         index = index,
                         "acquired proactive relay session"
                     );
@@ -252,6 +252,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+    use crate::reachability::test_logs::CapturedLogs;
 
     fn peer_id(seed: u8) -> PeerId {
         PeerId::from_bytes([seed; 32])
@@ -329,6 +330,28 @@ mod tests {
             1,
             "should stop on first success, not walk further"
         );
+    }
+
+    #[tokio::test]
+    async fn acquired_relay_log_names_no_relay_address() {
+        let relay = allocated(40_001).public_addr();
+        let establisher = ScriptedEstablisher::new(vec![Ok(allocated(relay.port()))]);
+        let coordinator = RelayAcquisition::new(establisher);
+        let logs = CapturedLogs::default();
+        let result = {
+            let _guard = logs.capture();
+            coordinator.acquire(vec![candidate(1, 10000)]).await
+        };
+        assert!(result.is_ok());
+
+        let relayer = peer_id(1);
+        let lines = logs.lines_containing(&format!("relayer={relayer:?}"));
+        assert_eq!(lines.len(), 1, "{}", logs.text());
+        for line in lines {
+            assert!(line.contains("acquired proactive relay session"), "{line}");
+            assert!(!line.contains(&relay.ip().to_string()), "{line}");
+            assert!(!line.contains(&relay.port().to_string()), "{line}");
+        }
     }
 
     #[tokio::test]

@@ -40,3 +40,63 @@ pub(crate) mod session;
 
 pub(crate) use acquisition::{RelaySessionEstablishError, RelaySessionEstablisher};
 pub(crate) use driver::spawn_acquisition_driver;
+
+#[cfg(test)]
+pub(crate) mod test_logs {
+    //! Captures formatted INFO+ events, the levels production ships to the
+    //! fleet log store, so tests can check what a log line names.
+
+    use std::io;
+    use std::sync::{Arc, Mutex};
+
+    use tracing::Level;
+    use tracing::subscriber::DefaultGuard;
+
+    #[derive(Clone, Default)]
+    pub(crate) struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+    impl CapturedLogs {
+        /// Route this thread's INFO+ events here until the guard drops.
+        pub(crate) fn capture(&self) -> DefaultGuard {
+            let logs = self.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                // A timestamp's digits could match a port a test looks for.
+                .without_time()
+                .with_max_level(Level::INFO)
+                .with_writer(move || logs.clone())
+                .finish();
+            tracing::subscriber::set_default(subscriber)
+        }
+
+        pub(crate) fn text(&self) -> String {
+            self.0
+                .lock()
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                .unwrap_or_default()
+        }
+
+        pub(crate) fn lines_containing(&self, needle: &str) -> Vec<String> {
+            self.text()
+                .lines()
+                .filter(|line| line.contains(needle))
+                .map(str::to_owned)
+                .collect()
+        }
+    }
+
+    impl io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            let mut bytes = self
+                .0
+                .lock()
+                .map_err(|_| io::Error::other("captured log buffer poisoned"))?;
+            bytes.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+}

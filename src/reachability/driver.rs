@@ -73,6 +73,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, trace, warn};
 
 use crate::dht_network_manager::{DhtNetworkEvent, DhtNetworkManager};
+use crate::reachability::acquisition::AcquiredRelay;
 use crate::reachability::canary::{
     RelayCanaryPolicy, RelayCanaryVerdict, verify_relay_with_canaries,
 };
@@ -246,8 +247,9 @@ impl AcquisitionDriver {
             .await;
             match outcome {
                 RelayAcquisitionOutcome::Acquired(relay) => {
-                    // Lines that name the relayer log only the relay's port, so
-                    // they don't tie its peer ID to its IP.
+                    // Lines that name the relayer log no part of the relay's
+                    // address: even the allocated port would tie its peer ID
+                    // to its IP, which the relay-preparation log pairs with it.
                     let relay_addr = relay.allocation.public_addr();
                     match verify_relay_with_canaries(
                         &self.dht,
@@ -261,17 +263,7 @@ impl AcquisitionDriver {
                             successes,
                             attempts,
                         } => {
-                            if let Err(error) = self
-                                .transport
-                                .publish_proactive_relay_session(relay.allocation)
-                                .await
-                            {
-                                warn!(
-                                    relayer = ?relay.relayer,
-                                    relay_port = relay_addr.port(),
-                                    %error,
-                                    "driver: failed to commit canary-verified relay"
-                                );
+                            if !self.commit_verified_relay(&relay).await {
                                 apply_canary_rejection_event(
                                     &mut self.canary_rejected_relayers,
                                     CanaryRejectionEvent::AcquisitionFailed,
@@ -295,7 +287,6 @@ impl AcquisitionDriver {
                             self.force_publish_typed_set(Some(relay_addr)).await;
                             info!(
                                 relayer = ?relay.relayer,
-                                relay_port = relay_addr.port(),
                                 successes,
                                 attempts,
                                 "driver: relay canary verified and published"
@@ -317,7 +308,6 @@ impl AcquisitionDriver {
                         } => {
                             warn!(
                                 relayer = ?relay.relayer,
-                                relay_port = relay_addr.port(),
                                 successes,
                                 attempts,
                                 "driver: relay failed canary quorum, entering backoff before trying next candidate"
@@ -340,7 +330,6 @@ impl AcquisitionDriver {
                         } => {
                             warn!(
                                 relayer = ?relay.relayer,
-                                relay_port = relay_addr.port(),
                                 successes,
                                 failures,
                                 unavailable,
@@ -412,6 +401,28 @@ impl AcquisitionDriver {
 
     async fn force_publish_typed_set(&mut self, relay: Option<SocketAddr>) {
         self.publish_typed_set_with_policy(relay, true).await;
+    }
+
+    /// Advertise a canary-verified relay. Returns `false`, after logging why,
+    /// if the transport refuses it.
+    async fn commit_verified_relay(&self, relay: &AcquiredRelay) -> bool {
+        match self
+            .transport
+            .publish_proactive_relay_session(relay.allocation)
+            .await
+        {
+            Ok(()) => true,
+            Err(error) => {
+                // The error names no address, so it can sit next to the
+                // relayer's peer ID.
+                warn!(
+                    relayer = ?relay.relayer,
+                    %error,
+                    "driver: failed to commit canary-verified relay"
+                );
+                false
+            }
+        }
     }
 
     /// Tear down and clear a relay allocation that never passed canary.
@@ -648,7 +659,6 @@ impl AcquisitionDriver {
                         RelayCanaryVerdict::Verified { successes, attempts } => {
                             info!(
                                 relayer = %relayer.to_hex(),
-                                relay_port = relay.port(),
                                 successes,
                                 attempts,
                                 "driver: established relay passed periodic canary revalidation"
@@ -658,7 +668,6 @@ impl AcquisitionDriver {
                         RelayCanaryVerdict::Rejected { successes, attempts } => {
                             warn!(
                                 relayer = %relayer.to_hex(),
-                                relay_port = relay.port(),
                                 successes,
                                 attempts,
                                 "driver: established relay failed periodic canary revalidation; withdrawing"
@@ -676,7 +685,6 @@ impl AcquisitionDriver {
                         } => {
                             info!(
                                 relayer = %relayer.to_hex(),
-                                relay_port = relay.port(),
                                 successes,
                                 failures,
                                 unavailable,
@@ -809,7 +817,11 @@ fn relay_revalidation_initial_delay(peer_id: &PeerId) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{KnownReachability, MultiAddr, WebRtcCertificateHash, WebRtcDirectAddr};
+    use crate::error::P2pResult;
+    use crate::reachability::test_logs::CapturedLogs;
+    use crate::{
+        KnownReachability, MultiAddr, NodeConfig, P2PNode, WebRtcCertificateHash, WebRtcDirectAddr,
+    };
 
     const REJECTED_RELAYER_SEED: u8 = 7;
     const SECOND_RELAYER_SEED: u8 = 8;
@@ -915,19 +927,19 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn publication_driver_skips_empty_replacements_even_when_forced() {
-        let node = crate::P2PNode::new(
-            crate::NodeConfig::builder()
+    async fn local_node() -> P2pResult<P2PNode> {
+        P2PNode::new(
+            NodeConfig::builder()
                 .local(true)
                 .port(0)
                 .ipv6(false)
-                .build()
-                .unwrap(),
+                .build()?,
         )
         .await
-        .unwrap();
-        let mut driver = AcquisitionDriver {
+    }
+
+    fn driver_for(node: &P2PNode) -> AcquisitionDriver {
+        AcquisitionDriver {
             dht: Arc::clone(node.dht_manager()),
             transport: Arc::clone(node.transport()),
             relayer_peer_id: Arc::new(RwLock::new(None)),
@@ -936,7 +948,46 @@ mod tests {
             current_backoff: BACKOFF_INITIAL,
             last_publication_attempt: None,
             canary_rejected_relayers: HashSet::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn relay_commit_failure_log_names_no_relay_address() -> P2pResult<()> {
+        let node = local_node().await?;
+        let driver = driver_for(&node);
+        // The transport never prepared a detached allocation, so publishing
+        // it fails, as it does for a relay lost before publication.
+        let relay_addr = SocketAddr::from(([203, 0, 113, 7], 40_001));
+        let relay = AcquiredRelay {
+            relayer: peer_id(REJECTED_RELAYER_SEED),
+            allocation: PreparedRelay::detached(relay_addr),
         };
+
+        let logs = CapturedLogs::default();
+        let committed = {
+            let _guard = logs.capture();
+            driver.commit_verified_relay(&relay).await
+        };
+        assert!(!committed);
+
+        let relayer = relay.relayer;
+        let lines = logs.lines_containing(&format!("relayer={relayer:?}"));
+        assert_eq!(lines.len(), 1, "{}", logs.text());
+        for line in lines {
+            assert!(
+                line.contains("failed to commit canary-verified relay"),
+                "{line}"
+            );
+            assert!(!line.contains(&relay_addr.ip().to_string()), "{line}");
+            assert!(!line.contains(&relay_addr.port().to_string()), "{line}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn publication_driver_skips_empty_replacements_even_when_forced() {
+        let node = local_node().await.unwrap();
+        let mut driver = driver_for(&node);
         let address = browser_record(1)
             .decode_known()
             .unwrap()
