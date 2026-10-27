@@ -37,10 +37,9 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-      # Note: Using specific features instead of --all-features to avoid sp1-sdk
-      # build issues (linker OOM on Linux, C++20 on Windows).
+      # --all-targets lints tests too; .clippy.toml allows unwrap/expect in tests.
       - name: Run clippy (strict)
-        run: cargo clippy --all-features -- -D warnings -D clippy::unwrap_used -D clippy::expect_used
+        run: cargo clippy --all-features --all-targets -- -D warnings -D clippy::unwrap_used -D clippy::expect_used
 
       - name: Check for backup files
         run: |
