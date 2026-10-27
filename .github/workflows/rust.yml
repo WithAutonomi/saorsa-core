@@ -9,7 +9,8 @@ env:
 
 # Note: Main test suites are in separate workflows:
 # - lint.yml: Format and clippy checks
-# - unit-tests.yml: Unit and integration tests (all platforms)
+# - unit-tests.yml: Unit and integration tests (all platforms; this also
+#   builds the library on Linux, macOS and Windows)
 
 jobs:
   compiler-baseline:
@@ -38,66 +39,6 @@ jobs:
       - name: Check portable client library on the declared compiler baseline
         run: cargo check --locked --lib --no-default-features --target wasm32-unknown-unknown
 
-  portable-core-wasm:
-    name: Portable core WASM
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
-      - name: Check transport-independent lookup engine
-        run: cargo check --lib --no-default-features --target wasm32-unknown-unknown
-
-  # Build verification on all platforms
-  build:
-    name: Build (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-    steps:
-      - name: Free disk space (Ubuntu)
-        if: matrix.os == 'ubuntu-latest'
-        run: |
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /usr/local/share/boost
-          df -h
-
-      - uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-build-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Install system dependencies (Ubuntu)
-        if: matrix.os == 'ubuntu-latest'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y pkg-config libssl-dev build-essential protobuf-compiler
-
-      - name: Install system dependencies (Windows)
-        if: matrix.os == 'windows-latest'
-        run: choco install protoc
-
-      - name: Install system dependencies (macOS)
-        if: matrix.os == 'macos-latest'
-        run: brew install protobuf
-
-      - name: Build
-        run: cargo build
-
   security_audit:
     name: Security Audit
     runs-on: ubuntu-latest
@@ -112,22 +53,3 @@ jobs:
           key: ${{ runner.os }}-cargo-audit
       - run: cargo install cargo-audit
       - run: cargo audit
-
-  minimal-versions:
-    name: Minimal versions
-    # Temporarily disabled - time crate 0.3.46 requires Rust 1.88 which breaks minimal-versions
-    if: false
-    continue-on-error: true
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y pkg-config libssl-dev build-essential protobuf-compiler
-      - run: cargo update -Z minimal-versions
-      # Note: Using specific features instead of --all-features to avoid sp1-sdk
-      # build issues (linker OOM on Linux, C++20 on Windows).
-      - run: cargo check
