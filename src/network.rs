@@ -3089,9 +3089,6 @@ mod tests {
         }
     }
 
-    /// Helper function to create a test tool
-    // MCP removed: test tool helper deleted
-
     // =========================================================================
     // PeerRouteKind / route classification — pure-helper unit tests.
     //

@@ -544,7 +544,6 @@ async fn wildcard_bind_publishes_observed_address_after_peer_connection() {
 /// 7. Asserts `node_a`'s DHT self-entry still publishes the pinned
 ///    address, completing the end-to-end contract.
 #[tokio::test]
-#[ignore = "flaky/broken since always-masque-relay rebase; tracked in V2-210"]
 async fn pinned_address_survives_connection_drop() {
     let node_a = P2PNode::new(wildcard_mode_config())
         .await
