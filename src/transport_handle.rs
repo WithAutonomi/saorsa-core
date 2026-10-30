@@ -1970,6 +1970,40 @@ impl TransportHandle {
         result
     }
 
+    /// Send a message to `peer_id` on `channel_id` alone (raw, no trust
+    /// reporting): never on another of the peer's channels, never dialling,
+    /// never retried. A channel the send finds gone is forgotten, as
+    /// [`Self::send_message`] does. See
+    /// [`crate::P2PNode::send_message_on_channel`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a `PeerNotFound` network error if `channel_id` is not one of
+    /// `peer_id`'s channels, or the error of the send.
+    pub async fn send_message_on_channel(
+        &self,
+        peer_id: &PeerId,
+        channel_id: &str,
+        protocol: &str,
+        data: impl Into<Bytes>,
+    ) -> Result<()> {
+        let mapped = self
+            .peer_to_channel
+            .get(peer_id)
+            .is_some_and(|channels| channels.value().contains(channel_id));
+        if !mapped {
+            return Err(P2PError::Network(NetworkError::PeerNotFound(
+                peer_id.to_hex().into(),
+            )));
+        }
+        let result = self.send_on_channel(channel_id, protocol, data).await;
+        if let Err(error) = &result {
+            self.remove_channel_after_send_failure(channel_id, error)
+                .await;
+        }
+        result
+    }
+
     /// Return all channel IDs for an app-level peer, if known.
     pub async fn channels_for_peer(&self, app_peer_id: &PeerId) -> Vec<String> {
         self.peer_to_channel
