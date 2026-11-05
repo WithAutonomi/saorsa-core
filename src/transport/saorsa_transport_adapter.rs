@@ -511,9 +511,11 @@ fn record_attributed_observer(
 /// hold a `0.0.0.0:<ephemeral>` UDP socket for its discovery timeout (2 s when
 /// no gateway answers). On a host that starts several loopback nodes on fixed
 /// ports, such as a local test network, that socket can take a port a later
-/// node is about to bind, which then fails with "address in use".
+/// node is about to bind, which then fails with "address in use". The IP is
+/// canonicalized first, since `IpAddr::is_loopback` is false for an
+/// IPv4-mapped loopback address such as `::ffff:127.0.0.1`.
 fn upnp_config_for(bind_addr: SocketAddr) -> UpnpConfig {
-    if bind_addr.ip().is_loopback() {
+    if canonicalize_ip(bind_addr.ip()).is_loopback() {
         UpnpConfig::disabled()
     } else {
         UpnpConfig::default()
@@ -2688,11 +2690,22 @@ mod tests {
 
     #[test]
     fn upnp_is_off_for_a_loopback_bind_and_on_otherwise() {
-        for loopback in ["127.0.0.1:0", "127.0.0.1:10000", "[::1]:0"] {
+        for loopback in [
+            "127.0.0.1:0",
+            "127.0.0.1:10000",
+            "[::1]:0",
+            "[::ffff:127.0.0.1]:0",
+        ] {
             let addr: SocketAddr = loopback.parse().unwrap();
             assert!(!upnp_config_for(addr).enabled, "{loopback}");
         }
-        for routable in ["0.0.0.0:0", "0.0.0.0:10000", "[::]:0", "192.168.1.10:10000"] {
+        for routable in [
+            "0.0.0.0:0",
+            "0.0.0.0:10000",
+            "[::]:0",
+            "192.168.1.10:10000",
+            "[::ffff:192.168.1.10]:10000",
+        ] {
             let addr: SocketAddr = routable.parse().unwrap();
             assert!(upnp_config_for(addr).enabled, "{routable}");
         }
