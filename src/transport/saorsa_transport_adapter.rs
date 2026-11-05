@@ -66,6 +66,7 @@ use crate::quantum_crypto::saorsa_transport_integration::{MlDsaPublicKey, MlDsaS
 use futures::StreamExt;
 use saorsa_transport::SharedTransport;
 use saorsa_transport::link_transport::StreamType;
+use saorsa_transport::upnp::UpnpConfig;
 
 /// Protocol identifier for saorsa DHT overlay
 ///
@@ -504,6 +505,22 @@ fn record_attributed_observer(
 }
 
 #[allow(dead_code)]
+/// UPnP port mapping for a transport bound to `bind_addr`.
+///
+/// A gateway can only forward traffic to an address on the LAN, so a socket
+/// bound to loopback can never be mapped, and the gateway search would only
+/// hold a `0.0.0.0:<ephemeral>` UDP socket for its discovery timeout (2 s when
+/// no gateway answers). On a host that starts several loopback nodes on fixed
+/// ports, such as a local test network, that socket can take a port a later
+/// node is about to bind, which then fails with "address in use".
+fn upnp_config_for(bind_addr: SocketAddr) -> UpnpConfig {
+    if bind_addr.ip().is_loopback() {
+        UpnpConfig::disabled()
+    } else {
+        UpnpConfig::default()
+    }
+}
+
 impl P2PNetworkNode<P2pLinkTransport> {
     /// Create a new P2P network node with default P2pLinkTransport
     pub async fn new(bind_addr: SocketAddr) -> Result<Self> {
@@ -552,6 +569,7 @@ impl P2PNetworkNode<P2pLinkTransport> {
                 allow_loopback,
                 enable_relay_service,
                 advertise_external_addresses,
+                upnp: upnp_config_for(bind_addr),
                 ..NatConfig::default()
             });
         if let Some(max_msg_size) = max_msg_size {
@@ -2664,9 +2682,21 @@ fn normalize_connection_event(event: ConnectionEvent) -> ConnectionEvent {
 mod tests {
     use super::{
         DispatchPlan, StackChoice, StackRole, bucket_targets, decide_dispatch,
-        to_dual_stack_dial_list,
+        to_dual_stack_dial_list, upnp_config_for,
     };
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    #[test]
+    fn upnp_is_off_for_a_loopback_bind_and_on_otherwise() {
+        for loopback in ["127.0.0.1:0", "127.0.0.1:10000", "[::1]:0"] {
+            let addr: SocketAddr = loopback.parse().unwrap();
+            assert!(!upnp_config_for(addr).enabled, "{loopback}");
+        }
+        for routable in ["0.0.0.0:0", "0.0.0.0:10000", "[::]:0", "192.168.1.10:10000"] {
+            let addr: SocketAddr = routable.parse().unwrap();
+            assert!(upnp_config_for(addr).enabled, "{routable}");
+        }
+    }
 
     /// Test TDD: verify no duplicate peer registration
     ///
