@@ -504,7 +504,6 @@ fn record_attributed_observer(
     }
 }
 
-#[allow(dead_code)]
 /// UPnP port mapping for a transport bound to `bind_addr`.
 ///
 /// A gateway can only forward traffic to an address on the LAN, so a socket
@@ -521,6 +520,7 @@ fn upnp_config_for(bind_addr: SocketAddr) -> UpnpConfig {
     }
 }
 
+#[allow(dead_code)]
 impl P2PNetworkNode<P2pLinkTransport> {
     /// Create a new P2P network node with default P2pLinkTransport
     pub async fn new(bind_addr: SocketAddr) -> Result<Self> {
