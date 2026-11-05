@@ -35,6 +35,32 @@ fn test_config() -> NodeConfig {
 // ---------------------------------------------------------------------------
 
 /// A freshly-created node is not running and not bootstrapped.
+/// A node whose port is taken reports why the bind failed, not only "Failed to
+/// create transport": the setup error keeps its whole cause chain.
+#[tokio::test]
+async fn a_taken_port_reports_why_the_bind_failed() {
+    let holder = std::net::UdpSocket::bind("127.0.0.1:0").expect("hold a port");
+    let port = holder.local_addr().expect("held address").port();
+    let config = NodeConfig::builder()
+        .local(true)
+        .port(port)
+        .ipv6(false)
+        .build()
+        .expect("test config should be valid");
+
+    let err = P2PNode::new(config)
+        .await
+        .err()
+        .expect("a node cannot bind a port another socket holds")
+        .to_string();
+    assert!(err.contains("Failed to create transport"), "{err}");
+    // An io::Error's message ends in "(os error N)" on every platform.
+    assert!(
+        err.contains("os error"),
+        "the bind's io::Error is missing: {err}"
+    );
+}
+
 #[tokio::test]
 async fn new_node_is_not_running() {
     let node = P2PNode::new(test_config()).await.unwrap();
