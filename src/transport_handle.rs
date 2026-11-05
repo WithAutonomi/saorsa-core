@@ -541,8 +541,11 @@ impl TransportHandle {
             )
             .await
             .map_err(|e| {
+                // `{:#}` keeps anyhow's cause chain. `{}` printed only the outermost
+                // context ("Failed to create transport") and dropped the reason,
+                // such as the bind's "address in use".
                 P2PError::Transport(crate::error::TransportError::SetupFailed(
-                    format!("Failed to create dual-stack network nodes: {}", e).into(),
+                    format!("Failed to create dual-stack network nodes: {e:#}").into(),
                 ))
             })?,
         );
@@ -734,7 +737,7 @@ impl TransportHandle {
                         Ok(d) => d,
                         Err(e2) => {
                             return Err(P2PError::Network(NetworkError::BindError(
-                                format!("Failed to create dual-stack network node: {}", e2).into(),
+                                format!("Failed to create dual-stack network node: {e2:#}").into(),
                             )));
                         }
                     }
@@ -2409,7 +2412,7 @@ impl TransportHandle {
         info!("Starting dual-stack listeners (saorsa-transport)...");
         let socket_addrs = self.dual_node.local_addrs().await.map_err(|e| {
             P2PError::Transport(crate::error::TransportError::SetupFailed(
-                format!("Failed to get local addresses: {}", e).into(),
+                format!("Failed to get local addresses: {e:#}").into(),
             ))
         })?;
         let addrs: Vec<SocketAddr> = socket_addrs.clone();
