@@ -1927,6 +1927,39 @@ impl P2PNode {
         .await
     }
 
+    /// Send a message to `peer_id` on `channel_id` alone: the channel one of
+    /// the peer's messages arrived on, as named by that message's
+    /// `transport_source`.
+    ///
+    /// Unlike [`Self::send_message`], this never falls back to another of the
+    /// peer's channels, never dials and never retries. A signed message is
+    /// not bound to the channel it arrives on, so another connection can come
+    /// to be mapped to the same identity (by sending on a message the peer
+    /// signed); a reply meant for the connection a request came on must not
+    /// reach it.
+    ///
+    /// A channel is named by its remote address, so the message goes on the
+    /// connection the transport holds at that address when it is sent: a new
+    /// connection from the same address, made before the old one's close is
+    /// handled, is not told apart from it. A channel the send finds gone is
+    /// forgotten, as [`Self::send_message`] does.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `PeerNotFound` network error if `channel_id` is not one of
+    /// `peer_id`'s channels, or the error of the send.
+    pub async fn send_message_on_channel(
+        &self,
+        peer_id: &PeerId,
+        channel_id: &str,
+        protocol: &str,
+        data: impl Into<Bytes>,
+    ) -> Result<()> {
+        self.transport
+            .send_message_on_channel(peer_id, channel_id, protocol, data)
+            .await
+    }
+
     /// Ensure an identity-authenticated channel to `peer_id` exists, dialing a
     /// fresh connection when necessary.
     ///
@@ -4226,6 +4259,127 @@ mod tests {
         // Verify peer no longer exists
         assert!(!node.is_peer_connected(&channel_peer_id).await);
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_message_on_a_channel_goes_only_on_one_of_the_peer_s_own() -> Result<()> {
+        let config = create_test_node_config();
+        let node = P2PNode::new(config).await?;
+
+        let channel_id = UNCONNECTED_CHANNEL_ID.to_string();
+        let peer = PeerId::from_name("channel owner");
+        let other = PeerId::from_name("someone else");
+        node.transport
+            .inject_peer_to_channel(peer, channel_id.clone())
+            .await;
+
+        // Not one of the peer's channels: refused before anything is sent.
+        let refused = node
+            .send_message_on_channel(&peer, "127.0.0.1:10", "test", b"hi".to_vec())
+            .await;
+        assert!(matches!(
+            refused,
+            Err(P2PError::Network(NetworkError::PeerNotFound(_)))
+        ));
+        let refused = node
+            .send_message_on_channel(&other, &channel_id, "test", b"hi".to_vec())
+            .await;
+        assert!(matches!(
+            refused,
+            Err(P2PError::Network(NetworkError::PeerNotFound(_)))
+        ));
+        // Its own channel, with no connection behind it: the send fails
+        // there, nothing is dialled, and the dead channel is forgotten.
+        let sent = node
+            .send_message_on_channel(&peer, &channel_id, "test", b"hi".to_vec())
+            .await;
+        assert!(sent.is_err());
+        assert!(node.transport.channels_for_peer(&peer).await.is_empty());
+        assert!(
+            node.transport
+                .peer_info_by_channel(&channel_id)
+                .await
+                .is_none()
+        );
+
+        Ok(())
+    }
+
+    /// With two channels mapped to one peer, a message sent on one never
+    /// reaches the peer over the other.
+    #[tokio::test]
+    async fn a_message_on_a_dead_channel_does_not_go_on_a_live_one() -> Result<()> {
+        let node1 = P2PNode::new(create_test_node_config()).await?;
+        let node2 = P2PNode::new(create_test_node_config()).await?;
+        node1.start().await?;
+        node2.start().await?;
+        let node2_addr = node2
+            .listen_addrs()
+            .await
+            .into_iter()
+            .find(|a| a.is_ipv4())
+            .ok_or_else(|| {
+                P2PError::Network(NetworkError::InvalidAddress(
+                    "Node 2 did not expose an IPv4 listen address".into(),
+                ))
+            })?;
+        let live = node1.connect_peer(&node2_addr).await?;
+        let node2_id = node1
+            .wait_for_peer_identity(&live, Duration::from_secs(5))
+            .await?;
+        // A second channel taken for node 2's, with nothing behind it.
+        node1
+            .transport
+            .inject_peer_to_channel(node2_id, UNCONNECTED_CHANNEL_ID.to_string())
+            .await;
+        let mut events = node2.subscribe_events();
+        let received = |events: &mut broadcast::Receiver<P2PEvent>| {
+            let mut got = Vec::new();
+            while let Ok(event) = events.try_recv() {
+                if let P2PEvent::Message { topic, data, .. } = event
+                    && topic == "isolation"
+                {
+                    got.push(data);
+                }
+            }
+            got
+        };
+
+        let dead = node1
+            .send_message_on_channel(
+                &node2_id,
+                UNCONNECTED_CHANNEL_ID,
+                "isolation",
+                b"dead".to_vec(),
+            )
+            .await;
+        assert!(dead.is_err());
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            received(&mut events).is_empty(),
+            "nothing went on the live channel"
+        );
+        assert_eq!(
+            node1.transport.channels_for_peer(&node2_id).await,
+            vec![live.clone()]
+        );
+
+        node1
+            .send_message_on_channel(&node2_id, &live, "isolation", b"live".to_vec())
+            .await?;
+        let mut got = Vec::new();
+        for _ in 0..40 {
+            got.extend(received(&mut events));
+            if !got.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(got, vec![b"live".to_vec()]);
+
+        node1.stop().await?;
+        node2.stop().await?;
         Ok(())
     }
 
